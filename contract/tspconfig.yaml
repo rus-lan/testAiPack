@@ -1,0 +1,15 @@
+kind: project
+
+entrypoint: index.tsp
+
+emit:
+  - "@typespec/openapi3"
+  - "@typespec/json-schema"
+
+options:
+  "@typespec/openapi3":
+    emitter-output-dir: "{project-root}/dist/openapi3"
+  "@typespec/json-schema":
+    emitter-output-dir: "{project-root}/dist/json-schema"
+    file-type: "json"
+    emitAllModels: true

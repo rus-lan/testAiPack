@@ -1,0 +1,16 @@
+{
+  "name": "testaipack-contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeSpec contracts for testaipack — A/B tester for opencode integrations.",
+  "scripts": {
+    "compile": "tsp compile .",
+    "build": "tsp compile ."
+  },
+  "devDependencies": {
+    "@typespec/compiler": "latest",
+    "@typespec/openapi3": "latest",
+    "@typespec/json-schema": "latest"
+  }
+}
