@@ -1,9 +1,129 @@
-/**
- * Util: git — typed helpers around the `git` CLI (clone, status, diff, rev-parse).
- *
- * @see docs/phases/02-repo-clone.ru.md
- * @see docs/phases/08-diff.ru.md
- *
- * TODO: implement per phase-doc
- */
-export const git = /* TODO */ null as never
+import { Data, Effect } from 'effect'
+import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
+
+export interface DiffStat {
+  readonly filesChanged: number
+  readonly additions: number
+  readonly deletions: number
+}
+
+export class GitError extends Data.TaggedError('GitError')<{
+  readonly command: string
+  readonly exitCode: number
+  readonly stderr: string
+}> {}
+
+const GIT_MAX_BUFFER = 64 * 1024 * 1024
+
+interface GitRunResult {
+  readonly stdout: string
+  readonly stderr: string
+  readonly exitCode: number
+}
+
+const execGit = (args: readonly string[], cwd: string): Promise<GitRunResult> =>
+  new Promise((resolve) => {
+    execFile(
+      'git',
+      [...args],
+      { cwd, maxBuffer: GIT_MAX_BUFFER },
+      (err, stdout, stderr) => {
+        const exitCode = err === null ? 0 : typeof err.code === 'number' ? err.code : -1
+        resolve({ stdout, stderr, exitCode })
+      },
+    )
+  })
+
+const runGit = (
+  command: string,
+  args: readonly string[],
+  cwd: string,
+): Effect.Effect<{ readonly stdout: string; readonly stderr: string }, GitError> =>
+  Effect.gen(function* () {
+    const result = yield* Effect.tryPromise({
+      try: () => execGit(args, cwd),
+      catch: (e) =>
+        new GitError({
+          command,
+          exitCode: -1,
+          stderr: `failed to spawn git: ${String(e)}`,
+        }),
+    })
+    if (result.exitCode !== 0) {
+      yield* Effect.fail(
+        new GitError({ command, exitCode: result.exitCode, stderr: result.stderr }),
+      )
+    }
+    return { stdout: result.stdout, stderr: result.stderr }
+  })
+
+export const init = (cwd: string): Effect.Effect<void, GitError> =>
+  Effect.as(runGit('init', ['init', '--quiet', cwd], process.cwd()), undefined)
+
+export const clone = (
+  url: string,
+  dst: string,
+  opts: { readonly shallow?: boolean } = {},
+): Effect.Effect<void, GitError> => {
+  const args: readonly string[] = [
+    'clone',
+    ...(opts.shallow === true ? ['--depth', '1'] : []),
+    url,
+    dst,
+  ]
+  return Effect.as(runGit('clone', args, process.cwd()), undefined)
+}
+
+export const addAll = (cwd: string): Effect.Effect<void, GitError> =>
+  Effect.as(runGit('add', ['add', '-A'], cwd), undefined)
+
+export const commit = (
+  cwd: string,
+  message: string,
+): Effect.Effect<void, GitError> =>
+  Effect.as(
+    runGit(
+      'commit',
+      ['-c', 'user.email=t@t', '-c', 'user.name=testaipack', 'commit', '-m', message, '--quiet'],
+      cwd,
+    ),
+    undefined,
+  )
+
+export const diffCached = (cwd: string): Effect.Effect<string, GitError> =>
+  Effect.map(runGit('diff', ['diff', '--cached'], cwd), (r) => r.stdout)
+
+const parseNumStatField = (field: string | undefined): number => {
+  if (field === undefined || field === '-') return 0
+  return Number.parseInt(field, 10) || 0
+}
+
+export const diffStat = (cwd: string): Effect.Effect<DiffStat, GitError> =>
+  Effect.gen(function* () {
+    const { stdout } = yield* runGit('numstat', ['diff', '--cached', '--numstat'], cwd)
+    return stdout.split('\n').reduce<DiffStat>(
+      (acc, line) => {
+        const trimmed = line.trim()
+        if (trimmed === '') return acc
+        const parts = trimmed.split('\t')
+        if (parts.length < 2) return acc
+        return {
+          filesChanged: acc.filesChanged + 1,
+          additions: acc.additions + parseNumStatField(parts[0]),
+          deletions: acc.deletions + parseNumStatField(parts[1]),
+        }
+      },
+      { filesChanged: 0, additions: 0, deletions: 0 },
+    )
+  })
+
+export const revParseHead = (cwd: string): Effect.Effect<string, GitError> => {
+  if (!existsSync(path.join(cwd, '.git')) && !existsSync(cwd)) {
+    return Effect.fail(
+      new GitError({ command: 'rev-parse', exitCode: -1, stderr: 'cwd does not exist' }),
+    )
+  }
+  return Effect.map(runGit('rev-parse', ['rev-parse', 'HEAD'], cwd), (r) => r.stdout.trim())
+}

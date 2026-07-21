@@ -52,6 +52,18 @@ export default [
     rules: {
       '@typescript-eslint/no-non-null-assertion': 'off',
       'functional/no-let': 'off',
+      'functional/immutable-data': 'off',
+      'functional/prefer-readonly-type': 'off',
+    },
+  },
+  {
+    // Low-level subprocess seam: stream collection is inherently stateful
+    // (chunk accumulation, closure/exit flags across async callbacks).
+    files: ['src/opencode/spawn.ts'],
+    rules: {
+      'functional/no-let': 'off',
+      'functional/immutable-data': 'off',
+      'functional/prefer-readonly-type': 'off',
     },
   },
 ]
