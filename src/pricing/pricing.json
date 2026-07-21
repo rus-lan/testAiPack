@@ -1,0 +1,72 @@
+{
+  "$schema": "./pricing-schema.json",
+  "version": "0.1.0",
+  "providers": {
+    "anthropic": {
+      "claude-3-5-sonnet-20241022": {
+        "input": 3.0,
+        "output": 15.0,
+        "cacheRead": 0.3,
+        "cacheWrite": 3.75
+      },
+      "claude-3-5-haiku-20241022": {
+        "input": 0.8,
+        "output": 4.0,
+        "cacheRead": 0.08,
+        "cacheWrite": 1.0
+      },
+      "claude-3-opus-20240229": {
+        "input": 15.0,
+        "output": 75.0,
+        "cacheRead": 1.5,
+        "cacheWrite": 18.75
+      }
+    },
+    "openai": {
+      "gpt-4o": {
+        "input": 2.5,
+        "output": 10.0,
+        "cacheRead": 1.25,
+        "cacheWrite": 2.5
+      },
+      "gpt-4o-mini": {
+        "input": 0.15,
+        "output": 0.6,
+        "cacheRead": 0.075,
+        "cacheWrite": 0.15
+      },
+      "o1": {
+        "input": 15.0,
+        "output": 60.0,
+        "cacheRead": 7.5,
+        "cacheWrite": 15.0
+      }
+    },
+    "zai-coding-plan": {
+      "glm-5.2": {
+        "input": 2.0,
+        "output": 8.0,
+        "cacheRead": 0.2,
+        "cacheWrite": 2.0
+      },
+      "glm-4.7": {
+        "input": 0.5,
+        "output": 2.0,
+        "cacheRead": 0.05,
+        "cacheWrite": 0.5
+      },
+      "fable-5": {
+        "input": 5.0,
+        "output": 20.0,
+        "cacheRead": 0.5,
+        "cacheWrite": 5.0
+      }
+    }
+  },
+  "fallback": {
+    "input": 1.0,
+    "output": 5.0,
+    "cacheRead": 0.1,
+    "cacheWrite": 1.0
+  }
+}

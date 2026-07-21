@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+contract/node_modules/
+
+# Build artifacts
+dist/
+contract/dist/
+*.tsbuildinfo
+
+# Test & coverage
+coverage/
+.testaipack/
+screenshots/
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Env
+.env
+.env.local
+
+# Cache
+.cache/
+.turbo/
+.eslintcache
