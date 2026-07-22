@@ -1,11 +1,15 @@
 import { Data, Effect } from 'effect'
 import {
   access as fsAccess,
+  appendFile as fsAppendFile,
+  copyFile as fsCopyFile,
   cp as fsCp,
   mkdir as fsMkdir,
   readFile as fsReadFile,
+  readdir as fsReaddir,
   readlink,
   rm as fsRm,
+  stat as fsStat,
   symlink as fsSymlink,
   writeFile as fsWriteFile,
 } from 'node:fs/promises'
@@ -53,6 +57,15 @@ export const writeFile = (
   Effect.tryPromise({
     try: () => fsWriteFile(path, content, 'utf8'),
     catch: wrap('writeFile', path),
+  })
+
+export const appendFile = (
+  path: string,
+  content: string,
+): Effect.Effect<void, FsError> =>
+  Effect.tryPromise({
+    try: () => fsAppendFile(path, content, 'utf8'),
+    catch: wrap('appendFile', path),
   })
 
 export const readFile = (path: string): Effect.Effect<string, FsError> =>
@@ -104,3 +117,29 @@ export const readSymlink = (linkPath: string): Effect.Effect<string, FsError> =>
     try: () => readlink(linkPath),
     catch: wrap('readSymlink', linkPath),
   })
+
+export const readDir = (path: string): Effect.Effect<readonly string[], FsError> =>
+  Effect.tryPromise({
+    try: () => fsReaddir(path),
+    catch: wrap('readDir', path),
+  })
+
+export const copyFile = (
+  src: string,
+  dst: string,
+): Effect.Effect<void, FsError> =>
+  Effect.tryPromise({
+    try: () => fsCopyFile(src, dst),
+    catch: wrap('copyFile', src),
+  })
+
+export type PathKind = 'file' | 'dir' | 'missing'
+
+export const pathKind = (path: string): Effect.Effect<PathKind> =>
+  Effect.tryPromise({
+    try: async () => {
+      const s = await fsStat(path)
+      return s.isDirectory() ? 'dir' : 'file'
+    },
+    catch: (): PathKind => 'missing',
+  }).pipe(Effect.catchAll((e) => Effect.succeed(e)))

@@ -54,6 +54,14 @@ export default [
       'functional/no-let': 'off',
       'functional/immutable-data': 'off',
       'functional/prefer-readonly-type': 'off',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+        },
+      ],
     },
   },
   {

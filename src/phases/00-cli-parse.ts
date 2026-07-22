@@ -3,7 +3,668 @@
  *
  * @see docs/phases/00-cli-parse.ru.md
  * @see contract/phases/00-cli-parse.tsp
- *
- * TODO: implement per phase-doc
  */
-export const cliParse = /* TODO */ null as never
+import { Effect } from 'effect'
+import path from 'node:path'
+import { z } from 'zod'
+import type {
+  AuthWhitelist,
+  CliParseInput,
+  CliParseResult,
+  IsolationMode,
+  LogLevel,
+  OutputFormat,
+  PackType,
+  RunInput,
+  TimeoutConfig,
+  TimelineMode,
+} from '@generated/types'
+import {
+  authWhitelistSchema,
+  isolationModeSchema,
+  logLevelSchema,
+  outputFormatSchema,
+  packTypeSchema,
+  runInputSchema,
+  timeoutConfigSchema,
+  timelineModeSchema,
+} from '@generated/schemas'
+import { detectPack } from '../pack/detector.js'
+import type { PackDetectError } from '../pack/detector.js'
+import { cliParseError } from '../errors.js'
+import type { PhaseError } from '../errors.js'
+import { exists, readFile } from '../util/fs.js'
+import { isDockerAvailable } from '../util/docker.js'
+
+export type CliParseOutput = CliParseResult & {
+  readonly flagDefaults: Readonly<Record<string, unknown>>
+}
+
+const DEFAULT_RUNS = 3
+const DEFAULT_FORMATS: readonly OutputFormat[] = ['md']
+const ALL_FORMATS: readonly OutputFormat[] = ['md', 'html', 'json', 'yaml']
+const DEFAULT_TIMEOUTS: TimeoutConfig = {
+  preflightSeconds: 60,
+  runSeconds: 600,
+  verifySeconds: 300,
+  installSeconds: 300,
+  watchdogSeconds: 1200,
+}
+const DEFAULT_AUTH: AuthWhitelist = {
+  opencode: false,
+  npmrc: false,
+  anthropic: false,
+  openai: false,
+  gemini: false,
+  aws: false,
+  ssh: false,
+  git: false,
+}
+
+type TimeoutUpdate = { readonly [K in keyof TimeoutConfig]?: number | undefined }
+type AuthUpdate = { readonly [K in keyof AuthWhitelist]?: boolean | undefined }
+
+const timeoutPartialSchema = timeoutConfigSchema.partial()
+const authPartialSchema = authWhitelistSchema.partial()
+
+const configFileSchema = z
+  .object({
+    repoUrl: z.string().optional(),
+    packRef: z.string().optional(),
+    packType: packTypeSchema.optional(),
+    prompt: z.string().optional(),
+    promptFiles: z.array(z.string()).optional(),
+    init: z.string().optional(),
+    initFiles: z.array(z.string()).optional(),
+    verify: z.string().optional(),
+    judge: z.string().optional(),
+    judgeFiles: z.array(z.string()).optional(),
+    runs: z.number().int().optional(),
+    isolation: isolationModeSchema.optional(),
+    opencodeVersion: z.string().optional(),
+    pureBaseline: z.boolean().optional(),
+    preflightEnabled: z.boolean().optional(),
+    preflightModel: z.string().optional(),
+    formats: z.union([z.array(outputFormatSchema), z.literal('all')]).optional(),
+    outputPath: z.string().optional(),
+    diffHtml: z.boolean().optional(),
+    collapseRepeats: z.boolean().optional(),
+    timelineMode: timelineModeSchema.optional(),
+    timeouts: timeoutPartialSchema.optional(),
+    workspacePath: z.string().optional(),
+    logLevel: logLevelSchema.optional(),
+    pricingPath: z.string().optional(),
+    auth: authPartialSchema.optional(),
+  })
+  .strict()
+
+type ConfigFile = z.infer<typeof configFileSchema>
+
+interface CliRaw {
+  readonly repoUrl?: string
+  readonly prompts: readonly string[]
+  readonly inits: readonly string[]
+  readonly verifies: readonly string[]
+  readonly judges: readonly string[]
+  readonly runs?: number
+  readonly isolation?: IsolationMode
+  readonly packRef?: string
+  readonly packType?: PackType
+  readonly formats: readonly (OutputFormat | 'all')[]
+  readonly pureBaseline?: boolean
+  readonly preflightEnabled?: boolean
+  readonly diffHtml?: boolean
+  readonly collapseRepeats?: boolean
+  readonly timelineMode?: TimelineMode
+  readonly logLevel?: LogLevel
+  readonly outputPath?: string
+  readonly workspacePath?: string
+  readonly opencodeVersion?: string
+  readonly preflightModel?: string
+  readonly pricingPath?: string
+  readonly timeouts: TimeoutUpdate
+  readonly auth: AuthUpdate
+}
+
+const EMPTY_CLI: CliRaw = {
+  prompts: [],
+  inits: [],
+  verifies: [],
+  judges: [],
+  formats: [],
+  timeouts: {},
+  auth: {},
+}
+
+const VALUE_FLAGS: Readonly<Record<string, string>> = {
+  '--prompt': 'prompts',
+  '-p': 'prompts',
+  '--init': 'inits',
+  '--verify': 'verifies',
+  '--judge': 'judges',
+  '--format': 'formats',
+  '-f': 'formats',
+  '--auth': 'auth',
+  '--runs': 'runs',
+  '-n': 'runs',
+  '--isolation': 'isolation',
+  '--pack': 'packRef',
+  '--pack-type': 'packType',
+  '--timeline-mode': 'timelineMode',
+  '--log-level': 'logLevel',
+  '--output': 'outputPath',
+  '-o': 'outputPath',
+  '--workspace': 'workspacePath',
+  '-w': 'workspacePath',
+  '--opencode-version': 'opencodeVersion',
+  '--preflight-model': 'preflightModel',
+  '--pricing-path': 'pricingPath',
+  '--timeout-preflight': 'preflightSeconds',
+  '--timeout-run': 'runSeconds',
+  '--timeout-verify': 'verifySeconds',
+  '--timeout-install': 'installSeconds',
+  '--timeout-watchdog': 'watchdogSeconds',
+  '--timeout-total': 'totalSeconds',
+}
+
+const BOOLEAN_FLAGS: Readonly<
+  Record<string, { readonly key: 'pureBaseline' | 'preflightEnabled' | 'diffHtml' | 'collapseRepeats'; readonly value: boolean }>
+> = {
+  '--pure-baseline': { key: 'pureBaseline', value: true },
+  '--no-pure-baseline': { key: 'pureBaseline', value: false },
+  '--preflight': { key: 'preflightEnabled', value: true },
+  '--no-preflight': { key: 'preflightEnabled', value: false },
+  '--diff-html': { key: 'diffHtml', value: true },
+  '--no-diff-html': { key: 'diffHtml', value: false },
+  '--collapse-repeats': { key: 'collapseRepeats', value: true },
+  '--no-collapse-repeats': { key: 'collapseRepeats', value: false },
+}
+
+const TIMEOUT_KEYS: ReadonlySet<string> = new Set([
+  'preflightSeconds',
+  'runSeconds',
+  'verifySeconds',
+  'installSeconds',
+  'watchdogSeconds',
+  'totalSeconds',
+])
+
+const AUTH_KEYS: ReadonlySet<keyof AuthWhitelist> = new Set([
+  'opencode', 'npmrc', 'anthropic', 'openai', 'gemini', 'aws', 'ssh', 'git',
+])
+
+const parseIntStrict = (s: string): number | undefined => {
+  if (!/^\s*-?\d+\s*$/.test(s)) return undefined
+  const n = Number(s)
+  return Number.isSafeInteger(n) ? n : undefined
+}
+
+const parseEnum = <T>(
+  value: string,
+  schema: z.ZodType<T>,
+  label: string,
+): Effect.Effect<T, PhaseError> =>
+  Effect.gen(function* () {
+    const r = schema.safeParse(value)
+    if (!r.success) {
+      return yield* Effect.fail(
+        cliParseError(`invalid ${label}: ${value}`, 'E_CONFIG_INVALID', { label, value }),
+      )
+    }
+    return r.data
+  })
+
+const setScalar = <K extends keyof CliRaw>(acc: CliRaw, key: K, value: CliRaw[K]): CliRaw => ({
+  ...acc,
+  [key]: value,
+})
+
+const parseValueFlag = (
+  acc: CliRaw,
+  dest: string,
+  raw: string,
+): Effect.Effect<CliRaw, PhaseError> =>
+  Effect.gen(function* () {
+    if (dest === 'prompts') return { ...acc, prompts: [...acc.prompts, raw] }
+    if (dest === 'inits') return { ...acc, inits: [...acc.inits, raw] }
+    if (dest === 'verifies') return { ...acc, verifies: [...acc.verifies, raw] }
+    if (dest === 'judges') return { ...acc, judges: [...acc.judges, raw] }
+    if (dest === 'auth') return setAuth(acc, raw)
+    if (TIMEOUT_KEYS.has(dest)) {
+      const n = parseIntStrict(raw)
+      if (n === undefined) {
+        return yield* Effect.fail(
+          cliParseError(`invalid timeout value: ${raw}`, 'E_CONFIG_INVALID', { key: dest, value: raw }),
+        )
+      }
+      return { ...acc, timeouts: { ...acc.timeouts, [dest]: n } }
+    }
+    if (dest === 'runs') {
+      const n = parseIntStrict(raw)
+      if (n === undefined) {
+        return yield* Effect.fail(
+          cliParseError(`invalid --runs value: ${raw}`, 'E_CONFIG_INVALID', { value: raw }),
+        )
+      }
+      return setScalar(acc, 'runs', n)
+    }
+    if (dest === 'isolation') {
+      const v = yield* parseEnum(raw, isolationModeSchema, '--isolation')
+      return setScalar(acc, 'isolation', v)
+    }
+    if (dest === 'packType') {
+      const v = yield* parseEnum(raw, packTypeSchema, '--pack-type')
+      return setScalar(acc, 'packType', v)
+    }
+    if (dest === 'timelineMode') {
+      const v = yield* parseEnum(raw, timelineModeSchema, '--timeline-mode')
+      return setScalar(acc, 'timelineMode', v)
+    }
+    if (dest === 'logLevel') {
+      const v = yield* parseEnum(raw, logLevelSchema, '--log-level')
+      return setScalar(acc, 'logLevel', v)
+    }
+    if (dest === 'formats') {
+      if (raw === 'all') return { ...acc, formats: [...acc.formats, 'all'] }
+      const v = yield* parseEnum(raw, outputFormatSchema, '--format')
+      return { ...acc, formats: [...acc.formats, v] }
+    }
+    if (dest === 'repoUrl') return setScalar(acc, 'repoUrl', raw)
+    if (dest === 'packRef') return setScalar(acc, 'packRef', raw)
+    if (dest === 'outputPath') return setScalar(acc, 'outputPath', raw)
+    if (dest === 'workspacePath') return setScalar(acc, 'workspacePath', raw)
+    if (dest === 'opencodeVersion') return setScalar(acc, 'opencodeVersion', raw)
+    if (dest === 'preflightModel') return setScalar(acc, 'preflightModel', raw)
+    if (dest === 'pricingPath') return setScalar(acc, 'pricingPath', raw)
+    return yield* Effect.fail(
+      cliParseError(`unknown flag destination: ${dest}`, 'E_CONFIG_INVALID', { dest }),
+    )
+  })
+
+const setAuth = (acc: CliRaw, kind: string): CliRaw => {
+  const k = kind as keyof AuthWhitelist
+  if (!AUTH_KEYS.has(k)) return acc
+  return { ...acc, auth: { ...acc.auth, [k]: true } }
+}
+
+const parseArgs = (args: readonly string[]): Effect.Effect<CliRaw, PhaseError> => {
+  const loop = (i: number, acc: CliRaw): Effect.Effect<CliRaw, PhaseError> =>
+    Effect.gen(function* () {
+      if (i >= args.length) return acc
+      const tok = args[i] ?? ''
+      if (tok === '') return yield* loop(i + 1, acc)
+
+      if (tok.startsWith('--') || tok.startsWith('-')) {
+        const eq = tok.indexOf('=')
+        if (eq >= 0) {
+          const flag = tok.slice(0, eq)
+          const inline = tok.slice(eq + 1)
+          const dest = VALUE_FLAGS[flag]
+          if (dest === undefined) {
+            return yield* Effect.fail(
+              cliParseError(`unknown flag: ${flag}`, 'E_CONFIG_INVALID', { flag }),
+            )
+          }
+          const next = yield* parseValueFlag(acc, dest, inline)
+          return yield* loop(i + 1, next)
+        }
+        const dest = VALUE_FLAGS[tok]
+        if (dest !== undefined) {
+          const rawNext = args[i + 1]
+          if (rawNext === undefined || rawNext === '' || rawNext.startsWith('-')) {
+            return yield* Effect.fail(
+              cliParseError(`flag ${tok} requires a value`, 'E_CONFIG_INVALID', { flag: tok }),
+            )
+          }
+          const next = yield* parseValueFlag(acc, dest, rawNext)
+          return yield* loop(i + 2, next)
+        }
+        const b = BOOLEAN_FLAGS[tok]
+        if (b !== undefined) {
+          return yield* loop(i + 1, setScalar(acc, b.key, b.value))
+        }
+        return yield* Effect.fail(
+          cliParseError(`unknown flag: ${tok}`, 'E_CONFIG_INVALID', { flag: tok }),
+        )
+      }
+
+      if (acc.repoUrl === undefined) {
+        return yield* loop(i + 1, setScalar(acc, 'repoUrl', tok))
+      }
+      return yield* Effect.fail(
+        cliParseError(`unexpected positional argument: ${tok}`, 'E_CONFIG_INVALID', { value: tok }),
+      )
+    })
+  return loop(0, EMPTY_CLI)
+}
+
+const readConfigFile = (
+  input: CliParseInput,
+): Effect.Effect<ConfigFile | undefined, PhaseError> =>
+  Effect.gen(function* () {
+    const file = input.configFile ?? path.join(input.cwd, '.testaipack', 'config.json')
+    const has = yield* exists(file)
+    if (!has) return undefined
+    const raw = yield* readFile(file).pipe(
+      Effect.mapError((e) =>
+        cliParseError(`cannot read config file: ${file}`, 'E_CONFIG_INVALID', {
+          file,
+          reason: 'unreadable',
+          cause: String(e),
+        }),
+      ),
+    )
+    const json = yield* Effect.try({
+      try: () => JSON.parse(raw) as unknown,
+      catch: (e) =>
+        cliParseError(`config file is not valid JSON: ${file}`, 'E_CONFIG_INVALID', {
+          file,
+          reason: 'invalid-json',
+          cause: String(e),
+        }),
+    })
+    const parsed = configFileSchema.safeParse(json)
+    if (!parsed.success) {
+      return yield* Effect.fail(
+        cliParseError(`config file violates schema: ${file}`, 'E_CONFIG_INVALID', {
+          file,
+          reason: 'schema-mismatch',
+          issues: parsed.error.issues,
+        }),
+      )
+    }
+    return parsed.data
+  })
+
+interface ResolvedText {
+  readonly text: string
+  readonly files: readonly string[]
+}
+
+const resolveTextSpecs = (
+  specs: readonly string[],
+  baseDir: string,
+  label: string,
+): Effect.Effect<ResolvedText, PhaseError> =>
+  Effect.gen(function* () {
+    const parts = yield* Effect.forEach(specs, (spec) =>
+      Effect.gen(function* () {
+        if (!spec.startsWith('@')) {
+          return { text: spec, file: undefined as string | undefined }
+        }
+        const rel = spec.slice(1)
+        const resolved = path.resolve(baseDir, rel)
+        const has = yield* exists(resolved)
+        if (!has) {
+          return yield* Effect.fail(
+            cliParseError(`${label} file not found: ${rel}`, 'E_CONFIG_INVALID', {
+              label,
+              path: rel,
+              reason: 'file-not-found',
+            }),
+          )
+        }
+        const content = yield* readFile(resolved).pipe(
+          Effect.mapError((e) =>
+            cliParseError(`${label} file unreadable: ${rel}`, 'E_CONFIG_INVALID', {
+              label,
+              path: rel,
+              cause: String(e),
+            }),
+          ),
+        )
+        return { text: content, file: resolved }
+      }),
+    )
+    const texts = parts.map((p) => p.text)
+    const files = parts.flatMap((p) => (p.file === undefined ? [] : [p.file]))
+    return { text: texts.join('\n\n'), files }
+  })
+
+const pick = <T>(
+  cliV: T | undefined,
+  cfgV: T | undefined,
+): { readonly value: T | undefined; readonly src: 'cli' | 'config' | 'default' } =>
+  cliV !== undefined
+    ? { value: cliV, src: 'cli' }
+    : cfgV !== undefined
+      ? { value: cfgV, src: 'config' }
+      : { value: undefined, src: 'default' }
+
+const normalizeConfigFormats = (
+  f: ConfigFile['formats'],
+): readonly (OutputFormat | 'all')[] | undefined => {
+  if (f === undefined) return undefined
+  if (f === 'all') return ['all']
+  return f
+}
+
+const resolveFormats = (
+  cliFormats: readonly (OutputFormat | 'all')[],
+  cfgFormats: readonly (OutputFormat | 'all')[] | undefined,
+): readonly OutputFormat[] => {
+  const combined = [...cliFormats, ...(cfgFormats ?? [])]
+  if (combined.includes('all')) return ALL_FORMATS
+  const deduped = combined.filter(
+    (f, i): f is OutputFormat => f !== 'all' && combined.indexOf(f) === i,
+  )
+  return deduped.length === 0 ? DEFAULT_FORMATS : deduped
+}
+
+const mergeTimeouts = (cliT: TimeoutUpdate, cfgT: TimeoutUpdate | undefined): TimeoutConfig => ({
+  preflightSeconds: cliT.preflightSeconds ?? cfgT?.preflightSeconds ?? DEFAULT_TIMEOUTS.preflightSeconds,
+  runSeconds: cliT.runSeconds ?? cfgT?.runSeconds ?? DEFAULT_TIMEOUTS.runSeconds,
+  verifySeconds: cliT.verifySeconds ?? cfgT?.verifySeconds ?? DEFAULT_TIMEOUTS.verifySeconds,
+  installSeconds: cliT.installSeconds ?? cfgT?.installSeconds ?? DEFAULT_TIMEOUTS.installSeconds,
+  watchdogSeconds: cliT.watchdogSeconds ?? cfgT?.watchdogSeconds ?? DEFAULT_TIMEOUTS.watchdogSeconds,
+  ...(cliT.totalSeconds !== undefined
+    ? { totalSeconds: cliT.totalSeconds }
+    : cfgT?.totalSeconds !== undefined
+      ? { totalSeconds: cfgT.totalSeconds }
+      : DEFAULT_TIMEOUTS.totalSeconds !== undefined
+        ? { totalSeconds: DEFAULT_TIMEOUTS.totalSeconds }
+        : {}),
+})
+
+const mergeAuth = (cliA: AuthUpdate, cfgA: AuthUpdate | undefined): AuthWhitelist => ({
+  opencode: cliA.opencode ?? cfgA?.opencode ?? DEFAULT_AUTH.opencode,
+  npmrc: cliA.npmrc ?? cfgA?.npmrc ?? DEFAULT_AUTH.npmrc,
+  anthropic: cliA.anthropic ?? cfgA?.anthropic ?? DEFAULT_AUTH.anthropic,
+  openai: cliA.openai ?? cfgA?.openai ?? DEFAULT_AUTH.openai,
+  gemini: cliA.gemini ?? cfgA?.gemini ?? DEFAULT_AUTH.gemini,
+  aws: cliA.aws ?? cfgA?.aws ?? DEFAULT_AUTH.aws,
+  ssh: cliA.ssh ?? cfgA?.ssh ?? DEFAULT_AUTH.ssh,
+  git: cliA.git ?? cfgA?.git ?? DEFAULT_AUTH.git,
+})
+
+interface IsolationResult {
+  readonly isolation: IsolationMode
+  readonly dockerDowngraded: boolean
+}
+
+const resolveIsolation = (requested: IsolationMode): Effect.Effect<IsolationResult, PhaseError> =>
+  Effect.gen(function* () {
+    if (requested !== 'docker') {
+      return { isolation: requested, dockerDowngraded: false }
+    }
+    const up = yield* isDockerAvailable()
+    return up
+      ? { isolation: requested, dockerDowngraded: false }
+      : { isolation: 'home', dockerDowngraded: true }
+  })
+
+export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, PhaseError> =>
+  Effect.gen(function* () {
+    const head = input.argv[0]
+    const rest = head === 'run' ? input.argv.slice(1) : input.argv.slice()
+    const cli = yield* parseArgs(rest)
+    const cfg = yield* readConfigFile(input)
+
+    const repoUrlPick = pick(cli.repoUrl, cfg?.repoUrl)
+    if (repoUrlPick.value === undefined) {
+      return yield* Effect.fail(
+        cliParseError('repoUrl is required (positional or config)', 'E_CONFIG_INVALID', {
+          reason: 'repoUrl-required',
+        }),
+      )
+    }
+
+    const cliPromptSpecs = cli.prompts
+    const cfgPromptSpecs: readonly string[] = [
+      ...(cfg?.promptFiles ?? []),
+      ...(cfg?.prompt !== undefined ? [cfg.prompt] : []),
+    ]
+    const promptSpecs = cliPromptSpecs.length > 0 ? cliPromptSpecs : cfgPromptSpecs
+    const promptSrc: 'cli' | 'config' | 'default' =
+      cliPromptSpecs.length > 0 ? 'cli' : cfgPromptSpecs.length > 0 ? 'config' : 'default'
+    if (promptSpecs.length === 0) {
+      return yield* Effect.fail(
+        cliParseError('--prompt is required for the run subcommand', 'E_CONFIG_INVALID', {
+          reason: 'prompt-required',
+        }),
+      )
+    }
+    const promptResolved = yield* resolveTextSpecs([...promptSpecs], input.cwd, 'prompt')
+
+    const initSpecs: readonly string[] =
+      cli.inits.length > 0 ? cli.inits : cfg?.init !== undefined ? [cfg.init] : []
+    const initResolved: ResolvedText | undefined =
+      initSpecs.length > 0 ? yield* resolveTextSpecs([...initSpecs], input.cwd, 'init') : undefined
+
+    const verifySpecs: readonly string[] =
+      cli.verifies.length > 0 ? cli.verifies : cfg?.verify !== undefined ? [cfg.verify] : []
+    const verifyResolved: ResolvedText | undefined =
+      verifySpecs.length > 0 ? yield* resolveTextSpecs([...verifySpecs], input.cwd, 'verify') : undefined
+
+    const judgeSpecs: readonly string[] =
+      cli.judges.length > 0 ? cli.judges : cfg?.judge !== undefined ? [cfg.judge] : []
+    const judgeResolved: ResolvedText | undefined =
+      judgeSpecs.length > 0 ? yield* resolveTextSpecs([...judgeSpecs], input.cwd, 'judge') : undefined
+
+    const runsPick = pick(cli.runs, cfg?.runs)
+    if (runsPick.value !== undefined && runsPick.value < 1) {
+      return yield* Effect.fail(
+        cliParseError('--runs must be ≥ 1', 'E_CONFIG_INVALID', {
+          reason: 'runs-min',
+          value: runsPick.value,
+        }),
+      )
+    }
+    const runs = runsPick.value ?? DEFAULT_RUNS
+
+    const isolationPick = pick(cli.isolation, cfg?.isolation)
+    const requestedIsolation: IsolationMode = isolationPick.value ?? 'home'
+
+    const isolationResolved = yield* resolveIsolation(requestedIsolation)
+    const { isolation, dockerDowngraded } = isolationResolved
+
+    const packRefPick = pick(cli.packRef, cfg?.packRef)
+    const explicitPackType = pick(cli.packType, cfg?.packType)
+    const packTypeResolved = yield* Effect.gen(function* () {
+      if (explicitPackType.value !== undefined) {
+        return { value: explicitPackType.value, src: explicitPackType.src }
+      }
+      if (packRefPick.value === undefined) {
+        return { value: undefined as PackType | undefined, src: 'default' as const }
+      }
+      const ref = packRefPick.value
+      const detected = yield* detectPack(ref).pipe(
+        Effect.mapError((e: PackDetectError) =>
+          cliParseError(`invalid --pack reference: ${ref}`, 'E_CONFIG_INVALID', {
+            packRef: ref,
+            reason: e.reason,
+          }),
+        ),
+      )
+      return { value: detected.type, src: packRefPick.src }
+    })
+    const { value: packTypeValue, src: packTypeSrc } = packTypeResolved
+
+    const formats = resolveFormats(cli.formats, normalizeConfigFormats(cfg?.formats))
+
+    const pureBaselinePick = pick(cli.pureBaseline, cfg?.pureBaseline)
+    const preflightPick = pick(cli.preflightEnabled, cfg?.preflightEnabled)
+    const diffHtmlPick = pick(cli.diffHtml, cfg?.diffHtml)
+    const collapsePick = pick(cli.collapseRepeats, cfg?.collapseRepeats)
+    const timelinePick = pick(cli.timelineMode, cfg?.timelineMode)
+    const logPick = pick(cli.logLevel, cfg?.logLevel)
+    const outputPick = pick(cli.outputPath, cfg?.outputPath)
+    const workspacePick = pick(cli.workspacePath, cfg?.workspacePath)
+    const opencodeVersionPick = pick(cli.opencodeVersion, cfg?.opencodeVersion)
+    const preflightModelPick = pick(cli.preflightModel, cfg?.preflightModel)
+    const pricingPick = pick(cli.pricingPath, cfg?.pricingPath)
+
+    const timeouts = mergeTimeouts(cli.timeouts, cfg?.timeouts)
+    const auth = mergeAuth(cli.auth, cfg?.auth)
+
+    const sources: readonly ('cli' | 'config' | 'default')[] = [
+      repoUrlPick.src,
+      promptSrc,
+      runsPick.src,
+      isolationPick.src,
+      packRefPick.src,
+      packTypeSrc,
+      pureBaselinePick.src,
+      preflightPick.src,
+      diffHtmlPick.src,
+      collapsePick.src,
+      timelinePick.src,
+      logPick.src,
+      outputPick.src,
+      workspacePick.src,
+      opencodeVersionPick.src,
+      preflightModelPick.src,
+      pricingPick.src,
+    ]
+    const hasCli = sources.includes('cli')
+    const hasConfig = sources.includes('config')
+    const configSource: CliParseResult['configSource'] =
+      hasCli && hasConfig ? 'merged' : hasConfig ? 'config' : 'cli'
+
+    const runInput: RunInput = {
+      repoUrl: repoUrlPick.value,
+      prompt: promptResolved.text,
+      runs,
+      isolation,
+      auth,
+      pureBaseline: pureBaselinePick.value ?? true,
+      preflightEnabled: preflightPick.value ?? true,
+      formats: [...formats],
+      outputPath: outputPick.value ?? './results',
+      diffHtml: diffHtmlPick.value ?? false,
+      collapseRepeats: collapsePick.value ?? true,
+      timelineMode: timelinePick.value ?? 'side-by-side',
+      timeouts,
+      workspacePath: workspacePick.value ?? './.testaipack',
+      logLevel: logPick.value ?? 'info',
+      ...(packRefPick.value !== undefined ? { packRef: packRefPick.value } : {}),
+      ...(packTypeValue !== undefined ? { packType: packTypeValue } : {}),
+      ...(promptResolved.files.length > 0 ? { promptFiles: [...promptResolved.files] } : {}),
+      ...(initResolved !== undefined
+        ? { init: initResolved.text, initFiles: [...initResolved.files] }
+        : {}),
+      ...(verifyResolved !== undefined ? { verify: verifyResolved.text } : {}),
+      ...(judgeResolved !== undefined
+        ? { judge: judgeResolved.text, judgeFiles: [...judgeResolved.files] }
+        : {}),
+      ...(opencodeVersionPick.value !== undefined ? { opencodeVersion: opencodeVersionPick.value } : {}),
+      ...(preflightModelPick.value !== undefined ? { preflightModel: preflightModelPick.value } : {}),
+      ...(pricingPick.value !== undefined ? { pricingPath: pricingPick.value } : {}),
+    }
+
+    const zodResult = runInputSchema.safeParse(runInput)
+    if (!zodResult.success) {
+      return yield* Effect.fail(
+        cliParseError('resolved RunInput failed schema validation', 'E_CONFIG_INVALID', {
+          issues: zodResult.error.issues,
+        }),
+      )
+    }
+
+    const flagDefaults: Record<string, unknown> = {
+      dockerDowngraded,
+      configSource,
+    }
+
+    return { runInput, configSource, flagDefaults }
+  })

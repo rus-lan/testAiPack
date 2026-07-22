@@ -11,11 +11,15 @@ import {
   removeDir,
   copyDir,
   writeFile,
+  appendFile,
   readFile,
   writeJson,
   readJson,
   exists,
   symlink,
+  readDir,
+  copyFile,
+  pathKind,
 } from './fs.js'
 
 const run = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
@@ -100,5 +104,44 @@ describe('fs utils', () => {
   it('readFile returns FsError for a missing file', async () => {
     const err = await runFlip(readFile(path.join(await freshDir(), 'absent.txt')))
     expect(err).toBeInstanceOf(FsError)
+  })
+
+  it('appendFile creates then extends a file', async () => {
+    const p = path.join(await freshDir(), 'log.txt')
+    await run(appendFile(p, 'a\n'))
+    await run(appendFile(p, 'b\n'))
+    expect(await run(readFile(p))).toBe('a\nb\n')
+  })
+
+  it('readDir lists immediate entry names', async () => {
+    const d = await freshDir()
+    await run(writeFile(path.join(d, 'x.txt'), 'x'))
+    await run(ensureDir(path.join(d, 'sub')))
+    const names = await run(readDir(d))
+    expect([...names].sort()).toEqual(['sub', 'x.txt'])
+  })
+
+  it('readDir returns FsError for a missing directory', async () => {
+    const err = await runFlip(readDir(path.join(makeTempDir(), 'nope')))
+    expect(err).toBeInstanceOf(FsError)
+    expect(err.operation).toBe('readDir')
+  })
+
+  it('copyFile duplicates a single file', async () => {
+    const d = await freshDir()
+    const src = path.join(d, 'a.md')
+    const dst = path.join(d, 'b.md')
+    await run(writeFile(src, 'body'))
+    await run(copyFile(src, dst))
+    expect(await run(readFile(dst))).toBe('body')
+  })
+
+  it('pathKind classifies file / dir / missing', async () => {
+    const d = await freshDir()
+    const f = path.join(d, 'f.txt')
+    await run(writeFile(f, 'x'))
+    expect(await run(pathKind(f))).toBe('file')
+    expect(await run(pathKind(d))).toBe('dir')
+    expect(await run(pathKind(path.join(d, 'absent')))).toBe('missing')
   })
 })
