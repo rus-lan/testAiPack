@@ -1,8 +1,19 @@
 /**
- * Report: yaml — renders the final report as YAML (target: v0.2).
+ * Report: yaml — same canonical Report object serialised as YAML.
  *
  * @see docs/phases/11-report-render.ru.md
- *
- * TODO: implement in v0.2
+ * @see contract/phases/11-report-render.tsp
  */
-export const renderYaml = /* TODO */ null as never
+import { stringify } from 'yaml'
+import type { Report } from '@generated/types'
+import { reportSchema } from '@generated/schemas'
+
+export const renderYaml = (report: Report): string => {
+  const result = reportSchema.safeParse(report)
+  if (!result.success) {
+    throw new Error(
+      `renderYaml: report failed schema validation: ${JSON.stringify(result.error.issues)}`,
+    )
+  }
+  return stringify(report)
+}
