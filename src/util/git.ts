@@ -2,6 +2,7 @@ import { Data, Effect } from 'effect'
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
+import type { DiffSummary, FileChange } from '@generated/types'
 
 export interface DiffStat {
   readonly filesChanged: number
@@ -116,6 +117,35 @@ export const diffStat = (cwd: string): Effect.Effect<DiffStat, GitError> =>
         }
       },
       { filesChanged: 0, additions: 0, deletions: 0 },
+    )
+  })
+
+/**
+ * Like diffStat but also returns a per-file breakdown. `git diff --numstat`
+ * emits `additions\tdeletions\tpath` per line; binary files show `-` for both
+ * counts (mapped to 0 — the contract FileChange has no binary flag).
+ */
+export const diffStatFull = (cwd: string): Effect.Effect<DiffSummary, GitError> =>
+  Effect.gen(function* () {
+    const { stdout } = yield* runGit('numstat-full', ['diff', '--cached', '--numstat'], cwd)
+    return stdout.split('\n').reduce<DiffSummary>(
+      (acc, line) => {
+        const trimmed = line.trim()
+        if (trimmed === '') return acc
+        const parts = trimmed.split('\t')
+        if (parts[0] === undefined || parts[1] === undefined) return acc
+        const additions = parseNumStatField(parts[0])
+        const deletions = parseNumStatField(parts[1])
+        const filePath = parts.slice(2).join('\t') || '(unknown)'
+        const perFile: FileChange = { path: filePath, additions, deletions }
+        return {
+          filesChanged: acc.filesChanged + 1,
+          additions: acc.additions + additions,
+          deletions: acc.deletions + deletions,
+          perFile: [...acc.perFile, perFile],
+        }
+      },
+      { filesChanged: 0, additions: 0, deletions: 0, perFile: [] },
     )
   })
 

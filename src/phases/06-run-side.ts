@@ -1,9 +1,584 @@
 /**
  * Phase 06: run-side
  *
+ * Executes ONE side for ONE run index: `--init` (optional) → `--prompt` →
+ * `opencode export`, with a soft hang-watchdog and a hard run timeout, then
+ * optionally runs the `--verify` shell command. Crash / hang / timeout /
+ * context-overflow / rate-limit are all VALID run outcomes returned with a
+ * reduced `successRank`; only a missing export (`E_RUN_CRASH`) or an
+ * invalid export (`E_EXPORT_INVALID`) fail the phase.
+ *
  * @see docs/phases/06-run-side.ru.md
  * @see contract/phases/06-run-side.tsp
- *
- * TODO: implement per phase-doc
  */
-export const runSide = /* TODO */ null as never
+import { Effect } from 'effect'
+import type { Either } from 'effect'
+import path from 'node:path'
+import type {
+  EnvVarSet,
+  FinishCause,
+  RunSideInput,
+  RunSideResult,
+  Side,
+  SuccessRank,
+} from '@generated/types'
+import { opencodeExportSchema } from '@generated/schemas'
+import { run as opencodeRun, exportSession } from '../opencode/cli.js'
+import type { OpencodeError, OpencodeRunOptions, OpencodeRunResult } from '../opencode/cli.js'
+import { spawnProcess } from '../opencode/spawn.js'
+import { appendFile, ensureDir, readJson, writeFile } from '../util/fs.js'
+import type { PhaseError } from '../errors.js'
+import { runSideError } from '../errors.js'
+
+/** Consecutive identical tool calls above which a run with no clean finish is a doom-loop. */
+export const DOOM_LOOP_THRESHOLD = 10
+/** Watchdog poll interval (ms). The loop also resets on every streamed event. */
+const WATCHDOG_POLL_MS = 100
+
+type RunSideErrorCode =
+  | 'E_RUN_TIMEOUT'
+  | 'E_RUN_HANG_WATCHDOG'
+  | 'E_RUN_CRASH'
+  | 'E_VERIFY_TIMEOUT'
+  | 'E_VERIFY_FAILED'
+  | 'E_RATE_LIMIT_EXHAUSTED'
+  | 'E_OOM'
+  | 'E_DISK_FULL'
+  | 'E_PORT_CONFLICT'
+  | 'E_EXPORT_INVALID'
+  | 'E_TOTAL_TIMEOUT'
+
+const fail = (
+  message: string,
+  code: RunSideErrorCode,
+  side: Side,
+  runIndex: number,
+  context?: Record<string, unknown>,
+): PhaseError =>
+  runSideError(message, code, {
+    side,
+    runIndex,
+    ...(context === undefined ? {} : context),
+  })
+
+const failFs = (
+  e: { readonly operation: string; readonly path: string },
+  side: Side,
+  runIndex: number,
+): PhaseError =>
+  fail(`filesystem error during run: ${e.operation} ${e.path}`, 'E_DISK_FULL', side, runIndex, {
+    path: e.path,
+    operation: e.operation,
+  })
+
+// ---------------------------------------------------------------------------
+// Pure outcome analysis
+// ---------------------------------------------------------------------------
+
+const isRecord = (u: unknown): u is Record<string, unknown> =>
+  typeof u === 'object' && u !== null
+
+const FINISH_VALUES: readonly string[] = ['stop', 'tool-calls', 'length', 'error', 'other']
+
+const mapReasonToFinish = (raw: string): FinishCause | undefined => {
+  const r = raw.toLowerCase()
+  if (r === '') return undefined
+  if (r.includes('stop') || r.includes('end_turn') || r.includes('end turn') || r.includes('end-turn')) {
+    return 'stop'
+  }
+  if (
+    r.includes('length') ||
+    r.includes('max_token') ||
+    r.includes('max token') ||
+    r.includes('maxtokens') ||
+    r.includes('context_length') ||
+    r.includes('context length')
+  ) {
+    return 'length'
+  }
+  if (r.includes('tool')) return 'tool-calls'
+  if (r.includes('error')) return 'error'
+  return undefined
+}
+
+const asFinishCause = (s: string): FinishCause | undefined => {
+  if (FINISH_VALUES.includes(s)) return s as FinishCause
+  return mapReasonToFinish(s)
+}
+
+const finishFromEvent = (ev: unknown): FinishCause | undefined => {
+  if (!isRecord(ev)) return undefined
+  const direct = ev['finish']
+  if (typeof direct === 'string') {
+    const m = asFinishCause(direct)
+    if (m !== undefined) return m
+  }
+  const info = ev['info']
+  if (isRecord(info)) {
+    const f = info['finish']
+    if (typeof f === 'string') {
+      const m = asFinishCause(f)
+      if (m !== undefined) return m
+    }
+  }
+  const t = ev['type']
+  if (typeof t === 'string' && t === 'step-finish') {
+    const reason = ev['reason']
+    if (typeof reason === 'string') {
+      const m = mapReasonToFinish(reason)
+      if (m !== undefined) return m
+    }
+  }
+  return undefined
+}
+
+const resolveFinish = (events: readonly unknown[]): FinishCause => {
+  let last: FinishCause | undefined
+  for (const ev of events) {
+    const f = finishFromEvent(ev)
+    if (f !== undefined) last = f
+  }
+  return last ?? 'other'
+}
+
+export const computeMaxConsecutiveSameTool = (events: readonly unknown[]): number => {
+  let max = 0
+  let cur = 0
+  let prev: string | undefined
+  for (const ev of events) {
+    if (!isRecord(ev)) continue
+    if (ev['type'] !== 'tool') continue
+    const tool = ev['tool']
+    if (typeof tool !== 'string') continue
+    if (tool === prev) {
+      cur += 1
+      if (cur > max) max = cur
+    } else {
+      cur = 1
+      prev = tool
+      if (cur > max) max = cur
+    }
+  }
+  return max
+}
+
+const RATE_LIMIT_PATTERNS: readonly string[] = [
+  '429',
+  'rate limit',
+  'rate_limit',
+  'ratelimit',
+  'too many requests',
+]
+
+export const hasRateLimitSignal = (events: readonly unknown[]): boolean => {
+  for (const ev of events) {
+    let text: string
+    try {
+      text = JSON.stringify(ev)
+    } catch {
+      text = String(ev)
+    }
+    const lower = text.toLowerCase()
+    if (RATE_LIMIT_PATTERNS.some((p) => lower.includes(p))) return true
+  }
+  return false
+}
+
+export interface AnalyzeInput {
+  readonly events: readonly unknown[]
+  readonly exitCode: number
+  readonly timedOut: boolean
+  readonly watchdogTriggered: boolean
+  readonly doomLoopThreshold: number
+}
+
+export interface AnalyzeOutcome {
+  readonly rank: SuccessRank
+  readonly finish: FinishCause
+  readonly rateLimited: boolean
+  readonly maxConsecutiveSameTool: number
+}
+
+/**
+ * Map a finished opencode run to its `successRank` / `finishCause`. Pure and
+ * table-driven so every branch is unit-testable without spawning anything.
+ *
+ * Precedence (highest first): hard timeout → rate-limit → watchdog → crash
+ * (non-zero exit) → finish-based (stop=4 / tool-calls=3 / length=2) →
+ * doom-loop (1) → unknown (0).
+ */
+export const analyzeOutcome = (input: AnalyzeInput): AnalyzeOutcome => {
+  const maxConsecutiveSameTool = computeMaxConsecutiveSameTool(input.events)
+  const rateLimited = hasRateLimitSignal(input.events)
+  const finish = resolveFinish(input.events)
+  const base = { rateLimited, maxConsecutiveSameTool }
+
+  if (input.timedOut) return { rank: 0, finish: 'error', ...base }
+  if (rateLimited) return { rank: 0, finish: 'error', ...base }
+  if (input.watchdogTriggered) return { rank: 1, finish: 'tool-calls', ...base }
+  if (input.exitCode !== 0) return { rank: 0, finish: 'error', ...base }
+  switch (finish) {
+    case 'stop':
+      return { rank: 4, finish: 'stop', ...base }
+    case 'tool-calls':
+      return { rank: 3, finish: 'tool-calls', ...base }
+    case 'length':
+      return { rank: 2, finish: 'length', ...base }
+    default:
+      if (maxConsecutiveSameTool > input.doomLoopThreshold) {
+        return { rank: 1, finish: 'tool-calls', ...base }
+      }
+      return { rank: 0, finish, ...base }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Verify command
+// ---------------------------------------------------------------------------
+
+export interface VerifyResult {
+  readonly exitCode: number | null
+  readonly timedOut: boolean
+}
+
+const cleanProcessEnv = (): Record<string, string> =>
+  Object.entries(process.env).reduce<Record<string, string>>(
+    (acc, [k, v]) => (v === undefined ? acc : { ...acc, [k]: v }),
+    {},
+  )
+
+/** Run the `--verify` shell command in the app working dir with a hard timeout. */
+export const executeVerify = (
+  cmd: string,
+  cwd: string,
+  timeoutSec: number,
+  env?: Record<string, string>,
+): Effect.Effect<VerifyResult> =>
+  Effect.gen(function* () {
+    const out = yield* spawnProcess({
+      command: 'sh',
+      args: ['-c', cmd],
+      cwd,
+      env: env ?? cleanProcessEnv(),
+      ...(timeoutSec <= 0 ? {} : { timeoutMs: timeoutSec * 1000 }),
+    })
+    return { exitCode: out.exitCode, timedOut: out.timedOut }
+  })
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+export const buildEnvRecord = (homeEnv: EnvVarSet): Record<string, string> => ({
+  OPENCODE_DISABLE_PROJECT_CONFIG: homeEnv.OPENCODE_DISABLE_PROJECT_CONFIG ? '1' : '0',
+  OPENCODE_DISABLE_DEFAULT_PLUGINS: homeEnv.OPENCODE_DISABLE_DEFAULT_PLUGINS ? '1' : '0',
+  OPENCODE_DISABLE_EXTERNAL_SKILLS: homeEnv.OPENCODE_DISABLE_EXTERNAL_SKILLS ? '1' : '0',
+  OPENCODE_PURE: homeEnv.OPENCODE_PURE ? '1' : '0',
+})
+
+export const makeSessionId = (runId: string, side: Side, runIndex: number): string => {
+  const rand = Math.random().toString(16).slice(2, 8).padEnd(6, '0')
+  return `${runId}-${side}-${String(runIndex)}-${rand}`
+}
+
+const safeStringify = (e: unknown): string => {
+  try {
+    return JSON.stringify(e)
+  } catch {
+    return '{}'
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog + single opencode run
+// ---------------------------------------------------------------------------
+
+interface RunState {
+  readonly events: unknown[]
+  readonly lastEvent: { time: number }
+}
+
+type Winner =
+  | { readonly kind: 'run'; readonly result: Either.Either<OpencodeRunResult, OpencodeError> }
+  | { readonly kind: 'watchdog' }
+  | { readonly kind: 'total' }
+
+interface OnceResult {
+  readonly exitCode: number
+  readonly timedOut: boolean
+  readonly watchdogTriggered: boolean
+  readonly totalTimedOut: boolean
+  readonly durationMs: number
+}
+
+const makeWatchdog = (state: RunState, watchdogMs: number): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    if (watchdogMs <= 0) return
+    const poll = Math.max(1, Math.min(WATCHDOG_POLL_MS, watchdogMs))
+    for (;;) {
+      yield* Effect.sleep(poll)
+      if (Date.now() - state.lastEvent.time >= watchdogMs) return
+    }
+  })
+
+const runOnce = (
+  opts: OpencodeRunOptions,
+  state: RunState,
+  watchdogMs: number,
+  timeoutMs: number,
+  totalBound: boolean,
+  totalDeadline: number | undefined,
+): Effect.Effect<OnceResult> =>
+  Effect.gen(function* () {
+    const onEvent = (ev: unknown): void => {
+      state.lastEvent.time = Date.now()
+      state.events.push(ev)
+    }
+    const runEff = opencodeRun({ ...opts, timeoutMs, onEvent }).pipe(Effect.either)
+    const runTagged = runEff.pipe(
+      Effect.map((result): Winner => ({ kind: 'run', result })),
+    )
+    const watchdogTagged = makeWatchdog(state, watchdogMs).pipe(
+      Effect.map((): Winner => ({ kind: 'watchdog' })),
+    )
+    const winner: Winner = yield* (totalDeadline === undefined
+      ? Effect.raceFirst(runTagged, watchdogTagged)
+      : Effect.raceFirst(
+          runTagged,
+          Effect.raceFirst(
+            watchdogTagged,
+            Effect.sleep(Math.max(0, totalDeadline - Date.now())).pipe(
+              Effect.map((): Winner => ({ kind: 'total' })),
+            ),
+          ),
+        ))
+
+    if (winner.kind === 'watchdog') {
+      return {
+        exitCode: -1,
+        timedOut: false,
+        watchdogTriggered: true,
+        totalTimedOut: false,
+        durationMs: 0,
+      }
+    }
+    if (winner.kind === 'total') {
+      return {
+        exitCode: -1,
+        timedOut: false,
+        watchdogTriggered: false,
+        totalTimedOut: true,
+        durationMs: 0,
+      }
+    }
+    const e = winner.result
+    if (e._tag === 'Left') {
+      const err = e.left
+      if (err.timedOut) {
+        return {
+          exitCode: -1,
+          timedOut: !totalBound,
+          watchdogTriggered: false,
+          totalTimedOut: totalBound,
+          durationMs: 0,
+        }
+      }
+      return {
+        exitCode: err.exitCode ?? -1,
+        timedOut: false,
+        watchdogTriggered: false,
+        totalTimedOut: false,
+        durationMs: 0,
+      }
+    }
+    return {
+      exitCode: e.right.exitCode,
+      timedOut: false,
+      watchdogTriggered: false,
+      totalTimedOut: false,
+      durationMs: e.right.durationMs,
+    }
+  })
+
+// ---------------------------------------------------------------------------
+// Phase entry point
+// ---------------------------------------------------------------------------
+
+export const runSide = (
+  input: RunSideInput,
+): Effect.Effect<RunSideResult, PhaseError> =>
+  Effect.gen(function* () {
+    const startedAt = Date.now()
+    const { runInput, manifest, workspace, homeEnv, side, runIndex } = input
+    const sessionId =
+      input.sessionId === '' ? makeSessionId(manifest.runId, side, runIndex) : input.sessionId
+
+    const sideRawDir = path.join(workspace.raw, side)
+    yield* ensureDir(sideRawDir).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
+
+    const eventsLogPath = path.join(sideRawDir, `run-${String(runIndex)}.events.ndjson`)
+    const exportPath = path.join(sideRawDir, `run-${String(runIndex)}.json`)
+    const logPath = path.join(sideRawDir, `run-${String(runIndex)}.log`)
+
+    const log = (line: string): Effect.Effect<void> =>
+      appendFile(logPath, `${line}\n`).pipe(Effect.catchAll(() => Effect.void))
+
+    yield* log(`[START] side=${side} runIndex=${String(runIndex)} sessionId=${sessionId}`)
+
+    const appList = side === 'old' ? workspace.appsOld : workspace.appsNew
+    const appCwd: string = appList[runIndex - 1] ?? ''
+    if (appCwd === '') {
+      yield* Effect.fail(
+        fail('missing app working dir for run', 'E_RUN_CRASH', side, runIndex, { runIndex }),
+      )
+    }
+
+    const envRecord = buildEnvRecord(homeEnv)
+    const timeouts = runInput.timeouts
+    const runMs = timeouts.runSeconds * 1000
+    const watchdogMs = timeouts.watchdogSeconds * 1000
+    const totalDeadline =
+      timeouts.totalSeconds !== undefined ? startedAt + timeouts.totalSeconds * 1000 : undefined
+
+    const budget = (): { readonly timeoutMs: number; readonly totalBound: boolean } => {
+      if (totalDeadline !== undefined) {
+        const remaining = totalDeadline - Date.now()
+        if (remaining <= 0) return { timeoutMs: 0, totalBound: true }
+        if (remaining < runMs) return { timeoutMs: remaining, totalBound: true }
+      }
+      return { timeoutMs: runMs, totalBound: false }
+    }
+
+    const baseOpts = (prompt: string, continueSession: boolean): OpencodeRunOptions => ({
+      homeDir: homeEnv.HOME,
+      cwd: appCwd,
+      ...(homeEnv.OPENCODE_CONFIG_CONTENT === undefined
+        ? {}
+        : { configContent: homeEnv.OPENCODE_CONFIG_CONTENT }),
+      agent: 'build',
+      prompt,
+      session: sessionId,
+      continueSession,
+      auto: true,
+      ...(homeEnv.OPENCODE_PURE ? { pure: true } : {}),
+      env: envRecord,
+    })
+
+    const state: RunState = { events: [], lastEvent: { time: startedAt } }
+    const runResults: OnceResult[] = []
+
+    const hasInit = runInput.init !== undefined && runInput.init !== ''
+    if (hasInit) {
+      yield* log('[INIT] running --init')
+      state.lastEvent.time = Date.now()
+      const b = budget()
+      const r = yield* runOnce(
+        baseOpts(runInput.init ?? '', false),
+        state,
+        watchdogMs,
+        b.timeoutMs,
+        b.totalBound,
+        totalDeadline,
+      )
+      runResults.push(r)
+      yield* log(
+        `[INIT_DONE] exitCode=${String(r.exitCode)} timedOut=${String(r.timedOut)} watchdog=${String(r.watchdogTriggered)}`,
+      )
+    }
+
+    yield* log('[PROMPT] running --prompt')
+    state.lastEvent.time = Date.now()
+    const bp = budget()
+    const pr = yield* runOnce(
+      baseOpts(runInput.prompt, hasInit),
+      state,
+      watchdogMs,
+      bp.timeoutMs,
+      bp.totalBound,
+      totalDeadline,
+    )
+    runResults.push(pr)
+    yield* log(
+      `[PROMPT_DONE] exitCode=${String(pr.exitCode)} timedOut=${String(pr.timedOut)} watchdog=${String(pr.watchdogTriggered)}`,
+    )
+
+    const lastResult = runResults[runResults.length - 1]
+    const combinedExit = lastResult === undefined ? 0 : lastResult.exitCode
+    const anyTimedOut = runResults.some((r) => r.timedOut)
+    const anyWatchdog = runResults.some((r) => r.watchdogTriggered)
+    const anyTotal = runResults.some((r) => r.totalTimedOut)
+
+    const ndjson =
+      state.events.length === 0
+        ? ''
+        : `${state.events.map((e) => safeStringify(e)).join('\n')}\n`
+    yield* writeFile(eventsLogPath, ndjson).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
+
+    const exportStr: string = yield* exportSession(homeEnv.HOME, sessionId).pipe(
+      Effect.mapError((err: OpencodeError) =>
+        fail('opencode export produced no data', 'E_RUN_CRASH', side, runIndex, {
+          sessionId,
+          stderr: err.stderr,
+        }),
+      ),
+    )
+    yield* writeFile(exportPath, exportStr).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
+    yield* log(`[EXPORT] written to ${exportPath}`)
+
+    yield* readJson(exportPath, opencodeExportSchema).pipe(
+      Effect.mapError((e) => {
+        const tag = (e as { readonly _tag?: string })._tag
+        const detail =
+          tag === 'ParseError'
+            ? (e as { readonly reason: string }).reason
+            : `fs:${(e as { readonly operation: string }).operation}`
+        return fail(`export.json invalid: ${detail}`, 'E_EXPORT_INVALID', side, runIndex, {
+          path: exportPath,
+        })
+      }),
+    )
+
+    const outcome = analyzeOutcome({
+      events: state.events,
+      exitCode: combinedExit,
+      timedOut: anyTimedOut || anyTotal,
+      watchdogTriggered: anyWatchdog,
+      doomLoopThreshold: DOOM_LOOP_THRESHOLD,
+    })
+
+    let verifyExitCode: number | undefined
+    const hasVerify = runInput.verify !== undefined && runInput.verify !== ''
+    if (hasVerify) {
+      yield* log(`[VERIFY] running "${runInput.verify ?? ''}"`)
+      const vres = yield* executeVerify(runInput.verify ?? '', appCwd, timeouts.verifySeconds, {
+        ...envRecord,
+        HOME: homeEnv.HOME,
+      })
+      if (vres.timedOut) {
+        verifyExitCode = undefined
+        yield* log('[VERIFY_TIMEOUT]')
+      } else {
+        verifyExitCode = vres.exitCode ?? -1
+        yield* log(`[VERIFY_DONE] exitCode=${String(verifyExitCode)}`)
+      }
+    }
+
+    const durationMs = Date.now() - startedAt
+    yield* log(
+      `[STOP] finish=${outcome.finish} rank=${String(outcome.rank)} durationMs=${String(durationMs)}`,
+    )
+
+    const result: RunSideResult = {
+      side,
+      runIndex,
+      exportPath,
+      eventsLogPath,
+      successRank: outcome.rank,
+      finishCause: outcome.finish,
+      exitCode: combinedExit,
+      durationMs: String(durationMs),
+      watchdogTriggered: anyWatchdog,
+      ...(verifyExitCode === undefined ? {} : { verifyExitCode }),
+    }
+    return result
+  })

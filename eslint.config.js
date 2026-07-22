@@ -9,6 +9,7 @@ export default [
       'contract/node_modules/**',
       'contract/dist/**',
       'src/generated/**',
+      'src/**/*.d.ts',
       '.testaipack/**',
       'coverage/**',
     ],
@@ -68,6 +69,17 @@ export default [
     // Low-level subprocess seam: stream collection is inherently stateful
     // (chunk accumulation, closure/exit flags across async callbacks).
     files: ['src/opencode/spawn.ts'],
+    rules: {
+      'functional/no-let': 'off',
+      'functional/immutable-data': 'off',
+      'functional/prefer-readonly-type': 'off',
+    },
+  },
+  {
+    // Phase 06 run coordinator: a soft hang-watchdog races the opencode spawn
+    // while an `onEvent` bridge accumulates streamed events into shared state.
+    // This concurrent stateful coordination is the same shape as spawn.ts.
+    files: ['src/phases/06-run-side.ts'],
     rules: {
       'functional/no-let': 'off',
       'functional/immutable-data': 'off',
