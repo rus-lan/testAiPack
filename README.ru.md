@@ -133,6 +133,8 @@ npm run contract:codegen
 
 ## Разработка
 
+Перед первой правкой прочитайте [CONTRIBUTING.ru.md](CONTRIBUTING.ru.md) — там зафиксированы правила: **TDD** (тесты первыми, красный → зелёный), **контракты первичны** (правка `contract/*.tsp` → `tsp compile` → codegen → impl), порог **coverage ≥80%** (CI gate) и анти-rework-процедура (локально зелёные `typecheck` + `lint` + `test` перед push). Кратко: поведение меняется через контракт, тесты пишутся до impl, `src/generated/` не правится руками.
+
 ```bash
 # Зависимости
 npm install

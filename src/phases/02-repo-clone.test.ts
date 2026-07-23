@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Effect } from 'effect'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
+import { rm as fsRm } from 'node:fs/promises'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, writeFile } from '../util/fs.js'
 import { repoClone } from './02-repo-clone.js'
@@ -231,7 +232,7 @@ describe('repoClone — copy failure', () => {
     expect(err.context?.['reason']).toBe('copy-failed')
   })
 
-  it('non-deterministic copy (.git/HEAD differs) → E_REPO_CLONE_FAILED', async () => {
+  it('non-deterministic copy: tracked file dropped from a copy index (ls-files differs) → E_REPO_CLONE_FAILED', async () => {
     const src = await buildSourceRepo()
     const { tree } = await makeWorkspace(1)
     const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 1 })
@@ -241,7 +242,30 @@ describe('repoClone — copy failure', () => {
       Effect.gen(function* () {
         yield* fsActual.copyDir(srcP, dst)
         if (dst.endsWith(path.join('oldVersion', 'run-1'))) {
-          yield* writeFile(path.join(dst, '.git', 'HEAD'), 'ref: refs/heads/tampered\n')
+          yield* Effect.promise(() => fsRm(path.join(dst, 'README.md')))
+          yield* addAll(dst).pipe(Effect.catchAll(() => Effect.void))
+        }
+      }),
+    )
+    const err = await runFlip(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_REPO_CLONE_FAILED')
+    expect(err.context?.['reason']).toBe('non-deterministic')
+  })
+
+  it('non-deterministic copy: extra commit in a copy (rev-parse HEAD differs) → E_REPO_CLONE_FAILED', async () => {
+    const src = await buildSourceRepo()
+    const { tree } = await makeWorkspace(1)
+    const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 1 })
+    // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+    const fsActual = await vi.importActual<typeof import('../util/fs.js')>('../util/fs.js')
+    copyDirMock.mockImplementation((srcP, dst) =>
+      Effect.gen(function* () {
+        yield* fsActual.copyDir(srcP, dst)
+        if (dst.endsWith(path.join('oldVersion', 'run-1'))) {
+          yield* fsActual.writeFile(path.join(dst, 'extra.txt'), 'tampered\n')
+          yield* addAll(dst).pipe(Effect.catchAll(() => Effect.void))
+          yield* commit(dst, 'tamper').pipe(Effect.catchAll(() => Effect.void))
         }
       }),
     )

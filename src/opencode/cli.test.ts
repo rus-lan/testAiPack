@@ -13,6 +13,7 @@ import {
   exportSession,
   installPlugin,
   listMcp,
+  dbQuery,
   OpencodeError,
   buildRunArgs,
 } from './cli.js'
@@ -226,5 +227,47 @@ describe('opencode cli — auxiliary commands', () => {
   it('listMcp returns the mcp list stdout', async () => {
     ex.mockImplementation(() => Effect.succeed(okExec({ stdout: 'mcpA\nmcpB\n' })))
     expect(await runP(listMcp('/h'))).toBe('mcpA\nmcpB\n')
+  })
+})
+
+describe('opencode cli — dbQuery', () => {
+  it('calls `opencode db query <sql> --format json` in the isolated HOME', async () => {
+    ex.mockImplementation((input) => {
+      lastExec = input
+      return Effect.succeed(okExec({ stdout: '[]' }))
+    })
+    await runP(dbQuery('/home/iso', 'SELECT id FROM session'))
+    expect(lastExec?.command).toBe('opencode')
+    expect(lastExec?.args).toEqual(['db', 'query', 'SELECT id FROM session', '--format', 'json'])
+    expect(lastExec?.cwd).toBe('/home/iso')
+    expect(lastExec?.env['HOME']).toBe('/home/iso')
+  })
+
+  it('parses the JSON response into a value', async () => {
+    ex.mockImplementation(() =>
+      Effect.succeed(okExec({ stdout: '[{"id":"sess-a"},{"id":"sess-b"}]' })),
+    )
+    expect(await runP(dbQuery('/h', 'SELECT id'))).toEqual([
+      { id: 'sess-a' },
+      { id: 'sess-b' },
+    ])
+  })
+
+  it('raises OpencodeError on a non-zero exit', async () => {
+    ex.mockImplementation(() =>
+      Effect.succeed(okExec({ exitCode: 1, stderr: 'no such table' })),
+    )
+    const err = await runFlip(dbQuery('/h', 'SELECT 1'))
+    expect(err).toBeInstanceOf(OpencodeError)
+    expect(err.command).toBe('db')
+    expect(err.exitCode).toBe(1)
+    expect(err.stderr).toBe('no such table')
+  })
+
+  it('raises OpencodeError when stdout is not valid JSON', async () => {
+    ex.mockImplementation(() => Effect.succeed(okExec({ stdout: 'not-json' })))
+    const err = await runFlip(dbQuery('/h', 'SELECT 1'))
+    expect(err).toBeInstanceOf(OpencodeError)
+    expect(err.command).toBe('db')
   })
 })

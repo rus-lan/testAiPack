@@ -27,10 +27,17 @@ import { ensureDir, readFile, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import type { PricingTable } from '../pricing/lookup.js'
 import { loadPricing } from '../pricing/lookup.js'
-import { extractMetrics } from '../metrics/extract.js'
+import { extractMetricsFromTree } from '../metrics/extract.js'
 import type { ExtractedMetrics } from '../metrics/extract.js'
 import { buildSideAggregates, computeDelta } from '../metrics/aggregate.js'
+import { loadTreeForRun } from './10-timeline.js'
+import type { SessionTreeLoader } from './10-timeline.js'
 import type { RunSideResultExt } from './06-run-side.js'
+
+/** Injectable tree loader for v0.2 sub-agent aggregation (tests pass a stub). */
+export interface AggregateDeps {
+  readonly loadTree?: SessionTreeLoader
+}
 
 type ProcessedRun =
   | { readonly kind: 'ok'; readonly metrics: ExtractedMetrics; readonly id: string }
@@ -61,7 +68,9 @@ const readAndExtract = (
   r: RunSideResultExt,
   side: Side,
   rawDir: string,
+  homeDirs: readonly string[],
   pricing: PricingTable | null,
+  loader?: SessionTreeLoader,
 ): Effect.Effect<
   { readonly kind: 'ok'; readonly metrics: ExtractedMetrics; readonly id: string },
   PhaseError
@@ -83,9 +92,11 @@ const readAndExtract = (
     // uses exact-optional under exactOptionalPropertyTypes; the data is already
     // schema-validated, so the two are runtime-equivalent.
     const data = result.data as OpencodeExport
+    const homeDir = homeDirs[r.runIndex - 1] ?? ''
+    const tree = yield* loadTreeForRun(homeDir, data, loader)
     return {
       kind: 'ok' as const,
-      metrics: extractMetrics(data, pricing, r.successRank),
+      metrics: extractMetricsFromTree(tree, pricing, r.successRank),
       id: data.info.id,
     }
   })
@@ -94,8 +105,10 @@ const aggregateSide = (
   side: Side,
   results: readonly RunSideResultExt[],
   rawDir: string,
+  homeDirs: readonly string[],
   pricing: PricingTable | null,
   timestamp: string,
+  loader?: SessionTreeLoader,
 ): Effect.Effect<SideAggregates, PhaseError> =>
   Effect.gen(function* () {
     const processed = yield* Effect.forEach(
@@ -106,7 +119,7 @@ const aggregateSide = (
               kind: 'failed' as const,
               failedRun: toFailedRun(r, timestamp),
             })
-          : readAndExtract(r, side, rawDir, pricing),
+          : readAndExtract(r, side, rawDir, homeDirs, pricing, loader),
       { concurrency: 1 },
     )
     const extracted = processed.flatMap((p) => (p.kind === 'ok' ? [p.metrics] : []))
@@ -119,16 +132,18 @@ const ignorePricingError = (): Effect.Effect<null> => Effect.succeed(null)
 
 export const aggregate = (
   input: AggregateInput,
+  deps?: AggregateDeps,
 ): Effect.Effect<AggregateResult, PhaseError> =>
   Effect.gen(function* () {
     const { runInput, workspace, sideResults, manifest } = input
+    const loader = deps?.loadTree
     const pricing: PricingTable | null = runInput.pricingPath
       ? yield* loadPricing(runInput.pricingPath).pipe(Effect.catchAll(ignorePricingError))
       : null
 
     const timestamp = manifest.timestamp
-    const oldAgg = yield* aggregateSide('old', sideResults.old, workspace.raw, pricing, timestamp)
-    const newAgg = yield* aggregateSide('new', sideResults.new, workspace.raw, pricing, timestamp)
+    const oldAgg = yield* aggregateSide('old', sideResults.old, workspace.raw, workspace.homeOld, pricing, timestamp, loader)
+    const newAgg = yield* aggregateSide('new', sideResults.new, workspace.raw, workspace.homeNew, pricing, timestamp, loader)
     const metricsDiff = computeDelta(oldAgg, newAgg)
     const result: AggregateResult = {
       metricsDiff,

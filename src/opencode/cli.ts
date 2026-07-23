@@ -230,3 +230,32 @@ export const listMcp = (homeDir: string): Effect.Effect<string, OpencodeError> =
     yield* failOnNonZero('mcp', out)
     return out.stdout
   })
+
+/**
+ * `opencode db query <sql> --format json` — runs an SQL query against the
+ * opencode session database in an isolated HOME and parses the JSON result.
+ * Used by v0.2 to walk the session tree via the `session.parent_id` column.
+ */
+export const dbQuery = (
+  homeDir: string,
+  sql: string,
+): Effect.Effect<unknown, OpencodeError> =>
+  Effect.gen(function* () {
+    const out = yield* execCmd({
+      command: OPENCODE_BIN,
+      args: ['db', 'query', sql, '--format', 'json'],
+      cwd: homeDir,
+      env: buildBaseEnv(homeDir, {}),
+    })
+    yield* failOnNonZero('db', out)
+    return yield* Effect.try({
+      try: () => JSON.parse(out.stdout) as unknown,
+      catch: (e): OpencodeError =>
+        new OpencodeError({
+          command: 'db',
+          exitCode: out.exitCode,
+          stderr: `json parse failed: ${String(e)}`,
+          timedOut: false,
+        }),
+    })
+  })

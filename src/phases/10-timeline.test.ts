@@ -1,15 +1,25 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Effect } from 'effect'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, readFile, writeJson } from '../util/fs.js'
+
+vi.mock('../opencode/cli.js', () => ({
+  exportSession: vi.fn(),
+  dbQuery: vi.fn(),
+}))
+
+import { exportSession, dbQuery } from '../opencode/cli.js'
 import {
   timeline,
   extractEventsFromExport,
   collapseRepeats,
   renderTimelineHtml,
+  loadSessionTree,
 } from './10-timeline.js'
+import type { SessionTreeLoader } from './10-timeline.js'
+import type { SessionTreeNode } from '../metrics/extract.js'
 import { PhaseError } from '../errors.js'
 import type {
   Manifest,
@@ -22,6 +32,9 @@ import type {
   TimelineMode,
   WorkspaceTree,
 } from '@generated/types'
+
+const exportMock = vi.mocked(exportSession)
+const dbMock = vi.mocked(dbQuery)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
@@ -567,5 +580,223 @@ describe('timeline — errors', () => {
     }))
     expect(err.code).toBe('E_EXPORT_INVALID')
     expect(err.context?.['side']).toBe('new')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// loadSessionTree — walks parent_id tree (opencode cli mocked)
+// ---------------------------------------------------------------------------
+
+const setupTreeMocks = (
+  exports: Readonly<Record<string, Record<string, unknown>>>,
+  children: Readonly<Record<string, readonly string[]>>,
+): void => {
+  exportMock.mockImplementation((_h: string, sid: string) =>
+    Effect.succeed(JSON.stringify(exports[sid] ?? makeExport({ id: sid }))),
+  )
+  dbMock.mockImplementation((_h: string, sql: string) => {
+    const match = /parent_id = '([^']+)'/.exec(sql)
+    const pid = match?.[1] ?? ''
+    return Effect.succeed((children[pid] ?? []).map((id) => ({ id })))
+  })
+}
+
+describe('loadSessionTree', () => {
+  beforeEach(() => {
+    exportMock.mockReset()
+    dbMock.mockReset()
+  })
+
+  it('root with no children -> single root node, depth 0', async () => {
+    setupTreeMocks({ root: makeExport({ id: 'root' }) }, {})
+    const tree = await runP(loadSessionTree('/h', 'root'))
+    expect(tree).toHaveLength(1)
+    expect(tree[0]?.sessionId).toBe('root')
+    expect(tree[0]?.depth).toBe(0)
+    expect(tree[0]?.parentId).toBeNull()
+  })
+
+  it('root + 2 children -> 3 nodes, depths 0/1/1, parent=root', async () => {
+    setupTreeMocks(
+      {
+        root: makeExport({ id: 'root' }),
+        c1: makeExport({ id: 'c1' }),
+        c2: makeExport({ id: 'c2' }),
+      },
+      { root: ['c1', 'c2'] },
+    )
+    const tree = await runP(loadSessionTree('/h', 'root'))
+    expect(tree).toHaveLength(3)
+    expect(tree.map((n) => n.depth)).toEqual([0, 1, 1])
+    expect(tree.map((n) => n.parentId)).toEqual([null, 'root', 'root'])
+  })
+
+  it('root + child + grandchild -> depths 0/1/2', async () => {
+    setupTreeMocks(
+      {
+        root: makeExport({ id: 'root' }),
+        c: makeExport({ id: 'c' }),
+        g: makeExport({ id: 'g' }),
+      },
+      { root: ['c'], c: ['g'] },
+    )
+    const tree = await runP(loadSessionTree('/h', 'root'))
+    expect(tree.map((n) => n.depth)).toEqual([0, 1, 2])
+    expect(tree.map((n) => n.sessionId)).toEqual(['root', 'c', 'g'])
+  })
+
+  it('cycle (A->B->A) -> visited set breaks it, returns [A, B]', async () => {
+    setupTreeMocks(
+      { A: makeExport({ id: 'A' }), B: makeExport({ id: 'B' }) },
+      { A: ['B'], B: ['A'] },
+    )
+    const tree = await runP(loadSessionTree('/h', 'A'))
+    expect(tree).toHaveLength(2)
+    expect([...tree.map((n) => n.sessionId)].sort()).toEqual(['A', 'B'])
+  })
+
+  it('depth limit: a chain of 12 -> stops at depth 10 (≤11 nodes)', async () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `n${String(i)}`)
+    const exports: Record<string, Record<string, unknown>> = {}
+    const children: Record<string, readonly string[]> = {}
+    ids.forEach((id, i) => {
+      exports[id] = makeExport({ id })
+      if (i < ids.length - 1) children[id] = [ids[i + 1]!]
+    })
+    setupTreeMocks(exports, children)
+    const tree = await runP(loadSessionTree('/h', 'n0'))
+    expect(tree.length).toBeLessThanOrEqual(11)
+    expect(tree[tree.length - 1]?.depth).toBe(10)
+  })
+
+  it('dbQuery failure -> PhaseError E_EXPORT_INVALID', async () => {
+    dbMock.mockImplementation(() => Effect.fail(new Error('db down') as never))
+    exportMock.mockImplementation(() => Effect.succeed(JSON.stringify(makeExport({ id: 'root' }))))
+    const err = await runFlip(loadSessionTree('/h', 'root'))
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_EXPORT_INVALID')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// extractEventsFromExport — depth / parentSessionId
+// ---------------------------------------------------------------------------
+
+describe('extractEventsFromExport — swimlane metadata', () => {
+  it('accepts depth + parentSessionId and stamps them on every event', () => {
+    const exp = makeExport({ id: 'child', created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] }) as OpencodeExport
+    const ev = extractEventsFromExport(exp, 'new', 2, 1, 'parent-1')
+    expect(ev[0]!.swimlaneDepth).toBe(1)
+    expect(ev[0]!.parentSessionId).toBe('parent-1')
+    expect(ev[0]!.sessionId).toBe('child')
+  })
+
+  it('defaults to depth 0 and no parent (v0.1 root)', () => {
+    const exp = makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] }) as OpencodeExport
+    const ev = extractEventsFromExport(exp, 'old', 1)
+    expect(ev[0]!.swimlaneDepth).toBe(0)
+    expect(ev[0]!.parentSessionId).toBeUndefined()
+  })
+})
+
+describe('collapseRepeats — swimlane boundary', () => {
+  it('does not merge identical tool-calls across swimlanes (different sessionId)', () => {
+    const events: TimelineEvent[] = [
+      { ...callAt(100), sessionId: 'root' },
+      { ...callAt(200), sessionId: 'child' },
+    ]
+    expect(collapseRepeats(events)).toHaveLength(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// renderTimelineHtml — swimlane lanes
+// ---------------------------------------------------------------------------
+
+describe('renderTimelineHtml — swimlanes', () => {
+  it('renders one lane per sessionId, tagged with its depth', () => {
+    const tl: Timeline = {
+      old: [
+        { tStart: '0', tEnd: '10', side: 'old', runIndex: 1, sessionId: 'root', swimlaneDepth: 0, type: 'text' },
+        { tStart: '5', tEnd: '15', side: 'old', runIndex: 1, sessionId: 'child', parentSessionId: 'root', swimlaneDepth: 1, type: 'tool-call', tool: 'bash', status: 'completed' },
+      ],
+      new: [],
+      mode: 'side-by-side',
+    }
+    const html = renderTimelineHtml(tl)
+    expect(html).toContain('class="swimlane"')
+    expect(html).toContain('data-depth="0"')
+    expect(html).toContain('data-depth="1"')
+    expect(html).toContain('swimlane-label')
+    expect(html).toContain('>main<')
+    expect(html).toContain('>depth 1<')
+  })
+
+  it('indents depth-1 swimlane via its CSS data attribute', () => {
+    const tl: Timeline = {
+      old: [{ tStart: '0', tEnd: '1', side: 'old', runIndex: 1, sessionId: 'c', swimlaneDepth: 1, parentSessionId: 'r', type: 'text' }],
+      new: [],
+      mode: 'side-by-side',
+    }
+    const html = renderTimelineHtml(tl)
+    expect(html).toContain('data-depth="1"')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// timeline phase — swimlane via injected tree loader (v0.2)
+// ---------------------------------------------------------------------------
+
+const asTreeLoader = (fn: SessionTreeLoader): SessionTreeLoader => fn
+
+describe('timeline — swimlane (v0.2)', () => {
+  it('injected tree -> child events carry depth 1 + parentSessionId', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1 })
+    const rootExp = makeExport({ id: 'root', created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] })
+    const childExp = makeExport({ id: 'child', created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('c')] }] })
+    await writeRaw(tree, 'old', 1, rootExp)
+    await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
+
+    const loadTree = asTreeLoader(() =>
+      Effect.succeed<readonly SessionTreeNode[]>([
+        { sessionId: 'root', parentId: null, depth: 0, export: rootExp as OpencodeExport, children: [] },
+        { sessionId: 'child', parentId: 'root', depth: 1, export: childExp as OpencodeExport, children: [] },
+      ]),
+    )
+
+    const result = await runP(timeline(
+      {
+        runInput, manifest: fakeManifest, workspace: tree,
+        sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+      },
+      { loadTree },
+    ))
+
+    const childEvents = result.timeline.old.filter((e) => e.sessionId === 'child')
+    expect(childEvents.length).toBeGreaterThan(0)
+    expect(childEvents.every((e) => e.swimlaneDepth === 1)).toBe(true)
+    expect(childEvents.every((e) => e.parentSessionId === 'root')).toBe(true)
+    // root lane still present
+    expect(result.timeline.old.some((e) => e.sessionId === 'root' && e.swimlaneDepth === 0)).toBe(true)
+  })
+
+  it('injected loader failure -> degrades to root-only (no throw)', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1 })
+    await writeRaw(tree, 'old', 1, makeExport({ id: 'root', created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] }))
+    await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
+    const loadTree = asTreeLoader(() => Effect.fail(new PhaseError({
+      code: 'E_EXPORT_INVALID', phase: 'timeline', message: 'boom', timestamp: new Date(),
+    })))
+    const result = await runP(timeline(
+      {
+        runInput, manifest: fakeManifest, workspace: tree,
+        sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+      },
+      { loadTree },
+    ))
+    // root-only fallback: only sessionId 'root', depth 0
+    expect(result.timeline.old.every((e) => e.swimlaneDepth === 0)).toBe(true)
   })
 })

@@ -1,14 +1,17 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { Effect } from 'effect'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, readFile, writeFile, writeJson } from '../util/fs.js'
 import { aggregate } from './07-aggregate.js'
+import type { SessionTreeLoader } from './10-timeline.js'
+import type { SessionTreeNode } from '../metrics/extract.js'
 import { PhaseError } from '../errors.js'
 import type {
   ErrorCode,
   Manifest,
+  OpencodeExport,
   RunInput,
   RunSideResult,
   WorkspaceTree,
@@ -169,11 +172,11 @@ describe('aggregate — happy path', () => {
     expect(existsSync(path.join(tree.results, 'metrics.json'))).toBe(true)
   })
 
-  it('maxParallelism is 1 per run (v0.1)', async () => {
+  it('maxParallelism is 1 per run (single root session, no sub-agents)', async () => {
     const tree = await makeWorkspace(1)
     const runInput = makeRunInput({ runs: 1 })
-    await writeRaw(tree, 'old', 1, exportJson({ totalTokens: 10 }))
-    await writeRaw(tree, 'new', 1, exportJson({ totalTokens: 10 }))
+    await writeRaw(tree, 'old', 1, exportJson({ totalTokens: 10, tStart: 0, tEnd: 5000 }))
+    await writeRaw(tree, 'new', 1, exportJson({ totalTokens: 10, tStart: 0, tEnd: 5000 }))
     const result = await runP(aggregate({
       runInput,
       manifest: makeManifest(runInput),
@@ -185,6 +188,49 @@ describe('aggregate — happy path', () => {
     }))
     expect(result.rawAggregates.old.primary.maxParallelism).toBe(1)
     expect(result.metricsDiff.deltas.maxParallelism.better).toBe('context-dependent')
+  })
+
+  it('aggregates a session tree: sums tokens across nodes, maxParallelism from intervals', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1 })
+    const rootExp = exportJson({ id: 'root', totalTokens: 100, tStart: 0, tEnd: 1000 })
+    const childExp = exportJson({ id: 'child', totalTokens: 50, tStart: 200, tEnd: 800 })
+    await writeRaw(tree, 'old', 1, rootExp)
+    await writeRaw(tree, 'new', 1, exportJson({ totalTokens: 100, tStart: 0, tEnd: 1000 }))
+
+    const loadTree = vi.fn(((): SessionTreeLoader => () =>
+      Effect.succeed<readonly SessionTreeNode[]>([
+        { sessionId: 'root', parentId: null, depth: 0, export: rootExp as OpencodeExport, children: [] },
+        { sessionId: 'child', parentId: 'root', depth: 1, export: childExp as OpencodeExport, children: [] },
+      ]))())
+
+    const result = await runP(aggregate(
+      {
+        runInput, manifest: makeManifest(runInput), workspace: tree,
+        sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+      },
+      { loadTree },
+    ))
+    // old: root(100) + child(50) summed across the tree
+    expect(result.rawAggregates.old.primary.totalTokens).toBe('150')
+    // overlapping root[0,1000] & child[200,800] -> parallelism 2
+    expect(result.rawAggregates.old.primary.maxParallelism).toBe(2)
+    // wallClockMs = outer envelope, not the sum
+    expect(result.rawAggregates.old.primary.wallClockMs).toBe('1000')
+    expect(loadTree).toHaveBeenCalled()
+  })
+
+  it('no sub-agents (default) -> maxParallelism 1, tokens from root only', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1 })
+    await writeRaw(tree, 'old', 1, exportJson({ totalTokens: 77, tStart: 0, tEnd: 3000 }))
+    await writeRaw(tree, 'new', 1, exportJson({ totalTokens: 77, tStart: 0, tEnd: 3000 }))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.old.primary.totalTokens).toBe('77')
+    expect(result.rawAggregates.old.primary.maxParallelism).toBe(1)
   })
 })
 

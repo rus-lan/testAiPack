@@ -48,7 +48,7 @@ describe('cliParse — happy path', () => {
     expect(ri.outputPath).toBe('./results')
     expect(ri.workspacePath).toBe('./.testaipack')
     expect(ri.auth).toEqual({
-      opencode: false, npmrc: false, anthropic: false, openai: false,
+      opencode: true, npmrc: true, anthropic: false, openai: false,
       gemini: false, aws: false, ssh: false, git: false,
     })
     expect(result.configSource).toBe('cli')
@@ -448,6 +448,78 @@ describe('cliParse — flags surface', () => {
   it('rejects a value flag with no value', async () => {
     const cwd = makeTempDir()
     const err = await runFlip(cliParse({ argv: ['run', REPO, '--prompt'], cwd }))
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+})
+
+describe('cliParse — auth whitelist', () => {
+  it('default (no auth flags) → opencode=true, npmrc=true, rest false', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.runInput.auth).toEqual({
+      opencode: true, npmrc: true, anthropic: false, openai: false,
+      gemini: false, aws: false, ssh: false, git: false,
+    })
+  })
+
+  it('--no-auth-opencode disables only opencode (npmrc stays default-on)', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--no-auth-opencode'], cwd }),
+    )
+    expect(result.runInput.auth.opencode).toBe(false)
+    expect(result.runInput.auth.npmrc).toBe(true)
+  })
+
+  it('--no-auth-npmrc disables only npmrc', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--no-auth-npmrc'], cwd }),
+    )
+    expect(result.runInput.auth.npmrc).toBe(false)
+    expect(result.runInput.auth.opencode).toBe(true)
+  })
+
+  it('--auth aws enables aws alongside the defaults', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x', '--auth', 'aws'], cwd }))
+    expect(result.runInput.auth.aws).toBe(true)
+    expect(result.runInput.auth.opencode).toBe(true)
+    expect(result.runInput.auth.npmrc).toBe(true)
+  })
+
+  it('combines --auth aws with --no-auth-opencode', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({
+        argv: ['run', REPO, '--prompt', 'x', '--auth', 'aws', '--no-auth-opencode'],
+        cwd,
+      }),
+    )
+    expect(result.runInput.auth.aws).toBe(true)
+    expect(result.runInput.auth.opencode).toBe(false)
+    expect(result.runInput.auth.npmrc).toBe(true)
+  })
+
+  it('config-file auth overrides defaults', async () => {
+    const cwd = makeTempDir()
+    await ensureDirP(path.join(cwd, '.testaipack'))
+    await writeFileP(
+      path.join(cwd, '.testaipack', 'config.json'),
+      JSON.stringify({ repoUrl: REPO, prompt: 'x', auth: { opencode: false, aws: true } }),
+    )
+    const result = await runP(cliParse({ argv: ['run'], cwd }))
+    expect(result.runInput.auth.opencode).toBe(false)
+    expect(result.runInput.auth.npmrc).toBe(true)
+    expect(result.runInput.auth.aws).toBe(true)
+  })
+
+  it('--no-auth-bogus → E_CONFIG_INVALID', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--no-auth-bogus'], cwd }),
+    )
     expect(err).toBeInstanceOf(PhaseError)
     expect(err.code).toBe('E_CONFIG_INVALID')
   })

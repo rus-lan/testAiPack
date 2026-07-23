@@ -9,9 +9,9 @@ import path from 'node:path'
 import type { RepoCloneInput, RepoCloneResult } from '@generated/types'
 import { repoCloneError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
-import { clone } from '../util/git.js'
+import { clone, revParseHead, lsFilesStage } from '../util/git.js'
 import type { GitError } from '../util/git.js'
-import { copyDir, exists, readFile } from '../util/fs.js'
+import { copyDir, exists } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 
 const AUTH_HINT_RE = /Permission denied \(publickey\)|Authentication failed/i
@@ -39,11 +39,23 @@ const toCopyFailed = (repoUrl: string, dest: string, e: FsError): PhaseError => 
   })
 }
 
-const readHead = (repoPath: string): Effect.Effect<string> =>
-  readFile(path.join(repoPath, '.git', 'HEAD')).pipe(
-    Effect.map((s) => s.trim()),
-    Effect.catchAll(() => Effect.succeed('')),
-  )
+const fingerprint = (repoPath: string): Effect.Effect<string, GitError> =>
+  Effect.gen(function* () {
+    const head = yield* revParseHead(repoPath)
+    const staged = yield* lsFilesStage(repoPath)
+    return `${head}\n${staged}`
+  })
+
+const fingerprintError = (
+  repoUrl: string,
+  where: string,
+  e: GitError,
+): PhaseError =>
+  repoCloneError(`cannot read ${where} fingerprint: ${e.stderr}`, 'E_REPO_CLONE_FAILED', {
+    repoUrl,
+    reason: 'non-deterministic',
+    path: where,
+  })
 
 const checkDeterminism = (
   sourcePath: string,
@@ -51,19 +63,26 @@ const checkDeterminism = (
   repoUrl: string,
 ): Effect.Effect<void, PhaseError> =>
   Effect.gen(function* () {
-    const sourceHead = yield* readHead(sourcePath)
-    if (sourceHead === '') return
+    const sourceFp = yield* fingerprint(sourcePath).pipe(
+      Effect.mapError((e: GitError) => fingerprintError(repoUrl, sourcePath, e)),
+    )
     for (const dest of copies) {
-      const head = yield* readHead(dest)
-      if (head !== sourceHead) {
+      const copyFp = yield* fingerprint(dest).pipe(
+        Effect.mapError((e: GitError) => fingerprintError(repoUrl, dest, e)),
+      )
+      if (copyFp !== sourceFp) {
         return yield* Effect.fail(
-          repoCloneError('non-deterministic copy: .git/HEAD differs', 'E_REPO_CLONE_FAILED', {
-            repoUrl,
-            reason: 'non-deterministic',
-            source: sourceHead,
-            copy: head,
-            dest,
-          }),
+          repoCloneError(
+            'non-deterministic copy: rev-parse HEAD or ls-files differs',
+            'E_REPO_CLONE_FAILED',
+            {
+              repoUrl,
+              reason: 'non-deterministic',
+              source: sourceFp,
+              copy: copyFp,
+              dest,
+            },
+          ),
         )
       }
     }

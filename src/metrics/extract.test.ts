@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import type { OpencodeExport } from '@generated/types'
-import { extractMetrics } from './extract.js'
+import { extractMetrics, computeMaxParallelism, extractMetricsFromTree } from './extract.js'
+import type { SessionTreeNode } from './extract.js'
 import type { PricingTable } from '../pricing/lookup.js'
 
 const toolPart = (
@@ -42,6 +43,7 @@ const message = (parts: readonly Record<string, unknown>[], finish?: string): Op
 }
 
 const makeExport = (over: {
+  readonly id?: string
   readonly tokens?: { readonly input: number; readonly output: number; readonly reasoning: number; readonly cacheRead: number; readonly cacheWrite: number }
   readonly cost?: number
   readonly tStart?: number
@@ -50,7 +52,7 @@ const makeExport = (over: {
   readonly summary?: { readonly additions: number; readonly deletions: number; readonly files: number }
 }): OpencodeExport => ({
   info: {
-    id: 'sess-1',
+    id: over.id ?? 'sess-1',
     slug: 's',
     projectID: 'p',
     directory: '/x',
@@ -106,7 +108,7 @@ describe('extractMetrics — primary', () => {
     expect(primary.toolCallCount).toBe(2)
   })
 
-  it('maxParallelism is always 1 in v0.1', () => {
+  it('maxParallelism for a single session is 1', () => {
     const { primary } = extractMetrics(makeExport({}), null, 4)
     expect(primary.maxParallelism).toBe(1)
   })
@@ -218,5 +220,142 @@ describe('extractMetrics — secondary', () => {
     const exp = makeExport({ summary: { additions: 42, deletions: 7, files: 3 } })
     const { secondary } = extractMetrics(exp, null, 4)
     expect(secondary.fileDiffStats).toEqual({ additions: 42, deletions: 7, filesChanged: 3 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// computeMaxParallelism — pure, table-tested
+// ---------------------------------------------------------------------------
+
+interface ParallelCase {
+  readonly name: string
+  readonly sessions: readonly { readonly timeCreated: number; readonly timeUpdated: number }[]
+  readonly expected: number
+}
+
+const PARALLEL_CASES: readonly ParallelCase[] = [
+  { name: 'empty -> 0', sessions: [], expected: 0 },
+  { name: 'single session -> 1', sessions: [{ timeCreated: 0, timeUpdated: 100 }], expected: 1 },
+  {
+    name: 'two disjoint -> 1',
+    sessions: [{ timeCreated: 0, timeUpdated: 100 }, { timeCreated: 200, timeUpdated: 300 }],
+    expected: 1,
+  },
+  {
+    name: 'two overlapping -> 2',
+    sessions: [{ timeCreated: 0, timeUpdated: 200 }, { timeCreated: 100, timeUpdated: 300 }],
+    expected: 2,
+  },
+  {
+    name: 'three fully parallel -> 3',
+    sessions: [
+      { timeCreated: 0, timeUpdated: 300 },
+      { timeCreated: 0, timeUpdated: 300 },
+      { timeCreated: 0, timeUpdated: 300 },
+    ],
+    expected: 3,
+  },
+  {
+    name: 'edge: end of one = start of next -> 1',
+    sessions: [{ timeCreated: 0, timeUpdated: 100 }, { timeCreated: 100, timeUpdated: 200 }],
+    expected: 1,
+  },
+]
+
+describe('computeMaxParallelism', () => {
+  it.each(PARALLEL_CASES)('$name', ({ sessions, expected }) => {
+    expect(computeMaxParallelism(sessions)).toBe(expected)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// extractMetricsFromTree — fold over a session tree
+// ---------------------------------------------------------------------------
+
+const node = (exp: OpencodeExport, depth: number, parentId: string | null): SessionTreeNode => ({
+  sessionId: exp.info.id,
+  parentId,
+  depth,
+  export: exp,
+  children: [],
+})
+
+describe('extractMetricsFromTree', () => {
+  it('single-node tree -> identical to extractMetrics (maxParallelism 1)', () => {
+    const exp = makeExport({ tokens: { input: 360, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 } })
+    const single = extractMetrics(exp, null, 4)
+    const tree = extractMetricsFromTree([node(exp, 0, null)], null, 4)
+    expect(tree.primary).toEqual(single.primary)
+    expect(tree.primary.maxParallelism).toBe(1)
+    expect(tree.primary.totalTokens).toBe('360')
+  })
+
+  it('sums totalTokens / stepCount / toolCallCount across nodes', () => {
+    const root = makeExport({ id: 'root', tokens: { input: 100, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 } })
+    const child = makeExport({ id: 'child', tokens: { input: 50, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 } })
+    const { primary } = extractMetricsFromTree([node(root, 0, null), node(child, 1, 'root')], null, 4)
+    expect(primary.totalTokens).toBe('150')
+    expect(primary.stepCount).toBe(0)
+    expect(primary.toolCallCount).toBe(0)
+  })
+
+  it('wallClockMs is the outer envelope, not the sum', () => {
+    const root = makeExport({ id: 'root', tStart: 0, tEnd: 1000 })
+    const child = makeExport({ id: 'child', tStart: 200, tEnd: 800 })
+    const { primary } = extractMetricsFromTree([node(root, 0, null), node(child, 1, 'root')], null, 4)
+    expect(primary.wallClockMs).toBe('1000')
+  })
+
+  it('maxParallelism reflects overlapping child intervals', () => {
+    const root = makeExport({ id: 'root', tStart: 0, tEnd: 1000 })
+    const child = makeExport({ id: 'child', tStart: 200, tEnd: 800 })
+    const { primary } = extractMetricsFromTree([node(root, 0, null), node(child, 1, 'root')], null, 4)
+    expect(primary.maxParallelism).toBe(2)
+  })
+
+  it('non-overlapping nodes -> maxParallelism 1', () => {
+    const root = makeExport({ id: 'root', tStart: 0, tEnd: 100 })
+    const child = makeExport({ id: 'child', tStart: 200, tEnd: 300 })
+    const { primary } = extractMetricsFromTree([node(root, 0, null), node(child, 1, 'root')], null, 4)
+    expect(primary.maxParallelism).toBe(1)
+  })
+
+  it('costUsd sums info.cost across nodes', () => {
+    const root = makeExport({ id: 'root', cost: 0.01 })
+    const child = makeExport({ id: 'child', cost: 0.02 })
+    const { primary } = extractMetricsFromTree([node(root, 0, null), node(child, 1, 'root')], null, 4)
+    expect(primary.costUsd).toBeCloseTo(0.03, 5)
+  })
+
+  it('successRank comes from the argument (root-owned)', () => {
+    const root = makeExport({})
+    const { primary } = extractMetricsFromTree([node(root, 0, null)], null, 3)
+    expect(primary.successRank).toBe(3)
+  })
+
+  it('empty tree -> zeroed metrics with the given successRank', () => {
+    const tree = extractMetricsFromTree([], null, 2)
+    expect(tree.primary.totalTokens).toBe('0')
+    expect(tree.primary.maxParallelism).toBe(0)
+    expect(tree.primary.successRank).toBe(2)
+  })
+
+  it('secondary sums token counts and merges perTool across nodes', () => {
+    const root = makeExport({
+      id: 'root',
+      tokens: { input: 100, output: 200, reasoning: 50, cacheRead: 10, cacheWrite: 0 },
+      messages: [message([toolPart('bash', { id: 'a', start: 0, end: 100 })])],
+    })
+    const child = makeExport({
+      id: 'child',
+      tokens: { input: 30, output: 40, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+      messages: [message([toolPart('bash', { id: 'b', start: 0, end: 200, status: 'error' })])],
+    })
+    const { secondary } = extractMetricsFromTree([node(root, 0, null), node(child, 1, 'root')], null, 4)
+    expect(secondary.inputTokens).toBe('130')
+    expect(secondary.outputTokens).toBe('240')
+    // bash: 2 calls, 1 error -> 0.5
+    expect(secondary.perTool['bash']?.count).toBe(2)
+    expect(secondary.perTool['bash']?.errorRate).toBeCloseTo(0.5, 3)
   })
 })

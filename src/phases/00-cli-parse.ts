@@ -51,8 +51,8 @@ const DEFAULT_TIMEOUTS: TimeoutConfig = {
   watchdogSeconds: 90,
 }
 const DEFAULT_AUTH: AuthWhitelist = {
-  opencode: false,
-  npmrc: false,
+  opencode: true,
+  npmrc: true,
   anthropic: false,
   openai: false,
   gemini: false,
@@ -193,6 +193,8 @@ const AUTH_KEYS: ReadonlySet<keyof AuthWhitelist> = new Set([
   'opencode', 'npmrc', 'anthropic', 'openai', 'gemini', 'aws', 'ssh', 'git',
 ])
 
+const NO_AUTH_PREFIX = '--no-auth-'
+
 const parseIntStrict = (s: string): number | undefined => {
   if (!/^\s*-?\d+\s*$/.test(s)) return undefined
   const n = Number(s)
@@ -299,6 +301,16 @@ const parseArgs = (args: readonly string[]): Effect.Effect<CliRaw, PhaseError> =
       if (tok === '') return yield* loop(i + 1, acc)
 
       if (tok.startsWith('--') || tok.startsWith('-')) {
+        if (tok.startsWith(NO_AUTH_PREFIX)) {
+          const kind = tok.slice(NO_AUTH_PREFIX.length)
+          const k = kind as keyof AuthWhitelist
+          if (!AUTH_KEYS.has(k)) {
+            return yield* Effect.fail(
+              cliParseError(`unknown auth kind: ${kind}`, 'E_CONFIG_INVALID', { flag: tok }),
+            )
+          }
+          return yield* loop(i + 1, { ...acc, auth: { ...acc.auth, [k]: false } })
+        }
         const eq = tok.indexOf('=')
         if (eq >= 0) {
           const flag = tok.slice(0, eq)

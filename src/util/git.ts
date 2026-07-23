@@ -157,3 +157,12 @@ export const revParseHead = (cwd: string): Effect.Effect<string, GitError> => {
   }
   return Effect.map(runGit('rev-parse', ['rev-parse', 'HEAD'], cwd), (r) => r.stdout.trim())
 }
+
+export const lsFilesStage = (cwd: string): Effect.Effect<string, GitError> => {
+  if (!existsSync(path.join(cwd, '.git')) && !existsSync(cwd)) {
+    return Effect.fail(
+      new GitError({ command: 'ls-files', exitCode: -1, stderr: 'cwd does not exist' }),
+    )
+  }
+  return Effect.map(runGit('ls-files', ['ls-files', '-s'], cwd), (r) => r.stdout)
+}

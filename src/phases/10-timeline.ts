@@ -9,7 +9,7 @@
  * @see docs/phases/10-timeline.ru.md
  * @see contract/phases/10-timeline.tsp
  */
-import { Effect } from 'effect'
+import { Effect, Either } from 'effect'
 import path from 'node:path'
 import type {
   ExportPart,
@@ -26,6 +26,10 @@ import { timelineError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
 import { ensureDir, readFile, writeFile, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
+import { dbQuery, exportSession } from '../opencode/cli.js'
+import type { OpencodeError } from '../opencode/cli.js'
+import { isRecord } from '../util/types.js'
+import type { SessionTreeNode } from '../metrics/extract.js'
 
 // ---------------------------------------------------------------------------
 // Pure: event extraction from a single export
@@ -42,13 +46,21 @@ interface EventBase {
   readonly runIndex: number
   readonly sessionId: string
   readonly swimlaneDepth: number
+  readonly parentSessionId?: string
 }
 
-const eventBase = (side: Side, runIndex: number, sessionId: string): EventBase => ({
+const eventBase = (
+  side: Side,
+  runIndex: number,
+  sessionId: string,
+  depth: number,
+  parentSessionId: string | null,
+): EventBase => ({
   side,
   runIndex,
   sessionId,
-  swimlaneDepth: 0,
+  swimlaneDepth: depth,
+  ...(parentSessionId === null ? {} : { parentSessionId }),
 })
 
 /** Map one export part to 0..n timeline events (pre-normalization). */
@@ -120,9 +132,11 @@ export const extractEventsFromExport = (
   exp: OpencodeExport,
   side: Side,
   runIndex: number,
+  depth = 0,
+  parentSessionId: string | null = null,
 ): readonly TimelineEvent[] => {
   const sessionId = exp.info.id
-  const base = eventBase(side, runIndex, sessionId)
+  const base = eventBase(side, runIndex, sessionId, depth, parentSessionId)
 
   const minCreated = exp.messages.reduce<number>((min, msg) => {
     const c = toMs(msg.info.time.created, min)
@@ -164,7 +178,8 @@ const sameToolRun = (a: TimelineEvent, b: TimelineEvent): boolean => {
     tb !== undefined &&
     ta === tb &&
     a.runIndex === b.runIndex &&
-    a.side === b.side
+    a.side === b.side &&
+    a.sessionId === b.sessionId
   )
 }
 
@@ -183,6 +198,190 @@ export const collapseRepeats = (events: readonly TimelineEvent[]): readonly Time
     }
     return [...acc, e]
   }, [])
+
+// ---------------------------------------------------------------------------
+// Session tree (v0.2): walk `session.parent_id` to discover sub-agents spawned
+// via the `task` tool. Each child session becomes its own swimlane.
+// ---------------------------------------------------------------------------
+
+/** Cap recursion so a pathological (or cyclic) graph cannot exhaust the stack. */
+const MAX_TREE_DEPTH = 10
+
+const treeExportInvalid = (cause: unknown): PhaseError =>
+  timelineError('session tree export invalid', 'E_EXPORT_INVALID', {
+    reason: 'tree-export',
+    cause: String(cause),
+  })
+
+const treeDbFailure = (e: OpencodeError): PhaseError =>
+  timelineError(`session tree db query failed: ${e.stderr}`, 'E_EXPORT_INVALID', {
+    reason: 'tree-db',
+    cause: e,
+  })
+
+const parseChildIds = (rows: unknown): readonly string[] => {
+  if (!Array.isArray(rows)) return []
+  return rows.flatMap((r): readonly string[] => {
+    if (isRecord(r) && typeof r['id'] === 'string') return [r['id']]
+    return []
+  })
+}
+
+const fetchChildIds = (
+  homeDir: string,
+  parentId: string,
+): Effect.Effect<readonly string[], PhaseError> =>
+  Effect.gen(function* () {
+    const rows = yield* dbQuery(
+      homeDir,
+      `SELECT id FROM session WHERE parent_id = '${parentId}'`,
+    ).pipe(Effect.mapError(treeDbFailure))
+    return parseChildIds(rows)
+  })
+
+const exportOne = (
+  homeDir: string,
+  sessionId: string,
+): Effect.Effect<OpencodeExport, PhaseError> =>
+  Effect.gen(function* () {
+    const raw = yield* exportSession(homeDir, sessionId).pipe(Effect.mapError(treeDbFailure))
+    const parsed = yield* Effect.try({
+      try: () => JSON.parse(raw) as unknown,
+      catch: (e) => treeExportInvalid(e),
+    })
+    const result = opencodeExportSchema.safeParse(parsed)
+    if (!result.success) return yield* Effect.fail(treeExportInvalid(result.error))
+    return result.data as OpencodeExport
+  })
+
+/**
+ * Recursive core shared by {@link loadSessionTree} and {@link loadTreeForRun}:
+ * returns the subtree of all DESCENDANTS of `parentId` (never `parentId`
+ * itself). Each child is exported exactly once; the root's own export is the
+ * caller's responsibility (loaded from disk by the phase, re-exported by
+ * `loadSessionTree`). A `visited` set breaks cycles; depth is capped.
+ */
+const fetchChildSubtree = (
+  homeDir: string,
+  parentId: string,
+  parentDepth: number,
+  visited: ReadonlySet<string>,
+): Effect.Effect<readonly SessionTreeNode[], PhaseError> =>
+  Effect.gen(function* () {
+    if (parentDepth >= MAX_TREE_DEPTH) return []
+    const childIds = yield* fetchChildIds(homeDir, parentId)
+    const childTrees = yield* Effect.forEach(
+      childIds,
+      (cid): Effect.Effect<readonly SessionTreeNode[], PhaseError> =>
+        Effect.gen(function* () {
+          if (visited.has(cid)) return []
+          const nextVisited: ReadonlySet<string> = new Set([...visited, cid])
+          const exp = yield* exportOne(homeDir, cid)
+          const node: SessionTreeNode = {
+            sessionId: cid,
+            parentId,
+            depth: parentDepth + 1,
+            export: exp,
+            children: [],
+          }
+          const descendants = yield* fetchChildSubtree(homeDir, cid, parentDepth + 1, nextVisited)
+          return [node, ...descendants]
+        }),
+      { concurrency: 1 },
+    )
+    return childTrees.flat()
+  })
+
+/**
+ * Load the full session tree rooted at `rootSessionId` as a flat DFS list
+ * (root first, then its children recursively). The root is re-exported via
+ * `opencode export`; a `visited` set breaks cycles along `parent_id`; depth is
+ * capped at {@link MAX_TREE_DEPTH}. Each node carries its own validated export.
+ */
+export const loadSessionTree = (
+  homeDir: string,
+  rootSessionId: string,
+): Effect.Effect<readonly SessionTreeNode[], PhaseError> =>
+  Effect.gen(function* () {
+    const visited: ReadonlySet<string> = new Set([rootSessionId])
+    const rootExp = yield* exportOne(homeDir, rootSessionId)
+    const rootNode: SessionTreeNode = {
+      sessionId: rootSessionId,
+      parentId: null,
+      depth: 0,
+      export: rootExp,
+      children: [],
+    }
+    const descendants = yield* fetchChildSubtree(homeDir, rootSessionId, 0, visited)
+    return [rootNode, ...descendants]
+  })
+
+export type SessionTreeLoader = (
+  homeDir: string,
+  rootSessionId: string,
+) => Effect.Effect<readonly SessionTreeNode[], PhaseError>
+
+const rootOnly = (exp: OpencodeExport): SessionTreeNode => ({
+  sessionId: exp.info.id,
+  parentId: null,
+  depth: 0,
+  export: exp,
+  children: [],
+})
+
+/** Best-effort tree from the on-disk root + DB-descended sub-agents (no re-export of root). */
+const defaultTreeForRun = (
+  homeDir: string,
+  rootExport: OpencodeExport,
+): Effect.Effect<readonly SessionTreeNode[], PhaseError> =>
+  Effect.gen(function* () {
+    const root = rootOnly(rootExport)
+    if (homeDir === '') return [root]
+    const visited: ReadonlySet<string> = new Set([rootExport.info.id])
+    const either = yield* fetchChildSubtree(homeDir, rootExport.info.id, 0, visited).pipe(
+      Effect.either,
+      Effect.catchAllDefect(
+        (d): Effect.Effect<Either.Either<readonly SessionTreeNode[], PhaseError>> =>
+          Effect.succeed(Either.left(d as PhaseError)),
+      ),
+    )
+    if (either._tag === 'Left') return [root]
+    return [root, ...either.right]
+  })
+
+/**
+ * Resolve the session tree for one run, resiliently:
+ * - an injected `loader` (tests / explicit wiring) is always preferred;
+ * - otherwise {@link defaultTreeForRun} builds the tree from the on-disk root
+ *   plus DB-descended sub-agents (the root is never re-exported). With no home
+ *   dir, on any DB/export failure, OR when `opencode db query` is unavailable
+ *   (old opencode / mock), the run degrades to a root-only tree, identical to
+ *   v0.1. Defects are caught too, so a tree problem never fails the whole phase.
+ */
+export const loadTreeForRun = (
+  homeDir: string,
+  rootExport: OpencodeExport,
+  loader?: SessionTreeLoader,
+): Effect.Effect<readonly SessionTreeNode[], PhaseError> =>
+  Effect.gen(function* () {
+    if (loader !== undefined) {
+      const either = yield* loader(homeDir, rootExport.info.id).pipe(
+        Effect.either,
+        Effect.catchAllDefect(
+          (d): Effect.Effect<Either.Either<readonly SessionTreeNode[], PhaseError>> =>
+            Effect.succeed(Either.left(d as PhaseError)),
+        ),
+      )
+      if (either._tag === 'Left') return [rootOnly(rootExport)]
+      return either.right.length > 0 ? either.right : [rootOnly(rootExport)]
+    }
+    return yield* defaultTreeForRun(homeDir, rootExport)
+  })
+
+export interface TimelineDeps {
+  /** Override the session-tree loader (tests inject a stub tree here). */
+  readonly loadTree?: SessionTreeLoader
+}
 
 // ---------------------------------------------------------------------------
 // Pure: HTML rendering
@@ -262,7 +461,12 @@ h1{font-size:16px}
 .event:hover::after{content:attr(data-tooltip);position:absolute;bottom:100%;left:0;background:#000;padding:4px;border-radius:3px;white-space:nowrap;z-index:10;color:#fff}
 .legend{margin:10px 0;font-size:12px}
 .legend span{display:inline-block;padding:2px 6px;margin-right:8px;color:#fff;border-radius:3px}
-.mode-badge{display:inline-block;background:#333;color:#fff;padding:2px 8px;border-radius:3px;font-size:12px;margin-left:8px}`
+.mode-badge{display:inline-block;background:#333;color:#fff;padding:2px 8px;border-radius:3px;font-size:12px;margin-left:8px}
+.swimlane{display:flex;align-items:stretch;gap:2px;min-height:24px;border-left:2px dashed transparent;padding-left:4px;margin-bottom:2px}
+.swimlane[data-depth="1"]{border-left-color:#888;margin-left:20px}
+.swimlane[data-depth="2"]{border-left-color:#aaa;margin-left:40px}
+.swimlane[data-depth="3"]{border-left-color:#bbb;margin-left:60px}
+.swimlane-label{font-size:10px;color:#555;min-width:60px;padding:4px 0;align-self:center;flex-shrink:0}`
 
 const renderLegend = (): string =>
   '<div class="legend">' +
@@ -275,10 +479,60 @@ const renderLegend = (): string =>
   '<span class="event step-finish">step-finish</span>' +
   '</div>'
 
+interface Swimlane {
+  readonly sessionId: string
+  readonly depth: number
+  readonly parentSessionId: string | null
+  readonly events: readonly TimelineEvent[]
+}
+
+/**
+ * Group a side's flat event list into one swimlane per `sessionId`, preserving
+ * first-appearance order (the events arrive already sorted by runIndex/tStart,
+ * so the root lane surfaces before its children). Each lane carries the depth
+ * and parent of its first event — these describe the session-tree position.
+ */
+const groupSwimlanes = (events: readonly TimelineEvent[]): readonly Swimlane[] => {
+  const grouped = events.reduce<Readonly<Record<string, readonly TimelineEvent[]>>>(
+    (acc, e) => {
+      const prev = acc[e.sessionId] ?? []
+      return { ...acc, [e.sessionId]: [...prev, e] }
+    },
+    {},
+  )
+  return Object.entries(grouped).flatMap(([sessionId, evs]): readonly Swimlane[] => {
+    const first = evs[0]
+    if (first === undefined) return []
+    return [
+      {
+        sessionId,
+        depth: first.swimlaneDepth,
+        parentSessionId: first.parentSessionId ?? null,
+        events: evs,
+      },
+    ]
+  })
+}
+
+const swimlaneLabel = (lane: Swimlane): string =>
+  lane.depth === 0 ? 'main' : `depth ${String(lane.depth)}`
+
+const renderSwimlane = (lane: Swimlane): string =>
+  `<div class="swimlane" data-depth="${String(lane.depth)}">` +
+  `<div class="swimlane-label">${escapeHtml(swimlaneLabel(lane))}</div>` +
+  `<div class="events">${renderEventRow(lane.events)}</div>` +
+  `</div>`
+
+const renderSideLanes = (events: readonly TimelineEvent[]): string => {
+  const lanes = groupSwimlanes(events)
+  if (lanes.length === 0) return '<div class="events"></div>'
+  return lanes.map(renderSwimlane).join('')
+}
+
 const renderSideBySide = (tl: Timeline): string =>
   `<div class="timeline">` +
-  `<div class="side old"><h2>OLD (baseline)</h2><div class="events">${renderEventRow(tl.old)}</div></div>` +
-  `<div class="side new"><h2>NEW (with pack)</h2><div class="events">${renderEventRow(tl.new)}</div></div>` +
+  `<div class="side old"><h2>OLD (baseline)</h2>${renderSideLanes(tl.old)}</div>` +
+  `<div class="side new"><h2>NEW (with pack)</h2>${renderSideLanes(tl.new)}</div>` +
   `</div>`
 
 const renderMerged = (tl: Timeline): string => {
@@ -333,6 +587,8 @@ const readOneRun = (
   side: Side,
   r: RunSideResult,
   rawDir: string,
+  homeDirs: readonly string[],
+  loader?: SessionTreeLoader,
 ): Effect.Effect<readonly TimelineEvent[], PhaseError> =>
   Effect.gen(function* () {
     const file = path.join(rawDir, side, `run-${String(r.runIndex)}.json`)
@@ -352,31 +608,59 @@ const readOneRun = (
       return yield* Effect.fail(toExportInvalid(side, r.runIndex, parsed.error))
     }
     const data = parsed.data as OpencodeExport
-    return extractEventsFromExport(data, side, r.runIndex)
+    const homeDir = homeDirs[r.runIndex - 1] ?? ''
+    const tree = yield* loadTreeForRun(homeDir, data, loader)
+    return tree.flatMap((node) =>
+      extractEventsFromExport(node.export, side, r.runIndex, node.depth, node.parentId),
+    )
   })
+
+const byRunStartDepth = (a: TimelineEvent, b: TimelineEvent): number => {
+  if (a.runIndex !== b.runIndex) return a.runIndex - b.runIndex
+  const ta = Number(a.tStart)
+  const tb = Number(b.tStart)
+  if (ta !== tb) return ta - tb
+  return a.swimlaneDepth - b.swimlaneDepth
+}
 
 const collectSide = (
   side: Side,
   results: readonly RunSideResult[],
   rawDir: string,
+  homeDirs: readonly string[],
+  loader?: SessionTreeLoader,
 ): Effect.Effect<readonly TimelineEvent[], PhaseError> =>
   Effect.gen(function* () {
     const perRun = yield* Effect.forEach(
       results,
-      (r) => readOneRun(side, r, rawDir),
+      (r) => readOneRun(side, r, rawDir, homeDirs, loader),
       { concurrency: 1 },
     )
-    return perRun.flat()
+    return [...perRun.flat()].sort(byRunStartDepth)
   })
 
 export const timeline = (
   input: TimelineInput,
+  deps?: TimelineDeps,
 ): Effect.Effect<TimelineResult, PhaseError> =>
   Effect.gen(function* () {
     const { runInput, workspace, sideResults } = input
+    const loader = deps?.loadTree
 
-    const oldEvents = yield* collectSide('old', sideResults.old, workspace.raw)
-    const newEvents = yield* collectSide('new', sideResults.new, workspace.raw)
+    const oldEvents = yield* collectSide(
+      'old',
+      sideResults.old,
+      workspace.raw,
+      workspace.homeOld,
+      loader,
+    )
+    const newEvents = yield* collectSide(
+      'new',
+      sideResults.new,
+      workspace.raw,
+      workspace.homeNew,
+      loader,
+    )
 
     const oldFinal = runInput.collapseRepeats ? collapseRepeats(oldEvents) : oldEvents
     const newFinal = runInput.collapseRepeats ? collapseRepeats(newEvents) : newEvents
