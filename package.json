@@ -1,6 +1,6 @@
 {
   "name": "testaipack",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "A/B tester for opencode integrations — compares work before/after installing a pack (skill/plugin/agent/command/mcp)",
   "type": "module",
   "bin": {
@@ -13,6 +13,8 @@
   },
   "scripts": {
     "build": "bun build --compile --outfile=dist/testaipack bin/testaipack.ts",
+    "build:all": "bash scripts/release.sh",
+    "release": "bash scripts/release.sh && bash scripts/publish-release.sh",
     "dev": "tsx watch bin/testaipack.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings=0",
