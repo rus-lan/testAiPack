@@ -53,7 +53,7 @@
 ## Требования
 
 - **opencode** — тестируемый AI-агент (запускается под капотом).
-- **Node.js** `>=20` — для зависимостей и tooling.
+- **Node.js** `>=22` — для зависимостей и tooling.
 - **bun** `>=1.1` — для сборки бинарника (`npm run build`).
 - **git** — клонирование репозиториев.
 - **docker** *(опционально)* — только для `--isolation=docker`.
@@ -393,7 +393,7 @@ npm run dev           # tsx watch bin/testaipack.ts
 npm run format        # prettier --write .
 ```
 
-**Требования:** Node `>=20`, bun `>=1.1` (для сборки). TypeSpec-компилятор
+**Требования:** Node `>=22`, bun `>=1.1` (для сборки). TypeSpec-компилятор
 ставится как devDependency.
 
 ---

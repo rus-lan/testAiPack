@@ -40,7 +40,7 @@ SHA256 checksums в `checksums-sha256.txt`.
 
 - **opencode** CLI в PATH (для запусков)
 - **git** (для клонирования и diff)
-- Для сборки из исходников: Node ≥20, bun ≥1.1
+- Для сборки из исходников: Node ≥22, bun ≥1.1
 
 ## Лицензия
 

@@ -27,7 +27,7 @@
     "prepare:dev": "npm run contract:codegen"
   },
   "engines": {
-    "node": ">=20.0.0",
+    "node": ">=22.0.0",
     "bun": ">=1.1.0"
   },
   "dependencies": {
