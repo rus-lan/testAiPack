@@ -7,6 +7,9 @@
  * @see docs/phases/11-report-render.ru.md
  */
 import type { MetricDelta, PrimaryDeltas, PrimaryMetrics } from '@generated/types'
+import { toNum } from '../util/numeric.js'
+
+export { toNum }
 
 export type MetricKind = 'int' | 'cost' | 'rank'
 
@@ -25,8 +28,6 @@ export const PRIMARY_METRICS: readonly PrimaryMeta[] = [
   { key: 'successRank', label: 'Success rank', kind: 'rank' },
   { key: 'maxParallelism', label: 'Max parallelism', kind: 'int' },
 ]
-
-export const toNum = (v: string | number): number => (typeof v === 'number' ? v : Number(v))
 
 export const trimTrailingZeros = (s: string): string => s.replace(/0+$/, '').replace(/\.$/, '')
 

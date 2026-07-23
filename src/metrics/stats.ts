@@ -54,9 +54,4 @@ export const interquartileRange = (values: readonly number[]): number | undefine
   return percentile(values, 75) - percentile(values, 25)
 }
 
-/** Safe string|number -> finite number, falling back to 0. */
-export const toNum = (v: string | number | undefined): number => {
-  if (v === undefined) return 0
-  const n = typeof v === 'number' ? v : Number(v)
-  return Number.isFinite(n) ? n : 0
-}
+export { toNum } from '../util/numeric.js'

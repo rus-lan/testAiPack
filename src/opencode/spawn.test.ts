@@ -3,7 +3,7 @@ import { Effect } from 'effect'
 import path from 'node:path'
 import { spawnProcess, execCmd } from './spawn.js'
 import { makeTempDir } from '../../tests/setup.js'
-import { ensureDir } from '../util/fs.js'
+import { ensureDir, readFile } from '../util/fs.js'
 
 const run = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 
@@ -92,5 +92,51 @@ describe('execCmd (real subprocess)', () => {
       }),
     )
     expect(out.exitCode).toBe(3)
+  })
+
+  it('kills the child process when interrupted by a timeout', async () => {
+    const dir = makeTempDir()
+    await run(ensureDir(dir))
+    const pidFile = path.join(dir, 'pid')
+    const childScript = `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(()=>{}, 60000)`
+    const result = await run(
+      execCmd({
+        command: process.execPath,
+        args: ['-e', childScript],
+        cwd: process.cwd(),
+        env: { ...process.env } as Record<string, string>,
+      }).pipe(Effect.timeoutOption(400)),
+    )
+    expect(result._tag).toBe('None')
+
+    let pid: number | undefined
+    for (let i = 0; i < 50; i++) {
+      try {
+        pid = Number(await run(readFile(pidFile)))
+        if (Number.isFinite(pid) && pid > 0) break
+      } catch {
+        // pid file not written yet
+      }
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    expect(pid).toBeGreaterThan(0)
+
+    const isAlive = (p: number): boolean => {
+      try {
+        process.kill(p, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    let dead = false
+    for (let i = 0; i < 50; i++) {
+      if (!isAlive(pid as number)) {
+        dead = true
+        break
+      }
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    expect(dead).toBe(true)
   })
 })

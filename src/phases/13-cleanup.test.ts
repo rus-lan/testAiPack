@@ -39,13 +39,17 @@ beforeEach(async () => {
 })
 
 describe('cleanup — ephemeral off (default)', () => {
-  it('deletes nothing and returns empty gcLogPath', async () => {
+  it('deletes nothing and writes gc.log noting retention is on', async () => {
     const workspace = await buildWorkspaceTree()
     const result = await runP(
       cleanup({ runInput: makeRunInput(), manifest: makeManifest(), workspace, ephemeral: false }),
     )
     expect(result.deleted).toEqual([])
-    expect(result.gcLogPath).toBe('')
+    expect(result.gcLogPath).toBe(path.join(workspace.results, 'gc.log'))
+    expect(result.gcLogPath).not.toBe('')
+    expect(existsSync(result.gcLogPath)).toBe(true)
+    const log = await runP(readFile(result.gcLogPath))
+    expect(log).toContain('cleanup skipped (retention on)')
     expect(existsSync(path.join(workspace.root, 'apps'))).toBe(true)
     expect(existsSync(workspace.pack)).toBe(true)
   })

@@ -24,7 +24,7 @@ import type {
 import type { PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
 import { installPlugin } from '../opencode/cli.js'
 import type { OpencodeError } from '../opencode/cli.js'
-import { copyDir, copyFile, ensureDir, pathKind, removeDir, symlink, writeFile } from '../util/fs.js'
+import { copyDir, copyFile, ensureDir, pathKind, removeDir, symlink, writeFile, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import type { PhaseError } from '../errors.js'
 import { homeIsolationError } from '../errors.js'
@@ -227,7 +227,7 @@ const packInfoFrom = (outcome: PackInstallOutcome): PackInfo => {
   }
 }
 
-const buildConfig = (side: Side, pack: PackInfo | undefined): string => {
+const buildConfigObject = (side: Side, pack: PackInfo | undefined): Record<string, unknown> => {
   const base: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
     agent: {
@@ -237,18 +237,17 @@ const buildConfig = (side: Side, pack: PackInfo | undefined): string => {
       },
     },
   }
-  const withPack =
-    side === 'new' && pack !== undefined && pack.type !== null
-      ? {
-          ...base,
-          testaipack: {
-            packName: pack.name,
-            packType: pack.type,
-            registeredIn: [...pack.registeredIn],
-          },
-        }
-      : base
-  return JSON.stringify(withPack, null, 2)
+  if (side === 'new' && pack !== undefined && pack.type !== null) {
+    return {
+      ...base,
+      testaipack: {
+        packName: pack.name,
+        packType: pack.type,
+        registeredIn: [...pack.registeredIn],
+      },
+    }
+  }
+  return base
 }
 
 const buildEnvVars = (
@@ -289,8 +288,21 @@ export const homeIsolation = (
     const installSeconds = input.runInput.timeouts.installSeconds
     const packOutcome = input.packInstall
     const packInfo = packOutcome === undefined ? undefined : packInfoFrom(packOutcome)
-    const baselineCfg = buildConfig('old', packInfo)
-    const newCfg = buildConfig('new', packInfo)
+    const baselineObj = buildConfigObject('old', packInfo)
+    const newObj = buildConfigObject('new', packInfo)
+    const baselineCfg = JSON.stringify(baselineObj, null, 2)
+    const newCfg = JSON.stringify(newObj, null, 2)
+
+    const configDir = input.workspace.config
+    yield* ensureDir(configDir).pipe(
+      Effect.mapError((e: FsError) => setupFail(`cannot create config dir: ${e.path}`, { path: e.path })),
+    )
+    yield* writeJson(path.join(configDir, 'baseline.json'), baselineObj).pipe(
+      Effect.mapError((e: FsError) => setupFail(`cannot write baseline.json: ${e.path}`, { path: e.path })),
+    )
+    yield* writeJson(path.join(configDir, 'new.json'), newObj).pipe(
+      Effect.mapError((e: FsError) => setupFail(`cannot write new.json: ${e.path}`, { path: e.path })),
+    )
 
     const processSide = (side: Side): Effect.Effect<SideResult, PhaseError> =>
       Effect.gen(function* () {

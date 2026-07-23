@@ -87,20 +87,21 @@ const stderrOf = (e: OpencodeError): string => e.stderr
 
 // ---- gates -----------------------------------------------------------------
 
-const gateOpencodeLaunch = (
-  homePaths: PreflightInput['homePaths'],
+const runOpencodeLaunch = (
+  homeDir: string,
+  side: Side,
   checks: readonly PreflightCheck[],
 ): Effect.Effect<PreflightCheck, PhaseError> =>
   Effect.gen(function* () {
     const start = Date.now()
-    yield* opencodeVersion(homePaths.old).pipe(
+    yield* opencodeVersion(homeDir).pipe(
       Effect.catchAll((e) =>
         isTimeout(e)
-          ? fail('E_PREFLIGHT_TIMEOUT', 'opencode-launch', 'old', 2, 'opencode --version timed out', checks)
+          ? fail('E_PREFLIGHT_TIMEOUT', 'opencode-launch', side, 2, 'opencode --version timed out', checks)
           : fail(
               'E_PREFLIGHT_FAILED',
               'opencode-launch',
-              'old',
+              side,
               2,
               `opencode --version failed: ${stderrOf(e)}`,
               checks,
@@ -108,20 +109,31 @@ const gateOpencodeLaunch = (
             ),
       ),
     )
-    return { name: 'opencode-launch', side: 'old', passed: true, durationMs: String(Date.now() - start) }
+    return { name: 'opencode-launch', side, passed: true, durationMs: String(Date.now() - start) }
   })
 
-const gateAuthPing = (
-  input: PreflightInputExt,
+const gateOpencodeLaunch = (
+  homePaths: PreflightInput['homePaths'],
+  checks: readonly PreflightCheck[],
+): Effect.Effect<readonly PreflightCheck[], PhaseError> =>
+  Effect.gen(function* () {
+    const oldCheck = yield* runOpencodeLaunch(homePaths.old, 'old', checks)
+    const newCheck = yield* runOpencodeLaunch(homePaths.new, 'new', checks)
+    return [oldCheck, newCheck]
+  })
+
+const runAuthPing = (
+  homeDir: string,
+  side: Side,
+  model: string | undefined,
+  timeoutMs: number,
   checks: readonly PreflightCheck[],
 ): Effect.Effect<PreflightCheck, PhaseError> =>
   Effect.gen(function* () {
     const start = Date.now()
-    const model = input.runInput.preflightModel
-    const timeoutMs = input.runInput.timeouts.preflightSeconds * 1000
     yield* opencodeRun({
-      homeDir: input.homePaths.old,
-      cwd: input.homePaths.old,
+      homeDir,
+      cwd: homeDir,
       agent: 'build',
       ...(model === undefined ? {} : { model }),
       prompt: 'reply with the single word OK',
@@ -130,38 +142,59 @@ const gateAuthPing = (
       Effect.catchAll((e) => {
         const stderr = stderrOf(e)
         if (isTimeout(e)) {
-          return fail('E_PREFLIGHT_TIMEOUT', 'auth-ping', 'old', 2, 'auth-ping timed out', checks)
+          return fail('E_PREFLIGHT_TIMEOUT', 'auth-ping', side, 2, 'auth-ping timed out', checks)
         }
         if (AUTH_MISSING_RE.test(stderr)) {
-          return fail('E_AUTH_MISSING', 'auth-ping', 'old', 2, `no credentials: ${stderr}`, checks, { stderr })
+          return fail('E_AUTH_MISSING', 'auth-ping', side, 2, `no credentials: ${stderr}`, checks, { stderr })
         }
-        return fail('E_PREFLIGHT_FAILED', 'auth-ping', 'old', 2, `auth-ping failed: ${stderr}`, checks, { stderr })
+        return fail('E_PREFLIGHT_FAILED', 'auth-ping', side, 2, `auth-ping failed: ${stderr}`, checks, { stderr })
       }),
     )
-    return { name: 'auth-ping', side: 'old', passed: true, durationMs: String(Date.now() - start) }
+    return { name: 'auth-ping', side, passed: true, durationMs: String(Date.now() - start) }
+  })
+
+const gateAuthPing = (
+  input: PreflightInputExt,
+  checks: readonly PreflightCheck[],
+): Effect.Effect<readonly PreflightCheck[], PhaseError> =>
+  Effect.gen(function* () {
+    const model = input.runInput.preflightModel
+    const timeoutMs = input.runInput.timeouts.preflightSeconds * 1000
+    const oldCheck = yield* runAuthPing(input.homePaths.old, 'old', model, timeoutMs, checks)
+    const newCheck = yield* runAuthPing(input.homePaths.new, 'new', model, timeoutMs, checks)
+    return [oldCheck, newCheck]
+  })
+
+const runBuildAgent = (
+  homeDir: string,
+  side: Side,
+  checks: readonly PreflightCheck[],
+): Effect.Effect<PreflightCheck, PhaseError> =>
+  Effect.gen(function* () {
+    const start = Date.now()
+    const file = path.join(homeDir, '.config/opencode/agents/build.md')
+    const ok = yield* exists(file)
+    if (!ok) {
+      yield* fail(
+        'E_PREFLIGHT_FAILED',
+        'build-agent',
+        side,
+        2,
+        `build agent missing in ${side} HOME`,
+        checks,
+      )
+    }
+    return { name: 'build-agent', side, passed: true, durationMs: String(Date.now() - start) }
   })
 
 const gateBuildAgent = (
   homePaths: PreflightInput['homePaths'],
   checks: readonly PreflightCheck[],
-): Effect.Effect<PreflightCheck, PhaseError> =>
+): Effect.Effect<readonly PreflightCheck[], PhaseError> =>
   Effect.gen(function* () {
-    const start = Date.now()
-    const oldFile = path.join(homePaths.old, '.config/opencode/agents/build.md')
-    const newFile = path.join(homePaths.new, '.config/opencode/agents/build.md')
-    const oldOk = yield* exists(oldFile)
-    const newOk = yield* exists(newFile)
-    if (!oldOk || !newOk) {
-      yield* fail(
-        'E_PREFLIGHT_FAILED',
-        'build-agent',
-        'old',
-        2,
-        `build agent missing (old=${String(oldOk)}, new=${String(newOk)})`,
-        checks,
-      )
-    }
-    return { name: 'build-agent', side: 'old', passed: true, durationMs: String(Date.now() - start) }
+    const oldCheck = yield* runBuildAgent(homePaths.old, 'old', checks)
+    const newCheck = yield* runBuildAgent(homePaths.new, 'new', checks)
+    return [oldCheck, newCheck]
   })
 
 const instructionName = (inst: RegistrationInstruction): string => {
@@ -217,18 +250,20 @@ const instructionVisible = (
 const gatePackVisibility = (
   input: PreflightInputExt,
   checks: readonly PreflightCheck[],
-): Effect.Effect<PreflightCheck, PhaseError> =>
+): Effect.Effect<readonly PreflightCheck[], PhaseError> =>
   Effect.gen(function* () {
     const start = Date.now()
     const pack = input.packInstall
     if (pack === undefined || pack.detectedType === null || pack.instructions.length === 0) {
-      return {
-        name: 'pack-visibility',
-        side: 'new',
-        passed: true,
-        durationMs: String(Date.now() - start),
-        details: 'skipped (no pack)',
-      }
+      return [
+        {
+          name: 'pack-visibility',
+          side: 'new',
+          passed: true,
+          durationMs: String(Date.now() - start),
+          details: 'skipped (no pack)',
+        },
+      ]
     }
     for (const inst of pack.instructions) {
       const visible = yield* instructionVisible(inst, input.homePaths)
@@ -244,7 +279,9 @@ const gatePackVisibility = (
         )
       }
     }
-    return { name: 'pack-visibility', side: 'new', passed: true, durationMs: String(Date.now() - start) }
+    return [
+      { name: 'pack-visibility', side: 'new', passed: true, durationMs: String(Date.now() - start) },
+    ]
   })
 
 const leakedOntoOld = (
@@ -269,9 +306,18 @@ const leakedOntoOld = (
 const gateBaselineIdentical = (
   input: PreflightInputExt,
   checks: readonly PreflightCheck[],
-): Effect.Effect<PreflightCheck, PhaseError> =>
+): Effect.Effect<readonly PreflightCheck[], PhaseError> =>
   Effect.gen(function* () {
     const start = Date.now()
+    // Re-verify gates 1–3 for side=old (idempotent: they already ran and passed
+    // in gates 1–3; the spec requires gate 5 to repeat them as a baseline
+    // sanity check before the pack-leak assertion).
+    const model = input.runInput.preflightModel
+    const timeoutMs = input.runInput.timeouts.preflightSeconds * 1000
+    yield* runOpencodeLaunch(input.homePaths.old, 'old', checks)
+    yield* runAuthPing(input.homePaths.old, 'old', model, timeoutMs, checks)
+    yield* runBuildAgent(input.homePaths.old, 'old', checks)
+    // Pack-leak assertion: no pack files/symlinks may have landed on the old side.
     const pack = input.packInstall
     if (pack !== undefined && pack.detectedType !== null) {
       for (const inst of pack.instructions) {
@@ -289,7 +335,9 @@ const gateBaselineIdentical = (
         }
       }
     }
-    return { name: 'baseline-identical', side: 'old', passed: true, durationMs: String(Date.now() - start) }
+    return [
+      { name: 'baseline-identical', side: 'old', passed: true, durationMs: String(Date.now() - start) },
+    ]
   })
 
 const formatLine = (c: PreflightCheck): string => {
@@ -315,7 +363,7 @@ export const preflight = (input: PreflightInputExt): Effect.Effect<PreflightResu
 
     interface Gate {
       readonly name: GateName
-      readonly run: (checks: readonly PreflightCheck[]) => Effect.Effect<PreflightCheck, PhaseError>
+      readonly run: (checks: readonly PreflightCheck[]) => Effect.Effect<readonly PreflightCheck[], PhaseError>
     }
 
     const gates: readonly Gate[] = [
@@ -331,9 +379,11 @@ export const preflight = (input: PreflightInputExt): Effect.Effect<PreflightResu
       [] as readonly PreflightCheck[],
       (acc, gate) =>
         Effect.gen(function* () {
-          const check = yield* gate.run(acc)
-          yield* writeLog(logPath, formatLine(check))
-          return [...acc, check]
+          const produced = yield* gate.run(acc)
+          for (const check of produced) {
+            yield* writeLog(logPath, formatLine(check))
+          }
+          return [...acc, ...produced]
         }),
     )
 

@@ -322,6 +322,12 @@ export const runPipeline = (
       reporter,
       (r) => Object.keys(r.paths).join(', '),
     )
+    // Spec invariant: report.md is printed to stdout. The rendered Markdown is
+    // carried on the result only when the user requested Markdown output.
+    if (report.stdoutMd !== undefined) {
+      const stdoutMd = report.stdoutMd
+      yield* Effect.sync(() => process.stdout.write(`${stdoutMd}\n`))
+    }
 
     // 12 review-workspace
     const review = yield* timedPhase(

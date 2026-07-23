@@ -16,8 +16,9 @@ import type {
 import { manifestSchema } from '@generated/schemas'
 import { workspaceSetupError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
-import { ensureDir, exists, pathKind, readDir, readFile, writeFile, writeJson } from '../util/fs.js'
+import { ensureDir, pathKind, readDir, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
+import { updateGitignore } from '../util/gitignore.js'
 import { version as opencodeVersionProbe } from '../opencode/cli.js'
 
 export type WorkspaceSetupInputExt = WorkspaceSetupInput & {
@@ -25,7 +26,6 @@ export type WorkspaceSetupInputExt = WorkspaceSetupInput & {
 }
 
 const VERSION_PROBE_TIMEOUT_MS = 5000
-const GITIGNORE_LINE = '.testaipack/'
 
 const range = (n: number) => Array.from({ length: n }, (_, i) => i + 1)
 
@@ -52,20 +52,6 @@ const probeOpencodeVersion = (probeHome: string): Effect.Effect<string> =>
     if (either._tag === 'Right' && either.right._tag === 'Some') return either.right.value
     return 'unknown'
   })
-
-const updateGitignore = (projectRoot: string): Effect.Effect<void> =>
-  Effect.gen(function* () {
-    const giPath = path.join(projectRoot, '.gitignore')
-    const present = yield* exists(giPath)
-    if (present) {
-      const content = yield* readFile(giPath)
-      if (content.split('\n').includes(GITIGNORE_LINE)) return
-      const sep = content.length === 0 || content.endsWith('\n') ? '' : '\n'
-      yield* writeFile(giPath, `${content}${sep}${GITIGNORE_LINE}\n`)
-      return
-    }
-    yield* writeFile(giPath, `${GITIGNORE_LINE}\n`)
-  }).pipe(Effect.catchAll(() => Effect.succeed(undefined)))
 
 const buildManifest = (
   runInput: RunInput,
@@ -156,7 +142,7 @@ export const workspaceSetup = (
       Effect.mapError(mapFsTo('write-failed', path.join(rootPath, 'manifest.json'))),
     )
 
-    yield* updateGitignore(projectRoot)
+    yield* updateGitignore(path.join(projectRoot, '.gitignore'))
 
     const runs = runInput.runs
     const runPaths = (base: string) => range(runs).map((n) => path.join(base, `run-${n.toString()}`))

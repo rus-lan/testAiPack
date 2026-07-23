@@ -52,10 +52,16 @@ export const cleanup = (
     const resultsDir = workspace.results
 
     if (!ephemeral) {
+      const gcLogPath = path.join(resultsDir, 'gc.log')
+      const stamp = new Date().toISOString()
+      yield* ensureDir(resultsDir).pipe(Effect.catchAll(softEnsure('ensureDir')))
+      yield* appendFile(gcLogPath, `[${stamp}] cleanup skipped (retention on)\n`).pipe(
+        Effect.catchAll(softEnsure('appendGcLog')),
+      )
       return {
         deleted: [],
         kept: [...allWorkspacePaths(workspace)],
-        gcLogPath: '',
+        gcLogPath,
       }
     }
 

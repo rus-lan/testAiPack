@@ -29,6 +29,7 @@ import {
 } from './workspace-runs.js'
 import { runDoctor, hasCriticalFailure } from './doctor.js'
 import { exists, writeJson } from '../util/fs.js'
+import { updateGitignore } from '../util/gitignore.js'
 import { mapIdeToBinary } from '../phases/12-review-workspace.js'
 import { renderMd } from '../report/md.js'
 import { PhaseError } from '../errors.js'
@@ -225,22 +226,6 @@ const DEFAULT_CONFIG = {
   preflightEnabled: true,
 }
 
-const GITIGNORE_LINE = '.testaipack/'
-
-const updateGitignore = async (projectRoot: string): Promise<void> => {
-  const giPath = path.join(projectRoot, '.gitignore')
-  const { readFile, writeFile, exists: existsFn } = await import('../util/fs.js')
-  const has = await Effect.runPromise(existsFn(giPath))
-  if (has) {
-    const content = await Effect.runPromise(readFile(giPath))
-    if (content.split('\n').includes(GITIGNORE_LINE)) return
-    const sep = content.length === 0 || content.endsWith('\n') ? '' : '\n'
-    await Effect.runPromise(writeFile(giPath, `${content}${sep}${GITIGNORE_LINE}\n`))
-    return
-  }
-  await Effect.runPromise(writeFile(giPath, `${GITIGNORE_LINE}\n`))
-}
-
 export const executeInit = async (workspace: string): Promise<number> => {
   const root = await Effect.runPromise(ensureWorkspace(workspace))
   const cfgPath = path.join(root, 'config.json')
@@ -248,7 +233,8 @@ export const executeInit = async (workspace: string): Promise<number> => {
   if (!hasCfg) {
     await Effect.runPromise(writeJson(cfgPath, DEFAULT_CONFIG))
   }
-  await updateGitignore(path.dirname(path.resolve(root)))
+  const giPath = path.join(path.dirname(path.resolve(root)), '.gitignore')
+  await Effect.runPromise(updateGitignore(giPath))
   process.stdout.write(`Initialized testaipack workspace at ${root}\n`)
   return 0
 }

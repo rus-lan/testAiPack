@@ -48,7 +48,7 @@ const DEFAULT_TIMEOUTS: TimeoutConfig = {
   runSeconds: 600,
   verifySeconds: 300,
   installSeconds: 300,
-  watchdogSeconds: 1200,
+  watchdogSeconds: 90,
 }
 const DEFAULT_AUTH: AuthWhitelist = {
   opencode: false,
@@ -163,7 +163,7 @@ const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '--timeout-run': 'runSeconds',
   '--timeout-verify': 'verifySeconds',
   '--timeout-install': 'installSeconds',
-  '--timeout-watchdog': 'watchdogSeconds',
+  '--watchdog': 'watchdogSeconds',
   '--timeout-total': 'totalSeconds',
 }
 
@@ -213,6 +213,10 @@ const parseEnum = <T>(
     }
     return r.data
   })
+
+const MODEL_REF_PATTERN = /^[a-zA-Z0-9._-]+[/:][a-zA-Z0-9._-]+$/
+
+const isValidModelRef = (m: string): boolean => MODEL_REF_PATTERN.test(m)
 
 const setScalar = <K extends keyof CliRaw>(acc: CliRaw, key: K, value: CliRaw[K]): CliRaw => ({
   ...acc,
@@ -597,6 +601,17 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const timeouts = mergeTimeouts(cli.timeouts, cfg?.timeouts)
     const auth = mergeAuth(cli.auth, cfg?.auth)
 
+    const preflightModelValue = preflightModelPick.value
+    if (preflightModelValue !== undefined && !isValidModelRef(preflightModelValue)) {
+      return yield* Effect.fail(
+        cliParseError(
+          `model unavailable: ${preflightModelValue}`,
+          'E_MODEL_UNAVAILABLE',
+          { model: preflightModelValue, reason: 'unknown-model' },
+        ),
+      )
+    }
+
     const sources: readonly ('cli' | 'config' | 'default')[] = [
       repoUrlPick.src,
       promptSrc,
@@ -632,7 +647,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       formats: [...formats],
       outputPath: outputPick.value ?? './results',
       diffHtml: diffHtmlPick.value ?? false,
-      collapseRepeats: collapsePick.value ?? true,
+      collapseRepeats: collapsePick.value ?? false,
       timelineMode: timelinePick.value ?? 'side-by-side',
       timeouts,
       workspacePath: workspacePick.value ?? './.testaipack',

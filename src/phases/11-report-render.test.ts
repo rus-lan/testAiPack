@@ -87,6 +87,42 @@ describe('reportRender — format selection', () => {
   })
 })
 
+describe('reportRender — stdout Markdown', () => {
+  it('result carries stdoutMd when md is in requested formats', async () => {
+    const out = makeTempDir()
+    const input = makeReportRenderInput({
+      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
+    })
+    const result = await runP(reportRender(input))
+    expect(result.stdoutMd).toBeDefined()
+    expect(typeof result.stdoutMd).toBe('string')
+    expect(result.stdoutMd).toContain('# testaipack report: run-abc-001')
+    // stdoutMd matches the file written to disk
+    const onDisk = await runP(readFile(`${out}/report.md`))
+    expect(result.stdoutMd).toBe(onDisk)
+  })
+
+  it('result omits stdoutMd when only json is requested', async () => {
+    const out = makeTempDir()
+    const input = makeReportRenderInput({
+      runInput: makeRunInput({ formats: ['json'], outputPath: out }),
+    })
+    const result = await runP(reportRender(input))
+    expect(result.stdoutMd).toBeUndefined()
+    // report.md is still written to disk (always), just not surfaced to stdout
+    expect(existsSync(`${out}/report.md`)).toBe(true)
+  })
+
+  it('stdoutMd is present when formats include md alongside others', async () => {
+    const out = makeTempDir()
+    const input = makeReportRenderInput({
+      runInput: makeRunInput({ formats: ['md', 'yaml'], outputPath: out }),
+    })
+    const result = await runP(reportRender(input))
+    expect(result.stdoutMd).toBeDefined()
+  })
+})
+
 describe('reportRender — markdown content', () => {
   it('written report.md contains all mandatory sections', async () => {
     const out = makeTempDir()

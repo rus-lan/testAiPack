@@ -145,11 +145,20 @@ export const spawnProcess = (input: SpawnInput): Effect.Effect<SpawnOutput> =>
 
 export const execCmd = (input: ExecInput): Effect.Effect<ExecOutput> =>
   Effect.async<ExecOutput>((resume) => {
+    const controller = new AbortController()
+    let settled = false
     nodeExecFile(
       input.command,
       [...input.args],
-      { cwd: input.cwd, env: input.env, maxBuffer: 16 * 1024 * 1024 },
+      {
+        cwd: input.cwd,
+        env: input.env,
+        maxBuffer: 16 * 1024 * 1024,
+        signal: controller.signal,
+      },
       (err, stdout, stderr) => {
+        if (settled) return
+        settled = true
         const exitCode = err === null ? 0 : typeof err.code === 'number' ? err.code : -1
         resume(
           Effect.succeed({
@@ -160,5 +169,8 @@ export const execCmd = (input: ExecInput): Effect.Effect<ExecOutput> =>
         )
       },
     )
-    return Effect.sync(() => undefined)
+    return Effect.sync(() => {
+      settled = true
+      controller.abort()
+    })
   })

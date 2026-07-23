@@ -44,7 +44,7 @@ npm run contract:codegen
   --pure-baseline \
   --runs 5 \
   --judge @prompts/judge.md \
-  --preflight-model claude-3-5-haiku-20241022 \
+  --preflight-model anthropic/claude-3-5-haiku-20241022 \
   --format md html json \
   --output ./.testaipack/last/report \
   --collapse-repeats \
@@ -105,7 +105,7 @@ npm run contract:codegen
 | --------------------- | ----------------------------------------------------------------------- |
 | `review [run-id]`     | Открыть multi-root VSCode workspace для прогона (old/new side-by-side). |
 | `report [run-id]`     | Перерендерить отчёт по сохранённым данным прогона.                      |
-| `compare <id1> <id2>` | Сравнить два прогона (цель: v0.3).                                      |
+| `compare <id1> <id2>` | Сравнить два прогона (v0.3, не реализовано).                          |
 | `gc`                  | Очистка старых прогонов из рабочего дерева.                             |
 | `list`                | Список всех прогонов в `<workspace>`.                                   |
 | `init`                | Инициализировать `<workspace>/.testaipack/`.                            |
@@ -125,7 +125,7 @@ npm run contract:codegen
 ```
 
 - **Контракт:** `contract/` — TypeSpec; компилируется в JSON Schema → `src/generated/` (TS-типы + Zod-схемы).
-- **Изоляция:** фейковый `$HOME` (`src/isolation/`); `docker` — цель v0.3.
+- **Изоляция:** фейковый `$HOME` — фаза `src/phases/04-home-isolation.ts` (строитель дерева `src/isolation/home-builder.ts`); `docker` — цель v0.3.
 - **Метрики:** `src/metrics/` — извлечение из opencode-export, медиана/IQR, правило 1.5×IQR для значимости (v0.2).
 - **Цены:** `src/pricing/pricing.json` — USD за 1M токенов по провайдерам.
 

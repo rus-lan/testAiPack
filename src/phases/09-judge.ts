@@ -12,6 +12,7 @@
  * @see contract/phases/09-judge.tsp
  */
 import { Effect } from 'effect'
+import path from 'node:path'
 import type {
   DiffResult,
   JudgeInput,
@@ -22,6 +23,8 @@ import type {
 } from '@generated/types'
 import { run as opencodeRun } from '../opencode/cli.js'
 import type { OpencodeRunOptions } from '../opencode/cli.js'
+import { ensureDir, writeJson } from '../util/fs.js'
+import { isRecord } from '../util/types.js'
 import { judgeError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
 
@@ -49,9 +52,6 @@ const isModelUnavailable = (stderr: string): boolean => {
   return MODEL_UNAVAILABLE_PATTERNS.some((p) => lower.includes(p))
 }
 
-const isRecord = (u: unknown): u is Record<string, unknown> =>
-  typeof u === 'object' && u !== null && !Array.isArray(u)
-
 // ---------------------------------------------------------------------------
 // Pure: patch selection
 // ---------------------------------------------------------------------------
@@ -73,12 +73,23 @@ const firstNonEmptyPatch = (
 // Pure: prompt builder
 // ---------------------------------------------------------------------------
 
+/** Patches above this size are truncated before being sent to the judge model. */
+const MAX_PATCH_CHARS = 100_000
+const TRUNCATED_PATCH_CHARS = 50_000
+
+const truncatePatch = (patch: string): string => {
+  if (patch.length <= MAX_PATCH_CHARS) return patch
+  return `[truncated from ${String(patch.length)} chars]\n${patch.slice(0, TRUNCATED_PATCH_CHARS)}`
+}
+
 export const buildJudgePrompt = (
   runInput: RunInput,
   oldPatch: string,
   newPatch: string,
 ): string => {
   const packRef = runInput.packRef ?? 'n/a'
+  const oldTrunc = truncatePatch(oldPatch)
+  const newTrunc = truncatePatch(newPatch)
   return [
     '<system context>',
     'You are judging an A/B test of an opencode integration.',
@@ -87,13 +98,13 @@ export const buildJudgePrompt = (
     '',
     '<old side diff (baseline, no pack)>',
     '```diff',
-    oldPatch,
+    oldTrunc,
     '```',
     '</old side>',
     '',
     `<new side diff (with pack: ${packRef})>`,
     '```diff',
-    newPatch,
+    newTrunc,
     '```',
     '</new side>',
     '',
@@ -120,6 +131,8 @@ const isVerdict = (v: unknown): v is JudgeVerdict =>
   typeof v === 'string' && VERDICTS.includes(v as JudgeVerdict)
 
 const isIntegerValue = (u: unknown): u is number => Number.isInteger(u)
+
+const clampQuality = (n: number): number => Math.max(0, Math.min(10, n))
 
 const safeJsonParse = (s: string): unknown => {
   try {
@@ -155,10 +168,15 @@ export const parseJudgeResponse = (raw: string): ParsedJudge | null => {
   const oldQuality = obj['oldQuality']
   const newQuality = obj['newQuality']
   if (!isIntegerValue(oldQuality) || !isIntegerValue(newQuality)) return null
-  if (oldQuality < 0 || oldQuality > 10 || newQuality < 0 || newQuality > 10) return null
+  // Quality out of [0, 10] is clamped rather than rejected (spec step 7).
   const explanation = obj['explanation']
   if (typeof explanation !== 'string') return null
-  return { verdict, oldQuality, newQuality, explanation }
+  return {
+    verdict,
+    oldQuality: clampQuality(oldQuality),
+    newQuality: clampQuality(newQuality),
+    explanation,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,20 +247,26 @@ const unclearFromFailure = (explanation: string, rawResponse: string, modelUsed:
 // Phase entry point
 // ---------------------------------------------------------------------------
 
-export const judge = (
+/**
+ * Computes the judge result (or null when the judge was not requested). Does
+ * not touch disk. The only failure path is `E_MODEL_UNAVAILABLE` (hard model
+ * unavailability); timeout/crash/429 return a `JudgeResult` with verdict
+ * "unclear".
+ */
+const computeJudge = (
   input: JudgeInput,
-): Effect.Effect<JudgeResultOutput, PhaseError> =>
+): Effect.Effect<JudgeResult | null, PhaseError> =>
   Effect.gen(function* () {
     const { runInput, diff } = input
 
     if (runInput.judge === undefined || runInput.judge === '') {
-      return { judge: null }
+      return null
     }
 
     const oldPatch = firstNonEmptyPatch(diff.old)
     const newPatch = firstNonEmptyPatch(diff.new)
     if (oldPatch === null && newPatch === null) {
-      return { judge: bothEmptyResult() }
+      return bothEmptyResult()
     }
 
     const prompt = buildJudgePrompt(
@@ -279,22 +303,16 @@ export const judge = (
       const explanation = err.timedOut
         ? `judge timeout after ${String(runInput.timeouts.runSeconds)}s`
         : `judge crashed (exit ${err.exitCode === null ? 'unknown' : String(err.exitCode)})`
-      return { judge: unclearFromFailure(explanation, '', model ?? '') }
+      return unclearFromFailure(explanation, '', model ?? '')
     }
 
     const raw = extractAssistantText(outcome.right.stdout)
     const parsed = parseJudgeResponse(raw)
     if (parsed === null) {
-      return {
-        judge: unclearFromFailure(
-          'Failed to parse judge response',
-          raw,
-          model ?? '',
-        ),
-      }
+      return unclearFromFailure('Failed to parse judge response', raw, model ?? '')
     }
 
-    const judgeResult: JudgeResult = {
+    return {
       verdict: parsed.verdict,
       oldQuality: parsed.oldQuality,
       newQuality: parsed.newQuality,
@@ -302,6 +320,46 @@ export const judge = (
       ...(raw === '' ? {} : { rawResponse: raw }),
       modelUsed: model ?? '',
       timestamp: nowIso(),
-    }
-    return { judge: judgeResult }
+    } satisfies JudgeResult
+  })
+
+/**
+ * Writes `results/judge.json` with `{ judge: <result | null> }`. Best-effort:
+ * a disk failure is logged but never fails the phase (the only contract error
+ * is `E_MODEL_UNAVAILABLE`, which is unrelated to disk writes).
+ */
+const writeJudgeJson = (
+  resultsDir: string,
+  result: JudgeResult | null,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const judgeJsonPath = path.join(resultsDir, 'judge.json')
+    yield* ensureDir(resultsDir).pipe(
+      Effect.catchAll((e) =>
+        Effect.sync(() => {
+          console.warn(
+            `judge: cannot create results dir: ${e.operation} on ${e.path}: ${String(e.cause)}`,
+          )
+        }),
+      ),
+    )
+    yield* writeJson(judgeJsonPath, { judge: result }).pipe(
+      Effect.catchAll((e) =>
+        Effect.sync(() => {
+          console.warn(
+            `judge: cannot write judge.json: ${e.operation} on ${e.path}: ${String(e.cause)}`,
+          )
+        }),
+      ),
+    )
+  })
+
+export const judge = (
+  input: JudgeInput,
+): Effect.Effect<JudgeResultOutput, PhaseError> =>
+  Effect.gen(function* () {
+    const result = yield* computeJudge(input)
+    const resultsDir = path.resolve(input.runInput.outputPath)
+    yield* writeJudgeJson(resultsDir, result)
+    return { judge: result }
   })

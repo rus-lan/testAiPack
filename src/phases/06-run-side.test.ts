@@ -14,7 +14,7 @@ import {
   DOOM_LOOP_THRESHOLD,
 } from './06-run-side.js'
 import type { AnalyzeInput } from './06-run-side.js'
-import type { RunInput, Manifest, WorkspaceTree, EnvVarSet, RunSideInput } from '@generated/types'
+import type { RunInput, Manifest, WorkspaceTree, EnvVarSet, RunSideInput, ErrorCode } from '@generated/types'
 import type { OpencodeRunOptions } from '../opencode/cli.js'
 
 vi.mock('../opencode/cli.js', () => ({
@@ -272,12 +272,13 @@ describe('phase 06 — run-side', () => {
     expect(result.successRank).toBe(0)
     expect(result.finishCause).toBe('error')
     expect(result.exitCode).toBe(1)
+    expect(result.errorCode).toBe('E_RUN_CRASH')
     // export.json still written despite crash
     const exported = await runP(readFile(result.exportPath))
     expect(exported).toBe(validExport())
   })
 
-  it('hang (watchdog) → watchdogTriggered true, rank 1, finish tool-calls', async () => {
+  it('hang (watchdog) → watchdogTriggered true, rank 0, finish error, E_RUN_HANG_WATCHDOG', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     // mock run sleeps a long time without emitting any event
@@ -293,8 +294,9 @@ describe('phase 06 — run-side', () => {
     })
     const result = await runP(runSide(input))
     expect(result.watchdogTriggered).toBe(true)
-    expect(result.successRank).toBe(1)
-    expect(result.finishCause).toBe('tool-calls')
+    expect(result.successRank).toBe(0)
+    expect(result.finishCause).toBe('error')
+    expect(result.errorCode).toBe('E_RUN_HANG_WATCHDOG')
   })
 
   it('hard run timeout → timedOut, rank 0, finish error', async () => {
@@ -308,6 +310,7 @@ describe('phase 06 — run-side', () => {
     const result = await runP(runSide(buildInput(root)))
     expect(result.successRank).toBe(0)
     expect(result.finishCause).toBe('error')
+    expect(result.errorCode).toBe('E_RUN_TIMEOUT')
   })
 
   it('total timeout (totalSeconds exhausted) → rank 0, finish error', async () => {
@@ -331,6 +334,7 @@ describe('phase 06 — run-side', () => {
     expect(result.successRank).toBe(0)
     expect(result.finishCause).toBe('error')
     expect(result.watchdogTriggered).toBe(false)
+    expect(result.errorCode).toBe('E_RUN_TIMEOUT')
   })
 
   it('context-overflow (finish length) → rank 2, finish length', async () => {
@@ -342,6 +346,7 @@ describe('phase 06 — run-side', () => {
     const result = await runP(runSide(buildInput(root)))
     expect(result.successRank).toBe(2)
     expect(result.finishCause).toBe('length')
+    expect(result.errorCode).toBeUndefined()
   })
 
   it('rate-limit exhausted (429 in events) → rank 0, finish error', async () => {
@@ -356,6 +361,7 @@ describe('phase 06 — run-side', () => {
     const result = await runP(runSide(buildInput(root)))
     expect(result.successRank).toBe(0)
     expect(result.finishCause).toBe('error')
+    expect(result.errorCode).toBe('E_RATE_LIMIT_EXHAUSTED')
   })
 
   it('doom-loop (same tool × 20, no clean finish) → rank 1', async () => {
@@ -366,13 +372,14 @@ describe('phase 06 — run-side', () => {
     const result = await runP(runSide(buildInput(root)))
     expect(result.successRank).toBe(1)
     expect(result.finishCause).toBe('tool-calls')
+    expect(result.errorCode).toBeUndefined()
   })
 
   // -------------------------------------------------------------------------
   // verify outcomes
   // -------------------------------------------------------------------------
 
-  it('verify non-zero exit → verifyExitCode = N, phase OK', async () => {
+  it('verify non-zero exit → verifyExitCode = N, rank reduced by 1, E_VERIFY_FAILED', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     spawnMock.mockImplementation(() =>
@@ -381,10 +388,12 @@ describe('phase 06 — run-side', () => {
     const input = buildInput(root, { runInput: { verify: 'npm test' } })
     const result = await runP(runSide(input))
     expect(result.verifyExitCode).toBe(2)
-    expect(result.successRank).toBe(4)
+    // run finished stop (rank 4) -> verify fail reduces to rank 3
+    expect(result.successRank).toBe(3)
+    expect(result.errorCode).toBe('E_VERIFY_FAILED')
   })
 
-  it('verify timeout → verifyExitCode undefined, phase OK', async () => {
+  it('verify timeout → verifyExitCode undefined, rank 0, E_VERIFY_TIMEOUT', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     spawnMock.mockImplementation(() =>
@@ -393,8 +402,9 @@ describe('phase 06 — run-side', () => {
     const input = buildInput(root, { runInput: { verify: 'npm test' } })
     const result = await runP(runSide(input))
     expect(result.verifyExitCode).toBeUndefined()
-    // run itself succeeded, so rank stays based on run outcome
-    expect(result.successRank).toBe(4)
+    // verify timeout forces rank 0 even though the run itself succeeded
+    expect(result.successRank).toBe(0)
+    expect(result.errorCode).toBe('E_VERIFY_TIMEOUT')
   })
 
   // -------------------------------------------------------------------------
@@ -556,6 +566,7 @@ describe('phase 06 — run-side', () => {
     readonly input: AnalyzeInput
     readonly rank: number
     readonly finish: string
+    readonly errorCode?: ErrorCode
   }[] = [
     {
       name: 'clean stop → 4',
@@ -604,18 +615,21 @@ describe('phase 06 — run-side', () => {
       input: { events: [], exitCode: 1, timedOut: false, watchdogTriggered: false, doomLoopThreshold: DOOM_LOOP_THRESHOLD },
       rank: 0,
       finish: 'error',
+      errorCode: 'E_RUN_CRASH',
     },
     {
       name: 'hard timeout → 0',
       input: { events: [stepFinish('stop')], exitCode: 0, timedOut: true, watchdogTriggered: false, doomLoopThreshold: DOOM_LOOP_THRESHOLD },
       rank: 0,
       finish: 'error',
+      errorCode: 'E_RUN_TIMEOUT',
     },
     {
-      name: 'watchdog → 1',
+      name: 'watchdog → 0',
       input: { events: [], exitCode: 0, timedOut: false, watchdogTriggered: true, doomLoopThreshold: DOOM_LOOP_THRESHOLD },
-      rank: 1,
-      finish: 'tool-calls',
+      rank: 0,
+      finish: 'error',
+      errorCode: 'E_RUN_HANG_WATCHDOG',
     },
     {
       name: 'rate-limit (429) → 0',
@@ -628,6 +642,7 @@ describe('phase 06 — run-side', () => {
       },
       rank: 0,
       finish: 'error',
+      errorCode: 'E_RATE_LIMIT_EXHAUSTED',
     },
     {
       name: 'exit 0 but no finish signal → 0 (other)',
@@ -654,6 +669,7 @@ describe('phase 06 — run-side', () => {
       const out = analyzeOutcome(c.input)
       expect(out.rank).toBe(c.rank)
       expect(out.finish).toBe(c.finish)
+      expect(out.errorCode).toBe(c.errorCode)
     })
   }
 

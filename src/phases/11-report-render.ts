@@ -63,21 +63,34 @@ export const buildReport = (input: ReportRenderInput): Report => {
   }
 }
 
+/**
+ * Local result extension: the contract `ReportRenderResult` carries the file
+ * paths and stdout format, but not the rendered Markdown body. The pipeline
+ * needs the rendered MD to print it to stdout (spec invariant: "report.md
+ * напечатан в stdout"), so this extension exposes it when Markdown output was
+ * requested by the user.
+ */
+export interface ReportRenderResultExt extends ReportRenderResult {
+  readonly stdoutMd?: string
+}
+
 export const reportRender = (
   input: ReportRenderInput,
-): Effect.Effect<ReportRenderResult, PhaseError> =>
+): Effect.Effect<ReportRenderResultExt, PhaseError> =>
   Effect.gen(function* () {
     const { runInput } = input
     const report = buildReport(input)
     const resultsDir = path.resolve(runInput.outputPath)
-    const formats: ReportRenderResult['formats'] = runInput.formats.includes('md')
+    const mdRequested = runInput.formats.includes('md')
+    const formats: ReportRenderResult['formats'] = mdRequested
       ? [...runInput.formats]
       : [...runInput.formats, 'md']
 
     yield* ensureDir(resultsDir).pipe(Effect.mapError(toDiskFull('ensureDir', resultsDir)))
 
+    const mdContent = renderMd(report)
     const mdPath = path.join(resultsDir, 'report.md')
-    yield* writeFile(mdPath, renderMd(report)).pipe(
+    yield* writeFile(mdPath, mdContent).pipe(
       Effect.mapError(toDiskFull('write report.md', mdPath)),
     )
 
@@ -103,5 +116,10 @@ export const reportRender = (
       ...(htmlWanted ? { html: htmlPath } : {}),
     }
 
-    return { formats, paths, stdoutFormat }
+    return {
+      formats,
+      paths,
+      stdoutFormat,
+      ...(mdRequested ? { stdoutMd: mdContent } : {}),
+    }
   })

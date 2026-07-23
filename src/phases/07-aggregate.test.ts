@@ -7,11 +7,13 @@ import { ensureDir, readFile, writeFile, writeJson } from '../util/fs.js'
 import { aggregate } from './07-aggregate.js'
 import { PhaseError } from '../errors.js'
 import type {
+  ErrorCode,
   Manifest,
   RunInput,
   RunSideResult,
   WorkspaceTree,
 } from '@generated/types'
+import type { RunSideResultExt } from './06-run-side.js'
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
@@ -77,8 +79,8 @@ const sideResult = (
   side: 'old' | 'new',
   runIndex: number,
   successRank: number,
-  opts: { readonly finishCause?: RunSideResult['finishCause']; readonly exitCode?: number; readonly watchdog?: boolean } = {},
-): RunSideResult => ({
+  opts: { readonly finishCause?: RunSideResult['finishCause']; readonly exitCode?: number; readonly watchdog?: boolean; readonly errorCode?: ErrorCode } = {},
+): RunSideResultExt => ({
   side,
   runIndex,
   exportPath: '',
@@ -88,6 +90,7 @@ const sideResult = (
   exitCode: opts.exitCode ?? 0,
   durationMs: '0',
   watchdogTriggered: opts.watchdog ?? false,
+  ...(opts.errorCode === undefined ? {} : { errorCode: opts.errorCode }),
 })
 
 interface ExportOpts {
@@ -229,7 +232,7 @@ describe('aggregate — failed runs', () => {
       sideResults: {
         old: [
           sideResult('old', 1, 0, { finishCause: 'error', exitCode: 1 }),
-          sideResult('old', 2, 0, { watchdog: true }),
+          sideResult('old', 2, 0, { watchdog: true, errorCode: 'E_RUN_HANG_WATCHDOG' }),
         ],
         new: [
           sideResult('new', 1, 0, { finishCause: 'error', exitCode: 1 }),
@@ -287,14 +290,14 @@ describe('aggregate — failed runs', () => {
 })
 
 describe('aggregate — cost source', () => {
-  it('pricing.json present -> cost computed from pricing table', async () => {
+  it('pricing.json present and info.cost = 0 -> cost computed from pricing table', async () => {
     const tree = await makeWorkspace(1)
     const pricingPath = path.join(tree.root, 'pricing.json')
     await runP(writeJson(pricingPath, PRICING_JSON))
     const runInput = makeRunInput({ runs: 1, pricingPath })
-    // 1M input tokens @ 1/M = 1.0 USD
-    await writeRaw(tree, 'old', 1, exportJson({ totalTokens: 1000000, cost: 999 }))
-    await writeRaw(tree, 'new', 1, exportJson({ totalTokens: 1000000, cost: 999 }))
+    // 1M input tokens @ 1/M = 1.0 USD; info.cost = 0 so pricing path is taken
+    await writeRaw(tree, 'old', 1, exportJson({ totalTokens: 1000000, cost: 0 }))
+    await writeRaw(tree, 'new', 1, exportJson({ totalTokens: 1000000, cost: 0 }))
     const result = await runP(aggregate({
       runInput,
       manifest: makeManifest(runInput),

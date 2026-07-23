@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Effect } from 'effect'
+import { existsSync } from 'node:fs'
 import { judge, parseJudgeResponse, buildJudgePrompt } from './09-judge.js'
+import { makeTempDir } from '../../tests/setup.js'
+import { readFile } from '../util/fs.js'
 import type {
   DiffResult,
   DiffRunResult,
@@ -43,7 +46,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
   pureBaseline: true,
   preflightEnabled: true,
   formats: ['md'],
-  outputPath: './results',
+  outputPath: makeTempDir(),
   diffHtml: false,
   collapseRepeats: false,
   timelineMode: 'side-by-side',
@@ -188,8 +191,9 @@ const PARSE_CASES: readonly ParseCase[] = [
   { name: 'empty string', raw: '', expect: null },
   { name: 'missing fields', raw: '{"verdict":"ok"}', expect: null },
   { name: 'verdict out of enum', raw: '{"verdict":"great","oldQuality":5,"newQuality":5,"explanation":"x"}', expect: null },
-  { name: 'quality out of range high', raw: '{"verdict":"ok","oldQuality":15,"newQuality":5,"explanation":"x"}', expect: null },
-  { name: 'quality out of range low', raw: '{"verdict":"ok","oldQuality":-1,"newQuality":5,"explanation":"x"}', expect: null },
+  { name: 'quality out of range high', raw: '{"verdict":"ok","oldQuality":15,"newQuality":5,"explanation":"x"}', expect: { verdict: 'ok', oldQuality: 10, newQuality: 5, explanation: 'x' } },
+  { name: 'quality out of range low', raw: '{"verdict":"ok","oldQuality":-1,"newQuality":5,"explanation":"x"}', expect: { verdict: 'ok', oldQuality: 0, newQuality: 5, explanation: 'x' } },
+  { name: 'quality clamps both extremes', raw: '{"verdict":"ok","oldQuality":-5,"newQuality":42,"explanation":"x"}', expect: { verdict: 'ok', oldQuality: 0, newQuality: 10, explanation: 'x' } },
   { name: 'quality not integer', raw: '{"verdict":"ok","oldQuality":5.5,"newQuality":5,"explanation":"x"}', expect: null },
   { name: 'explanation not string', raw: '{"verdict":"ok","oldQuality":5,"newQuality":5,"explanation":42}', expect: null },
   { name: 'not an object', raw: '[1,2,3]', expect: null },
@@ -225,6 +229,26 @@ describe('buildJudgePrompt', () => {
     const runInput = without(makeRunInput({}), 'packRef')
     const prompt = buildJudgePrompt(runInput, 'a', 'b')
     expect(prompt).toContain('with pack: n/a')
+  })
+
+  it('truncates patches larger than 100KB to 50KB with a notice', () => {
+    const runInput = makeRunInput({})
+    const big = 'X'.repeat(200_000)
+    const prompt = buildJudgePrompt(runInput, big, 'NEWPATCH')
+    expect(prompt).toContain('[truncated from 200000 chars]')
+    // truncated body is the 50_000-char slice, not the full 200_000
+    const fullMatch = prompt.match(/X+/g) ?? []
+    const longestXRun = fullMatch.reduce((m, s) => Math.max(m, s.length), 0)
+    expect(longestXRun).toBe(50_000)
+    // the small new patch survives untouched
+    expect(prompt).toContain('NEWPATCH')
+  })
+
+  it('does not truncate patches at or below 100KB', () => {
+    const runInput = makeRunInput({})
+    const exact = 'Y'.repeat(100_000)
+    const prompt = buildJudgePrompt(runInput, exact, 'n')
+    expect(prompt).not.toContain('[truncated')
   })
 })
 
@@ -393,5 +417,43 @@ describe('judge — model unavailable (fatal → E_MODEL_UNAVAILABLE)', () => {
     runMock.mockImplementation(failWith({ exitCode: 1, stderr: 'model not found: cheap/judge-model', timedOut: false }))
     const err = await runFlip(judge(buildInput({})))
     expect(err.code).toBe('E_MODEL_UNAVAILABLE')
+  })
+})
+
+describe('judge — results/judge.json artifact', () => {
+  it('writes judge.json with the result when the judge runs', async () => {
+    runMock.mockImplementation(
+      succeedWith(textEvent('{"verdict":"ok","oldQuality":7,"newQuality":9,"explanation":"new wins"}')),
+    )
+    const input = buildInput({})
+    const result = await runP(judge(input))
+    const judgeJsonPath = `${input.runInput.outputPath}/judge.json`
+    expect(existsSync(judgeJsonPath)).toBe(true)
+    const onDisk = JSON.parse(await runP(readFile(judgeJsonPath))) as { judge: JudgeResult | null }
+    expect(onDisk.judge).not.toBeNull()
+    expect((onDisk.judge as JudgeResult).verdict).toBe('ok')
+    expect((onDisk.judge as JudgeResult).newQuality).toBe(9)
+    expect(result.judge).not.toBeNull()
+  })
+
+  it('writes judge.json with { judge: null } when the judge is not requested', async () => {
+    const input = directInput(without(makeRunInput({}), 'judge'))
+    const result = await runP(judge(input))
+    const judgeJsonPath = `${input.runInput.outputPath}/judge.json`
+    expect(existsSync(judgeJsonPath)).toBe(true)
+    const onDisk = JSON.parse(await runP(readFile(judgeJsonPath))) as { judge: JudgeResult | null }
+    expect(onDisk.judge).toBeNull()
+    expect(result.judge).toBeNull()
+    expect(runMock).not.toHaveBeenCalled()
+  })
+
+  it('writes judge.json with an unclear verdict when the judge response is unparseable', async () => {
+    runMock.mockImplementation(succeedWith(textEvent('I cannot decide this one.')))
+    const input = buildInput({})
+    await runP(judge(input))
+    const onDisk = JSON.parse(await runP(readFile(`${input.runInput.outputPath}/judge.json`))) as {
+      judge: JudgeResult | null
+    }
+    expect((onDisk.judge as JudgeResult).verdict).toBe('unclear')
   })
 })

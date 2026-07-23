@@ -1,11 +1,6 @@
 import { Effect } from 'effect'
 import { execCmd } from '../opencode/spawn.js'
-
-const inheritEnv = (keys: readonly string[]): Record<string, string> =>
-  keys.reduce<Record<string, string>>((acc, k) => {
-    const v = process.env[k]
-    return v === undefined ? acc : { ...acc, [k]: v }
-  }, {})
+import { inheritEnv } from './env.js'
 
 const DOCKER_ENV_KEYS: readonly string[] = [
   'PATH',

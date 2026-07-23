@@ -1,5 +1,7 @@
 import { Data, Effect } from 'effect'
 import { spawnProcess, execCmd } from './spawn.js'
+import { inheritEnv } from '../util/env.js'
+import { isRecord } from '../util/types.js'
 
 export interface OpencodeRunOptions {
   readonly homeDir: string
@@ -35,12 +37,6 @@ export class OpencodeError extends Data.TaggedError('OpencodeError')<{
 
 const OPENCODE_BIN = process.env['OPENCODE_BIN'] ?? 'opencode'
 
-const inheritEnv = (keys: readonly string[]): Record<string, string> =>
-  keys.reduce<Record<string, string>>((acc, k) => {
-    const v = process.env[k]
-    return v === undefined ? acc : { ...acc, [k]: v }
-  }, {})
-
 const buildBaseEnv = (
   homeDir: string,
   extra: Record<string, string>,
@@ -69,9 +65,6 @@ export const buildRunArgs = (opts: OpencodeRunOptions): readonly string[] => [
   '--format',
   'json',
 ]
-
-const isRecord = (u: unknown): u is Record<string, unknown> =>
-  typeof u === 'object' && u !== null
 
 const sessionIdFromEvent = (ev: unknown): string | undefined => {
   if (isRecord(ev) && typeof ev['sessionId'] === 'string') return ev['sessionId']

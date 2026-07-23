@@ -42,7 +42,7 @@ describe('cliParse — happy path', () => {
     expect(ri.formats).toEqual(['md'])
     expect(ri.pureBaseline).toBe(true)
     expect(ri.preflightEnabled).toBe(true)
-    expect(ri.collapseRepeats).toBe(true)
+    expect(ri.collapseRepeats).toBe(false)
     expect(ri.timelineMode).toBe('side-by-side')
     expect(ri.logLevel).toBe('info')
     expect(ri.outputPath).toBe('./results')
@@ -334,6 +334,64 @@ describe('cliParse — result shape', () => {
   })
 })
 
+describe('cliParse — model availability (E_MODEL_UNAVAILABLE)', () => {
+  it('bare model name without provider prefix → E_MODEL_UNAVAILABLE', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--preflight-model', 'invalidformat'], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_MODEL_UNAVAILABLE')
+  })
+
+  it('provider/model form → OK', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--preflight-model', 'anthropic/glm-5.2'], cwd }),
+    )
+    expect(result.runInput.preflightModel).toBe('anthropic/glm-5.2')
+  })
+
+  it('provider:model form → OK', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--preflight-model', 'openai:gpt-4o'], cwd }),
+    )
+    expect(result.runInput.preflightModel).toBe('openai:gpt-4o')
+  })
+
+  it('no --preflight-model → OK (smoke-test, no validation)', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.runInput.preflightModel).toBeUndefined()
+  })
+})
+
+describe('cliParse — watchdog flag', () => {
+  it('default watchdog timeout is 90s', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.runInput.timeouts.watchdogSeconds).toBe(90)
+  })
+
+  it('--watchdog sets the watchdog timeout', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--watchdog', '120'], cwd }),
+    )
+    expect(result.runInput.timeouts.watchdogSeconds).toBe(120)
+  })
+
+  it('--timeout-watchdog is no longer a known flag → E_CONFIG_INVALID', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--timeout-watchdog', '120'], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+})
+
 describe('cliParse — flags surface', () => {
   it('accepts the full set of value/boolean flags and reflects them on RunInput', async () => {
     const cwd = makeTempDir()
@@ -342,7 +400,7 @@ describe('cliParse — flags surface', () => {
         argv: [
           'run', REPO, '--prompt', 'x',
           '--output', '/tmp/out', '--workspace', '/tmp/ws',
-          '--opencode-version', '2.0.0', '--preflight-model', 'glm-5.2',
+          '--opencode-version', '2.0.0', '--preflight-model', 'anthropic/glm-5.2',
           '--pricing-path', '/p.json', '--timeout-install', '42',
           '--auth', 'anthropic', '--auth', 'ssh',
           '--init', 'do setup', '--verify', 'check it', '--judge', 'decide',
@@ -356,7 +414,7 @@ describe('cliParse — flags surface', () => {
     expect(ri.outputPath).toBe('/tmp/out')
     expect(ri.workspacePath).toBe('/tmp/ws')
     expect(ri.opencodeVersion).toBe('2.0.0')
-    expect(ri.preflightModel).toBe('glm-5.2')
+    expect(ri.preflightModel).toBe('anthropic/glm-5.2')
     expect(ri.pricingPath).toBe('/p.json')
     expect(ri.timeouts.installSeconds).toBe(42)
     expect(ri.auth.anthropic).toBe(true)

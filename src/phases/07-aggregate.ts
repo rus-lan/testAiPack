@@ -17,7 +17,6 @@ import type {
   ErrorCode,
   FailedRun,
   OpencodeExport,
-  RunSideResult,
   Side,
   SideAggregates,
 } from '@generated/types'
@@ -31,17 +30,15 @@ import { loadPricing } from '../pricing/lookup.js'
 import { extractMetrics } from '../metrics/extract.js'
 import type { ExtractedMetrics } from '../metrics/extract.js'
 import { buildSideAggregates, computeDelta } from '../metrics/aggregate.js'
+import type { RunSideResultExt } from './06-run-side.js'
 
 type ProcessedRun =
   | { readonly kind: 'ok'; readonly metrics: ExtractedMetrics; readonly id: string }
   | { readonly kind: 'failed'; readonly failedRun: FailedRun }
 
-const errorCodeFor = (r: RunSideResult): ErrorCode =>
-  r.watchdogTriggered
-    ? 'E_RUN_HANG_WATCHDOG'
-    : 'E_RUN_CRASH'
+const errorCodeFor = (r: RunSideResultExt): ErrorCode => r.errorCode ?? 'E_RUN_CRASH'
 
-const toFailedRun = (r: RunSideResult, timestamp: string): FailedRun => ({
+const toFailedRun = (r: RunSideResultExt, timestamp: string): FailedRun => ({
   runIndex: r.runIndex,
   errorCode: errorCodeFor(r),
   errorMessage: `run ${r.side}/${String(r.runIndex)} failed: finishCause=${r.finishCause} exitCode=${String(r.exitCode)} watchdog=${String(r.watchdogTriggered)}`,
@@ -61,7 +58,7 @@ const toExportInvalid = (side: Side, runIndex: number, cause: unknown): PhaseErr
   )
 
 const readAndExtract = (
-  r: RunSideResult,
+  r: RunSideResultExt,
   side: Side,
   rawDir: string,
   pricing: PricingTable | null,
@@ -95,7 +92,7 @@ const readAndExtract = (
 
 const aggregateSide = (
   side: Side,
-  results: readonly RunSideResult[],
+  results: readonly RunSideResultExt[],
   rawDir: string,
   pricing: PricingTable | null,
   timestamp: string,

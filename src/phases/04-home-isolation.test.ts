@@ -347,6 +347,44 @@ describe('phase 04 — homeIsolation', () => {
     expect(newJson['agent']).toBeDefined()
   })
 
+  it('writes config/baseline.json and config/new.json to disk', async () => {
+    await useFakeHome(async (h) => {
+      await runP(ensureDir(path.join(h, '.opencode')))
+    })
+    const packDir = await writePackSkill('myskill')
+    const input = buildInput({}, skillOutcome(packDir))
+    const result = await runP(homeIsolation(input))
+    const baselinePath = path.join(input.workspace.config, 'baseline.json')
+    const newPath = path.join(input.workspace.config, 'new.json')
+    expect(await runP(exists(baselinePath))).toBe(true)
+    expect(await runP(exists(newPath))).toBe(true)
+    const baselineOnDisk = JSON.parse(await runP(readFile(baselinePath))) as Record<string, unknown>
+    const newOnDisk = JSON.parse(await runP(readFile(newPath))) as Record<string, unknown>
+    expect(baselineOnDisk).toEqual(JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>)
+    expect(newOnDisk).toEqual(JSON.parse(result.generatedConfigs.new) as Record<string, unknown>)
+    expect(baselineOnDisk['testaipack']).toBeUndefined()
+    const packMeta = newOnDisk['testaipack'] as Record<string, unknown>
+    expect(packMeta).toBeDefined()
+    expect(packMeta['packName']).toBe('myskill')
+    expect(packMeta['packType']).toBe('skill')
+    expect(newOnDisk['agent']).toBeDefined()
+  })
+
+  it('smoke-test writes identical baseline.json and new.json (no pack metadata)', async () => {
+    await useFakeHome(async (h) => {
+      await runP(ensureDir(path.join(h, '.opencode')))
+    })
+    const input = buildInput({}, undefined)
+    await runP(homeIsolation(input))
+    const baselinePath = path.join(input.workspace.config, 'baseline.json')
+    const newPath = path.join(input.workspace.config, 'new.json')
+    const baselineOnDisk = JSON.parse(await runP(readFile(baselinePath))) as Record<string, unknown>
+    const newOnDisk = JSON.parse(await runP(readFile(newPath))) as Record<string, unknown>
+    expect(baselineOnDisk['testaipack']).toBeUndefined()
+    expect(newOnDisk['testaipack']).toBeUndefined()
+    expect(baselineOnDisk).toEqual(newOnDisk)
+  })
+
   it('N=3 → three homeTrees per side, three envVars per side', async () => {
     await useFakeHome(async (h) => {
       await runP(ensureDir(path.join(h, '.opencode')))

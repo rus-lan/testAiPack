@@ -82,10 +82,10 @@ const PRICING: PricingTable = {
 }
 
 describe('extractMetrics — primary', () => {
-  it('totalTokens = input + output + reasoning + cache.read + cache.write', () => {
+  it('totalTokens = input + output + reasoning + cache.read (no cache.write)', () => {
     const exp = makeExport({ tokens: { input: 100, output: 200, reasoning: 50, cacheRead: 10, cacheWrite: 5 } })
     const { primary } = extractMetrics(exp, null, 4)
-    expect(primary.totalTokens).toBe(String(100 + 200 + 50 + 10 + 5))
+    expect(primary.totalTokens).toBe(String(100 + 200 + 50 + 10))
   })
 
   it('wallClockMs = updated - created', () => {
@@ -116,13 +116,23 @@ describe('extractMetrics — primary', () => {
     expect(primary.successRank).toBe(3)
   })
 
-  it('cost falls back to info.cost when no pricing table', () => {
+  it('cost uses info.cost when no pricing table', () => {
     const exp = makeExport({ cost: 0.0123 })
     const { primary } = extractMetrics(exp, null, 4)
     expect(primary.costUsd).toBeCloseTo(0.0123, 5)
   })
 
-  it('cost is computed from the pricing table when provided', () => {
+  it('info.cost takes precedence over pricing when present (> 0)', () => {
+    const exp = makeExport({
+      cost: 0.5,
+      tokens: { input: 1000000, output: 1000000, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+    })
+    const { primary } = extractMetrics(exp, PRICING, 4)
+    // pricing would yield 3.0, but info.cost (0.5) wins
+    expect(primary.costUsd).toBeCloseTo(0.5, 6)
+  })
+
+  it('cost is computed from the pricing table when info.cost is 0', () => {
     const exp = makeExport({ tokens: { input: 1000000, output: 1000000, reasoning: 0, cacheRead: 0, cacheWrite: 0 } })
     const { primary } = extractMetrics(exp, PRICING, 4)
     // 1M input @1 + 1M output @2 = 3.0

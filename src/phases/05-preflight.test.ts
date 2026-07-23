@@ -5,7 +5,7 @@ import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, writeFile, symlink, removeDir } from '../util/fs.js'
 import { preflight } from './05-preflight.js'
 import type { PreflightInputExt } from './05-preflight.js'
-import type { RunInput, Manifest } from '@generated/types'
+import type { RunInput, Manifest, PreflightCheck } from '@generated/types'
 import type { PackInstallOutcome } from './03-pack-install.js'
 
 vi.mock('../opencode/cli.js', () => ({
@@ -161,7 +161,7 @@ describe('phase 05 — preflight', () => {
     expect(result.logPath).toBe(expectedLogPath(homes))
   })
 
-  it('all-pass (skill pack) → 5 checks, exitCode=0', async () => {
+  it('all-pass (skill pack) → 8 checks (gates 1-3 per side + gate 4 + gate 5), exitCode=0', async () => {
     const homes = await buildHomes()
     const packDir = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(packDir))
@@ -182,8 +182,18 @@ describe('phase 05 — preflight', () => {
     const result = await runP(preflight(input))
     expect(result.allPassed).toBe(true)
     expect(result.exitCode).toBe(0)
-    expect(result.checks.length).toBe(5)
+    expect(result.checks.length).toBe(8)
     expect(result.checks.every((c) => c.passed)).toBe(true)
+    const byName = (name: string, side: string): PreflightCheck | undefined =>
+      result.checks.find((c) => c.name === name && c.side === side)
+    expect(byName('opencode-launch', 'old')).toBeDefined()
+    expect(byName('opencode-launch', 'new')).toBeDefined()
+    expect(byName('auth-ping', 'old')).toBeDefined()
+    expect(byName('auth-ping', 'new')).toBeDefined()
+    expect(byName('build-agent', 'old')).toBeDefined()
+    expect(byName('build-agent', 'new')).toBeDefined()
+    expect(byName('pack-visibility', 'new')).toBeDefined()
+    expect(byName('baseline-identical', 'old')).toBeDefined()
   })
 
   it('opencode-launch fail → E_PREFLIGHT_FAILED, exitCode=2', async () => {
@@ -350,5 +360,98 @@ describe('phase 05 — preflight', () => {
     const input = buildInput(homes, {}, outcome)
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
+  })
+})
+
+describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {
+  beforeEach(() => {
+    versionMock.mockReset()
+    runMock.mockReset()
+    versionMock.mockImplementation(() => Effect.succeed('1.0.0'))
+    runMock.mockImplementation(() =>
+      Effect.succeed({
+        exitCode: 0,
+        stdout: '{"role":"assistant","text":"OK"}',
+        stderr: '',
+        durationMs: 5,
+        timedOut: false,
+      }),
+    )
+  })
+
+  it('gate 1 fail for new (opencode --version fails in new HOME) → E_PREFLIGHT_FAILED, exit 2', async () => {
+    const homes = await buildHomes()
+    versionMock.mockImplementation((homeDir: string) =>
+      homeDir === homes.new
+        ? Effect.fail(
+            new OpencodeError({
+              command: 'version',
+              exitCode: 1,
+              stderr: 'crash in new HOME',
+              timedOut: false,
+            }),
+          )
+        : Effect.succeed('1.0.0'),
+    )
+    const input = buildInput(homes, {}, undefined)
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
+    expect(err.context?.['exitCode']).toBe(2)
+    expect(err.context?.['check']).toBe('opencode-launch')
+    expect(err.context?.['side']).toBe('new')
+  })
+
+  it('gate 2 fail for new (auth-ping fails in new HOME) → E_PREFLIGHT_FAILED, exit 2', async () => {
+    const homes = await buildHomes()
+    runMock.mockImplementation((opts: { homeDir: string }) =>
+      opts.homeDir === homes.new
+        ? Effect.fail(
+            new OpencodeError({
+              command: 'run',
+              exitCode: 1,
+              stderr: 'HTTP 429 rate limited in new HOME',
+              timedOut: false,
+            }),
+          )
+        : Effect.succeed({
+            exitCode: 0,
+            stdout: '{"role":"assistant","text":"OK"}',
+            stderr: '',
+            durationMs: 5,
+            timedOut: false,
+          }),
+    )
+    const input = buildInput(homes, {}, undefined)
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
+    expect(err.context?.['exitCode']).toBe(2)
+    expect(err.context?.['check']).toBe('auth-ping')
+    expect(err.context?.['side']).toBe('new')
+  })
+
+  it('gate 3 fail for new (build.md absent in new HOME) → E_PREFLIGHT_FAILED, exit 2', async () => {
+    const homes = await buildHomes()
+    await runP(removeDir(path.join(homes.new, '.config', 'opencode', 'agents', 'build.md')))
+    const input = buildInput(homes, {}, undefined)
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
+    expect(err.context?.['check']).toBe('build-agent')
+    expect(err.context?.['side']).toBe('new')
+  })
+
+  it('gate 5 re-runs gates 1-3 for old (auth-ping invoked twice for old HOME) + pack-leak check', async () => {
+    const homes = await buildHomes()
+    const input = buildInput(homes, {}, undefined)
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    // gate 2 runs auth-ping for old once; gate 5 re-runs it for old again → ≥2 calls with homeDir=old
+    const oldCalls = runMock.mock.calls.filter(
+      (c) => (c[0] as { homeDir: string } | undefined)?.homeDir === homes.old,
+    )
+    expect(oldCalls.length).toBeGreaterThanOrEqual(2)
+    // baseline-identical check present and passed
+    const gate5 = result.checks.find((c) => c.name === 'baseline-identical')
+    expect(gate5).toBeDefined()
+    expect(gate5?.passed).toBe(true)
   })
 })

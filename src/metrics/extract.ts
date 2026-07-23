@@ -166,12 +166,15 @@ const costFromPricing = (exp: OpencodeExport, pricing: PricingTable): number => 
 }
 
 /**
- * Cost precedence (per phase task): pricing.json first when configured and
- * loadable; otherwise fall back to the provider-reported `info.cost`. The caller
- * resolves pricing into a table (or null) once and passes it in.
+ * Cost precedence (per phase 07 spec): provider-reported `info.cost` first when
+ * present (> 0); otherwise compute from the pricing table (if configured and
+ * loadable); otherwise 0. The caller resolves pricing into a table (or null)
+ * once and passes it in.
  */
-const resolveCost = (exp: OpencodeExport, pricing: PricingTable | null): number =>
-  pricing === null ? exp.info.cost : costFromPricing(exp, pricing)
+const resolveCost = (exp: OpencodeExport, pricing: PricingTable | null): number => {
+  const infoCost = exp.info.cost
+  return infoCost > 0 ? infoCost : pricing ? costFromPricing(exp, pricing) : 0
+}
 
 export const extractMetrics = (
   exp: OpencodeExport,
@@ -179,7 +182,7 @@ export const extractMetrics = (
   successRank: SuccessRank,
 ): ExtractedMetrics => {
   const t = exp.info.tokens
-  const totalTokens = t.input + t.output + t.reasoning + t.cache.read + t.cache.write
+  const totalTokens = t.input + t.output + t.reasoning + t.cache.read
   const wallClockMs = durationOf(exp.info.time.created, exp.info.time.updated)
   const tools = toolPartsOf(exp)
   const stepDur = stepDurations(exp)

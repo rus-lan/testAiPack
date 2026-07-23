@@ -16,6 +16,7 @@ import type { Either } from 'effect'
 import path from 'node:path'
 import type {
   EnvVarSet,
+  ErrorCode,
   FinishCause,
   RunSideInput,
   RunSideResult,
@@ -27,6 +28,7 @@ import { run as opencodeRun, exportSession } from '../opencode/cli.js'
 import type { OpencodeError, OpencodeRunOptions, OpencodeRunResult } from '../opencode/cli.js'
 import { spawnProcess } from '../opencode/spawn.js'
 import { appendFile, ensureDir, readJson, writeFile } from '../util/fs.js'
+import { isRecord } from '../util/types.js'
 import type { PhaseError } from '../errors.js'
 import { runSideError } from '../errors.js'
 
@@ -47,6 +49,16 @@ type RunSideErrorCode =
   | 'E_PORT_CONFLICT'
   | 'E_EXPORT_INVALID'
   | 'E_TOTAL_TIMEOUT'
+
+/**
+ * Local extension of the contract RunSideResult: carries the precise failure
+ * cause for every rank-0 / rank-reduced outcome so phase 07 can preserve it in
+ * FailedRun instead of collapsing all failures to E_RUN_CRASH. Lives here rather
+ * than in contract/main.tsp because the errorCode is phase-06-derived metadata.
+ */
+export interface RunSideResultExt extends RunSideResult {
+  readonly errorCode?: ErrorCode
+}
 
 const fail = (
   message: string,
@@ -74,9 +86,6 @@ const failFs = (
 // ---------------------------------------------------------------------------
 // Pure outcome analysis
 // ---------------------------------------------------------------------------
-
-const isRecord = (u: unknown): u is Record<string, unknown> =>
-  typeof u === 'object' && u !== null
 
 const FINISH_VALUES: readonly string[] = ['stop', 'tool-calls', 'length', 'error', 'other']
 
@@ -197,6 +206,7 @@ export interface AnalyzeOutcome {
   readonly finish: FinishCause
   readonly rateLimited: boolean
   readonly maxConsecutiveSameTool: number
+  readonly errorCode?: ErrorCode
 }
 
 /**
@@ -205,7 +215,9 @@ export interface AnalyzeOutcome {
  *
  * Precedence (highest first): hard timeout → rate-limit → watchdog → crash
  * (non-zero exit) → finish-based (stop=4 / tool-calls=3 / length=2) →
- * doom-loop (1) → unknown (0).
+ * doom-loop (1) → unknown (0). Every rank-0 branch also sets `errorCode` so
+ * downstream (phase 07) can record the precise cause; length (2) and doom-loop
+ * (1) are valid outcomes and carry no errorCode.
  */
 export const analyzeOutcome = (input: AnalyzeInput): AnalyzeOutcome => {
   const maxConsecutiveSameTool = computeMaxConsecutiveSameTool(input.events)
@@ -213,10 +225,11 @@ export const analyzeOutcome = (input: AnalyzeInput): AnalyzeOutcome => {
   const finish = resolveFinish(input.events)
   const base = { rateLimited, maxConsecutiveSameTool }
 
-  if (input.timedOut) return { rank: 0, finish: 'error', ...base }
-  if (rateLimited) return { rank: 0, finish: 'error', ...base }
-  if (input.watchdogTriggered) return { rank: 1, finish: 'tool-calls', ...base }
-  if (input.exitCode !== 0) return { rank: 0, finish: 'error', ...base }
+  if (input.timedOut) return { rank: 0, finish: 'error', ...base, errorCode: 'E_RUN_TIMEOUT' }
+  if (rateLimited) return { rank: 0, finish: 'error', ...base, errorCode: 'E_RATE_LIMIT_EXHAUSTED' }
+  if (input.watchdogTriggered)
+    return { rank: 0, finish: 'error', ...base, errorCode: 'E_RUN_HANG_WATCHDOG' }
+  if (input.exitCode !== 0) return { rank: 0, finish: 'error', ...base, errorCode: 'E_RUN_CRASH' }
   switch (finish) {
     case 'stop':
       return { rank: 4, finish: 'stop', ...base }
@@ -406,7 +419,7 @@ const runOnce = (
 
 export const runSide = (
   input: RunSideInput,
-): Effect.Effect<RunSideResult, PhaseError> =>
+): Effect.Effect<RunSideResultExt, PhaseError> =>
   Effect.gen(function* () {
     const startedAt = Date.now()
     const { runInput, manifest, workspace, homeEnv, side, runIndex } = input
@@ -514,12 +527,22 @@ export const runSide = (
         : `${state.events.map((e) => safeStringify(e)).join('\n')}\n`
     yield* writeFile(eventsLogPath, ndjson).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
 
+    const exportTimeoutMs = runMs
     const exportStr: string = yield* exportSession(homeEnv.HOME, sessionId).pipe(
       Effect.mapError((err: OpencodeError) =>
         fail('opencode export produced no data', 'E_RUN_CRASH', side, runIndex, {
           sessionId,
           stderr: err.stderr,
         }),
+      ),
+      Effect.timeout(exportTimeoutMs),
+      Effect.catchTag('TimeoutException', () =>
+        Effect.fail(
+          fail('opencode export timed out', 'E_RUN_TIMEOUT', side, runIndex, {
+            sessionId,
+            timeoutMs: exportTimeoutMs,
+          }),
+        ),
       ),
     )
     yield* writeFile(exportPath, exportStr).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
@@ -546,6 +569,8 @@ export const runSide = (
       doomLoopThreshold: DOOM_LOOP_THRESHOLD,
     })
 
+    let rank = outcome.rank
+    let errorCode = outcome.errorCode
     let verifyExitCode: number | undefined
     const hasVerify = runInput.verify !== undefined && runInput.verify !== ''
     if (hasVerify) {
@@ -556,29 +581,38 @@ export const runSide = (
       })
       if (vres.timedOut) {
         verifyExitCode = undefined
+        rank = 0
+        errorCode = 'E_VERIFY_TIMEOUT'
         yield* log('[VERIFY_TIMEOUT]')
       } else {
         verifyExitCode = vres.exitCode ?? -1
+        if (verifyExitCode !== 0) {
+          rank = Math.max(0, rank - 1)
+          if (errorCode === undefined) {
+            errorCode = 'E_VERIFY_FAILED'
+          }
+        }
         yield* log(`[VERIFY_DONE] exitCode=${String(verifyExitCode)}`)
       }
     }
 
     const durationMs = Date.now() - startedAt
     yield* log(
-      `[STOP] finish=${outcome.finish} rank=${String(outcome.rank)} durationMs=${String(durationMs)}`,
+      `[STOP] finish=${outcome.finish} rank=${String(rank)} durationMs=${String(durationMs)}`,
     )
 
-    const result: RunSideResult = {
+    const result: RunSideResultExt = {
       side,
       runIndex,
       exportPath,
       eventsLogPath,
-      successRank: outcome.rank,
+      successRank: rank,
       finishCause: outcome.finish,
       exitCode: combinedExit,
       durationMs: String(durationMs),
       watchdogTriggered: anyWatchdog,
       ...(verifyExitCode === undefined ? {} : { verifyExitCode }),
+      ...(errorCode === undefined ? {} : { errorCode }),
     }
     return result
   })
