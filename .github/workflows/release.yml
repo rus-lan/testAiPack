@@ -1,0 +1,131 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.3.1, 0.4.0). Leave empty to use package.json version.'
+        required: false
+        type: string
+        default: ''
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Dry-run (build only, no tag/release)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Cache contract deps
+        uses: actions/cache@v4
+        with:
+          path: contract/node_modules
+          key: contract-${{ runner.os }}-${{ hashFiles('contract/package-lock.json') }}
+
+      - name: Install contract deps
+        working-directory: contract
+        run: npm ci
+
+      - name: Install root deps
+        run: npm ci
+
+      - name: Compile + codegen contracts
+        run: npm run contract:codegen
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION (tag v$VERSION)"
+
+      - name: Build all platforms
+        run: bash scripts/release.sh "${{ steps.version.outputs.version }}"
+
+      - name: Verify artifacts
+        run: |
+          ls -la dist/release/
+          test -f dist/release/testaipack-linux-x64
+          test -f dist/release/testaipack-linux-arm64
+          test -f dist/release/testaipack-darwin-x64
+          test -f dist/release/testaipack-darwin-arm64
+          test -f dist/release/testaipack-windows-x64.exe
+          test -f dist/release/checksums-sha256.txt
+
+      - name: Smoke-test binary
+        run: ./dist/release/testaipack-linux-x64 --help
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          mkdir -p dist
+          sed 's/{{VERSION}}/${{ steps.version.outputs.version }}/g' \
+            scripts/release-notes.template.md > dist/release-notes-final.md
+          echo "path=dist/release-notes-final.md" >> "$GITHUB_OUTPUT"
+
+      - name: Dry-run stop
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "Dry-run complete. Artifacts built in dist/release/ — no tag/release created."
+          echo "Preview release notes:"
+          cat dist/release-notes-final.md
+
+      - name: Publish release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/publish-release.sh \
+            "${{ steps.version.outputs.version }}" \
+            "${{ steps.notes.outputs.path }}" \
+            "${{ inputs.prerelease }}"
+
+      - name: Upload release artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: |
+            dist/release/
+            dist/release-notes-final.md
+          retention-days: 14

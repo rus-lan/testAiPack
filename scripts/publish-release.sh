@@ -4,18 +4,25 @@
 # - creates the release (or reuses an existing one for the tag)
 # - uploads every file under dist/release/ as a release asset
 #
+# Usage: publish-release.sh [VERSION] [NOTES_FILE] [PRERELEASE]
+#   VERSION      - release version (default: package.json version)
+#   NOTES_FILE   - release body markdown (default: dist/release-notes.md)
+#   PRERELEASE   - "true" to mark as pre-release (default: "false")
+#
 # Requires: GITHUB_TOKEN env var, dist/release/* built (run scripts/release.sh first),
-#           dist/release-notes.md with the release body.
+#           NOTES_FILE with the release body.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION=$(node -p "require('./package.json').version")
+VERSION="${1:-$(node -p "require('./package.json').version")}"
+NOTES_FILE="${2:-dist/release-notes.md}"
+PRERELEASE="${3:-false}"
+
 TAG="v${VERSION}"
 OWNER="rus-lan"
 REPO="testAiPack"
 RELEASE_DIR="dist/release"
-NOTES_FILE="dist/release-notes.md"
 
 if [ -z "${GITHUB_TOKEN:-}" ]; then
   echo "GITHUB_TOKEN not set" >&2
@@ -63,14 +70,15 @@ else
   BODY_JSON=$(python3 -c '
 import json, sys
 body = open(sys.argv[1]).read()
+prerelease = sys.argv[3].lower() == "true"
 print(json.dumps({
   "tag_name": sys.argv[2],
   "name": sys.argv[2],
   "body": body,
   "draft": False,
-  "prerelease": False
+  "prerelease": prerelease
 }))
-' "$NOTES_FILE" "$TAG")
+' "$NOTES_FILE" "$TAG" "$PRERELEASE")
 
   RESPONSE=$(printf '%s' "$BODY_JSON" | curl -fsSL -X POST \
     -H "$AUTH" -H "$ACCEPT" -H "$API_VERSION" \

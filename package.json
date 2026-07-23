@@ -24,7 +24,7 @@
     "test:coverage": "vitest run --coverage",
     "contract:compile": "tsp compile ./contract",
     "contract:codegen": "tsp compile ./contract && tsx scripts/codegen.ts && prettier --write src/generated",
-    "prepare": "npm run contract:codegen"
+    "prepare:dev": "npm run contract:codegen"
   },
   "engines": {
     "node": ">=20.0.0",

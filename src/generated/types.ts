@@ -4,147 +4,147 @@
  * Re-run `npm run contract:codegen` after changing contract/*.tsp.
  */
 
-export type Side = "old" | "new"
+export type Side = 'old' | 'new'
 
 export type RecordUnknown = Record<string, unknown>
 
 export type AggregateError = {
-  code: "E_EXPORT_INVALID";
-  message: string;
-  side: Side;
-  runIndex?: number;
-  context?: RecordUnknown;
+  code: 'E_EXPORT_INVALID'
+  message: string
+  side: Side
+  runIndex?: number
+  context?: RecordUnknown
 }
 
-export type PackType = "skill" | "plugin" | "agent" | "command" | "mcp" | "all"
+export type PackType = 'skill' | 'plugin' | 'agent' | 'command' | 'mcp' | 'all'
 
-export type IsolationMode = "home" | "docker"
+export type IsolationMode = 'home' | 'docker'
 
 export type AuthWhitelist = {
-  opencode: boolean;
-  npmrc: boolean;
-  anthropic: boolean;
-  openai: boolean;
-  gemini: boolean;
-  aws: boolean;
-  ssh: boolean;
-  git: boolean;
+  opencode: boolean
+  npmrc: boolean
+  anthropic: boolean
+  openai: boolean
+  gemini: boolean
+  aws: boolean
+  ssh: boolean
+  git: boolean
 }
 
-export type OutputFormat = "md" | "html" | "json" | "yaml"
+export type OutputFormat = 'md' | 'html' | 'json' | 'yaml'
 
-export type TimelineMode = "side-by-side" | "tree-diff" | "merged"
+export type TimelineMode = 'side-by-side' | 'tree-diff' | 'merged'
 
 export type TimeoutConfig = {
-  preflightSeconds: number;
-  runSeconds: number;
-  verifySeconds: number;
-  installSeconds: number;
-  watchdogSeconds: number;
-  totalSeconds?: number;
+  preflightSeconds: number
+  runSeconds: number
+  verifySeconds: number
+  installSeconds: number
+  watchdogSeconds: number
+  totalSeconds?: number
 }
 
-export type LogLevel = "debug" | "info" | "warn" | "error"
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 export type RunInput = {
-  repoUrl: string;
-  packRef?: string;
-  packType?: PackType;
-  prompt: string;
-  promptFiles?: Array<string>;
-  init?: string;
-  initFiles?: Array<string>;
-  verify?: string;
-  runs: number;
-  isolation: IsolationMode;
-  opencodeVersion?: string;
-  auth: AuthWhitelist;
-  pureBaseline: boolean;
-  judge?: string;
-  judgeFiles?: Array<string>;
-  preflightEnabled: boolean;
-  preflightModel?: string;
-  formats: Array<OutputFormat>;
-  outputPath: string;
-  diffHtml: boolean;
-  collapseRepeats: boolean;
-  timelineMode: TimelineMode;
-  timeouts: TimeoutConfig;
-  workspacePath: string;
-  logLevel: LogLevel;
-  pricingPath?: string;
+  repoUrl: string
+  packRef?: string
+  packType?: PackType
+  prompt: string
+  promptFiles?: Array<string>
+  init?: string
+  initFiles?: Array<string>
+  verify?: string
+  runs: number
+  isolation: IsolationMode
+  opencodeVersion?: string
+  auth: AuthWhitelist
+  pureBaseline: boolean
+  judge?: string
+  judgeFiles?: Array<string>
+  preflightEnabled: boolean
+  preflightModel?: string
+  formats: Array<OutputFormat>
+  outputPath: string
+  diffHtml: boolean
+  collapseRepeats: boolean
+  timelineMode: TimelineMode
+  timeouts: TimeoutConfig
+  workspacePath: string
+  logLevel: LogLevel
+  pricingPath?: string
 }
 
 export type Manifest = {
-  runId: string;
-  timestamp: string;
-  repoUrl: string;
-  packRef?: string;
-  packType?: PackType;
-  prompt: string;
-  init?: string;
-  verify?: string;
-  runs: number;
-  isolation: IsolationMode;
-  opencodeVersion: string;
-  flagDefaults: RecordUnknown;
+  runId: string
+  timestamp: string
+  repoUrl: string
+  packRef?: string
+  packType?: PackType
+  prompt: string
+  init?: string
+  verify?: string
+  runs: number
+  isolation: IsolationMode
+  opencodeVersion: string
+  flagDefaults: RecordUnknown
 }
 
 export type WorkspaceTree = {
-  root: string;
-  appsSource: string;
-  appsOld: Array<string>;
-  appsNew: Array<string>;
-  pack: string;
-  homeOld: Array<string>;
-  homeNew: Array<string>;
-  config: string;
-  results: string;
-  raw: string;
-  diff: string;
+  root: string
+  appsSource: string
+  appsOld: Array<string>
+  appsNew: Array<string>
+  pack: string
+  homeOld: Array<string>
+  homeNew: Array<string>
+  config: string
+  results: string
+  raw: string
+  diff: string
 }
 
 export type SuccessRank = number
 
-export type FinishCause = "stop" | "tool-calls" | "length" | "error" | "other"
+export type FinishCause = 'stop' | 'tool-calls' | 'length' | 'error' | 'other'
 
 export type RunSideResult = {
-  side: Side;
-  runIndex: number;
-  exportPath: string;
-  eventsLogPath: string;
-  successRank: SuccessRank;
-  finishCause: FinishCause;
-  exitCode: number;
-  durationMs: string;
-  verifyExitCode?: number;
-  watchdogTriggered: boolean;
+  side: Side
+  runIndex: number
+  exportPath: string
+  eventsLogPath: string
+  successRank: SuccessRank
+  finishCause: FinishCause
+  exitCode: number
+  durationMs: string
+  verifyExitCode?: number
+  watchdogTriggered: boolean
 }
 
 export type AggregateInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  workspace: WorkspaceTree;
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
   sideResults: {
-  old: Array<RunSideResult>;
-  new: Array<RunSideResult>;
-};
+    old: Array<RunSideResult>
+    new: Array<RunSideResult>
+  }
 }
 
 export type PrimaryMetrics = {
-  totalTokens: string;
-  wallClockMs: string;
-  costUsd: number;
-  stepCount: number;
-  toolCallCount: number;
-  successRank: SuccessRank;
-  maxParallelism: number;
+  totalTokens: string
+  wallClockMs: string
+  costUsd: number
+  stepCount: number
+  toolCallCount: number
+  successRank: SuccessRank
+  maxParallelism: number
 }
 
 export type ToolStat = {
-  count: number;
-  errorRate: number;
-  avgDurationMs: string;
+  count: number
+  errorRate: number
+  avgDurationMs: string
 }
 
 export type RecordToolStat = Record<string, ToolStat>
@@ -152,607 +152,652 @@ export type RecordToolStat = Record<string, ToolStat>
 export type RecordInt32 = Record<string, number>
 
 export type FileChange = {
-  path: string;
-  additions: number;
-  deletions: number;
+  path: string
+  additions: number
+  deletions: number
 }
 
 export type FileDiffStats = {
-  additions: number;
-  deletions: number;
-  filesChanged: number;
-  perFile?: Array<FileChange>;
+  additions: number
+  deletions: number
+  filesChanged: number
+  perFile?: Array<FileChange>
 }
 
 export type SecondaryMetrics = {
-  inputTokens: string;
-  outputTokens: string;
-  reasoningTokens: string;
-  cacheReadTokens: string;
-  perTool: RecordToolStat;
-  reasoningTimeMs: string;
-  stepLatencyP50Ms: string;
-  stepLatencyP95Ms: string;
-  toolLatencyAvgMs: string;
-  finishCauseDistribution: RecordInt32;
-  fileDiffStats: FileDiffStats;
-  maxConsecutiveSameTool: number;
+  inputTokens: string
+  outputTokens: string
+  reasoningTokens: string
+  cacheReadTokens: string
+  perTool: RecordToolStat
+  reasoningTimeMs: string
+  stepLatencyP50Ms: string
+  stepLatencyP95Ms: string
+  toolLatencyAvgMs: string
+  finishCauseDistribution: RecordInt32
+  fileDiffStats: FileDiffStats
+  maxConsecutiveSameTool: number
 }
 
 export type MetricDistribution = {
-  median: number;
-  min: number;
-  max: number;
-  iqr?: number;
-  samples: Array<number>;
+  median: number
+  min: number
+  max: number
+  iqr?: number
+  samples: Array<number>
 }
 
 export type AggregateStats = {
-  totalTokens: MetricDistribution;
-  wallClockMs: MetricDistribution;
-  costUsd: MetricDistribution;
-  stepCount: MetricDistribution;
-  toolCallCount: MetricDistribution;
-  successRank: MetricDistribution;
+  totalTokens: MetricDistribution
+  wallClockMs: MetricDistribution
+  costUsd: MetricDistribution
+  stepCount: MetricDistribution
+  toolCallCount: MetricDistribution
+  successRank: MetricDistribution
 }
 
-export type ErrorCode = "E_REPO_TIMEOUT" | "E_REPO_CLONE_FAILED" | "E_PACK_INVALID_REF" | "E_PACK_UNKNOWN_TYPE" | "E_PACK_INSTALL_TIMEOUT" | "E_PACK_INSTALL_FAILED" | "E_HOME_SETUP_FAILED" | "E_PREFLIGHT_TIMEOUT" | "E_PREFLIGHT_FAILED" | "E_PREFLIGHT_PACK_INVISIBLE" | "E_RUN_TIMEOUT" | "E_RUN_HANG_WATCHDOG" | "E_RUN_CRASH" | "E_VERIFY_TIMEOUT" | "E_VERIFY_FAILED" | "E_INSTALL_TIMEOUT" | "E_INSTALL_FAILED" | "E_TOTAL_TIMEOUT" | "E_OOM" | "E_DISK_FULL" | "E_PORT_CONFLICT" | "E_DOCKER_FAILED" | "E_EXPORT_INVALID" | "E_CONFIG_INVALID" | "E_AUTH_MISSING" | "E_MODEL_UNAVAILABLE" | "E_RATE_LIMIT_EXHAUSTED"
+export type ErrorCode =
+  | 'E_REPO_TIMEOUT'
+  | 'E_REPO_CLONE_FAILED'
+  | 'E_PACK_INVALID_REF'
+  | 'E_PACK_UNKNOWN_TYPE'
+  | 'E_PACK_INSTALL_TIMEOUT'
+  | 'E_PACK_INSTALL_FAILED'
+  | 'E_HOME_SETUP_FAILED'
+  | 'E_PREFLIGHT_TIMEOUT'
+  | 'E_PREFLIGHT_FAILED'
+  | 'E_PREFLIGHT_PACK_INVISIBLE'
+  | 'E_RUN_TIMEOUT'
+  | 'E_RUN_HANG_WATCHDOG'
+  | 'E_RUN_CRASH'
+  | 'E_VERIFY_TIMEOUT'
+  | 'E_VERIFY_FAILED'
+  | 'E_INSTALL_TIMEOUT'
+  | 'E_INSTALL_FAILED'
+  | 'E_TOTAL_TIMEOUT'
+  | 'E_OOM'
+  | 'E_DISK_FULL'
+  | 'E_PORT_CONFLICT'
+  | 'E_DOCKER_FAILED'
+  | 'E_EXPORT_INVALID'
+  | 'E_CONFIG_INVALID'
+  | 'E_AUTH_MISSING'
+  | 'E_MODEL_UNAVAILABLE'
+  | 'E_RATE_LIMIT_EXHAUSTED'
 
 export type FailedRun = {
-  runIndex: number;
-  errorCode: ErrorCode;
-  errorMessage: string;
-  timestamp: string;
+  runIndex: number
+  errorCode: ErrorCode
+  errorMessage: string
+  timestamp: string
 }
 
 export type SideAggregates = {
-  side: Side;
-  primary: PrimaryMetrics;
-  secondary: SecondaryMetrics;
-  stats: AggregateStats;
-  failedRuns: Array<FailedRun>;
-  rawRunIds: Array<string>;
+  side: Side
+  primary: PrimaryMetrics
+  secondary: SecondaryMetrics
+  stats: AggregateStats
+  failedRuns: Array<FailedRun>
+  rawRunIds: Array<string>
 }
 
 export type MetricDelta = {
-  absolute: number;
-  percent: number;
-  significant: boolean;
-  better: "better" | "worse" | "neutral" | "context-dependent";
+  absolute: number
+  percent: number
+  significant: boolean
+  better: 'better' | 'worse' | 'neutral' | 'context-dependent'
 }
 
 export type PrimaryDeltas = {
-  totalTokens: MetricDelta;
-  wallClockMs: MetricDelta;
-  costUsd: MetricDelta;
-  stepCount: MetricDelta;
-  toolCallCount: MetricDelta;
-  successRank: MetricDelta;
-  maxParallelism: MetricDelta;
+  totalTokens: MetricDelta
+  wallClockMs: MetricDelta
+  costUsd: MetricDelta
+  stepCount: MetricDelta
+  toolCallCount: MetricDelta
+  successRank: MetricDelta
+  maxParallelism: MetricDelta
 }
 
 export type MetricsDiff = {
-  old: SideAggregates;
-  new: SideAggregates;
-  deltas: PrimaryDeltas;
-  bothFailed: boolean;
+  old: SideAggregates
+  new: SideAggregates
+  deltas: PrimaryDeltas
+  bothFailed: boolean
 }
 
 export type AggregateResult = {
-  metricsDiff: MetricsDiff;
+  metricsDiff: MetricsDiff
   rawAggregates: {
-  old: SideAggregates;
-  new: SideAggregates;
-};
+    old: SideAggregates
+    new: SideAggregates
+  }
 }
 
 export type CleanupInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  workspace: WorkspaceTree;
-  ephemeral: boolean;
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
+  ephemeral: boolean
 }
 
 export type CleanupResult = {
-  deleted: Array<string>;
-  kept: Array<string>;
-  gcLogPath: string;
+  deleted: Array<string>
+  kept: Array<string>
+  gcLogPath: string
 }
 
 export type CliParseError = {
-  code: "E_CONFIG_INVALID" | "E_MODEL_UNAVAILABLE";
-  message: string;
-  context?: RecordUnknown;
+  code: 'E_CONFIG_INVALID' | 'E_MODEL_UNAVAILABLE'
+  message: string
+  context?: RecordUnknown
 }
 
 export type CliParseInput = {
-  argv: Array<string>;
-  cwd: string;
-  configFile?: string;
+  argv: Array<string>
+  cwd: string
+  configFile?: string
 }
 
 export type CliParseResult = {
-  runInput: RunInput;
-  configSource: "cli" | "config" | "merged";
+  runInput: RunInput
+  configSource: 'cli' | 'config' | 'merged'
 }
 
 export type DiffError = {
-  code: "E_DISK_FULL";
-  message: string;
-  side: Side;
-  runIndex?: number;
-  context?: RecordUnknown;
+  code: 'E_DISK_FULL'
+  message: string
+  side: Side
+  runIndex?: number
+  context?: RecordUnknown
 }
 
 export type DiffInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  workspace: WorkspaceTree;
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
 }
 
 export type DiffSummary = {
-  filesChanged: number;
-  additions: number;
-  deletions: number;
-  perFile: Array<FileChange>;
+  filesChanged: number
+  additions: number
+  deletions: number
+  perFile: Array<FileChange>
 }
 
 export type DiffRunResult = {
-  runIndex: number;
-  fullPatch: string;
-  summary: DiffSummary;
-  htmlPath?: string;
-  noChanges: boolean;
+  runIndex: number
+  fullPatch: string
+  summary: DiffSummary
+  htmlPath?: string
+  noChanges: boolean
 }
 
 export type DiffResult = {
-  side: Side;
-  runs: Array<DiffRunResult>;
+  side: Side
+  runs: Array<DiffRunResult>
 }
 
 export type DiffResultOutput = {
   diff: {
-  old: DiffResult;
-  new: DiffResult;
-};
+    old: DiffResult
+    new: DiffResult
+  }
 }
 
 export type EnvVarSet = {
-  HOME: string;
-  OPENCODE_DISABLE_PROJECT_CONFIG: boolean;
-  OPENCODE_DISABLE_DEFAULT_PLUGINS: boolean;
-  OPENCODE_DISABLE_EXTERNAL_SKILLS: boolean;
-  OPENCODE_PURE: boolean;
-  OPENCODE_CONFIG_CONTENT?: string;
+  HOME: string
+  OPENCODE_DISABLE_PROJECT_CONFIG: boolean
+  OPENCODE_DISABLE_DEFAULT_PLUGINS: boolean
+  OPENCODE_DISABLE_EXTERNAL_SKILLS: boolean
+  OPENCODE_PURE: boolean
+  OPENCODE_CONFIG_CONTENT?: string
 }
 
 export type ExportCache = {
-  read: number;
-  write: number;
+  read: number
+  write: number
 }
 
 export type ExportModel = {
-  id: string;
-  providerID: string;
-  variant?: string;
+  id: string
+  providerID: string
+  variant?: string
 }
 
 export type ExportSummary = {
-  additions: number;
-  deletions: number;
-  files: number;
+  additions: number
+  deletions: number
+  files: number
 }
 
 export type ExportTokens = {
-  input: number;
-  output: number;
-  reasoning: number;
-  cache: ExportCache;
+  input: number
+  output: number
+  reasoning: number
+  cache: ExportCache
 }
 
 export type ExportTimeRange = {
-  created: string;
-  updated: string;
+  created: string
+  updated: string
 }
 
 export type ExportInfo = {
-  id: string;
-  slug: string;
-  projectID: string;
-  directory: string;
-  title: string;
-  agent: string;
-  model: ExportModel;
-  version: string;
-  summary: ExportSummary;
-  cost: number;
-  tokens: ExportTokens;
-  time: ExportTimeRange;
+  id: string
+  slug: string
+  projectID: string
+  directory: string
+  title: string
+  agent: string
+  model: ExportModel
+  version: string
+  summary: ExportSummary
+  cost: number
+  tokens: ExportTokens
+  time: ExportTimeRange
 }
 
 export type ExportMessageInfo = {
-  role: "user" | "assistant";
-  agent?: string;
+  role: 'user' | 'assistant'
+  agent?: string
   model?: {
-  providerID: string;
-  modelID: string;
-};
-  cost?: number;
+    providerID: string
+    modelID: string
+  }
+  cost?: number
   tokens?: {
-  input: number;
-  output: number;
-  reasoning: number;
-  cache: ExportCache;
-  total?: number;
-};
+    input: number
+    output: number
+    reasoning: number
+    cache: ExportCache
+    total?: number
+  }
   time: {
-  created: string;
-  completed?: string;
-};
-  finish?: FinishCause;
+    created: string
+    completed?: string
+  }
+  finish?: FinishCause
   path?: {
-  cwd: string;
-  root: string;
-};
-  parentID?: string;
+    cwd: string
+    root: string
+  }
+  parentID?: string
 }
 
 export type ExportTextPart = {
-  type: "text";
-  text: string;
-  id: string;
+  type: 'text'
+  text: string
+  id: string
 }
 
 export type ExportReasoningPart = {
-  type: "reasoning";
-  text: string;
+  type: 'reasoning'
+  text: string
   time: {
-  start: string;
-  end: string;
-};
-  id: string;
+    start: string
+    end: string
+  }
+  id: string
 }
 
 export type ExportToolState = {
-  status: "pending" | "running" | "completed" | "error";
-  input: unknown;
-  output?: string;
-  metadata?: RecordUnknown;
-  title?: string;
+  status: 'pending' | 'running' | 'completed' | 'error'
+  input: unknown
+  output?: string
+  metadata?: RecordUnknown
+  title?: string
   time?: {
-  start: string;
-  end: string;
-};
+    start: string
+    end: string
+  }
 }
 
 export type ExportToolPart = {
-  type: "tool";
-  tool: string;
-  callID: string;
-  state: ExportToolState;
-  id: string;
+  type: 'tool'
+  tool: string
+  callID: string
+  state: ExportToolState
+  id: string
 }
 
 export type ExportStepStartPart = {
-  type: "step-start";
-  snapshot?: string;
-  id: string;
+  type: 'step-start'
+  snapshot?: string
+  id: string
 }
 
 export type ExportStepFinishPart = {
-  type: "step-finish";
-  reason?: string;
-  snapshot?: string;
+  type: 'step-finish'
+  reason?: string
+  snapshot?: string
   tokens?: {
-  input: number;
-  output: number;
-  reasoning: number;
-  cache: ExportCache;
-  total?: number;
-};
-  cost?: number;
-  id: string;
+    input: number
+    output: number
+    reasoning: number
+    cache: ExportCache
+    total?: number
+  }
+  cost?: number
+  id: string
 }
 
-export type ExportPart = ExportTextPart | ExportReasoningPart | ExportToolPart | ExportStepStartPart | ExportStepFinishPart
+export type ExportPart =
+  ExportTextPart | ExportReasoningPart | ExportToolPart | ExportStepStartPart | ExportStepFinishPart
 
 export type ExportMessage = {
-  info: ExportMessageInfo;
-  parts: Array<ExportPart>;
+  info: ExportMessageInfo
+  parts: Array<ExportPart>
 }
 
 export type HomeIsolationError = {
-  code: "E_HOME_SETUP_FAILED" | "E_AUTH_MISSING" | "E_DOCKER_FAILED" | "E_PACK_INSTALL_TIMEOUT" | "E_PACK_INSTALL_FAILED";
-  message: string;
-  context?: RecordUnknown;
+  code:
+    | 'E_HOME_SETUP_FAILED'
+    | 'E_AUTH_MISSING'
+    | 'E_DOCKER_FAILED'
+    | 'E_PACK_INSTALL_TIMEOUT'
+    | 'E_PACK_INSTALL_FAILED'
+  message: string
+  context?: RecordUnknown
 }
 
 export type PackInstallResult = {
-  packPath: string;
-  detectedType: PackType | unknown;
-  installLogPath: string;
-  registeredIn: Array<string>;
+  packPath: string
+  detectedType: PackType | unknown
+  installLogPath: string
+  registeredIn: Array<string>
 }
 
 export type HomeIsolationInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  workspace: WorkspaceTree;
-  packInstall?: PackInstallResult;
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
+  packInstall?: PackInstallResult
 }
 
 export type HomeTree = {
-  basePath: string;
-  structure: Array<string>;
-  copiedAuth: Array<string>;
+  basePath: string
+  structure: Array<string>
+  copiedAuth: Array<string>
 }
 
 export type HomeIsolationResult = {
   homeTrees: {
-  old: Array<HomeTree>;
-  new: Array<HomeTree>;
-};
-  envVars: Array<Array<EnvVarSet>>;
+    old: Array<HomeTree>
+    new: Array<HomeTree>
+  }
+  envVars: Array<Array<EnvVarSet>>
   generatedConfigs: {
-  baseline: string;
-  new: string;
-};
+    baseline: string
+    new: string
+  }
 }
 
 export type JudgeError = {
-  code: "E_MODEL_UNAVAILABLE";
-  message: string;
-  context?: RecordUnknown;
+  code: 'E_MODEL_UNAVAILABLE'
+  message: string
+  context?: RecordUnknown
 }
 
 export type JudgeInput = {
-  runInput: RunInput;
-  manifest: Manifest;
+  runInput: RunInput
+  manifest: Manifest
   diff: {
-  old: DiffResult;
-  new: DiffResult;
-};
+    old: DiffResult
+    new: DiffResult
+  }
 }
 
-export type JudgeVerdict = "ok" | "fail" | "unclear"
+export type JudgeVerdict = 'ok' | 'fail' | 'unclear'
 
 export type JudgeResult = {
-  verdict: JudgeVerdict;
-  oldQuality: number;
-  newQuality: number;
-  explanation: string;
-  rawResponse?: string;
-  modelUsed: string;
-  timestamp: string;
+  verdict: JudgeVerdict
+  oldQuality: number
+  newQuality: number
+  explanation: string
+  rawResponse?: string
+  modelUsed: string
+  timestamp: string
 }
 
 export type JudgeResultOutput = {
-  judge: JudgeResult | unknown;
+  judge: JudgeResult | unknown
 }
 
 export type OpencodeExport = {
-  info: ExportInfo;
-  messages: Array<ExportMessage>;
+  info: ExportInfo
+  messages: Array<ExportMessage>
 }
 
 export type PackInstallError = {
-  code: "E_PACK_INVALID_REF" | "E_PACK_UNKNOWN_TYPE" | "E_INSTALL_TIMEOUT" | "E_INSTALL_FAILED";
-  message: string;
-  packRef: string;
-  context?: RecordUnknown;
+  code: 'E_PACK_INVALID_REF' | 'E_PACK_UNKNOWN_TYPE' | 'E_INSTALL_TIMEOUT' | 'E_INSTALL_FAILED'
+  message: string
+  packRef: string
+  context?: RecordUnknown
 }
 
 export type PackInstallInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  workspace: WorkspaceTree;
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
 }
 
 export type PhaseError = {
-  code: ErrorCode;
-  phase: string;
-  message: string;
-  cause?: unknown;
-  context?: RecordUnknown;
-  timestamp: string;
+  code: ErrorCode
+  phase: string
+  message: string
+  cause?: unknown
+  context?: RecordUnknown
+  timestamp: string
 }
 
 export type PreflightCheck = {
-  name: string;
-  side: Side;
-  passed: boolean;
-  durationMs: string;
-  details?: string;
+  name: string
+  side: Side
+  passed: boolean
+  durationMs: string
+  details?: string
 }
 
 export type PreflightError = {
-  code: "E_PREFLIGHT_TIMEOUT" | "E_PREFLIGHT_FAILED" | "E_PREFLIGHT_PACK_INVISIBLE" | "E_AUTH_MISSING";
-  phase: "preflight";
-  check: "opencode-launch" | "auth-ping" | "build-agent" | "pack-visibility" | "baseline-identical";
-  side: Side;
-  message: string;
-  context?: RecordUnknown;
+  code:
+    'E_PREFLIGHT_TIMEOUT' | 'E_PREFLIGHT_FAILED' | 'E_PREFLIGHT_PACK_INVISIBLE' | 'E_AUTH_MISSING'
+  phase: 'preflight'
+  check: 'opencode-launch' | 'auth-ping' | 'build-agent' | 'pack-visibility' | 'baseline-identical'
+  side: Side
+  message: string
+  context?: RecordUnknown
 }
 
 export type PreflightInput = {
-  runInput: RunInput;
-  manifest: Manifest;
+  runInput: RunInput
+  manifest: Manifest
   homePaths: {
-  old: string;
-  new: string;
-};
+    old: string
+    new: string
+  }
 }
 
 export type PreflightResult = {
-  checks: Array<PreflightCheck>;
-  allPassed: boolean;
-  exitCode: 0 | 2 | 3;
-  logPath: string;
+  checks: Array<PreflightCheck>
+  allPassed: boolean
+  exitCode: 0 | 2 | 3
+  logPath: string
 }
 
 export type RepoCloneError = {
-  code: "E_REPO_TIMEOUT" | "E_REPO_CLONE_FAILED";
-  message: string;
-  repoUrl: string;
-  context?: RecordUnknown;
+  code: 'E_REPO_TIMEOUT' | 'E_REPO_CLONE_FAILED'
+  message: string
+  repoUrl: string
+  context?: RecordUnknown
 }
 
 export type RepoCloneInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  workspace: WorkspaceTree;
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
 }
 
 export type RepoCloneResult = {
-  sourcePath: string;
+  sourcePath: string
   copyPaths: {
-  old: Array<string>;
-  new: Array<string>;
-};
-  cloneDurationMs: string;
+    old: Array<string>
+    new: Array<string>
+  }
+  cloneDurationMs: string
 }
 
-export type TimelineEventType = "reasoning" | "tool-call" | "tool-result" | "step-finish" | "text"
+export type TimelineEventType = 'reasoning' | 'tool-call' | 'tool-result' | 'step-finish' | 'text'
 
 export type TimelineEvent = {
-  tStart: string;
-  tEnd: string;
-  side: Side;
-  runIndex: number;
-  sessionId: string;
-  parentSessionId?: string;
-  swimlaneDepth: number;
-  type: TimelineEventType;
-  tool?: string;
-  tokens?: number;
-  status?: "pending" | "running" | "completed" | "error";
+  tStart: string
+  tEnd: string
+  side: Side
+  runIndex: number
+  sessionId: string
+  parentSessionId?: string
+  swimlaneDepth: number
+  type: TimelineEventType
+  tool?: string
+  tokens?: number
+  status?: 'pending' | 'running' | 'completed' | 'error'
 }
 
 export type Timeline = {
-  old: Array<TimelineEvent>;
-  new: Array<TimelineEvent>;
-  mode: TimelineMode;
+  old: Array<TimelineEvent>
+  new: Array<TimelineEvent>
+  mode: TimelineMode
 }
 
 export type ReportSummary = {
-  headlineResult: string;
-  improvements: Array<MetricDelta>;
-  regressions: Array<MetricDelta>;
-  neutral: Array<MetricDelta>;
-  failures: Array<FailedRun>;
+  headlineResult: string
+  improvements: Array<MetricDelta>
+  regressions: Array<MetricDelta>
+  neutral: Array<MetricDelta>
+  failures: Array<FailedRun>
 }
 
 export type Report = {
-  manifest: Manifest;
-  metricsDiff: MetricsDiff;
-  timeline: Timeline;
+  manifest: Manifest
+  metricsDiff: MetricsDiff
+  timeline: Timeline
   diff: {
-  old: DiffResult;
-  new: DiffResult;
-};
-  judge?: JudgeResult;
-  summary: ReportSummary;
+    old: DiffResult
+    new: DiffResult
+  }
+  judge?: JudgeResult
+  summary: ReportSummary
 }
 
 export type ReportRenderError = {
-  code: "E_DISK_FULL";
-  message: string;
-  context?: RecordUnknown;
+  code: 'E_DISK_FULL'
+  message: string
+  context?: RecordUnknown
 }
 
 export type ReportRenderInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  metricsDiff: MetricsDiff;
-  timeline: Timeline;
+  runInput: RunInput
+  manifest: Manifest
+  metricsDiff: MetricsDiff
+  timeline: Timeline
   diff: {
-  old: DiffResult;
-  new: DiffResult;
-};
-  judge?: JudgeResult;
-  summary: ReportSummary;
+    old: DiffResult
+    new: DiffResult
+  }
+  judge?: JudgeResult
+  summary: ReportSummary
 }
 
 export type ReportRenderResult = {
-  formats: Array<OutputFormat>;
+  formats: Array<OutputFormat>
   paths: {
-  md?: string;
-  json?: string;
-  yaml?: string;
-  html?: string;
-};
-  stdoutFormat: "md" | "json";
+    md?: string
+    json?: string
+    yaml?: string
+    html?: string
+  }
+  stdoutFormat: 'md' | 'json'
 }
 
 export type ReviewWorkspaceInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  workspace: WorkspaceTree;
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
 }
 
 export type ReviewWorkspaceResult = {
-  workspacePath: string;
-  opened: boolean;
-  command: string;
+  workspacePath: string
+  opened: boolean
+  command: string
 }
 
 export type RunSideError = {
-  code: "E_RUN_TIMEOUT" | "E_RUN_HANG_WATCHDOG" | "E_RUN_CRASH" | "E_VERIFY_TIMEOUT" | "E_VERIFY_FAILED" | "E_RATE_LIMIT_EXHAUSTED" | "E_OOM" | "E_DISK_FULL" | "E_PORT_CONFLICT" | "E_EXPORT_INVALID" | "E_TOTAL_TIMEOUT";
-  message: string;
-  side: Side;
-  runIndex: number;
-  context?: RecordUnknown;
+  code:
+    | 'E_RUN_TIMEOUT'
+    | 'E_RUN_HANG_WATCHDOG'
+    | 'E_RUN_CRASH'
+    | 'E_VERIFY_TIMEOUT'
+    | 'E_VERIFY_FAILED'
+    | 'E_RATE_LIMIT_EXHAUSTED'
+    | 'E_OOM'
+    | 'E_DISK_FULL'
+    | 'E_PORT_CONFLICT'
+    | 'E_EXPORT_INVALID'
+    | 'E_TOTAL_TIMEOUT'
+  message: string
+  side: Side
+  runIndex: number
+  context?: RecordUnknown
 }
 
 export type RunSideInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  workspace: WorkspaceTree;
-  homeEnv: EnvVarSet;
-  side: Side;
-  runIndex: number;
-  sessionId: string;
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
+  homeEnv: EnvVarSet
+  side: Side
+  runIndex: number
+  sessionId: string
 }
 
 export type TimelineError = {
-  code: "E_EXPORT_INVALID";
-  message: string;
-  side?: Side;
-  runIndex?: number;
-  context?: RecordUnknown;
+  code: 'E_EXPORT_INVALID'
+  message: string
+  side?: Side
+  runIndex?: number
+  context?: RecordUnknown
 }
 
 export type TimelineInput = {
-  runInput: RunInput;
-  manifest: Manifest;
-  workspace: WorkspaceTree;
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
   sideResults: {
-  old: Array<RunSideResult>;
-  new: Array<RunSideResult>;
-};
+    old: Array<RunSideResult>
+    new: Array<RunSideResult>
+  }
 }
 
 export type TimelineResult = {
-  timeline: Timeline;
-  jsonPath: string;
-  htmlPath?: string;
+  timeline: Timeline
+  jsonPath: string
+  htmlPath?: string
 }
 
 export type WorkspaceSetupError = {
-  code: "E_HOME_SETUP_FAILED";
-  message: string;
-  reason?: "already-exists" | "not-a-directory" | "mkdir-failed" | "write-failed";
-  path?: string;
-  context?: RecordUnknown;
+  code: 'E_HOME_SETUP_FAILED'
+  message: string
+  reason?: 'already-exists' | 'not-a-directory' | 'mkdir-failed' | 'write-failed'
+  path?: string
+  context?: RecordUnknown
 }
 
 export type WorkspaceSetupInput = {
-  runInput: RunInput;
-  runId: string;
+  runInput: RunInput
+  runId: string
 }
 
 export type WorkspaceSetupResult = {
-  manifest: Manifest;
-  rootPath: string;
-  treePaths: WorkspaceTree;
+  manifest: Manifest
+  rootPath: string
+  treePaths: WorkspaceTree
 }

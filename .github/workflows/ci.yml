@@ -6,10 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -22,6 +29,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
+
+      - name: Cache contract deps
+        uses: actions/cache@v4
+        with:
+          path: contract/node_modules
+          key: contract-${{ runner.os }}-${{ hashFiles('contract/package-lock.json') }}
 
       - name: Install contract deps
         working-directory: contract
@@ -36,6 +50,16 @@ jobs:
       - name: Codegen TS types from contracts
         run: npm run contract:codegen
 
+      - name: Verify codegen is deterministic
+        run: |
+          if [ -n "$(git status --porcelain src/generated)" ]; then
+            echo "::error::Codegen produced output that differs from the committed files."
+            echo "Run 'npm run contract:codegen' locally and commit the result."
+            git status --porcelain src/generated
+            git --no-pager diff src/generated | head -80
+            exit 1
+          fi
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -48,15 +72,20 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Smoke-test binary
+        run: ./dist/testaipack --help
+
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage
           path: coverage/
+          retention-days: 7
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: testaipack-binary
+          name: testaipack-linux-x64
           path: dist/testaipack
+          retention-days: 7

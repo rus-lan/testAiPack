@@ -271,7 +271,7 @@ const HEADER = `/**
 `
 
 async function loadSchemas(): Promise<Map<string, JsonSchema>> {
-  const files = await readdir(SCHEMA_DIR)
+  const files = (await readdir(SCHEMA_DIR)).sort()
   const schemas = new Map<string, JsonSchema>()
   for (const file of files) {
     if (!file.endsWith('.json')) continue
