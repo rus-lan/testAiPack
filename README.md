@@ -103,6 +103,33 @@ npm run build                # → dist/testaipack (нужен bun)
 testaipack doctor     # opencode, git, node, bun — всё на месте?
 ```
 
+### Docker-изоляция (опционально)
+
+Для `--isolation docker` нужен локальный образ с предустановленным opencode —
+публичного образа `opencode/opencode:*` в Docker Hub нет, поэтому соберите его
+один раз:
+
+```bash
+bash scripts/build-docker-image.sh
+```
+
+Скрипт соберёт образ `testaipack-opencode:latest` (ставит opencode из GitHub
+releases поверх `node:22-slim`) и проверит, что `opencode --version` работает.
+После этого:
+
+```bash
+./dist/testaipack run <repo> \
+  --isolation docker \
+  --docker-image testaipack-opencode:latest \
+  --pack ... --prompt ...
+```
+
+При недоступном Docker daemon (`docker info` не отвечает) фаза 00 автоматически
+откатится на `home`-изоляцию. Если образ не собран, preflight (gate 1) выдаст
+понятную ошибку с подсказкой собрать его через `bash scripts/build-docker-image.sh`
+или переопределить через `--docker-image`.
+
+
 ---
 
 ## Быстрый старт
@@ -140,7 +167,7 @@ testaipack doctor     # opencode, git, node, bun — всё на месте?
   --init @prompts/init.md \
   --verify "npm test && npm run lint" \
   --isolation home \
-  --docker-image opencode/opencode:latest \
+  --docker-image testaipack-opencode:latest \
   --opencode-version 0.5.0 \
   --aws --ssh --git \
   --pure-baseline \
@@ -226,7 +253,7 @@ testaipack doctor     # opencode, git, node, bun — всё на месте?
 | `--init <text\|@file>`     | `string`                                  | —                             | Опц. промпт, запускаемый ДО `--prompt` в той же сессии (подготовка окружения).                                   |
 | `--verify <cmd>`           | `string`                                  | —                             | Опц. shell-команда после работы агента (например `npm test`). Учитывается в метриках успеха.                     |
 | `--isolation <mode>`       | `home\|docker`                            | `home`                        | Режим изоляции. `docker` запускает opencode в `docker run --rm` контейнере (v0.3); при недоступном Docker daemon молча откатывается на `home`. |
-| `--docker-image <image>`   | `string`                                  | `opencode/opencode:latest`    | Образ для `--isolation=docker`. Игнорируется в режиме `home`.                    |
+| `--docker-image <image>`   | `string`                                  | `testaipack-opencode:latest`  | Образ для `--isolation=docker`. Игнорируется в режиме `home`.                    |
 | `--opencode-version <ver>` | `string`                                  | latest                        | Пин версии opencode для обеих сторон.                                                                            |
 | `--aws`                    | флаг                                      | off                           | Добавить AWS-credentials (`~/.aws/`) в whitelist изоляции.                                                       |
 | `--ssh`                    | флаг                                      | off                           | Добавить SSH-ключи (`~/.ssh/`) в whitelist.                                                                      |
@@ -237,7 +264,7 @@ testaipack doctor     # opencode, git, node, bun — всё на месте?
 | `--no-preflight`           | флаг                                      | off                           | Пропустить pre-flight стадию (пинг модели, проверка пакета).                                                     |
 | `--preflight-model <m>`    | `string`                                  | из конфига                    | Модель для pre-flight ping.                                                                                      |
 | `--format <f>...`          | `md\|html\|json\|yaml` (повторяется)      | `md`                          | Форматы отчёта. Несколько через пробел.                                                                          |
-| `--output <path>`          | `string`                                  | `<workspace>/<run-id>/report` | Куда писать файлы отчёта.                                                                                        |
+| `--output <path>`          | `string`                                  | `<workspace>/<run-id>/results` | Куда писать отчётные артефакты (report, metrics, timeline, diff, judge, gc.log и т.п.). Manifest и рабочее дерево остаются в `<workspace>/<run-id>`. |
 | `--no-diff-html`           | флаг                                      | off                           | Не генерировать HTML side-by-side diff.                                                                          |
 | `--collapse-repeats`       | флаг                                      | off                           | Сжимать повторяющиеся tool-call последовательности в карте.                                                      |
 | `--timeline-mode <m>`      | `side-by-side\|tree-diff\|merged`         | `side-by-side`                | Режим отображения таймлайна.                                                                                     |

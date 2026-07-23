@@ -1,0 +1,16 @@
+node_modules
+contract/node_modules
+dist
+contract/dist
+.testaipack
+.git
+coverage
+.cache
+.turbo
+.eslintcache
+screenshots
+results
+*.log
+*.tsbuildinfo
+.env
+.env*

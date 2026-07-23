@@ -14,8 +14,13 @@ import { randomBytes } from 'node:crypto'
 import { spawnProcess, execCmd } from '../opencode/spawn.js'
 import { inheritEnv } from '../util/env.js'
 
-/** Default opencode container image. Override with `--docker-image`. */
-export const DEFAULT_OPENCODE_IMAGE = 'opencode/opencode:latest'
+/**
+ * Default Docker image for `--isolation=docker` mode. No upstream
+ * `opencode/opencode:*` image is published, so this points at a locally built
+ * image. Build it with `bash scripts/build-docker-image.sh`, or override with
+ * the `--docker-image` flag.
+ */
+export const DEFAULT_OPENCODE_IMAGE = 'testaipack-opencode:latest'
 
 /** Best-effort `docker kill` deadline after a run timeout. */
 const KILL_TIMEOUT_MS = 5000
@@ -38,7 +43,7 @@ export class DockerError extends Data.TaggedError('DockerError')<{
 }> {}
 
 export interface DockerRunOptions {
-  /** Container image, e.g. `opencode/opencode:latest`. */
+  /** Container image, e.g. `testaipack-opencode:latest`. */
   readonly image: string
   /** Host working dir → mounted as `/workspace` (container `-w`). */
   readonly cwd: string

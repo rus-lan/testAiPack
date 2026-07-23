@@ -316,13 +316,13 @@ describe('opencode cli — dbQuery', () => {
 })
 
 describe('opencode cli — docker mode', () => {
-  const dockerImg = { image: 'opencode/opencode:latest' }
+  const dockerImg = { image: 'testaipack-opencode:latest' }
 
   it('run(docker) routes through dockerRun and never calls the spawner', async () => {
     await runP(run({ ...baseOpts, agent: 'coder', docker: dockerImg }))
     expect(dr).toHaveBeenCalledTimes(1)
     expect(sp).not.toHaveBeenCalled()
-    expect(lastDocker?.image).toBe('opencode/opencode:latest')
+    expect(lastDocker?.image).toBe('testaipack-opencode:latest')
     expect(lastDocker?.cwd).toBe('/work/app')
     expect(lastDocker?.homeDir).toBe('/home/test')
     expect(lastDocker?.command).toEqual([

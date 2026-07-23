@@ -4,12 +4,14 @@
  * completion line; phase 06 (run-side) runs old/new concurrently with N runs
  * sequential per side, reporting each run as an indented sub-line.
  *
- * The orchestrator overrides `runInput.outputPath` to the workspace `results/`
- * directory so report files and metrics.json land together inside the run
- * tree (phase 00's CLI default of `./results` is only a fallback for the
- * no-workspace case).
+ * The orchestrator points `runInput.outputPath` (and the run tree's `results`
+ * + `diff`) at the report-output location: the workspace `results/` directory
+ * by default, or an explicit `--output <path>` when the user supplies one.
+ * Manifest and the rest of the workspace structure always stay under
+ * `<workspace>/<run-id>`; only report artifacts move with `--output`.
  */
 import { Effect } from 'effect'
+import path from 'node:path'
 import type {
   EnvVarSet,
   JudgeResult,
@@ -193,13 +195,25 @@ export const runPipeline = (
     )
     const { manifest, treePaths } = ws
 
-    const runInput: RunInput = { ...baseRunInput, outputPath: treePaths.results }
+    // --output: when the user gave an explicit output dir (cli or config),
+    // report artifacts (report.*, metrics.json, timeline.*, diff/, judge.json,
+    // review.code-workspace, preflight.log, install.log, gc.log) land there.
+    // Manifest + workspace structure (apps, home, raw, pack, config) stay under
+    // <workspace>/<run-id>. Without --output the run tree's results/ is used.
+    const customOutput = parsed.outputPathProvided
+      ? path.resolve(opts.cwd, baseRunInput.outputPath)
+      : undefined
+    const resultsDir = customOutput ?? treePaths.results
+    const runInput: RunInput = { ...baseRunInput, outputPath: resultsDir }
+    const treePathsUsed: WorkspaceTree = customOutput
+      ? { ...treePaths, results: customOutput, diff: path.join(customOutput, 'diff') }
+      : treePaths
 
     // 02 repo-clone
     yield* timedPhase(
       2,
       'repo-clone',
-      repoClone({ runInput, manifest, workspace: treePaths }),
+      repoClone({ runInput, manifest, workspace: treePathsUsed }),
       reporter,
       () => runInput.repoUrl,
     )
@@ -208,7 +222,7 @@ export const runPipeline = (
     const pack = yield* timedPhase(
       3,
       'pack-install',
-      packInstall({ runInput, manifest, workspace: treePaths }),
+      packInstall({ runInput, manifest, workspace: treePathsUsed }),
       reporter,
       detailForPack,
     )
@@ -220,7 +234,7 @@ export const runPipeline = (
       homeIsolation({
         runInput,
         manifest,
-        workspace: treePaths,
+        workspace: treePathsUsed,
         packInstall: pack,
         ...(parsed.dockerImage === undefined ? {} : { dockerImage: parsed.dockerImage }),
       }),
@@ -255,8 +269,8 @@ export const runPipeline = (
     const start06 = Date.now()
     const both = yield* Effect.all(
       {
-        old: runOneSide('old', runInput, manifest, treePaths, oldEnvs, home.dockerImage, reporter),
-        new: runOneSide('new', runInput, manifest, treePaths, newEnvs, home.dockerImage, reporter),
+        old: runOneSide('old', runInput, manifest, treePathsUsed, oldEnvs, home.dockerImage, reporter),
+        new: runOneSide('new', runInput, manifest, treePathsUsed, newEnvs, home.dockerImage, reporter),
       },
       { concurrency: 2 },
     )
@@ -276,7 +290,7 @@ export const runPipeline = (
     const agg = yield* timedPhase(
       7,
       'aggregate',
-      aggregate({ runInput, manifest, workspace: treePaths, sideResults }),
+      aggregate({ runInput, manifest, workspace: treePathsUsed, sideResults }),
       reporter,
       (r) =>
         r.metricsDiff.bothFailed ? 'both sides failed' : 'metricsDiff computed',
@@ -286,7 +300,7 @@ export const runPipeline = (
     const diffOut = yield* timedPhase(
       8,
       'diff',
-      diff({ runInput, manifest, workspace: treePaths }),
+      diff({ runInput, manifest, workspace: treePathsUsed }),
       reporter,
       (r) =>
         `${String(r.diff.old.runs.length + r.diff.new.runs.length)} run patch(es)`,
@@ -306,7 +320,7 @@ export const runPipeline = (
     const tl = yield* timedPhase(
       10,
       'timeline',
-      timeline({ runInput, manifest, workspace: treePaths, sideResults }),
+      timeline({ runInput, manifest, workspace: treePathsUsed, sideResults }),
       reporter,
       (r) => `${String(r.timeline.old.length + r.timeline.new.length)} events`,
     )
@@ -342,7 +356,7 @@ export const runPipeline = (
     const review = yield* timedPhase(
       12,
       'review-workspace',
-      reviewWorkspace({ runInput, manifest, workspace: treePaths }),
+      reviewWorkspace({ runInput, manifest, workspace: treePathsUsed }),
       reporter,
     )
 
@@ -353,7 +367,7 @@ export const runPipeline = (
       cleanup({
         runInput,
         manifest,
-        workspace: treePaths,
+        workspace: treePathsUsed,
         ephemeral: opts.ephemeral,
       }),
       reporter,
@@ -369,7 +383,7 @@ export const runPipeline = (
     return {
       runId,
       manifest,
-      workspace: treePaths,
+      workspace: treePathsUsed,
       rootPath: ws.rootPath,
       metricsDiff: agg.metricsDiff,
       reportPaths: report.paths,

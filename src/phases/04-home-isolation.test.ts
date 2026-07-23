@@ -5,6 +5,7 @@ import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, writeFile, exists, readSymlink, readFile } from '../util/fs.js'
 import { homeIsolation } from './04-home-isolation.js'
 import type { HomeIsolationInputExt } from './04-home-isolation.js'
+import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import type {
   RunInput,
   Manifest,
@@ -544,7 +545,7 @@ describe('phase 04 — homeIsolation', () => {
     const input = buildInput({ isolation: 'docker' }, undefined)
     const result = await runP(homeIsolation(input))
     expect(result.isolation).toBe('docker')
-    expect(result.dockerImage).toBe('opencode/opencode:latest')
+    expect(result.dockerImage).toBe(DEFAULT_OPENCODE_IMAGE)
     expect(result.homeTrees.old).toHaveLength(1)
     expect(result.homeTrees.new).toHaveLength(1)
   })

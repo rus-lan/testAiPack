@@ -37,7 +37,7 @@ vi.mock('../opencode/cli.js', () => ({
 
 vi.mock('../isolation/docker-runner.js', () => ({
   ensureImage: vi.fn(),
-  DEFAULT_OPENCODE_IMAGE: 'opencode/opencode:latest',
+  DEFAULT_OPENCODE_IMAGE: 'testaipack-opencode:latest',
   DockerError: class extends Error {
     readonly _tag = 'DockerError'
     readonly command: string
@@ -63,7 +63,7 @@ vi.mock('../isolation/docker-runner.js', () => ({
 const { version, run, OpencodeError } = await import('../opencode/cli.js')
 const versionMock = vi.mocked(version)
 const runMock = vi.mocked(run)
-const { ensureImage, DockerError } = await import('../isolation/docker-runner.js')
+const { ensureImage, DockerError, DEFAULT_OPENCODE_IMAGE } = await import('../isolation/docker-runner.js')
 const ensureImageMock = vi.mocked(ensureImage)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
@@ -137,14 +137,18 @@ const buildInput = (
   runInputOverrides: Partial<RunInput>,
   packInstall: PackInstallOutcome | undefined,
 ): PreflightInputExt => ({
-  runInput: makeRunInput({ workspacePath: homes.root, ...runInputOverrides }),
+  runInput: makeRunInput({
+    workspacePath: homes.root,
+    outputPath: path.join(homes.root, 'out'),
+    ...runInputOverrides,
+  }),
   manifest: { ...fakeManifest, ...(packInstall === undefined ? {} : { packRef: 'github:o/myskill', packType: 'skill' }) },
   homePaths: { old: homes.old, new: homes.new },
   ...(packInstall === undefined ? {} : { packInstall }),
 })
 
-const expectedLogPath = (homes: { root: string }): string =>
-  path.join(homes.root, fakeManifest.runId, 'results', 'preflight.log')
+const expectedLogPath = (input: PreflightInputExt): string =>
+  path.join(input.runInput.outputPath, 'preflight.log')
 
 const skillOutcome = (packDir: string, name = 'myskill'): PackInstallOutcome => ({
   packPath: packDir,
@@ -206,7 +210,7 @@ describe('phase 05 — preflight', () => {
     expect(result.checks).toEqual([])
     expect(result.allPassed).toBe(true)
     expect(result.exitCode).toBe(0)
-    expect(result.logPath).toBe(expectedLogPath(homes))
+    expect(result.logPath).toBe(expectedLogPath(input))
   })
 
   it('all-pass (skill pack) → 8 checks (gates 1-3 per side + gate 4 + gate 5), exitCode=0', async () => {
@@ -432,20 +436,20 @@ describe('phase 05 — preflight', () => {
     const homes = await buildHomes()
     const input: PreflightInputExt = {
       ...buildInput(homes, { isolation: 'docker' }, undefined),
-      dockerImage: 'opencode/opencode:latest',
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
     }
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
-    expect(ensureImageMock).toHaveBeenCalledWith('opencode/opencode:latest')
+    expect(ensureImageMock).toHaveBeenCalledWith(DEFAULT_OPENCODE_IMAGE)
     // version invoked with the docker exec spec for both sides
     const dockerCalls = versionMock.mock.calls.filter(
       (c) => (c[1] as { image?: string } | undefined)?.image !== undefined,
     )
     expect(dockerCalls.length).toBeGreaterThanOrEqual(2)
-    expect((dockerCalls[0]?.[1] as { image: string }).image).toBe('opencode/opencode:latest')
+    expect((dockerCalls[0]?.[1] as { image: string }).image).toBe(DEFAULT_OPENCODE_IMAGE)
   })
 
-  it('docker mode: ensureImage failure → E_PREFLIGHT_FAILED (docker pull failed)', async () => {
+  it('docker mode: ensureImage failure → E_PREFLIGHT_FAILED (image unavailable)', async () => {
     const homes = await buildHomes()
     ensureImageMock.mockImplementation(() =>
       Effect.fail(
@@ -459,7 +463,9 @@ describe('phase 05 — preflight', () => {
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_FAILED')
     expect(err.context?.['check']).toBe('opencode-launch')
-    expect(err.message).toContain('docker pull failed')
+    expect(err.message).toContain('unavailable')
+    expect(err.message).toContain('build-docker-image.sh')
+    expect(err.message).toContain('manifest unknown')
     expect(err.context?.['image']).toBe('opencode/missing:latest')
   })
 
@@ -476,7 +482,7 @@ describe('phase 05 — preflight', () => {
     )
     const input: PreflightInputExt = {
       ...buildInput(homes, { isolation: 'docker' }, undefined),
-      dockerImage: 'opencode/opencode:latest',
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
     }
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
@@ -485,7 +491,7 @@ describe('phase 05 — preflight', () => {
     )
     expect(dockerRunCalls.length).toBeGreaterThan(0)
     expect((dockerRunCalls[0]?.[0] as { docker: { image: string } }).docker.image).toBe(
-      'opencode/opencode:latest',
+      DEFAULT_OPENCODE_IMAGE,
     )
   })
 })

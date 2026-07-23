@@ -436,6 +436,54 @@ describe('renderTimelineHtml', () => {
     expect(html).toContain('merged')
   })
 
+  it('tree-diff mode renders both sides without throwing', () => {
+    const html = renderTimelineHtml(sampleTimeline('tree-diff'))
+    expect(html).toContain('<!DOCTYPE html>')
+    expect(html).toContain('class="side old"')
+    expect(html).toContain('class="side new"')
+    expect(html).toContain('tree-diff')
+  })
+
+  it('tree-diff flags events present on only one side (by tool+type)', () => {
+    const tl: Timeline = {
+      // old has bash tool-call + reasoning; new has read tool-call + reasoning
+      old: [
+        { tStart: '0', tEnd: '10', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'reasoning' },
+        { tStart: '10', tEnd: '20', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' },
+      ],
+      new: [
+        { tStart: '0', tEnd: '10', side: 'new', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'reasoning' },
+        { tStart: '10', tEnd: '20', side: 'new', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'read', status: 'completed' },
+      ],
+      mode: 'tree-diff',
+    }
+    const html = renderTimelineHtml(tl)
+    // reasoning is on both sides → not flagged; bash/read are unique per side
+    expect(html).toContain('only-old')
+    expect(html).toContain('only-new')
+    expect(html).toMatch(/tool-call bash only-old/)
+    expect(html).toMatch(/tool-call read only-new/)
+    expect(html).not.toMatch(/reasoning only/)
+  })
+
+  it('tree-diff with identical sides flags nothing', () => {
+    const tl: Timeline = {
+      old: [{ tStart: '0', tEnd: '5', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' }],
+      new: [{ tStart: '0', tEnd: '5', side: 'new', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' }],
+      mode: 'tree-diff',
+    }
+    const html = renderTimelineHtml(tl)
+    // no event div carries an only-* flag (legend still lists the swatches)
+    expect(html).not.toMatch(/event \w+[^"]* only-old/)
+    expect(html).not.toMatch(/event \w+[^"]* only-new/)
+  })
+
+  it('empty tree-diff timeline still produces valid HTML', () => {
+    const html = renderTimelineHtml({ old: [], new: [], mode: 'tree-diff' })
+    expect(html).toContain('<!DOCTYPE html>')
+    expect(html).toContain('class="events"')
+  })
+
   it('empty timeline still produces valid HTML', () => {
     const html = renderTimelineHtml({ old: [], new: [], mode: 'side-by-side' })
     expect(html).toContain('<!DOCTYPE html>')

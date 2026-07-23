@@ -57,7 +57,7 @@ const execCalls = (): readonly ExecInput[] =>
   ex.mock.calls.map((c) => c[0])
 
 const baseOpts = {
-  image: 'opencode/opencode:latest',
+  image: DEFAULT_OPENCODE_IMAGE,
   cwd: '/host/workspace',
   homeDir: '/host/home',
   command: ['opencode', '--version'],
@@ -72,7 +72,7 @@ describe('docker-runner — buildDockerRunArgs', () => {
       '-v', '/host/home:/home/opencode',
       '-w', '/workspace',
       '-e', 'HOME=/home/opencode',
-      'opencode/opencode:latest',
+      DEFAULT_OPENCODE_IMAGE,
       'opencode', '--version',
     ])
   })
@@ -83,7 +83,7 @@ describe('docker-runner — buildDockerRunArgs', () => {
       'cnt-1',
     )
     const homeIdx = args.indexOf('HOME=/home/opencode')
-    const imageIdx = args.indexOf('opencode/opencode:latest')
+    const imageIdx = args.indexOf(DEFAULT_OPENCODE_IMAGE)
     expect(args).toContain('-e')
     expect(args).toContain('FOO=bar')
     expect(args).toContain('BAZ=qux')
@@ -112,7 +112,7 @@ describe('docker-runner — dockerRun', () => {
     expect(lastSpawn?.args).toContain('-w')
     expect(lastSpawn?.args).toContain('/workspace')
     expect(lastSpawn?.args).toContain('HOME=/home/opencode')
-    expect(lastSpawn?.args).toContain('opencode/opencode:latest')
+    expect(lastSpawn?.args).toContain(DEFAULT_OPENCODE_IMAGE)
     expect(lastSpawn?.args).toContain('opencode')
     expect(lastSpawn?.args).toContain('--version')
     expect(lastSpawn?.args[0]).toBe('run')
@@ -193,9 +193,9 @@ describe('docker-runner — dockerRun', () => {
 describe('docker-runner — imageExists', () => {
   it('inspects the image: exit 0 ⇒ true', async () => {
     ex.mockImplementation(() => Effect.succeed(okExec({ exitCode: 0 })))
-    expect(await runP(imageExists('opencode/opencode:latest'))).toBe(true)
+    expect(await runP(imageExists(DEFAULT_OPENCODE_IMAGE))).toBe(true)
     expect(execCalls().at(-1)?.args).toEqual([
-      'image', 'inspect', 'opencode/opencode:latest',
+      'image', 'inspect', DEFAULT_OPENCODE_IMAGE,
     ])
   })
 
@@ -207,13 +207,13 @@ describe('docker-runner — imageExists', () => {
 
 describe('docker-runner — pullImage', () => {
   it('runs `docker pull <image>` and succeeds on exit 0', async () => {
-    await runP(pullImage('opencode/opencode:latest'))
-    expect(execCalls().at(-1)?.args).toEqual(['pull', 'opencode/opencode:latest'])
+    await runP(pullImage(DEFAULT_OPENCODE_IMAGE))
+    expect(execCalls().at(-1)?.args).toEqual(['pull', DEFAULT_OPENCODE_IMAGE])
   })
 
   it('fails with DockerError on non-zero exit', async () => {
     ex.mockImplementation(() => Effect.succeed(okExec({ exitCode: 1, stderr: 'network error' })))
-    const err = await runFlip(pullImage('opencode/opencode:latest'))
+    const err = await runFlip(pullImage(DEFAULT_OPENCODE_IMAGE))
     expect(err).toBeInstanceOf(DockerError)
     expect(err.command).toBe('pull')
     expect(err.exitCode).toBe(1)
@@ -231,7 +231,7 @@ describe('docker-runner — pullImage', () => {
         })
       }),
     )
-    const err = await runFlip(pullImage('opencode/opencode:latest', 50))
+    const err = await runFlip(pullImage(DEFAULT_OPENCODE_IMAGE, 50))
     expect(err).toBeInstanceOf(DockerError)
     expect(err.timedOut).toBe(true)
     expect(err.command).toBe('pull')
@@ -243,7 +243,7 @@ describe('docker-runner — ensureImage', () => {
     ex.mockImplementation((input) =>
       Effect.succeed(okExec({ exitCode: input.args[0] === 'image' ? 0 : 0 })),
     )
-    await runP(ensureImage('opencode/opencode:latest'))
+    await runP(ensureImage(DEFAULT_OPENCODE_IMAGE))
     const pulled = execCalls().some((c) => c.args[0] === 'pull')
     expect(pulled).toBe(false)
   })
@@ -254,7 +254,7 @@ describe('docker-runner — ensureImage', () => {
       if (input.args[0] === 'image') return Effect.succeed(okExec({ exitCode: 1 }))
       return Effect.succeed(okExec({ exitCode: 0, stdout: 'pulled' }))
     })
-    await runP(ensureImage('opencode/opencode:latest'))
+    await runP(ensureImage(DEFAULT_OPENCODE_IMAGE))
     const pulled = execCalls().some((c) => c.args[0] === 'pull')
     expect(pulled).toBe(true)
   })
@@ -275,7 +275,7 @@ describe('docker-runner — ensureImage', () => {
 })
 
 describe('docker-runner — exports', () => {
-  it('exposes a default image constant', () => {
-    expect(DEFAULT_OPENCODE_IMAGE).toBe('opencode/opencode:latest')
+  it('exposes a default local image constant', () => {
+    expect(DEFAULT_OPENCODE_IMAGE).toBe('testaipack-opencode:latest')
   })
 })

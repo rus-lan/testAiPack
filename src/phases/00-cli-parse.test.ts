@@ -448,6 +448,23 @@ describe('cliParse — flags surface', () => {
     expect(ri.preflightEnabled).toBe(false)
     expect(ri.diffHtml).toBe(true)
     expect(ri.collapseRepeats).toBe(false)
+    expect(result.outputPathProvided).toBe(true)
+  })
+
+  it('outputPathProvided is false when --output is absent (default fallback)', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.outputPathProvided).toBe(false)
+    expect(result.runInput.outputPath).toBe('./results')
+  })
+
+  it('outputPathProvided is true when outputPath comes from config', async () => {
+    const cwd = makeTempDir()
+    await runP(ensureDir(path.join(cwd, '.testaipack')))
+    await runP(writeFile(path.join(cwd, '.testaipack', 'config.json'), JSON.stringify({ outputPath: '/from/config' })))
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.outputPathProvided).toBe(true)
+    expect(result.runInput.outputPath).toBe('/from/config')
   })
 
   it('supports the --flag=value inline form', async () => {

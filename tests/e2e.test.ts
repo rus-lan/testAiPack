@@ -320,6 +320,53 @@ describe('e2e: full A/B pipeline via runCli', () => {
     expect(code).not.toBe(0)
   }, 30_000)
 
+  it('--output <path> redirects report artifacts out of the workspace', async () => {
+    await withFakeHome(async () => {
+      const repo = await createTinyRepo()
+      const workspace = path.join(makeTempDir(), '.testaipack')
+      const outDir = path.join(makeTempDir(), 'my-output')
+
+      const code = await runCli([
+        'run',
+        repo,
+        '--prompt',
+        'do something',
+        '--runs',
+        '1',
+        '--no-preflight',
+        '--auth',
+        'opencode',
+        '--workspace',
+        workspace,
+        '--output',
+        outDir,
+      ])
+      expect(code).toBe(0)
+
+      const runDir = await findRunDir(workspace)
+      const wsResults = path.join(runDir, 'results')
+
+      // manifest + raw exports stay in the workspace tree
+      expect(existsSync(path.join(runDir, 'manifest.json'))).toBe(true)
+      expect(existsSync(path.join(wsResults, 'raw', 'old', 'run-1.json'))).toBe(true)
+      expect(existsSync(path.join(wsResults, 'raw', 'new', 'run-1.json'))).toBe(true)
+
+      // report artifacts land in the custom --output dir, not under workspace
+      expect(existsSync(path.join(outDir, 'report.md'))).toBe(true)
+      expect(existsSync(path.join(outDir, 'report.json'))).toBe(true)
+      expect(existsSync(path.join(outDir, 'metrics.json'))).toBe(true)
+      expect(existsSync(path.join(outDir, 'timeline.json'))).toBe(true)
+      expect(existsSync(path.join(outDir, 'diff', 'old', 'run-1', 'full.patch'))).toBe(true)
+      expect(existsSync(path.join(outDir, 'diff', 'new', 'run-1', 'full.patch'))).toBe(true)
+      expect(existsSync(path.join(outDir, 'review.code-workspace'))).toBe(true)
+      expect(existsSync(path.join(outDir, 'gc.log'))).toBe(true)
+
+      // and NOT in the workspace results dir
+      expect(existsSync(path.join(wsResults, 'report.md'))).toBe(false)
+      expect(existsSync(path.join(wsResults, 'metrics.json'))).toBe(false)
+    })
+  }, 60_000)
+
   it('preflight failure (opencode launch fails) exits with code 2', async () => {
     // version() fails on every call: phase 01 probe swallows it ('unknown'),
     // phase 05 gate 1 (opencode-launch) surfaces it as exit 2.

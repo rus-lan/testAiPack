@@ -39,6 +39,7 @@ import { isDockerAvailable } from '../util/docker.js'
 export type CliParseOutput = CliParseResult & {
   readonly flagDefaults: Readonly<Record<string, unknown>>
   readonly dockerImage?: string
+  readonly outputPathProvided: boolean
 }
 
 const DEFAULT_RUNS = 3
@@ -704,6 +705,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       runInput,
       configSource,
       flagDefaults,
+      outputPathProvided: outputPick.src !== 'default',
       ...(dockerImagePick.value === undefined ? {} : { dockerImage: dockerImagePick.value }),
     }
   })

@@ -79,8 +79,9 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
       - `wallClockMs = max(time_updated) − min(time_created)` по дереву сессий
         (v0.1: по root; v0.2: рекурсивный обход через `parent_id`).
       - `costUsd`: сначала из `info.cost`, если есть; иначе вычислить через
-        `pricing.json` (`runInput.pricingPath`) по токенам. Fallback на
-        `info.cost` документируется в `metrics.json.sourceCost`.
+        `pricing.json` (`runInput.pricingPath`) по токенам; иначе `0`.
+        (Происхождение значения в контракт не выносится — приоритет
+        `info.cost` > `pricing` > `0` фиксирован в реализации.)
       - `stepCount` = число parts с `type = "step-finish"`.
       - `toolCallCount` = число parts с `type = "tool"`.
       - `successRank` = значение из `RunSideResult.successRank` ( finish-cause
@@ -128,7 +129,7 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
 | Все прогоны одной стороны failed                   | `SideAggregates.stats.<m>.samples = []`, `primary` из 0/null, `deltas.<m>` neutral | — |
 | Все прогоны обеих сторон failed                    | `MetricsDiff.bothFailed = true` (не throw)         | —                    |
 | `pricing.json` отсутствует, `info.cost` тоже нет    | `costUsd = 0`/`null`, warning в логе               | —                    |
-| `info.cost` есть                                    | используется как primary, `sourceCost = "export"`  | —                    |
+| `info.cost` есть                                    | используется как `costUsd` (приоритет над pricing) | —                    |
 | `N < 4`                                             | `iqr` не задаётся в `MetricDistribution`           | —                    |
 | `totalTokens = 0` (пустой прогон)                   | валидное значение 0, не fail                       | —                    |
 | (v0.2) дерево сессий с циклом по parent_id          | visited-set обрывает цикл, warning                 | —                    |
@@ -147,10 +148,10 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
 - ✅ export invalid no code: `raw/old/run-2.json` повреждён, и
   `sideResults.old[1].successRank ≠ 0` → throw `E_EXPORT_INVALID` с `runIndex: 2`.
 - ✅ cost from info.cost: export содержит `info.cost = 0.0123` →
-  `primary.costUsd = 0.0123`, `sourceCost = "export"`.
-- ✅ cost from pricing: `info.cost` нет, есть `pricing.json` → cost вычислен,
-  `sourceCost = "pricing"`.
-- ✅ cost unknown: ни того, ни другого → `costUsd = null`/`0`, warning.
+  `primary.costUsd = 0.0123`.
+- ✅ cost from pricing: `info.cost` нет, есть `pricing.json` → cost вычислен
+  по токенам.
+- ✅ cost unknown: ни того, ни другого → `costUsd = 0`.
 - ✅ successRank aggregation: three runs с rank [4,4,3] → median 4, min 3, max 4
   в `stats.successRank`.
 - ✅ perTool aggregation: три прогона с разными наборами tool-ов →
@@ -172,8 +173,8 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
   `absolute`, `percent`, `significant`, `better`); если одна сторона failed,
   `better = "neutral"`.
 - `MetricsDiff.bothFailed = true` ⇔ обе стороны не имеют успешных прогонов.
-- `sourceCost ∈ {"export", "pricing", null}` документирует происхождение
-  `costUsd` — критично для воспроизводимости.
+- Происхождение `costUsd` фиксировано приоритетом в реализации:
+  `info.cost` > `pricing.json` > `0` (поле `sourceCost` в контракт не входит).
 
 ## 8. Зависимости от других фаз
 

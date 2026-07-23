@@ -1,6 +1,8 @@
 {
   "$schema": "./pricing-schema.json",
   "version": "0.1.0",
+  "lastUpdated": "2026-07-24",
+  "source": "official provider pricing pages (Anthropic, OpenAI, Google Vertex AI, Z.AI, DeepSeek, Mistral) — see notes per model; OpenAI/Gemini/DeepSeek/Z.AI do not bill a separate cache-write price (0); Mistral cached input is 10% of input price",
   "providers": {
     "anthropic": {
       "claude-3-5-sonnet-20241022": {
@@ -20,6 +22,60 @@
         "output": 75.0,
         "cacheRead": 1.5,
         "cacheWrite": 18.75
+      },
+      "claude-opus-4": {
+        "input": 15.0,
+        "output": 75.0,
+        "cacheRead": 1.5,
+        "cacheWrite": 18.75
+      },
+      "claude-opus-4-1": {
+        "input": 15.0,
+        "output": 75.0,
+        "cacheRead": 1.5,
+        "cacheWrite": 18.75
+      },
+      "claude-opus-4-5": {
+        "input": 5.0,
+        "output": 25.0,
+        "cacheRead": 0.5,
+        "cacheWrite": 6.25
+      },
+      "claude-opus-4-8": {
+        "input": 5.0,
+        "output": 25.0,
+        "cacheRead": 0.5,
+        "cacheWrite": 6.25
+      },
+      "claude-sonnet-4": {
+        "input": 3.0,
+        "output": 15.0,
+        "cacheRead": 0.3,
+        "cacheWrite": 3.75
+      },
+      "claude-sonnet-4-5": {
+        "input": 3.0,
+        "output": 15.0,
+        "cacheRead": 0.3,
+        "cacheWrite": 3.75
+      },
+      "claude-sonnet-5": {
+        "input": 2.0,
+        "output": 10.0,
+        "cacheRead": 0.2,
+        "cacheWrite": 2.5
+      },
+      "claude-haiku-4-5": {
+        "input": 1.0,
+        "output": 5.0,
+        "cacheRead": 0.1,
+        "cacheWrite": 1.25
+      },
+      "claude-fable-5": {
+        "input": 10.0,
+        "output": 50.0,
+        "cacheRead": 1.0,
+        "cacheWrite": 12.5
       }
     },
     "openai": {
@@ -27,39 +83,309 @@
         "input": 2.5,
         "output": 10.0,
         "cacheRead": 1.25,
-        "cacheWrite": 2.5
+        "cacheWrite": 0.0
       },
       "gpt-4o-mini": {
         "input": 0.15,
         "output": 0.6,
         "cacheRead": 0.075,
-        "cacheWrite": 0.15
+        "cacheWrite": 0.0
+      },
+      "gpt-4-turbo": {
+        "input": 10.0,
+        "output": 30.0,
+        "cacheRead": 0.0,
+        "cacheWrite": 0.0
       },
       "o1": {
         "input": 15.0,
         "output": 60.0,
         "cacheRead": 7.5,
-        "cacheWrite": 15.0
+        "cacheWrite": 0.0
+      },
+      "o1-preview": {
+        "input": 15.0,
+        "output": 60.0,
+        "cacheRead": 0.0,
+        "cacheWrite": 0.0
+      },
+      "o1-mini": {
+        "input": 1.1,
+        "output": 4.4,
+        "cacheRead": 0.55,
+        "cacheWrite": 0.0
+      },
+      "o3": {
+        "input": 10.0,
+        "output": 40.0,
+        "cacheRead": 2.5,
+        "cacheWrite": 0.0
+      },
+      "o3-mini": {
+        "input": 1.1,
+        "output": 4.4,
+        "cacheRead": 0.55,
+        "cacheWrite": 0.0
+      },
+      "gpt-4.1": {
+        "input": 2.0,
+        "output": 8.0,
+        "cacheRead": 0.5,
+        "cacheWrite": 0.0
+      },
+      "gpt-4.1-mini": {
+        "input": 0.4,
+        "output": 1.6,
+        "cacheRead": 0.1,
+        "cacheWrite": 0.0
+      },
+      "gpt-5.6-sol": {
+        "input": 5.0,
+        "output": 30.0,
+        "cacheRead": 0.5,
+        "cacheWrite": 6.25
+      },
+      "gpt-5.6-terra": {
+        "input": 2.5,
+        "output": 15.0,
+        "cacheRead": 0.25,
+        "cacheWrite": 3.125
+      },
+      "gpt-5.6-luna": {
+        "input": 1.0,
+        "output": 6.0,
+        "cacheRead": 0.1,
+        "cacheWrite": 1.25
+      },
+      "gpt-5.5": {
+        "input": 5.0,
+        "output": 30.0,
+        "cacheRead": 0.5,
+        "cacheWrite": 0.0
+      },
+      "gpt-5.4": {
+        "input": 2.5,
+        "output": 15.0,
+        "cacheRead": 0.25,
+        "cacheWrite": 0.0
+      },
+      "gpt-5.4-mini": {
+        "input": 0.75,
+        "output": 4.5,
+        "cacheRead": 0.075,
+        "cacheWrite": 0.0
+      },
+      "gpt-5.4-nano": {
+        "input": 0.2,
+        "output": 1.25,
+        "cacheRead": 0.02,
+        "cacheWrite": 0.0
+      }
+    },
+    "google": {
+      "gemini-1.5-pro": {
+        "input": 1.25,
+        "output": 5.0,
+        "cacheRead": 0.3125,
+        "cacheWrite": 0.0
+      },
+      "gemini-1.5-flash": {
+        "input": 0.075,
+        "output": 0.3,
+        "cacheRead": 0.01875,
+        "cacheWrite": 0.0
+      },
+      "gemini-2.0-flash": {
+        "input": 0.15,
+        "output": 0.6,
+        "cacheRead": 0.075,
+        "cacheWrite": 0.0
+      },
+      "gemini-2.0-flash-lite": {
+        "input": 0.075,
+        "output": 0.3,
+        "cacheRead": 0.0375,
+        "cacheWrite": 0.0
+      },
+      "gemini-2.5-pro": {
+        "input": 1.25,
+        "output": 10.0,
+        "cacheRead": 0.13,
+        "cacheWrite": 0.0
+      },
+      "gemini-2.5-flash": {
+        "input": 0.3,
+        "output": 2.5,
+        "cacheRead": 0.03,
+        "cacheWrite": 0.0
+      },
+      "gemini-2.5-flash-lite": {
+        "input": 0.1,
+        "output": 0.4,
+        "cacheRead": 0.01,
+        "cacheWrite": 0.0
       }
     },
     "zai-coding-plan": {
       "glm-5.2": {
-        "input": 2.0,
-        "output": 8.0,
+        "input": 1.4,
+        "output": 4.4,
+        "cacheRead": 0.26,
+        "cacheWrite": 0.0
+      },
+      "glm-5.1": {
+        "input": 1.4,
+        "output": 4.4,
+        "cacheRead": 0.26,
+        "cacheWrite": 0.0
+      },
+      "glm-5": {
+        "input": 1.0,
+        "output": 3.2,
         "cacheRead": 0.2,
-        "cacheWrite": 2.0
+        "cacheWrite": 0.0
+      },
+      "glm-5-turbo": {
+        "input": 1.2,
+        "output": 4.0,
+        "cacheRead": 0.24,
+        "cacheWrite": 0.0
       },
       "glm-4.7": {
-        "input": 0.5,
-        "output": 2.0,
-        "cacheRead": 0.05,
-        "cacheWrite": 0.5
+        "input": 0.6,
+        "output": 2.2,
+        "cacheRead": 0.11,
+        "cacheWrite": 0.0
       },
-      "fable-5": {
-        "input": 5.0,
-        "output": 20.0,
-        "cacheRead": 0.5,
-        "cacheWrite": 5.0
+      "glm-4.7-flash": {
+        "input": 0.0,
+        "output": 0.0,
+        "cacheRead": 0.0,
+        "cacheWrite": 0.0
+      },
+      "glm-4-flash": {
+        "input": 0.0,
+        "output": 0.0,
+        "cacheRead": 0.0,
+        "cacheWrite": 0.0
+      },
+      "glm-4.6": {
+        "input": 0.6,
+        "output": 2.2,
+        "cacheRead": 0.11,
+        "cacheWrite": 0.0
+      },
+      "glm-4.5": {
+        "input": 0.6,
+        "output": 2.2,
+        "cacheRead": 0.11,
+        "cacheWrite": 0.0
+      },
+      "glm-4.5-air": {
+        "input": 0.2,
+        "output": 1.1,
+        "cacheRead": 0.03,
+        "cacheWrite": 0.0
+      },
+      "glm-4.5-flash": {
+        "input": 0.0,
+        "output": 0.0,
+        "cacheRead": 0.0,
+        "cacheWrite": 0.0
+      }
+    },
+    "deepseek": {
+      "deepseek-chat": {
+        "input": 0.14,
+        "output": 0.28,
+        "cacheRead": 0.0028,
+        "cacheWrite": 0.0
+      },
+      "deepseek-reasoner": {
+        "input": 0.14,
+        "output": 0.28,
+        "cacheRead": 0.0028,
+        "cacheWrite": 0.0
+      },
+      "deepseek-v4-flash": {
+        "input": 0.14,
+        "output": 0.28,
+        "cacheRead": 0.0028,
+        "cacheWrite": 0.0
+      },
+      "deepseek-v4-pro": {
+        "input": 0.435,
+        "output": 0.87,
+        "cacheRead": 0.003625,
+        "cacheWrite": 0.0
+      }
+    },
+    "mistral": {
+      "mistral-large": {
+        "input": 0.5,
+        "output": 1.5,
+        "cacheRead": 0.05,
+        "cacheWrite": 0.0
+      },
+      "mistral-large-latest": {
+        "input": 0.5,
+        "output": 1.5,
+        "cacheRead": 0.05,
+        "cacheWrite": 0.0
+      },
+      "mistral-medium-latest": {
+        "input": 1.5,
+        "output": 7.5,
+        "cacheRead": 0.15,
+        "cacheWrite": 0.0
+      },
+      "mistral-small": {
+        "input": 0.15,
+        "output": 0.6,
+        "cacheRead": 0.015,
+        "cacheWrite": 0.0
+      },
+      "mistral-small-latest": {
+        "input": 0.15,
+        "output": 0.6,
+        "cacheRead": 0.015,
+        "cacheWrite": 0.0
+      },
+      "devstral-medium-latest": {
+        "input": 0.4,
+        "output": 2.0,
+        "cacheRead": 0.04,
+        "cacheWrite": 0.0
+      },
+      "codestral-latest": {
+        "input": 0.3,
+        "output": 0.9,
+        "cacheRead": 0.03,
+        "cacheWrite": 0.0
+      },
+      "magistral-medium-latest": {
+        "input": 2.0,
+        "output": 5.0,
+        "cacheRead": 0.2,
+        "cacheWrite": 0.0
+      },
+      "magistral-small-latest": {
+        "input": 0.5,
+        "output": 1.5,
+        "cacheRead": 0.05,
+        "cacheWrite": 0.0
+      },
+      "open-mixtral-8x22b": {
+        "input": 2.0,
+        "output": 6.0,
+        "cacheRead": 0.2,
+        "cacheWrite": 0.0
+      },
+      "open-mixtral-8x7b": {
+        "input": 0.7,
+        "output": 0.7,
+        "cacheRead": 0.07,
+        "cacheWrite": 0.0
       }
     }
   },
@@ -68,5 +394,19 @@
     "output": 5.0,
     "cacheRead": 0.1,
     "cacheWrite": 1.0
+  },
+  "notes": {
+    "claude-sonnet-5": "introductory pricing $2/$10 through 2026-08-31; standard pricing $3/$15 thereafter",
+    "claude-fable-5": "Fable 5 is an Anthropic model (was incorrectly listed under zai-coding-plan in a prior revision)",
+    "glm-4-flash": "alias for the free GLM flash tier (glm-4.7-flash / glm-4.5-flash); price 0 = free",
+    "glm-4.7-flash": "free model; price 0 = free",
+    "glm-4.5-flash": "free model; price 0 = free",
+    "zai-coding-plan-cacheWrite": "Z.AI context-cache storage is limited-time free; cacheWrite 0",
+    "deepseek-chat": "deepseek-chat/deepseek-reasoner deprecated 2026-07-24 in favor of deepseek-v4-flash; rates identical",
+    "gemini-1.5": "per-token rates derived from official per-character pricing at ~4 chars/token (<=128K context tier)",
+    "gemini-2.5-pro": "<=200K context tier; >200K is $2.50 input / $15 output",
+    "openai-cacheWrite": "OpenAI does not bill a separate cache-write price; caching is automatic; cacheWrite 0",
+    "openai-legacy": "gpt-4o/o1/o3/gpt-4.1 are legacy; last known stable official rates (superseded by gpt-5.x line)",
+    "mistral-cacheRead": "Mistral cached input is 10% of input price; no separate cache-write charge"
   }
 }

@@ -19,6 +19,7 @@ import type {
   Timeline,
   TimelineEvent,
   TimelineInput,
+  TimelineMode,
   TimelineResult,
 } from '@generated/types'
 import { opencodeExportSchema, timelineSchema } from '@generated/schemas'
@@ -394,6 +395,8 @@ const escapeHtml = (s: string): string =>
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
 
+type DiffFlag = 'only-old' | 'only-new' | null
+
 const toolClass = (tool: string | undefined): string => (tool === undefined ? '' : tool.toLowerCase())
 
 const PX_PER_MS = 0.5
@@ -410,18 +413,22 @@ const eventTooltip = (e: TimelineEvent): string => {
   return escapeHtml(parts.join(' '))
 }
 
-const eventClasses = (e: TimelineEvent): string => {
-  const baseClasses = ['event', e.type]
-  if (e.type === 'tool-call' || e.type === 'tool-result') {
-    const tc = toolClass(e.tool)
-    if (tc !== '') return [...baseClasses, tc].join(' ')
-  }
-  return baseClasses.join(' ')
+const eventClasses = (e: TimelineEvent, flag: DiffFlag = null): string => {
+  const baseClasses: readonly string[] = ['event', e.type]
+  const withTool =
+    e.type === 'tool-call' || e.type === 'tool-result'
+      ? (() => {
+          const tc = toolClass(e.tool)
+          return tc === '' ? baseClasses : [...baseClasses, tc]
+        })()
+      : baseClasses
+  const withFlag = flag === null ? withTool : [...withTool, flag]
+  return withFlag.join(' ')
 }
 
-const renderEvent = (e: TimelineEvent): string => {
+const renderEvent = (e: TimelineEvent, flag: DiffFlag = null): string => {
   const width = eventWidth(e)
-  const cls = eventClasses(e)
+  const cls = eventClasses(e, flag)
   const tooltip = eventTooltip(e)
   const statusAttr = e.status === 'error' ? ' data-status="error"' : ''
   const label =
@@ -435,8 +442,24 @@ const renderEvent = (e: TimelineEvent): string => {
   return `<div class="${cls}" style="width:${String(width)}px" data-tooltip="${tooltip}"${statusAttr}>${escapeHtml(label)}</div>`
 }
 
-const renderEventRow = (events: readonly TimelineEvent[]): string =>
-  events.map(renderEvent).join('')
+const renderEventRow = (
+  events: readonly TimelineEvent[],
+  otherKeys?: ReadonlySet<string>,
+  side?: Side,
+): string =>
+  events
+    .map((e) => {
+      const flag: DiffFlag =
+        otherKeys !== undefined && side !== undefined
+          ? otherKeys.has(eventDiffKey(e))
+            ? null
+            : side === 'old'
+              ? 'only-old'
+              : 'only-new'
+          : null
+      return renderEvent(e, flag)
+    })
+    .join('')
 
 const TIMELINE_CSS = `body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin:20px;color:#222}
 h1{font-size:16px}
@@ -458,6 +481,8 @@ h1{font-size:16px}
 .event.step-finish{background:#000;min-width:2px}
 .event.text{background:#ddd;color:#000}
 .event[data-status="error"]{border:2px solid #d32f2f}
+.event.only-old{outline:2px solid #d32f2f;outline-offset:-1px}
+.event.only-new{outline:2px solid #2e7d32;outline-offset:-1px}
 .event:hover::after{content:attr(data-tooltip);position:absolute;bottom:100%;left:0;background:#000;padding:4px;border-radius:3px;white-space:nowrap;z-index:10;color:#fff}
 .legend{margin:10px 0;font-size:12px}
 .legend span{display:inline-block;padding:2px 6px;margin-right:8px;color:#fff;border-radius:3px}
@@ -468,7 +493,7 @@ h1{font-size:16px}
 .swimlane[data-depth="3"]{border-left-color:#bbb;margin-left:60px}
 .swimlane-label{font-size:10px;color:#555;min-width:60px;padding:4px 0;align-self:center;flex-shrink:0}`
 
-const renderLegend = (): string =>
+const renderLegend = (mode: TimelineMode): string =>
   '<div class="legend">' +
   '<span class="event reasoning">reasoning</span>' +
   '<span class="event tool-call bash">bash</span>' +
@@ -477,6 +502,9 @@ const renderLegend = (): string =>
   '<span class="event tool-call read">read</span>' +
   '<span class="event tool-call">other tool</span>' +
   '<span class="event step-finish">step-finish</span>' +
+  (mode === 'tree-diff'
+    ? '<span class="event only-old">OLD only</span><span class="event only-new">NEW only</span>'
+    : '') +
   '</div>'
 
 interface Swimlane {
@@ -517,16 +545,24 @@ const groupSwimlanes = (events: readonly TimelineEvent[]): readonly Swimlane[] =
 const swimlaneLabel = (lane: Swimlane): string =>
   lane.depth === 0 ? 'main' : `depth ${String(lane.depth)}`
 
-const renderSwimlane = (lane: Swimlane): string =>
+const renderSwimlane = (
+  lane: Swimlane,
+  otherKeys?: ReadonlySet<string>,
+  side?: Side,
+): string =>
   `<div class="swimlane" data-depth="${String(lane.depth)}">` +
   `<div class="swimlane-label">${escapeHtml(swimlaneLabel(lane))}</div>` +
-  `<div class="events">${renderEventRow(lane.events)}</div>` +
+  `<div class="events">${renderEventRow(lane.events, otherKeys, side)}</div>` +
   `</div>`
 
-const renderSideLanes = (events: readonly TimelineEvent[]): string => {
+const renderSideLanes = (
+  events: readonly TimelineEvent[],
+  otherKeys?: ReadonlySet<string>,
+  side?: Side,
+): string => {
   const lanes = groupSwimlanes(events)
   if (lanes.length === 0) return '<div class="events"></div>'
-  return lanes.map(renderSwimlane).join('')
+  return lanes.map((l) => renderSwimlane(l, otherKeys, side)).join('')
 }
 
 const renderSideBySide = (tl: Timeline): string =>
@@ -534,6 +570,27 @@ const renderSideBySide = (tl: Timeline): string =>
   `<div class="side old"><h2>OLD (baseline)</h2>${renderSideLanes(tl.old)}</div>` +
   `<div class="side new"><h2>NEW (with pack)</h2>${renderSideLanes(tl.new)}</div>` +
   `</div>`
+
+const eventDiffKey = (e: TimelineEvent): string =>
+  e.tool === undefined ? e.type : `${e.type}:${e.tool}`
+
+const diffKeysOf = (events: readonly TimelineEvent[]): ReadonlySet<string> =>
+  new Set(events.map(eventDiffKey))
+
+/**
+ * tree-diff: side-by-side lanes, but events whose `type(+tool)` appears on only
+ * one side are outlined — red for OLD-only, green for NEW-only. Comparison is
+ * coarse on purpose (tool+type), so a renamed/swapped tool still surfaces as a
+ * diff without false-precision on timing.
+ */
+const renderTreeDiff = (tl: Timeline): string => {
+  const oldKeys = diffKeysOf(tl.old)
+  const newKeys = diffKeysOf(tl.new)
+  return `<div class="timeline">` +
+    `<div class="side old"><h2>OLD (baseline)</h2>${renderSideLanes(tl.old, newKeys, 'old')}</div>` +
+    `<div class="side new"><h2>NEW (with pack)</h2>${renderSideLanes(tl.new, oldKeys, 'new')}</div>` +
+    `</div>`
+}
 
 const renderMerged = (tl: Timeline): string => {
   const all = [...tl.old, ...tl.new].sort(
@@ -546,7 +603,9 @@ export const renderTimelineHtml = (tl: Timeline): string => {
   const body =
     tl.mode === 'merged'
       ? renderMerged(tl)
-      : renderSideBySide(tl)
+      : tl.mode === 'tree-diff'
+        ? renderTreeDiff(tl)
+        : renderSideBySide(tl)
   const dataJson = escapeHtml(JSON.stringify(tl))
   return `<!DOCTYPE html>
 <html lang="en">
@@ -557,7 +616,7 @@ export const renderTimelineHtml = (tl: Timeline): string => {
 </head>
 <body>
 <h1>testaipack timeline<span class="mode-badge">${escapeHtml(tl.mode)}</span></h1>
-${renderLegend()}
+${renderLegend(tl.mode)}
 ${body}
 <script type="application/json" id="timeline-data">${dataJson}</script>
 </body>

@@ -119,7 +119,7 @@ const runOpencodeLaunch = (
             'opencode-launch',
             side,
             2,
-            `docker pull failed: ${e.stderr}`,
+            `docker image '${docker.image}' unavailable. Build it with: bash scripts/build-docker-image.sh — or override with: --docker-image <image>. (${e.stderr.trim()})`,
             checks,
             { image: docker.image, stderr: e.stderr, ...(e.timedOut ? { timedOut: true } : {}) },
           ),
@@ -406,12 +406,7 @@ const formatLine = (c: PreflightCheck): string => {
 
 export const preflight = (input: PreflightInputExt): Effect.Effect<PreflightResult, PhaseError> =>
   Effect.gen(function* () {
-    const logPath = path.join(
-      input.runInput.workspacePath,
-      input.manifest.runId,
-      'results',
-      'preflight.log',
-    )
+    const logPath = path.join(input.runInput.outputPath, 'preflight.log')
     yield* ensureResultsDir(logPath)
 
     if (!input.runInput.preflightEnabled) {

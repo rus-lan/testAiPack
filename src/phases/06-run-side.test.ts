@@ -14,6 +14,7 @@ import {
   DOOM_LOOP_THRESHOLD,
 } from './06-run-side.js'
 import type { AnalyzeInput } from './06-run-side.js'
+import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import type { RunInput, Manifest, WorkspaceTree, EnvVarSet, RunSideInput, ErrorCode } from '@generated/types'
 import type { OpencodeRunOptions } from '../opencode/cli.js'
 
@@ -762,12 +763,12 @@ describe('phase 06 — run-side docker threading', () => {
     const input = buildInput(root, { runInput: { isolation: 'docker' } }) as RunSideInput & {
       dockerImage?: string
     }
-    input.dockerImage = 'opencode/opencode:latest'
+    input.dockerImage = 'custom/opencode:test'
     await runP(runSide(input))
     const runCalls = runMock.mock.calls.map((c) => c[0])
     expect(runCalls.length).toBeGreaterThan(0)
-    expect(runCalls.every((o) => o.docker?.image === 'opencode/opencode:latest')).toBe(true)
-    expect(exportMock.mock.calls[0]?.[2]).toEqual({ image: 'opencode/opencode:latest' })
+    expect(runCalls.every((o) => o.docker?.image === 'custom/opencode:test')).toBe(true)
+    expect(exportMock.mock.calls[0]?.[2]).toEqual({ image: 'custom/opencode:test' })
   })
 
   it('isolation=home ⇒ no docker spec on opencode calls', async () => {
@@ -786,6 +787,6 @@ describe('phase 06 — run-side docker threading', () => {
     const input = buildInput(root, { runInput: { isolation: 'docker' } })
     await runP(runSide(input))
     const runCalls = runMock.mock.calls.map((c) => c[0])
-    expect((runCalls[0] as OpencodeRunOptions).docker?.image).toBe('opencode/opencode:latest')
+    expect((runCalls[0] as OpencodeRunOptions).docker?.image).toBe(DEFAULT_OPENCODE_IMAGE)
   })
 })
