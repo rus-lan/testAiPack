@@ -15,9 +15,13 @@ import path from 'node:path'
 import type { PreflightCheck, PreflightInput, PreflightResult, Side } from '@generated/types'
 import type { PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
 import { run as opencodeRun, version as opencodeVersion } from '../opencode/cli.js'
-import type { OpencodeError } from '../opencode/cli.js'
-import { appendFile, ensureDir, exists } from '../util/fs.js'
+import type { DockerExec, OpencodeError } from '../opencode/cli.js'
+import { ensureImage } from '../isolation/docker-runner.js'
+import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
+import type { DockerError } from '../isolation/docker-runner.js'
+import { appendFile, ensureDir, exists, readFile } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
+import { isRecord } from '../util/types.js'
 import type { PhaseError } from '../errors.js'
 import { preflightError } from '../errors.js'
 
@@ -25,15 +29,27 @@ import { preflightError } from '../errors.js'
  * Local input extension: phase 05 needs the phase-03 outcome (instructions) to
  * perform accurate pack-visibility (gate 4) and baseline-leak (gate 5) checks
  * for every pack kind including 'all'. The contract `PreflightInput` carries
- * only `homePaths`; this extension adds the 03→05 hand-off.
+ * only `homePaths`; this extension adds the 03→05 hand-off and the docker image
+ * (resolved by phase 04) used when `isolation === 'docker'`.
  */
 export interface PreflightInputExt extends PreflightInput {
   readonly packInstall?: PackInstallOutcome
+  readonly dockerImage?: string
 }
 
 /** opencode layout: skills/agents/plugins are plural, command is singular. */
 const sectionDir = (section: 'agents' | 'commands'): string =>
   section === 'agents' ? 'agents' : 'command'
+
+/**
+ * Derive the docker exec spec when the run is in docker isolation. The image
+ * comes from phase 04 (which applies the `--docker-image` override or the
+ * default); we fall back to the default here defensively.
+ */
+const dockerFromInput = (input: PreflightInputExt): DockerExec | undefined =>
+  input.runInput.isolation === 'docker'
+    ? { image: input.dockerImage ?? DEFAULT_OPENCODE_IMAGE }
+    : undefined
 
 const AUTH_MISSING_RE = /API_KEY|credentials?\s+(not|missing|absent|are\s+not)|not authenticated|no.*provider/i
 
@@ -90,11 +106,27 @@ const stderrOf = (e: OpencodeError): string => e.stderr
 const runOpencodeLaunch = (
   homeDir: string,
   side: Side,
+  docker: DockerExec | undefined,
   checks: readonly PreflightCheck[],
 ): Effect.Effect<PreflightCheck, PhaseError> =>
   Effect.gen(function* () {
     const start = Date.now()
-    yield* opencodeVersion(homeDir).pipe(
+    if (docker !== undefined) {
+      yield* ensureImage(docker.image).pipe(
+        Effect.catchAll((e: DockerError) =>
+          fail(
+            'E_PREFLIGHT_FAILED',
+            'opencode-launch',
+            side,
+            2,
+            `docker pull failed: ${e.stderr}`,
+            checks,
+            { image: docker.image, stderr: e.stderr, ...(e.timedOut ? { timedOut: true } : {}) },
+          ),
+        ),
+      )
+    }
+    yield* opencodeVersion(homeDir, docker).pipe(
       Effect.catchAll((e) =>
         isTimeout(e)
           ? fail('E_PREFLIGHT_TIMEOUT', 'opencode-launch', side, 2, 'opencode --version timed out', checks)
@@ -113,12 +145,13 @@ const runOpencodeLaunch = (
   })
 
 const gateOpencodeLaunch = (
-  homePaths: PreflightInput['homePaths'],
+  input: PreflightInputExt,
   checks: readonly PreflightCheck[],
 ): Effect.Effect<readonly PreflightCheck[], PhaseError> =>
   Effect.gen(function* () {
-    const oldCheck = yield* runOpencodeLaunch(homePaths.old, 'old', checks)
-    const newCheck = yield* runOpencodeLaunch(homePaths.new, 'new', checks)
+    const docker = dockerFromInput(input)
+    const oldCheck = yield* runOpencodeLaunch(input.homePaths.old, 'old', docker, checks)
+    const newCheck = yield* runOpencodeLaunch(input.homePaths.new, 'new', docker, checks)
     return [oldCheck, newCheck]
   })
 
@@ -127,6 +160,7 @@ const runAuthPing = (
   side: Side,
   model: string | undefined,
   timeoutMs: number,
+  docker: DockerExec | undefined,
   checks: readonly PreflightCheck[],
 ): Effect.Effect<PreflightCheck, PhaseError> =>
   Effect.gen(function* () {
@@ -138,6 +172,7 @@ const runAuthPing = (
       ...(model === undefined ? {} : { model }),
       prompt: 'reply with the single word OK',
       timeoutMs,
+      ...(docker === undefined ? {} : { docker }),
     }).pipe(
       Effect.catchAll((e) => {
         const stderr = stderrOf(e)
@@ -160,8 +195,9 @@ const gateAuthPing = (
   Effect.gen(function* () {
     const model = input.runInput.preflightModel
     const timeoutMs = input.runInput.timeouts.preflightSeconds * 1000
-    const oldCheck = yield* runAuthPing(input.homePaths.old, 'old', model, timeoutMs, checks)
-    const newCheck = yield* runAuthPing(input.homePaths.new, 'new', model, timeoutMs, checks)
+    const docker = dockerFromInput(input)
+    const oldCheck = yield* runAuthPing(input.homePaths.old, 'old', model, timeoutMs, docker, checks)
+    const newCheck = yield* runAuthPing(input.homePaths.new, 'new', model, timeoutMs, docker, checks)
     return [oldCheck, newCheck]
   })
 
@@ -206,13 +242,14 @@ const instructionName = (inst: RegistrationInstruction): string => {
     case 'plugin':
       return inst.name
     case 'config':
-      return inst.section
+      return inst.name
   }
 }
 
 const probeSkillName = (
   homePaths: PreflightInput['homePaths'],
   name: string,
+  docker: DockerExec | undefined,
 ): Effect.Effect<boolean> =>
   opencodeRun({
     homeDir: homePaths.new,
@@ -220,20 +257,39 @@ const probeSkillName = (
     agent: 'build',
     prompt: 'list available skills',
     timeoutMs: 30_000,
+    ...(docker === undefined ? {} : { docker }),
   }).pipe(
     Effect.map((out) => out.stdout.includes(name) || out.stderr.includes(name)),
     Effect.catchAll(() => Effect.succeed(false)),
   )
 
+const mcpPresentIn = (
+  homeDir: string,
+  name: string,
+): Effect.Effect<boolean> =>
+  Effect.gen(function* () {
+    const cfgPath = path.join(homeDir, '.config/opencode/opencode.json')
+    if (!(yield* exists(cfgPath))) return false
+    const raw = yield* readFile(cfgPath).pipe(Effect.catchAll(() => Effect.succeed('')))
+    if (raw === '') return false
+    try {
+      const obj = JSON.parse(raw) as unknown
+      return isRecord(obj) && isRecord(obj['mcp']) && Object.prototype.hasOwnProperty.call(obj['mcp'], name)
+    } catch {
+      return false
+    }
+  })
+
 const instructionVisible = (
   inst: RegistrationInstruction,
   homePaths: PreflightInput['homePaths'],
+  docker: DockerExec | undefined,
 ): Effect.Effect<boolean> =>
   Effect.gen(function* () {
     if (inst.kind === 'symlink') {
       const hasMd = yield* exists(path.join(inst.target, 'SKILL.md'))
       if (!hasMd) return false
-      return yield* probeSkillName(homePaths, inst.name)
+      return yield* probeSkillName(homePaths, inst.name, docker)
     }
     if (inst.kind === 'file') {
       return yield* exists(
@@ -244,7 +300,7 @@ const instructionVisible = (
       const dir = path.join(homePaths.new, '.config/opencode/plugins')
       return (yield* exists(path.join(dir, `${inst.name}.js`))) || (yield* exists(path.join(dir, inst.name)))
     }
-    return true
+    return yield* mcpPresentIn(homePaths.new, inst.name)
   })
 
 const gatePackVisibility = (
@@ -265,8 +321,9 @@ const gatePackVisibility = (
         },
       ]
     }
+    const docker = dockerFromInput(input)
     for (const inst of pack.instructions) {
-      const visible = yield* instructionVisible(inst, input.homePaths)
+      const visible = yield* instructionVisible(inst, input.homePaths, docker)
       if (!visible) {
         yield* fail(
           'E_PREFLIGHT_PACK_INVISIBLE',
@@ -300,7 +357,7 @@ const leakedOntoOld = (
     if (inst.kind === 'plugin') {
       return yield* exists(path.join(homePaths.old, '.config/opencode/plugins', inst.name))
     }
-    return false
+    return yield* mcpPresentIn(homePaths.old, inst.name)
   })
 
 const gateBaselineIdentical = (
@@ -314,8 +371,9 @@ const gateBaselineIdentical = (
     // sanity check before the pack-leak assertion).
     const model = input.runInput.preflightModel
     const timeoutMs = input.runInput.timeouts.preflightSeconds * 1000
-    yield* runOpencodeLaunch(input.homePaths.old, 'old', checks)
-    yield* runAuthPing(input.homePaths.old, 'old', model, timeoutMs, checks)
+    const docker = dockerFromInput(input)
+    yield* runOpencodeLaunch(input.homePaths.old, 'old', docker, checks)
+    yield* runAuthPing(input.homePaths.old, 'old', model, timeoutMs, docker, checks)
     yield* runBuildAgent(input.homePaths.old, 'old', checks)
     // Pack-leak assertion: no pack files/symlinks may have landed on the old side.
     const pack = input.packInstall
@@ -367,7 +425,7 @@ export const preflight = (input: PreflightInputExt): Effect.Effect<PreflightResu
     }
 
     const gates: readonly Gate[] = [
-      { name: 'opencode-launch', run: (c) => gateOpencodeLaunch(input.homePaths, c) },
+      { name: 'opencode-launch', run: (c) => gateOpencodeLaunch(input, c) },
       { name: 'auth-ping', run: (c) => gateAuthPing(input, c) },
       { name: 'build-agent', run: (c) => gateBuildAgent(input.homePaths, c) },
       { name: 'pack-visibility', run: (c) => gatePackVisibility(input, c) },

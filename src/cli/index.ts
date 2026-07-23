@@ -1,7 +1,7 @@
 /**
  * CLI entrypoint: parses argv with clipanion and dispatches to the phase
- * pipeline. Commands: `run` (default), `review`, `report`, `list`, `gc`,
- * `init`, `doctor`.
+ * pipeline. Commands: `run` (default), `review`, `report`, `compare`, `list`,
+ * `gc`, `init`, `doctor`.
  *
  * The `run` command forwards its raw trailing tokens (`Option.Proxy`) to phase
  * 00 (cli-parse), which owns flag parsing for the A/B run. Clipanion only
@@ -28,6 +28,11 @@ import {
   resolveWorkspace,
 } from './workspace-runs.js'
 import { runDoctor, hasCriticalFailure } from './doctor.js'
+import {
+  executeCompare,
+  isComparePerspective,
+  isCompareFormat,
+} from './compare.js'
 import { exists, writeJson } from '../util/fs.js'
 import { updateGitignore } from '../util/gitignore.js'
 import { mapIdeToBinary } from '../phases/12-review-workspace.js'
@@ -370,6 +375,48 @@ class GcCommand extends Command {
   }
 }
 
+class CompareCommand extends Command {
+  static override paths = [['compare']]
+  static override usage = Command.Usage({
+    category: 'Results',
+    description: 'Compare two runs side by side (cross-run A/B).',
+    details:
+      'Compares a chosen side of run-id-1 against run-id-2. `--perspective new-vs-new` compares the pack sides; `old-vs-old` compares baselines; `best` picks the higher-successRank side of each run; `auto` decides from the manifests (both pack → new-vs-new, both smoke-test → old-vs-old, otherwise best). `--format md|json` selects the output.',
+    examples: [
+      ['Pack then vs now', '$0 compare <run-id-1> <run-id-2> --perspective new-vs-new'],
+      ['JSON output', '$0 compare <run-id-1> <run-id-2> --format json'],
+    ],
+  })
+
+  runId1 = Option.String({ required: true, name: 'run-id-1' })
+  runId2 = Option.String({ required: true, name: 'run-id-2' })
+  perspective = Option.String('--perspective', 'auto')
+  format = Option.String('--format', 'md')
+  workspace = Option.String('--workspace', '.testaipack')
+
+  async execute(): Promise<number> {
+    const perspective = this.perspective
+    const format = this.format
+    if (!isComparePerspective(perspective)) {
+      console.error(
+        `invalid --perspective: ${perspective} (expected new-vs-new|old-vs-old|best|auto)`,
+      )
+      return 2
+    }
+    if (!isCompareFormat(format)) {
+      console.error(`invalid --format: ${format} (expected md|json)`)
+      return 2
+    }
+    return executeCompare({
+      runId1: this.runId1,
+      runId2: this.runId2,
+      perspective,
+      format,
+      workspace: this.workspace,
+    })
+  }
+}
+
 class InitCommand extends Command {
   static override paths = [['init']]
   static override usage = Command.Usage({
@@ -403,6 +450,7 @@ const COMMANDS: CommandClass[] = [
   RunCommand,
   ReviewCommand,
   ReportCommand,
+  CompareCommand,
   ListCommand,
   GcCommand,
   InitCommand,

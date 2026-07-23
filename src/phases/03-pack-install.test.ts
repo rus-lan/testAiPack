@@ -238,11 +238,68 @@ describe('phase 03 — packInstall', () => {
     }
   })
 
-  it('mcp → E_PACK_UNKNOWN_TYPE', async () => {
+  it('mcp (inline json): config instruction with parsed json, registeredIn=["mcp"]', async () => {
+    const built = await buildInput({
+      packRef: 'mcp:myserver:{"command":"npx","args":["-y","myserver"]}',
+    })
+    const result = await runP(packInstall(built.input))
+    expect(result.detectedType).toBe('mcp')
+    expect(result.registeredIn).toEqual(['mcp'])
+    expect(result.packPath).toBe(path.join(built.packDir, 'myserver'))
+    expect(result.instructions).toHaveLength(1)
+    expect(result.instructions[0]!.kind).toBe('config')
+    if (result.instructions[0]!.kind === 'config') {
+      expect(result.instructions[0]!.section).toBe('mcp')
+      expect(result.instructions[0]!.name).toBe('myserver')
+      expect(result.instructions[0]!.json).toEqual({ command: 'npx', args: ['-y', 'myserver'] })
+    }
+    expect(await runP(exists(path.join(built.packDir, 'myserver', 'mcp.json')))).toBe(true)
+    expect(cloneMock).not.toHaveBeenCalled()
+  })
+
+  it('mcp (@file): reads config file, parses json', async () => {
+    const cfgSrc = makeTempDir()
+    await runP(ensureDir(cfgSrc))
+    const cfgPath = path.join(cfgSrc, 'mcp.json')
+    await runP(writeFile(cfgPath, '{"command":"node","args":["srv.js"]}'))
+    const built = await buildInput({ packRef: `mcp:filesrv:@${cfgPath}` })
+    const result = await runP(packInstall(built.input))
+    expect(result.detectedType).toBe('mcp')
+    expect(result.registeredIn).toEqual(['mcp'])
+    if (result.instructions[0]!.kind === 'config') {
+      expect(result.instructions[0]!.name).toBe('filesrv')
+      expect(result.instructions[0]!.json).toEqual({ command: 'node', args: ['srv.js'] })
+    }
+  })
+
+  it('mcp (@file missing) → E_PACK_INVALID_REF', async () => {
+    const built = await buildInput({ packRef: 'mcp:myserver:@/nope/missing.json' })
+    const err = await runFlip(packInstall(built.input))
+    expect(err.code).toBe('E_PACK_INVALID_REF')
+  })
+
+  it('mcp (invalid json) → E_PACK_INVALID_REF', async () => {
+    const built = await buildInput({ packRef: 'mcp:myserver:{not json}' })
+    const err = await runFlip(packInstall(built.input))
+    expect(err.code).toBe('E_PACK_INVALID_REF')
+  })
+
+  it('mcp (no config, no standard file) → E_PACK_INVALID_REF', async () => {
     const built = await buildInput({ packRef: 'mcp:myserver' })
     const err = await runFlip(packInstall(built.input))
-    expect(err.code).toBe('E_PACK_UNKNOWN_TYPE')
-    expect(err.phase).toBe('pack-install')
+    expect(err.code).toBe('E_PACK_INVALID_REF')
+  })
+
+  it('mcp (no config in ref, standard mcp.json present) → reads it', async () => {
+    const built = await buildInput({ packRef: 'mcp:std' })
+    const packDir = path.join(built.packDir, 'std')
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'mcp.json'), '{"command":"x"}'))
+    const result = await runP(packInstall(built.input))
+    expect(result.detectedType).toBe('mcp')
+    if (result.instructions[0]!.kind === 'config') {
+      expect(result.instructions[0]!.json).toEqual({ command: 'x' })
+    }
   })
 
   it('all: repo with skills/ + commands/ → multiple sections + mixed instructions', async () => {

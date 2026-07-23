@@ -39,6 +39,7 @@ npm run contract:codegen
   --init @prompts/init.md \
   --verify "npm test && npm run lint" \
   --isolation home \
+  --docker-image opencode/opencode:latest \
   --opencode-version 0.5.0 \
   --aws --ssh --git \
   --pure-baseline \
@@ -67,12 +68,13 @@ npm run contract:codegen
 | Флаг                       | Тип                                       | По умолчанию                  | Описание                                                                                                         |
 | -------------------------- | ----------------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `<repo>` (позиционный)     | `string`                                  | — (обязательный)              | URL git-репозитория для A/B прогона.                                                                             |
-| `--pack <ref>`             | `string`                                  | —                             | Тестируемый пакет: git-URL, npm-pkg или локальный путь. Тип определяется автоматически.                          |
+| `--pack <ref>`             | `string`                                  | —                             | Тестируемый пакет: git-URL, npm-pkg, локальный путь или `mcp:<name>:<config>`. Тип определяется автоматически.    |
 | `--pack-type <type>`       | `skill\|plugin\|agent\|command\|mcp\|all` | авто                          | Переопределить тип пакета вместо авто-детекции.                                                                  |
 | `--prompt <text\|@file>`   | `string`                                  | — (обязательный)              | Промпт для агента на стороне сборки. `@file` читает содержимое файла.                                            |
 | `--init <text\|@file>`     | `string`                                  | —                             | Опц. промпт, запускаемый ДО `--prompt` в той же сессии (подготовка окружения).                                   |
 | `--verify <cmd>`           | `string`                                  | —                             | Опц. shell-команда после работы агента (например `npm test`). Учитывается в метриках успеха.                     |
-| `--isolation <mode>`       | `home\|docker`                            | `home`                        | Режим изоляции. `docker` — цель v0.3.                                                                            |
+| `--isolation <mode>`       | `home\|docker`                            | `home`                        | Режим изоляции. `docker` запускает opencode в `docker run --rm` контейнере (v0.3); при недоступном Docker daemon молча откатывается на `home`. |
+| `--docker-image <image>`   | `string`                                  | `opencode/opencode:latest`    | Образ для `--isolation=docker`. Игнорируется в режиме `home`.                                                                                   |
 | `--opencode-version <ver>` | `string`                                  | latest                        | Пин версии opencode для обеих сторон.                                                                            |
 | `--aws`                    | флаг                                      | off                           | Добавить AWS-credentials (`~/.aws/`) в whitelist изоляции.                                                       |
 | `--ssh`                    | флаг                                      | off                           | Добавить SSH-ключи (`~/.ssh/`) в whitelist.                                                                      |
@@ -97,6 +99,21 @@ npm run contract:codegen
 | `--pricing <path>`         | `string`                                  | встроенный                    | Своё дерево цен (USD за 1M токенов).                                                                             |
 | `--log-level <lvl>`        | `debug\|info\|warn\|error`                | `info`                        | Уровень логирования.                                                                                             |
 
+### Форматы `--pack`
+
+Тип пакета определяется по префиксу `--pack` (или фиксируется через `--pack-type`):
+
+| Ссылка                                               | Тип     | Что тестируется                                                             |
+| ---------------------------------------------------- | ------- | --------------------------------------------------------------------------- |
+| `github:owner/skill` / `git+https://…` / лок. путь   | `skill` | skill-пакет (каталог с `SKILL.md`).                                         |
+| `npm:myplugin`                                       | `plugin`| npm-модуль opencode-плагина (ставится через `opencode plugin`).             |
+| `agent:./build.md` / `agent:<git-url>`               | `agent` | одиночный агент (`.md`).                                                    |
+| `command:./run.md`                                    | `command`| одиночная команда (`.md`).                                                  |
+| `mcp:myserver:{"command":"npx","args":["-y","srv"]}` | `mcp`   | MCP-сервер: конфиг инлайн (v0.3).                                           |
+| `mcp:myserver:@./mcp.json`                            | `mcp`   | MCP-сервер: конфиг из файла (v0.3).                                         |
+
+MCP-конфиг вписывается в секцию `mcp` сгенерированного `opencode.json` на «новой» стороне (`mcp.<name>`); на baseline-стороне MCP-сервер отсутствует.
+
 ---
 
 ## Другие команды
@@ -105,11 +122,31 @@ npm run contract:codegen
 | --------------------- | ----------------------------------------------------------------------- |
 | `review [run-id]`     | Открыть multi-root VSCode workspace для прогона (old/new side-by-side). |
 | `report [run-id]`     | Перерендерить отчёт по сохранённым данным прогона.                      |
-| `compare <id1> <id2>` | Сравнить два прогона (v0.3, не реализовано).                          |
+| `compare <id1> <id2>` | Сравнить два любых прогона между собой (cross-run A/B).                 |
 | `gc`                  | Очистка старых прогонов из рабочего дерева.                             |
 | `list`                | Список всех прогонов в `<workspace>`.                                   |
 | `init`                | Инициализировать `<workspace>/.testaipack/`.                            |
 | `doctor`              | Проверить зависимости (opencode, git, bun, модель).                     |
+
+---
+
+## Сравнение двух прогонов (`compare`)
+
+`compare` сопоставляет **любые два прогона** между собой, а не только old/new внутри одного прогона. Удобно для вопросов «pack-X неделю назад vs сейчас» или «pack-X vs pack-Y». Команда берёт выбранную сторону каждого прогона и считает дельты (токены, время, стоимость, ранг успеха) через тот же движок, что и основной отчёт.
+
+| Флаг                       | По умолчанию | Описание                                                                                                          |
+| -------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `<run-id-1>` (позиционный) | —            | Первый прогон (база сравнения).                                                                                   |
+| `<run-id-2>` (позиционный) | —            | Второй прогон (сравнивается против первого; дельты = run2 minus run1).                                            |
+| `--perspective <p>`        | `auto`       | Какую сторону каждого прогона брать: `new-vs-new`, `old-vs-old`, `best` (макс. successRank), `auto`.             |
+| `--format <f>`             | `md`         | Формат вывода: `md` (Markdown-таблица) или `json`.                                                                |
+| `--workspace <path>`       | `.testaipack`| Корень рабочего дерева testaipack.                                                                                |
+
+Логика `--perspective auto`: оба прогона с pack → `new-vs-new`; оба smoke-test → `old-vs-old`; смешанный случай → `best`.
+
+```bash
+./dist/testaipack compare 2026-07-21_17-30-0a1b2c 2026-07-23_10-15-def456 --perspective new-vs-new
+```
 
 ---
 
@@ -125,7 +162,7 @@ npm run contract:codegen
 ```
 
 - **Контракт:** `contract/` — TypeSpec; компилируется в JSON Schema → `src/generated/` (TS-типы + Zod-схемы).
-- **Изоляция:** фейковый `$HOME` — фаза `src/phases/04-home-isolation.ts` (строитель дерева `src/isolation/home-builder.ts`); `docker` — цель v0.3.
+- **Изоляция:** фейковый `$HOME` — фаза `src/phases/04-home-isolation.ts` (строитель дерева `src/isolation/home-builder.ts`). Режим `--isolation=docker` (v0.3) прогоняет opencode в throwaway-контейнере (`src/isolation/docker-runner.ts`): хост-`$HOME` монтируется как `/home/opencode`, рабочая директория — как `/workspace`. При недоступном Docker daemon (фаза 00, `isDockerAvailable`) запуск автоматически откатывается на `home`-изоляцию.
 - **Метрики:** `src/metrics/` — извлечение из opencode-export, медиана/IQR, правило 1.5×IQR для значимости (v0.2).
 - **Цены:** `src/pricing/pricing.json` — USD за 1M токенов по провайдерам.
 

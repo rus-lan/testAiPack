@@ -26,7 +26,9 @@ import {
   exists,
   pathKind,
   readDir,
+  readFile,
   removeDir,
+  writeFile,
 } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import { packInstallError } from '../errors.js'
@@ -47,7 +49,7 @@ export type RegistrationInstruction =
       readonly target: string
     }
   | { readonly kind: 'plugin'; readonly name: string }
-  | { readonly kind: 'config'; readonly section: 'mcp'; readonly json: unknown }
+  | { readonly kind: 'config'; readonly section: 'mcp'; readonly name: string; readonly json: unknown }
 
 /**
  * Phase 03 outcome. Extends the contract `PackInstallResult` with:
@@ -345,6 +347,102 @@ const deliverAll = (
     }
   })
 
+const parseJsonConfig = (
+  text: string,
+  packRef: string,
+): Effect.Effect<unknown, PhaseError> =>
+  Effect.try({
+    try: () => JSON.parse(text) as unknown,
+    catch: (e): PhaseError =>
+      packInstallError(
+        `invalid mcp config json: ${text}`,
+        'E_PACK_INVALID_REF',
+        { packRef, reason: e instanceof Error ? e.message : String(e) },
+      ),
+  })
+
+const resolveMcpConfigText = (
+  ref: PackRef,
+  packDir: string,
+): Effect.Effect<string | undefined, PhaseError> =>
+  Effect.gen(function* () {
+    if (ref.config !== undefined) {
+      if (ref.config.startsWith('@')) {
+        const filePath = ref.config.slice(1)
+        const kind = yield* pathKind(filePath)
+        if (kind === 'missing') {
+          yield* failPack('E_PACK_INVALID_REF', `mcp config file not found: ${filePath}`, ref.raw, {
+            file: filePath,
+          })
+        }
+        return yield* readFile(filePath).pipe(
+          Effect.mapError((e: FsError) =>
+            packInstallError(`cannot read mcp config file: ${e.path}`, 'E_PACK_INVALID_REF', {
+              packRef: ref.raw,
+              file: e.path,
+            }),
+          ),
+        )
+      }
+      return ref.config
+    }
+    const mcpJson = path.join(packDir, 'mcp.json')
+    const configJson = path.join(packDir, 'config.json')
+    if (yield* exists(mcpJson)) {
+      return yield* readFile(mcpJson).pipe(
+        Effect.mapError((e: FsError) =>
+          packInstallError(`cannot read mcp.json: ${e.path}`, 'E_INSTALL_FAILED', { path: e.path }),
+        ),
+      )
+    }
+    if (yield* exists(configJson)) {
+      return yield* readFile(configJson).pipe(
+        Effect.mapError((e: FsError) =>
+          packInstallError(`cannot read config.json: ${e.path}`, 'E_INSTALL_FAILED', { path: e.path }),
+        ),
+      )
+    }
+    return undefined
+  })
+
+const deliverMcp = (
+  ref: PackRef,
+  packRoot: string,
+): Effect.Effect<Delivery, PhaseError> =>
+  Effect.gen(function* () {
+    const packDir = path.join(packRoot, ref.name)
+    yield* ensureDir(packDir).pipe(
+      Effect.mapError((e: FsError) =>
+        packInstallError(`cannot create pack dir: ${e.path}`, 'E_INSTALL_FAILED', {
+          path: e.path,
+        }),
+      ),
+    )
+
+    const configText = yield* resolveMcpConfigText(ref, packDir)
+    if (configText === undefined) {
+      yield* failPack(
+        'E_PACK_INVALID_REF',
+        `no mcp config provided for ${ref.name} (expected mcp:<name>:<json> or mcp:<name>:@<file>)`,
+        ref.raw,
+      )
+    }
+
+    const resolved = configText ?? ''
+    const parsed = yield* parseJsonConfig(resolved, ref.raw)
+    yield* writeFile(path.join(packDir, 'mcp.json'), resolved).pipe(
+      Effect.mapError((e: FsError) =>
+        packInstallError(`cannot persist mcp.json: ${e.path}`, 'E_INSTALL_FAILED', { path: e.path }),
+      ),
+    )
+
+    return {
+      packPath: packDir,
+      registeredIn: ['mcp'],
+      instructions: [{ kind: 'config', section: 'mcp', name: ref.name, json: parsed }],
+    }
+  })
+
 const runDelivery = (
   type: PackType,
   detected: PackRef,
@@ -363,11 +461,7 @@ const runDelivery = (
     case 'all':
       return deliverAll(detected, packRoot, seconds)
     case 'mcp':
-      return Effect.fail(
-        packInstallError('mcp packs are not supported in MVP (v0.3)', 'E_PACK_UNKNOWN_TYPE', {
-          packRef: detected.raw,
-        }),
-      )
+      return deliverMcp(detected, packRoot)
   }
 }
 

@@ -107,6 +107,8 @@ const buildRepos = async (tree: WorkspaceTree): Promise<void> => {
   }
 }
 
+const stripStyle = (html: string): string => html.replace(/<style>[\s\S]*?<\/style>/, '')
+
 beforeEach(async () => {
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   const fsActual = await vi.importActual<typeof import('../util/fs.js')>('../util/fs.js')
@@ -185,6 +187,47 @@ describe('diff — html', () => {
     expect(existsSync(r.htmlPath!)).toBe(true)
     const html = await runP(readFile(r.htmlPath!))
     expect(html).toContain('<style>')
+  })
+
+  it('side.html uses side-by-side layout with file list', async () => {
+    const tree = makeWorkspace(1)
+    await buildRepos(tree)
+    await runP(writeFile(path.join(tree.appsOld[0] ?? '', 'a.txt'), 'edit\n'))
+    const runInput = makeRunInput({ runs: 1, diffHtml: true })
+    const result = await runP(diff({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    const html = await runP(readFile(result.diff.old.runs[0]!.htmlPath!))
+    const body = stripStyle(html)
+    expect(body).toContain('d2h-file-list')
+    expect(body).toContain('d2h-files-diff')
+    expect(html).toContain('run-1')
+  })
+
+  it('side.html is self-contained (inlined diff2html CSS, no external http(s) links)', async () => {
+    const tree = makeWorkspace(1)
+    await buildRepos(tree)
+    await runP(writeFile(path.join(tree.appsOld[0] ?? '', 'a.txt'), 'edit\n'))
+    const runInput = makeRunInput({ runs: 1, diffHtml: true })
+    const result = await runP(diff({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    const html = await runP(readFile(result.diff.old.runs[0]!.htmlPath!))
+    expect(html).toContain('--d2h-bg-color')
+    expect(html).not.toMatch(/src=["']https?:\/\//i)
+    expect(html).not.toMatch(/<link[^>]+href=["']https?:\/\//i)
+    expect(html).not.toMatch(/@import\s+url\s*\(\s*https?:\/\//i)
+  })
+
+  it('empty patch -> renderNothingWhenEmpty: file list shows 0, no diff file blocks', async () => {
+    const tree = makeWorkspace(1)
+    await buildRepos(tree)
+    const runInput = makeRunInput({ runs: 1, diffHtml: true })
+    const result = await runP(diff({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    const r = result.diff.old.runs[0]!
+    expect(r.noChanges).toBe(true)
+    const html = await runP(readFile(r.htmlPath!))
+    expect(html).toContain('<html')
+    expect(html).toContain('--d2h-bg-color')
+    const body = stripStyle(html)
+    expect(body).toContain('Files changed (0)')
+    expect(body).not.toContain('d2h-file-wrapper')
   })
 
   it('diffHtml=false -> htmlPath omitted', async () => {

@@ -38,6 +38,7 @@ import { isDockerAvailable } from '../util/docker.js'
 
 export type CliParseOutput = CliParseResult & {
   readonly flagDefaults: Readonly<Record<string, unknown>>
+  readonly dockerImage?: string
 }
 
 const DEFAULT_RUNS = 3
@@ -81,6 +82,7 @@ const configFileSchema = z
     judgeFiles: z.array(z.string()).optional(),
     runs: z.number().int().optional(),
     isolation: isolationModeSchema.optional(),
+    dockerImage: z.string().optional(),
     opencodeVersion: z.string().optional(),
     pureBaseline: z.boolean().optional(),
     preflightEnabled: z.boolean().optional(),
@@ -108,6 +110,7 @@ interface CliRaw {
   readonly judges: readonly string[]
   readonly runs?: number
   readonly isolation?: IsolationMode
+  readonly dockerImage?: string
   readonly packRef?: string
   readonly packType?: PackType
   readonly formats: readonly (OutputFormat | 'all')[]
@@ -148,6 +151,7 @@ const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '--runs': 'runs',
   '-n': 'runs',
   '--isolation': 'isolation',
+  '--docker-image': 'dockerImage',
   '--pack': 'packRef',
   '--pack-type': 'packType',
   '--timeline-mode': 'timelineMode',
@@ -277,6 +281,7 @@ const parseValueFlag = (
     }
     if (dest === 'repoUrl') return setScalar(acc, 'repoUrl', raw)
     if (dest === 'packRef') return setScalar(acc, 'packRef', raw)
+    if (dest === 'dockerImage') return setScalar(acc, 'dockerImage', raw)
     if (dest === 'outputPath') return setScalar(acc, 'outputPath', raw)
     if (dest === 'workspacePath') return setScalar(acc, 'workspacePath', raw)
     if (dest === 'opencodeVersion') return setScalar(acc, 'opencodeVersion', raw)
@@ -574,6 +579,8 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const isolationResolved = yield* resolveIsolation(requestedIsolation)
     const { isolation, dockerDowngraded } = isolationResolved
 
+    const dockerImagePick = pick(cli.dockerImage, cfg?.dockerImage)
+
     const packRefPick = pick(cli.packRef, cfg?.packRef)
     const explicitPackType = pick(cli.packType, cfg?.packType)
     const packTypeResolved = yield* Effect.gen(function* () {
@@ -693,5 +700,10 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       configSource,
     }
 
-    return { runInput, configSource, flagDefaults }
+    return {
+      runInput,
+      configSource,
+      flagDefaults,
+      ...(dockerImagePick.value === undefined ? {} : { dockerImage: dockerImagePick.value }),
+    }
   })

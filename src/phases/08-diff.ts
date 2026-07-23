@@ -26,9 +26,36 @@ import { ensureDir, exists, writeFile } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import { addAll, diffCached, diffStatFull } from '../util/git.js'
 import type { GitError } from '../util/git.js'
+import { DIFF2HTML_CSS } from './08-diff-css.js'
 
-const BASE_CSS = `body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin:1rem;color:#222}
+const EXTRA_CSS = `body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin:1rem;color:#222;background:#fff}
+h1{font-size:1rem;font-weight:600;margin:0 0 1rem}
 .d2h-no-changes{color:#666;font-size:1.1rem}`
+
+const renderSideHtml = (patch: string, runId: string, side: Side, runIndex: number): string => {
+  const diffBody = renderDiffHtml(patch, {
+    outputFormat: 'side-by-side',
+    drawFileList: true,
+    matching: 'lines',
+    renderNothingWhenEmpty: true,
+  })
+  const body = diffBody === '' ? '<p class="d2h-no-changes">No changes</p>' : diffBody
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>testaipack diff: ${side} run-${String(runIndex)} (${runId})</title>
+<style>
+${DIFF2HTML_CSS}
+${EXTRA_CSS}
+</style>
+</head>
+<body>
+<h1>testaipack diff — ${side} / run-${String(runIndex)} (${runId})</h1>
+${body}
+</body>
+</html>`
+}
 
 const fsCauseText = (e: FsError): string => {
   const c = e.cause
@@ -58,24 +85,15 @@ const toGitFailure = (side: Side, runIndex: number, what: string, e: GitError): 
     exitCode: e.exitCode,
   })
 
-const writeSideHtml = (htmlPath: string, patch: string): Effect.Effect<string, FsError> =>
+const writeSideHtml = (
+  htmlPath: string,
+  patch: string,
+  runId: string,
+  side: Side,
+  runIndex: number,
+): Effect.Effect<string, FsError> =>
   Effect.gen(function* () {
-    const body =
-      patch.trim() === ''
-        ? '<p class="d2h-no-changes">No changes</p>'
-        : renderDiffHtml(patch, { drawFileList: true, outputFormat: 'side-by-side' })
-    const doc = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>testaipack diff</title>
-<style>${BASE_CSS}</style>
-</head>
-<body>
-${body}
-</body>
-</html>`
-    yield* writeFile(htmlPath, doc)
+    yield* writeFile(htmlPath, renderSideHtml(patch, runId, side, runIndex))
     return htmlPath
   })
 
@@ -85,6 +103,7 @@ const diffOneRun = (
   destDir: string,
   diffRoot: string,
   diffHtml: boolean,
+  runId: string,
 ): Effect.Effect<DiffRunResult, PhaseError> =>
   Effect.gen(function* () {
     const outDir = path.join(diffRoot, side, `run-${String(runIndex)}`)
@@ -126,7 +145,7 @@ const diffOneRun = (
 
     const htmlPath =
       diffHtml
-        ? yield* writeSideHtml(path.join(outDir, 'side.html'), fullPatch).pipe(
+        ? yield* writeSideHtml(path.join(outDir, 'side.html'), fullPatch, runId, side, runIndex).pipe(
             Effect.mapError((e: FsError) =>
               toDiskFull(side, runIndex, `write side.html failed: ${fsCauseText(e)}`, 'disk-full', e),
             ),
@@ -147,11 +166,12 @@ const diffSide = (
   appDirs: readonly string[],
   diffRoot: string,
   diffHtml: boolean,
+  runId: string,
 ): Effect.Effect<DiffResult, PhaseError> =>
   Effect.gen(function* () {
     const runs = yield* Effect.all(
       appDirs.map((dir, i) =>
-        diffOneRun(side, i + 1, dir, diffRoot, diffHtml),
+        diffOneRun(side, i + 1, dir, diffRoot, diffHtml, runId),
       ),
       { concurrency: 1 },
     )
@@ -163,7 +183,8 @@ export const diff = (
 ): Effect.Effect<DiffResultOutput, PhaseError> =>
   Effect.gen(function* () {
     const { runInput, workspace } = input
-    const oldResult = yield* diffSide('old', workspace.appsOld, workspace.diff, runInput.diffHtml)
-    const newResult = yield* diffSide('new', workspace.appsNew, workspace.diff, runInput.diffHtml)
+    const runId = input.manifest.runId
+    const oldResult = yield* diffSide('old', workspace.appsOld, workspace.diff, runInput.diffHtml, runId)
+    const newResult = yield* diffSide('new', workspace.appsNew, workspace.diff, runInput.diffHtml, runId)
     return { diff: { old: oldResult, new: newResult } }
   })

@@ -320,6 +320,25 @@ describe('cliParse — docker downgrade', () => {
     expect(result.flagDefaults.dockerDowngraded).toBe(false)
     expect(dockerMock).not.toHaveBeenCalled()
   })
+
+  it('--docker-image is parsed and surfaced on the CliParseOutput', async () => {
+    dockerMock.mockReturnValue(Effect.succeed(true))
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({
+        argv: ['run', REPO, '--prompt', 'x', '--isolation', 'docker', '--docker-image', 'registry/oc:dev'],
+        cwd,
+      }),
+    )
+    expect(result.dockerImage).toBe('registry/oc:dev')
+  })
+
+  it('without --docker-image the dockerImage field is absent', async () => {
+    dockerMock.mockReturnValue(Effect.succeed(false))
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.dockerImage).toBeUndefined()
+  })
 })
 
 describe('cliParse — result shape', () => {

@@ -19,24 +19,40 @@ import type {
   HomeIsolationInput,
   HomeIsolationResult,
   HomeTree,
+  IsolationMode,
   Side,
 } from '@generated/types'
 import type { PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
 import { installPlugin } from '../opencode/cli.js'
 import type { OpencodeError } from '../opencode/cli.js'
-import { copyDir, copyFile, ensureDir, pathKind, removeDir, symlink, writeFile, writeJson } from '../util/fs.js'
+import { copyDir, copyFile, ensureDir, exists, pathKind, readFile, removeDir, symlink, writeFile, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
+import { isRecord } from '../util/types.js'
+import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import type { PhaseError } from '../errors.js'
 import { homeIsolationError } from '../errors.js'
 
 /**
  * Local input extension: widens `packInstall` from the contract's
  * `PackInstallResult` to phase 03's `PackInstallOutcome` (which carries the
- * `instructions` field). The orchestrator always has the outcome from phase 03;
- * this interface is the honest type for that hand-off.
+ * `instructions` field), and carries the optional `dockerImage` override
+ * (`--docker-image`) for `--isolation=docker`. The orchestrator always has the
+ * outcome from phase 03; this interface is the honest type for that hand-off.
  */
 export interface HomeIsolationInputExt extends HomeIsolationInput {
   readonly packInstall?: PackInstallOutcome
+  readonly dockerImage?: string
+}
+
+/**
+ * Local result extension: records the resolved `isolation` mode and, for docker
+ * mode, the image that downstream phases (05 preflight, 06 run-side) must use.
+ * The contract `HomeIsolationResult` is the wire shape; these fields are
+ * in-process plumbing only.
+ */
+export interface HomeIsolationResultExt extends HomeIsolationResult {
+  readonly isolation: IsolationMode
+  readonly dockerImage?: string
 }
 
 const BUILD_AGENT_TEMPLATE = `---
@@ -147,6 +163,33 @@ const copyAuth = (
     return marked.filter((r): r is string => r !== null)
   })
 
+const readOpendcodeConfig = (
+  cfgPath: string,
+): Effect.Effect<Record<string, unknown>, PhaseError> =>
+  Effect.gen(function* () {
+    if (!(yield* exists(cfgPath))) return {}
+    const raw = yield* readFile(cfgPath).pipe(
+      Effect.mapError((e: FsError) =>
+        setupFail(`cannot read opencode.json: ${e.path}`, { path: e.path }),
+      ),
+    )
+    try {
+      const obj = JSON.parse(raw) as unknown
+      return isRecord(obj) ? obj : {}
+    } catch {
+      return {}
+    }
+  })
+
+const mergeMcpServer = (
+  existing: Record<string, unknown>,
+  name: string,
+  json: unknown,
+): Record<string, unknown> => {
+  const prevMcp = isRecord(existing['mcp']) ? existing['mcp'] : {}
+  return { ...existing, mcp: { ...prevMcp, [name]: json } }
+}
+
 const applyInstruction = (
   inst: RegistrationInstruction,
   homeDir: string,
@@ -204,11 +247,21 @@ const applyInstruction = (
         ),
       )
     case 'config':
-      return Effect.fail(
-        setupFail('mcp config instructions are not supported in MVP (v0.3)', {
-          section: inst.section,
-        }),
-      )
+      return Effect.gen(function* () {
+        const cfgPath = path.join(homeDir, '.config/opencode/opencode.json')
+        const existing = yield* readOpendcodeConfig(cfgPath)
+        const merged = mergeMcpServer(existing, inst.name, inst.json)
+        yield* ensureDir(path.dirname(cfgPath)).pipe(
+          Effect.mapError((e: FsError) =>
+            setupFail(`cannot create opencode config dir: ${e.path}`, { path: e.path }),
+          ),
+        )
+        yield* writeFile(cfgPath, `${JSON.stringify(merged, null, 2)}\n`).pipe(
+          Effect.mapError((e: FsError) =>
+            setupFail(`cannot write opencode.json: ${e.path}`, { path: e.path, server: inst.name }),
+          ),
+        )
+      })
   }
 }
 
@@ -220,14 +273,32 @@ interface PackInfo {
 
 const packInfoFrom = (outcome: PackInstallOutcome): PackInfo => {
   const head = outcome.instructions.find((i) => i.kind !== 'config')
+  const configHead = outcome.instructions.find(
+    (i): i is Extract<RegistrationInstruction, { readonly kind: 'config' }> => i.kind === 'config',
+  )
   return {
     type: outcome.detectedType,
-    name: head === undefined ? 'pack' : head.name,
+    name: head === undefined ? (configHead === undefined ? 'pack' : configHead.name) : head.name,
     registeredIn: outcome.registeredIn,
   }
 }
 
-const buildConfigObject = (side: Side, pack: PackInfo | undefined): Record<string, unknown> => {
+const collectMcpServers = (
+  instructions: readonly RegistrationInstruction[] | undefined,
+): Record<string, unknown> => {
+  if (instructions === undefined) return {}
+  return instructions.reduce<Record<string, unknown>>(
+    (acc, inst) =>
+      inst.kind === 'config' ? { ...acc, [inst.name]: inst.json } : acc,
+    {},
+  )
+}
+
+const buildConfigObject = (
+  side: Side,
+  pack: PackInfo | undefined,
+  mcpServers: Record<string, unknown>,
+): Record<string, unknown> => {
   const base: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
     agent: {
@@ -238,14 +309,16 @@ const buildConfigObject = (side: Side, pack: PackInfo | undefined): Record<strin
     },
   }
   if (side === 'new' && pack !== undefined && pack.type !== null) {
-    return {
+    const withPack: Record<string, unknown> = {
       ...base,
       testaipack: {
         packName: pack.name,
         packType: pack.type,
         registeredIn: [...pack.registeredIn],
       },
+      ...(Object.keys(mcpServers).length > 0 ? { mcp: { ...mcpServers } } : {}),
     }
+    return withPack
   }
   return base
 }
@@ -271,25 +344,20 @@ interface SideResult {
 
 export const homeIsolation = (
   input: HomeIsolationInputExt,
-): Effect.Effect<HomeIsolationResult, PhaseError> =>
+): Effect.Effect<HomeIsolationResultExt, PhaseError> =>
   Effect.gen(function* () {
-    if (input.runInput.isolation === 'docker') {
-      yield* Effect.fail(
-        homeIsolationError(
-          'docker isolation is not supported in MVP (v0.3)',
-          'E_DOCKER_FAILED',
-          { isolation: 'docker' },
-        ),
-      )
-    }
+    const isolation = input.runInput.isolation
+    const dockerImage =
+      isolation === 'docker' ? (input.dockerImage ?? DEFAULT_OPENCODE_IMAGE) : undefined
     const runs = input.runInput.runs
     const sourceHome = os.homedir()
     const authFlags = input.runInput.auth
     const installSeconds = input.runInput.timeouts.installSeconds
     const packOutcome = input.packInstall
     const packInfo = packOutcome === undefined ? undefined : packInfoFrom(packOutcome)
-    const baselineObj = buildConfigObject('old', packInfo)
-    const newObj = buildConfigObject('new', packInfo)
+    const mcpServers = collectMcpServers(packOutcome?.instructions)
+    const baselineObj = buildConfigObject('old', packInfo, mcpServers)
+    const newObj = buildConfigObject('new', packInfo, mcpServers)
     const baselineCfg = JSON.stringify(baselineObj, null, 2)
     const newCfg = JSON.stringify(newObj, null, 2)
 
@@ -364,5 +432,7 @@ export const homeIsolation = (
       },
       envVars: [[...oldSide.envs], [...newSide.envs]],
       generatedConfigs: { baseline: baselineCfg, new: newCfg },
+      isolation,
+      ...(dockerImage === undefined ? {} : { dockerImage }),
     }
   })

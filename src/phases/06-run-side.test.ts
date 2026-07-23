@@ -743,3 +743,49 @@ describe('phase 06 — run-side', () => {
     expect(r.exitCode).toBeNull()
   })
 })
+
+describe('phase 06 — run-side docker threading', () => {
+  beforeEach(() => {
+    runMock.mockReset()
+    exportMock.mockReset()
+    spawnMock.mockReset()
+    runMock.mockImplementation(emitThenSucceed([stepFinish('stop')]))
+    exportMock.mockImplementation(() => Effect.succeed(validExport()))
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ stdout: '', stderr: '', exitCode: 0, durationMs: 1, timedOut: false }),
+    )
+  })
+
+  it('isolation=docker ⇒ opencode run + export called with the docker image', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, { runInput: { isolation: 'docker' } }) as RunSideInput & {
+      dockerImage?: string
+    }
+    input.dockerImage = 'opencode/opencode:latest'
+    await runP(runSide(input))
+    const runCalls = runMock.mock.calls.map((c) => c[0])
+    expect(runCalls.length).toBeGreaterThan(0)
+    expect(runCalls.every((o) => o.docker?.image === 'opencode/opencode:latest')).toBe(true)
+    expect(exportMock.mock.calls[0]?.[2]).toEqual({ image: 'opencode/opencode:latest' })
+  })
+
+  it('isolation=home ⇒ no docker spec on opencode calls', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, { runInput: { isolation: 'home' } })
+    await runP(runSide(input))
+    const runCalls = runMock.mock.calls.map((c) => c[0])
+    expect(runCalls.every((o) => o.docker === undefined)).toBe(true)
+    expect(exportMock.mock.calls[0]?.[2]).toBeUndefined()
+  })
+
+  it('isolation=docker without dockerImage falls back to the default image', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, { runInput: { isolation: 'docker' } })
+    await runP(runSide(input))
+    const runCalls = runMock.mock.calls.map((c) => c[0])
+    expect((runCalls[0] as OpencodeRunOptions).docker?.image).toBe('opencode/opencode:latest')
+  })
+})

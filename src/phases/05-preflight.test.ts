@@ -35,9 +35,36 @@ vi.mock('../opencode/cli.js', () => ({
   listMcp: vi.fn(),
 }))
 
+vi.mock('../isolation/docker-runner.js', () => ({
+  ensureImage: vi.fn(),
+  DEFAULT_OPENCODE_IMAGE: 'opencode/opencode:latest',
+  DockerError: class extends Error {
+    readonly _tag = 'DockerError'
+    readonly command: string
+    readonly exitCode: number | null
+    readonly stderr: string
+    readonly timedOut: boolean
+    constructor(args: {
+      command: string
+      exitCode: number | null
+      stderr: string
+      timedOut: boolean
+      cause?: unknown
+    }) {
+      super(`docker ${args.command} failed`)
+      this.command = args.command
+      this.exitCode = args.exitCode
+      this.stderr = args.stderr
+      this.timedOut = args.timedOut
+    }
+  },
+}))
+
 const { version, run, OpencodeError } = await import('../opencode/cli.js')
 const versionMock = vi.mocked(version)
 const runMock = vi.mocked(run)
+const { ensureImage, DockerError } = await import('../isolation/docker-runner.js')
+const ensureImageMock = vi.mocked(ensureImage)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
@@ -135,10 +162,31 @@ const pluginOutcome = (name = 'myplugin'): PackInstallOutcome => ({
   instructions: [{ kind: 'plugin', name }],
 })
 
+const configOutcome = (name = 'myserver'): PackInstallOutcome => ({
+  packPath: '',
+  detectedType: 'mcp',
+  installLogPath: '/tmp/install.log',
+  registeredIn: ['mcp'],
+  instructions: [{ kind: 'config', section: 'mcp', name, json: { command: 'npx' } }],
+})
+
+const writeMcpConfig = async (homeDir: string, name: string): Promise<void> => {
+  const cfgDir = path.join(homeDir, '.config', 'opencode')
+  await runP(ensureDir(cfgDir))
+  await runP(
+    writeFile(
+      path.join(cfgDir, 'opencode.json'),
+      JSON.stringify({ mcp: { [name]: { command: 'npx' } } }),
+    ),
+  )
+}
+
 describe('phase 05 — preflight', () => {
   beforeEach(() => {
     versionMock.mockReset()
     runMock.mockReset()
+    ensureImageMock.mockReset()
+    ensureImageMock.mockImplementation(() => Effect.void)
     versionMock.mockImplementation(() => Effect.succeed('1.0.0'))
     runMock.mockImplementation(() =>
       Effect.succeed({
@@ -310,6 +358,24 @@ describe('phase 05 — preflight', () => {
     expect(err.context?.['exitCode']).toBe(3)
   })
 
+  it('pack-visibility mcp visible (opencode.json has mcp.<name> on new side) → exitCode=0', async () => {
+    const homes = await buildHomes()
+    await writeMcpConfig(homes.new, 'myserver')
+    const input = buildInput(homes, {}, configOutcome('myserver'))
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(result.allPassed).toBe(true)
+  })
+
+  it('pack-visibility mcp absent (no opencode.json on new side) → E_PREFLIGHT_PACK_INVISIBLE, exitCode=3', async () => {
+    const homes = await buildHomes()
+    const input = buildInput(homes, {}, configOutcome('myserver'))
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['check']).toBe('pack-visibility')
+  })
+
   it('smoke-test (no packInstall): gate 4 skipped, exitCode=0 if rest ok', async () => {
     const homes = await buildHomes()
     const input = buildInput(homes, {}, undefined)
@@ -361,12 +427,75 @@ describe('phase 05 — preflight', () => {
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
   })
+
+  it('docker mode: gate 1 calls ensureImage then version with the image', async () => {
+    const homes = await buildHomes()
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker' }, undefined),
+      dockerImage: 'opencode/opencode:latest',
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(ensureImageMock).toHaveBeenCalledWith('opencode/opencode:latest')
+    // version invoked with the docker exec spec for both sides
+    const dockerCalls = versionMock.mock.calls.filter(
+      (c) => (c[1] as { image?: string } | undefined)?.image !== undefined,
+    )
+    expect(dockerCalls.length).toBeGreaterThanOrEqual(2)
+    expect((dockerCalls[0]?.[1] as { image: string }).image).toBe('opencode/opencode:latest')
+  })
+
+  it('docker mode: ensureImage failure → E_PREFLIGHT_FAILED (docker pull failed)', async () => {
+    const homes = await buildHomes()
+    ensureImageMock.mockImplementation(() =>
+      Effect.fail(
+        new DockerError({ command: 'pull', exitCode: 1, stderr: 'manifest unknown', timedOut: false }),
+      ),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker' }, undefined),
+      dockerImage: 'opencode/missing:latest',
+    }
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
+    expect(err.context?.['check']).toBe('opencode-launch')
+    expect(err.message).toContain('docker pull failed')
+    expect(err.context?.['image']).toBe('opencode/missing:latest')
+  })
+
+  it('docker mode: auth-ping runs through the container (run called with docker spec)', async () => {
+    const homes = await buildHomes()
+    runMock.mockImplementation((opts: { docker?: { image: string } }) =>
+      Effect.succeed({
+        exitCode: 0,
+        stdout: opts.docker !== undefined ? 'OK-docker' : 'OK',
+        stderr: '',
+        durationMs: 5,
+        timedOut: false,
+      }),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker' }, undefined),
+      dockerImage: 'opencode/opencode:latest',
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    const dockerRunCalls = runMock.mock.calls.filter(
+      (c) => (c[0] as { docker?: { image: string } } | undefined)?.docker !== undefined,
+    )
+    expect(dockerRunCalls.length).toBeGreaterThan(0)
+    expect((dockerRunCalls[0]?.[0] as { docker: { image: string } }).docker.image).toBe(
+      'opencode/opencode:latest',
+    )
+  })
 })
 
 describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {
   beforeEach(() => {
     versionMock.mockReset()
     runMock.mockReset()
+    ensureImageMock.mockReset()
+    ensureImageMock.mockImplementation(() => Effect.void)
     versionMock.mockImplementation(() => Effect.succeed('1.0.0'))
     runMock.mockImplementation(() =>
       Effect.succeed({

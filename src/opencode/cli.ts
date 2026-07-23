@@ -1,7 +1,20 @@
 import { Data, Effect } from 'effect'
 import { spawnProcess, execCmd } from './spawn.js'
+import type { ExecOutput } from './spawn.js'
 import { inheritEnv } from '../util/env.js'
 import { isRecord } from '../util/types.js'
+import { dockerRun } from '../isolation/docker-runner.js'
+import type { DockerError } from '../isolation/docker-runner.js'
+
+/**
+ * When set, the opencode command runs inside a `docker run --rm` container with
+ * the host `cwd` → `/workspace` and host `homeDir` → `/home/opencode` mounted
+ * in. v0.3 `--isolation=docker` wires this from phase 06. Omitted ⇒ the legacy
+ * direct-spawn path (home isolation).
+ */
+export interface DockerExec {
+  readonly image: string
+}
 
 export interface OpencodeRunOptions {
   readonly homeDir: string
@@ -17,6 +30,7 @@ export interface OpencodeRunOptions {
   readonly env?: Record<string, string>
   readonly timeoutMs?: number
   readonly onEvent?: (event: unknown) => void
+  readonly docker?: DockerExec
 }
 
 export interface OpencodeRunResult {
@@ -53,6 +67,29 @@ const buildRunEnv = (opts: OpencodeRunOptions): Record<string, string> => {
       : { OPENCODE_CONFIG_CONTENT: opts.configContent }
   return buildBaseEnv(opts.homeDir, { ...configPart, ...(opts.env ?? {}) })
 }
+
+/**
+ * Docker env: only opencode-specific vars. `HOME` is set by `dockerRun`
+ * (`-e HOME=/home/opencode`); PATH/LANG come from the container image. Includes
+ * `OPENCODE_CONFIG_CONTENT` and the disable/pure flags passed via `opts.env`.
+ */
+const buildDockerEnv = (opts: OpencodeRunOptions): Record<string, string> => {
+  const configPart =
+    opts.configContent === undefined
+      ? {}
+      : { OPENCODE_CONFIG_CONTENT: opts.configContent }
+  return { ...configPart, ...(opts.env ?? {}) }
+}
+
+const dockerErrorToOpencode =
+  (command: string) =>
+  (d: DockerError): OpencodeError =>
+    new OpencodeError({
+      command,
+      exitCode: d.exitCode,
+      stderr: d.stderr,
+      timedOut: d.timedOut,
+    })
 
 export const buildRunArgs = (opts: OpencodeRunOptions): readonly string[] => [
   opts.prompt,
@@ -111,7 +148,6 @@ export const run = (
 ): Effect.Effect<OpencodeRunResult, OpencodeError> =>
   Effect.gen(function* () {
     const args = buildRunArgs(opts)
-    const env = buildRunEnv(opts)
     const onEvent = opts.onEvent
     const onLine =
       onEvent === undefined
@@ -123,6 +159,28 @@ export const run = (
             if (parsed.ok) onEvent(parsed.value)
           }
 
+    if (opts.docker !== undefined) {
+      const dres = yield* dockerRun({
+        image: opts.docker.image,
+        cwd: opts.cwd,
+        homeDir: opts.homeDir,
+        env: buildDockerEnv(opts),
+        command: [OPENCODE_BIN, ...args],
+        ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+        ...(onLine === undefined ? {} : { onStdoutLine: onLine }),
+      }).pipe(Effect.mapError(dockerErrorToOpencode('run')))
+      const sessionId = findSessionIdInText(dres.stdout)
+      return {
+        exitCode: dres.exitCode,
+        stdout: dres.stdout,
+        stderr: dres.stderr,
+        durationMs: dres.durationMs,
+        timedOut: false,
+        ...(sessionId === undefined ? {} : { sessionId }),
+      }
+    }
+
+    const env = buildRunEnv(opts)
     const out = yield* spawnProcess({
       command: OPENCODE_BIN,
       args,
@@ -178,13 +236,49 @@ const failOnNonZero = (
         }),
       )
 
-export const version = (homeDir: string): Effect.Effect<string, OpencodeError> =>
+interface SimpleOpencodeSpec {
+  readonly command: string
+  readonly args: readonly string[]
+  readonly homeDir: string
+  readonly docker?: DockerExec
+}
+
+/**
+ * Shared backend for the non-streaming opencode subcommands. In docker mode the
+ * command runs inside a container (cwd and homeDir both mount the isolated
+ * `$HOME`); otherwise it is a direct `execFile` in the isolated `$HOME`.
+ */
+const runSimpleOpencode = (
+  spec: SimpleOpencodeSpec,
+): Effect.Effect<ExecOutput, OpencodeError> =>
   Effect.gen(function* () {
-    const out = yield* execCmd({
+    if (spec.docker !== undefined) {
+      const dres = yield* dockerRun({
+        image: spec.docker.image,
+        cwd: spec.homeDir,
+        homeDir: spec.homeDir,
+        command: [OPENCODE_BIN, ...spec.args],
+      }).pipe(Effect.mapError(dockerErrorToOpencode(spec.command)))
+      return { stdout: dres.stdout, stderr: dres.stderr, exitCode: dres.exitCode }
+    }
+    return yield* execCmd({
       command: OPENCODE_BIN,
+      args: spec.args,
+      cwd: spec.homeDir,
+      env: buildBaseEnv(spec.homeDir, {}),
+    })
+  })
+
+export const version = (
+  homeDir: string,
+  docker?: DockerExec,
+): Effect.Effect<string, OpencodeError> =>
+  Effect.gen(function* () {
+    const out = yield* runSimpleOpencode({
+      command: 'version',
       args: ['--version'],
-      cwd: homeDir,
-      env: buildBaseEnv(homeDir, {}),
+      homeDir,
+      ...(docker === undefined ? {} : { docker }),
     })
     yield* failOnNonZero('version', out)
     return parseVersion(out.stdout)
@@ -193,13 +287,14 @@ export const version = (homeDir: string): Effect.Effect<string, OpencodeError> =
 export const exportSession = (
   homeDir: string,
   sessionId: string,
+  docker?: DockerExec,
 ): Effect.Effect<string, OpencodeError> =>
   Effect.gen(function* () {
-    const out = yield* execCmd({
-      command: OPENCODE_BIN,
+    const out = yield* runSimpleOpencode({
+      command: 'export',
       args: ['export', sessionId],
-      cwd: homeDir,
-      env: buildBaseEnv(homeDir, {}),
+      homeDir,
+      ...(docker === undefined ? {} : { docker }),
     })
     yield* failOnNonZero('export', out)
     return out.stdout
@@ -208,24 +303,28 @@ export const exportSession = (
 export const installPlugin = (
   homeDir: string,
   module: string,
+  docker?: DockerExec,
 ): Effect.Effect<void, OpencodeError> =>
   Effect.gen(function* () {
-    const out = yield* execCmd({
-      command: OPENCODE_BIN,
+    const out = yield* runSimpleOpencode({
+      command: 'plugin',
       args: ['plugin', module],
-      cwd: homeDir,
-      env: buildBaseEnv(homeDir, {}),
+      homeDir,
+      ...(docker === undefined ? {} : { docker }),
     })
     yield* failOnNonZero('plugin', out)
   })
 
-export const listMcp = (homeDir: string): Effect.Effect<string, OpencodeError> =>
+export const listMcp = (
+  homeDir: string,
+  docker?: DockerExec,
+): Effect.Effect<string, OpencodeError> =>
   Effect.gen(function* () {
-    const out = yield* execCmd({
-      command: OPENCODE_BIN,
+    const out = yield* runSimpleOpencode({
+      command: 'mcp',
       args: ['mcp', 'list'],
-      cwd: homeDir,
-      env: buildBaseEnv(homeDir, {}),
+      homeDir,
+      ...(docker === undefined ? {} : { docker }),
     })
     yield* failOnNonZero('mcp', out)
     return out.stdout
@@ -239,13 +338,14 @@ export const listMcp = (homeDir: string): Effect.Effect<string, OpencodeError> =
 export const dbQuery = (
   homeDir: string,
   sql: string,
+  docker?: DockerExec,
 ): Effect.Effect<unknown, OpencodeError> =>
   Effect.gen(function* () {
-    const out = yield* execCmd({
-      command: OPENCODE_BIN,
+    const out = yield* runSimpleOpencode({
+      command: 'db',
       args: ['db', 'query', sql, '--format', 'json'],
-      cwd: homeDir,
-      env: buildBaseEnv(homeDir, {}),
+      homeDir,
+      ...(docker === undefined ? {} : { docker }),
     })
     yield* failOnNonZero('db', out)
     return yield* Effect.try({

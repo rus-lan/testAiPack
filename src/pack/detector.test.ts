@@ -69,6 +69,29 @@ describe('detectPack', () => {
   it('mcp:<name> → Mcp/inline', async () => {
     const r = await run(detectPack('mcp:myserver'))
     expect(r).toMatchObject({ type: 'mcp', source: 'inline', name: 'myserver' })
+    expect(r.config).toBeUndefined()
+  })
+
+  it('mcp:<name>:<json> → Mcp/inline with config payload', async () => {
+    const r = await run(detectPack('mcp:myserver:{"command":"npx"}'))
+    expect(r).toMatchObject({ type: 'mcp', source: 'inline', name: 'myserver' })
+    expect(r.config).toBe('{"command":"npx"}')
+  })
+
+  it('mcp:<name>:@<file> → Mcp/inline with config file ref', async () => {
+    const r = await run(detectPack('mcp:myserver:@./cfg/mcp.json'))
+    expect(r).toMatchObject({ type: 'mcp', source: 'inline', name: 'myserver' })
+    expect(r.config).toBe('@./cfg/mcp.json')
+  })
+
+  it('mcp: (empty name) → PackDetectError', async () => {
+    const err = await runFlip(detectPack('mcp::{"command":"npx"}'))
+    expect(err).toBeInstanceOf(PackDetectError)
+  })
+
+  it('mcp:<name>: (empty config) → PackDetectError', async () => {
+    const err = await runFlip(detectPack('mcp:myserver:'))
+    expect(err).toBeInstanceOf(PackDetectError)
   })
 
   it('agent:<git url> → Agent/git', async () => {

@@ -25,7 +25,8 @@ import type {
 } from '@generated/types'
 import { opencodeExportSchema } from '@generated/schemas'
 import { run as opencodeRun, exportSession } from '../opencode/cli.js'
-import type { OpencodeError, OpencodeRunOptions, OpencodeRunResult } from '../opencode/cli.js'
+import type { DockerExec, OpencodeError, OpencodeRunOptions, OpencodeRunResult } from '../opencode/cli.js'
+import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import { spawnProcess } from '../opencode/spawn.js'
 import { appendFile, ensureDir, readJson, writeFile } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
@@ -58,6 +59,16 @@ type RunSideErrorCode =
  */
 export interface RunSideResultExt extends RunSideResult {
   readonly errorCode?: ErrorCode
+}
+
+/**
+ * Local extension of the contract RunSideInput: carries the docker image
+ * (resolved by phase 04) so that when `runInput.isolation === 'docker'` the
+ * opencode run + export execute inside the container. Only adds an optional
+ * field, so a plain `RunSideInput` is still assignable.
+ */
+export interface RunSideInputExt extends RunSideInput {
+  readonly dockerImage?: string
 }
 
 const fail = (
@@ -418,13 +429,18 @@ const runOnce = (
 // ---------------------------------------------------------------------------
 
 export const runSide = (
-  input: RunSideInput,
+  input: RunSideInputExt,
 ): Effect.Effect<RunSideResultExt, PhaseError> =>
   Effect.gen(function* () {
     const startedAt = Date.now()
     const { runInput, manifest, workspace, homeEnv, side, runIndex } = input
     const sessionId =
       input.sessionId === '' ? makeSessionId(manifest.runId, side, runIndex) : input.sessionId
+
+    const docker: DockerExec | undefined =
+      runInput.isolation === 'docker'
+        ? { image: input.dockerImage ?? DEFAULT_OPENCODE_IMAGE }
+        : undefined
 
     const sideRawDir = path.join(workspace.raw, side)
     yield* ensureDir(sideRawDir).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
@@ -475,6 +491,7 @@ export const runSide = (
       auto: true,
       ...(homeEnv.OPENCODE_PURE ? { pure: true } : {}),
       env: envRecord,
+      ...(docker === undefined ? {} : { docker }),
     })
 
     const state: RunState = { events: [], lastEvent: { time: startedAt } }
@@ -528,7 +545,7 @@ export const runSide = (
     yield* writeFile(eventsLogPath, ndjson).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
 
     const exportTimeoutMs = runMs
-    const exportStr: string = yield* exportSession(homeEnv.HOME, sessionId).pipe(
+    const exportStr: string = yield* exportSession(homeEnv.HOME, sessionId, docker).pipe(
       Effect.mapError((err: OpencodeError) =>
         fail('opencode export produced no data', 'E_RUN_CRASH', side, runIndex, {
           sessionId,

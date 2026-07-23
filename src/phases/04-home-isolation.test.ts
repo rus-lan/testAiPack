@@ -465,7 +465,7 @@ describe('phase 04 — homeIsolation', () => {
     expect(await runP(exists(oldCmdFile))).toBe(false)
   })
 
-  it('mcp config instruction → E_HOME_SETUP_FAILED (v0.3 not supported)', async () => {
+  it('mcp config instruction → writes mcp.<name> into opencode.json on new side', async () => {
     await useFakeHome(async (h) => {
       await runP(ensureDir(path.join(h, '.opencode')))
     })
@@ -474,20 +474,101 @@ describe('phase 04 — homeIsolation', () => {
       detectedType: 'mcp',
       installLogPath: '/tmp/install.log',
       registeredIn: ['mcp'],
-      instructions: [{ kind: 'config', section: 'mcp', json: { x: 1 } }],
+      instructions: [
+        {
+          kind: 'config',
+          section: 'mcp',
+          name: 'myserver',
+          json: { command: 'npx', args: ['-y', 'myserver'] },
+        },
+      ],
     }
     const input = buildInput({}, outcome)
-    const err = await runFlip(homeIsolation(input))
-    expect(err.code).toBe('E_HOME_SETUP_FAILED')
+    const result = await runP(homeIsolation(input))
+    const newCfgPath = path.join(
+      input.workspace.homeNew[0]!,
+      '.config',
+      'opencode',
+      'opencode.json',
+    )
+    const oldCfgPath = path.join(
+      input.workspace.homeOld[0]!,
+      '.config',
+      'opencode',
+      'opencode.json',
+    )
+    expect(await runP(exists(newCfgPath))).toBe(true)
+    const newCfg = JSON.parse(await runP(readFile(newCfgPath))) as Record<string, unknown>
+    const mcp = newCfg['mcp'] as Record<string, unknown>
+    expect(mcp).toBeDefined()
+    expect(mcp['myserver']).toEqual({ command: 'npx', args: ['-y', 'myserver'] })
+    expect(await runP(exists(oldCfgPath))).toBe(false)
+    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
+    expect((newJson['mcp'] as Record<string, unknown>)['myserver']).toBeDefined()
+    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
+    expect(baselineJson['mcp']).toBeUndefined()
   })
 
-  it('docker isolation (v0.3) → E_DOCKER_FAILED', async () => {
+  it('mcp config extends an existing opencode.json instead of overwriting', async () => {
+    await useFakeHome(async (h) => {
+      await runP(ensureDir(path.join(h, '.opencode')))
+    })
+    const outcome: PackInstallOutcome = {
+      packPath: '',
+      detectedType: 'mcp',
+      installLogPath: '/tmp/install.log',
+      registeredIn: ['mcp'],
+      instructions: [
+        { kind: 'config', section: 'mcp', name: 'srv2', json: { command: 'node' } },
+      ],
+    }
+    const input = buildInput({}, outcome)
+    // pre-place an existing opencode.json with a prior mcp server on the new side
+    const newHome = input.workspace.homeNew[0]!
+    const cfgDir = path.join(newHome, '.config', 'opencode')
+    await runP(ensureDir(cfgDir))
+    const preExisting = { otherKey: 1, mcp: { srv1: { command: 'a' } } }
+    await runP(writeFile(path.join(cfgDir, 'opencode.json'), JSON.stringify(preExisting)))
+    await runP(homeIsolation(input))
+    const after = JSON.parse(await runP(readFile(path.join(cfgDir, 'opencode.json')))) as Record<string, unknown>
+    expect(after['otherKey']).toBe(1)
+    const mcp = after['mcp'] as Record<string, unknown>
+    expect(mcp['srv1']).toEqual({ command: 'a' })
+    expect(mcp['srv2']).toEqual({ command: 'node' })
+  })
+
+  it('docker isolation (v0.3) builds HOMEs and records isolation/dockerImage', async () => {
     await useFakeHome(async (h) => {
       await runP(ensureDir(path.join(h, '.opencode')))
     })
     const input = buildInput({ isolation: 'docker' }, undefined)
-    const err = await runFlip(homeIsolation(input))
-    expect(err.code).toBe('E_DOCKER_FAILED')
+    const result = await runP(homeIsolation(input))
+    expect(result.isolation).toBe('docker')
+    expect(result.dockerImage).toBe('opencode/opencode:latest')
+    expect(result.homeTrees.old).toHaveLength(1)
+    expect(result.homeTrees.new).toHaveLength(1)
+  })
+
+  it('docker isolation honours a custom --docker-image override', async () => {
+    await useFakeHome(async (h) => {
+      await runP(ensureDir(path.join(h, '.opencode')))
+    })
+    const input: HomeIsolationInputExt = {
+      ...buildInput({ isolation: 'docker' }, undefined),
+      dockerImage: 'registry.example/oc:dev',
+    }
+    const result = await runP(homeIsolation(input))
+    expect(result.dockerImage).toBe('registry.example/oc:dev')
+  })
+
+  it('home isolation records isolation="home" and no dockerImage', async () => {
+    await useFakeHome(async (h) => {
+      await runP(ensureDir(path.join(h, '.opencode')))
+    })
+    const input = buildInput({ isolation: 'home' }, undefined)
+    const result = await runP(homeIsolation(input))
+    expect(result.isolation).toBe('home')
+    expect(result.dockerImage).toBeUndefined()
   })
 
   it('build.md written into every HOME (for preflight gate 3)', async () => {

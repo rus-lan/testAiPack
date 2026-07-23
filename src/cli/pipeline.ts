@@ -107,6 +107,7 @@ const runOneSide = (
   manifest: Manifest,
   workspace: WorkspaceTree,
   envs: readonly EnvVarSet[],
+  dockerImage: string | undefined,
   reporter: ProgressReporter,
 ): Effect.Effect<readonly RunSideResult[], PhaseError> =>
   Effect.forEach(
@@ -131,6 +132,7 @@ const runOneSide = (
         side,
         runIndex,
         sessionId: '',
+        ...(dockerImage === undefined ? {} : { dockerImage }),
       }).pipe(
         Effect.tap((r) =>
           Effect.sync(() => {
@@ -215,7 +217,13 @@ export const runPipeline = (
     const home = yield* timedPhase(
       4,
       'home-isolation',
-      homeIsolation({ runInput, manifest, workspace: treePaths, packInstall: pack }),
+      homeIsolation({
+        runInput,
+        manifest,
+        workspace: treePaths,
+        packInstall: pack,
+        ...(parsed.dockerImage === undefined ? {} : { dockerImage: parsed.dockerImage }),
+      }),
       reporter,
       () => `${String(runInput.runs * 2)} HOME trees`,
     )
@@ -233,6 +241,7 @@ export const runPipeline = (
         manifest,
         homePaths,
         packInstall: pack,
+        ...(home.dockerImage === undefined ? {} : { dockerImage: home.dockerImage }),
       }),
       reporter,
       (r) => (runInput.preflightEnabled ? `${String(r.checks.length)} checks passed` : 'skipped (--no-preflight)'),
@@ -246,8 +255,8 @@ export const runPipeline = (
     const start06 = Date.now()
     const both = yield* Effect.all(
       {
-        old: runOneSide('old', runInput, manifest, treePaths, oldEnvs, reporter),
-        new: runOneSide('new', runInput, manifest, treePaths, newEnvs, reporter),
+        old: runOneSide('old', runInput, manifest, treePaths, oldEnvs, home.dockerImage, reporter),
+        new: runOneSide('new', runInput, manifest, treePaths, newEnvs, home.dockerImage, reporter),
       },
       { concurrency: 2 },
     )
