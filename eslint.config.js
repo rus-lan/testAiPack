@@ -86,4 +86,12 @@ export default [
       'functional/prefer-readonly-type': 'off',
     },
   },
+  {
+    // clipanion command classes are OOP by design: instance fields backing
+    // Option.* declarations and `static paths`/`usage` must stay mutable.
+    files: ['src/cli/index.ts'],
+    rules: {
+      'functional/prefer-readonly-type': 'off',
+    },
+  },
 ]
