@@ -7,6 +7,17 @@ dist/
 contract/dist/
 *.tsbuildinfo
 
+# tsc build artifacts in source dirs
+bin/testaipack.*
+scripts/codegen.*
+src/**/*.js
+src/**/*.d.ts
+src/**/*.js.map
+tests/**/*.js
+tests/**/*.d.ts
+tests/**/*.js.map
+vitest.config.*
+
 # Test & coverage
 coverage/
 .testaipack/
