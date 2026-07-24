@@ -67,7 +67,7 @@
 ### Через 1 команду (рекомендуется)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rus-lan/testAiPack/main/install.sh | sh
+curl -fsSL https://github.com/rus-lan/testAiPack/releases/latest/download/install.sh | sh
 ```
 
 Скрипт определит платформу (linux/darwin/windows × x64/arm64), скачает

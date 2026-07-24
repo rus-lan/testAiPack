@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # testaipack installer — downloads the latest release binary for your platform.
-# Usage: curl -fsSL https://raw.githubusercontent.com/rus-lan/testAiPack/main/install.sh | sh
-#   or:  wget -qO- https://raw.githubusercontent.com/rus-lan/testAiPack/main/install.sh | sh
+# Usage: curl -fsSL https://github.com/rus-lan/testAiPack/releases/latest/download/install.sh | sh
+#   or:  wget -qO- https://github.com/rus-lan/testAiPack/releases/latest/download/install.sh | sh
 #
 # Override the install dir with:  INSTALL_DIR=/opt/bin sh install.sh
 set -eu

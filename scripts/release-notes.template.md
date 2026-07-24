@@ -5,7 +5,7 @@
 ## Установка
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rus-lan/testAiPack/main/install.sh | sh
+curl -fsSL https://github.com/rus-lan/testAiPack/releases/latest/download/install.sh | sh
 ```
 
 Или вручную — скачайте бинарник для своей платформы из assets ниже и положите в PATH.
