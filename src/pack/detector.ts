@@ -23,8 +23,8 @@ export class PackDetectError extends Data.TaggedError('PackDetectError')<{
   readonly reason: string
 }> {}
 
-const GIT_URL_RE = /^(https?|git\+https?|git\+ssh):\/\/[^\s]+\.git$/
-const GIT_SCP_RE = /^git@[^@\s]+:[^@\s/]+\/[^@\s]+\.git$/
+const GIT_URL_RE = /^(https?|git\+https?|git\+ssh|ssh|git):\/\/[^\s]+(?:\.git)?$/
+const GIT_SCP_RE = /^git@[^@\s]+:[^@\s/]+\/[^@\s]+(?:\.git)?$/
 const GITHUB_SHORT_RE = /^github:([^/\s]+)\/([^/\s]+?)(?:\.git)?$/
 const NPM_NAME_RE = /^@?[A-Za-z0-9][A-Za-z0-9._-]*$/
 
@@ -51,7 +51,9 @@ const normalizeGitUrl = (s: string): { readonly url: string; readonly name: stri
     const repo = githubMatch[2] ?? ''
     return { url: `https://github.com/${owner}/${repo}.git`, name: repo }
   }
-  return { url: s, name: baseName(s) }
+  // git rejects the npm-style "git+" prefix as an unknown remote helper.
+  const url = s.replace(/^git\+/, '')
+  return { url, name: baseName(s) }
 }
 
 interface Detected {

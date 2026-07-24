@@ -3,7 +3,7 @@ import { Effect } from 'effect'
 import path from 'node:path'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir } from '../util/fs.js'
-import { detectPack, PackDetectError } from './detector.js'
+import { detectPack, PackDetectError, type PackRef } from './detector.js'
 
 const run = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> =>
@@ -50,6 +50,23 @@ describe('detectPack', () => {
   it('git+https:// → Skill/git', async () => {
     const r = await run(detectPack('git+https://github.com/foo/bar.git'))
     expect(r).toMatchObject({ type: 'skill', source: 'git', name: 'bar' })
+  })
+
+  it.each<[string, Partial<PackRef>]>([
+    ['git+https://github.com/Graphify-Labs/graphify', { type: 'skill', source: 'git', name: 'graphify', url: 'https://github.com/Graphify-Labs/graphify' }],
+    ['git+https://github.com/Graphify-Labs/graphify.git', { type: 'skill', source: 'git', name: 'graphify', url: 'https://github.com/Graphify-Labs/graphify.git' }],
+    ['https://github.com/owner/repo', { type: 'skill', source: 'git', name: 'repo' }],
+    ['https://github.com/owner/repo.git', { type: 'skill', source: 'git', name: 'repo' }],
+    ['git+ssh://git@github.com/owner/repo', { type: 'skill', source: 'git', name: 'repo' }],
+    ['ssh://git@git.ecom.tech:5022/owner/repo', { type: 'skill', source: 'git', name: 'repo' }],
+    ['ssh://git@git.ecom.tech:5022/owner/repo.git', { type: 'skill', source: 'git', name: 'repo' }],
+    ['git@github.com:owner/repo', { type: 'skill', source: 'git', name: 'repo' }],
+    ['git@github.com:owner/repo.git', { type: 'skill', source: 'git', name: 'repo' }],
+    ['github:owner/repo', { type: 'skill', source: 'git', name: 'repo', url: 'https://github.com/owner/repo.git' }],
+  ])('%s → Skill/git (no .git suffix required)', async (ref, expected) => {
+    const r = await run(detectPack(ref))
+    expect(r).toMatchObject(expected)
+    expect(r.source).toBe('git')
   })
 
   it('absolute path → Skill/local (path preserved)', async () => {
