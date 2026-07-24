@@ -80,8 +80,20 @@ curl -fsSL https://raw.githubusercontent.com/rus-lan/testAiPack/main/install.sh 
 Скачайте бинарник для своей платформы со
 [страницы релизов](https://github.com/rus-lan/testAiPack/releases/latest) и
 положите `testaipack` в `PATH`. Бинарник self-contained (скомпилирован через
-`bun build --compile`). Доступные сборки: linux-x64/arm64, darwin-x64/arm64
-(Apple Silicon), windows-x64.
+`bun build --compile`).
+
+#### Платформы
+
+| Платформа                  | Файл                       | Статус                                  |
+| -------------------------- | -------------------------- | --------------------------------------- |
+| Linux x64                  | `testaipack-linux-x64`     | ✅ runtime verified                     |
+| Linux arm64                | `testaipack-linux-arm64`   | ⚠ собран, формат проверен (без runtime) |
+| macOS x64 (Intel)          | `testaipack-darwin-x64`    | ⚠ собран, формат проверен (без runtime) |
+| macOS arm64 (Apple Silicon)| `testaipack-darwin-arm64`  | ⚠ собран, формат проверен (без runtime) |
+| Windows x64                | `testaipack-windows-x64.exe` | ⚠ собран, формат проверен (без runtime) |
+
+Все бинарники — standalone (не требуют установленного runtime); SHA256-контрольные
+суммы лежат рядом в `checksums-sha256.txt`.
 
 ### Из исходников
 

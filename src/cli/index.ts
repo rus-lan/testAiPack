@@ -38,8 +38,10 @@ import { updateGitignore } from '../util/gitignore.js'
 import { mapIdeToBinary } from '../phases/12-review-workspace.js'
 import { renderMd } from '../report/md.js'
 import { PhaseError } from '../errors.js'
+import pkg from '../../package.json' with { type: 'json' }
 
 const BINARY_NAME = 'testaipack'
+const BINARY_VERSION: string = pkg.version
 
 const parseRunIndex = (s: string): number => {
   const n = Number.parseInt(s, 10)
@@ -461,6 +463,12 @@ const COMMANDS: CommandClass[] = [
 export const buildCli = (): Cli => Cli.from(COMMANDS, { binaryName: BINARY_NAME })
 
 export async function runCli(argv: readonly string[]): Promise<number> {
+  // Handle --version early so it works for every command (including the
+  // default `run` proxy, which would otherwise reject it as an unknown flag).
+  if (argv.includes('--version') || (argv.length === 1 && argv[0] === '-v')) {
+    process.stdout.write(`${BINARY_NAME} ${BINARY_VERSION}\n`)
+    return 0
+  }
   const cli = buildCli()
   const head = argv[0]
   if (argv.length === 0 || head === 'help') {
