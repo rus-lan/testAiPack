@@ -25,6 +25,12 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.3.4 (bugfix)
+
+- execCmd did not pass encoding utf8 to execFile causing opencode export output to be Buffer instead of string
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.3.3...v0.3.4
+
 ## v0.3.3 (bugfix)
 
 - opencode run crash: extract real session ID from events stream for export (previously fell back to fake ID on non-zero exit)

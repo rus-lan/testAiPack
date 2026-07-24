@@ -153,6 +153,7 @@ export const execCmd = (input: ExecInput): Effect.Effect<ExecOutput> =>
       {
         cwd: input.cwd,
         env: input.env,
+        encoding: 'utf8' as BufferEncoding,
         maxBuffer: 16 * 1024 * 1024,
         signal: controller.signal,
       },
