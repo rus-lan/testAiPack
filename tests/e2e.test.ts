@@ -28,17 +28,20 @@ vi.mock('../src/opencode/cli.js', () => ({
     readonly command: string
     readonly exitCode: number | null
     readonly stderr: string
+    readonly stdout: string
     readonly timedOut: boolean
     constructor(args: {
       command: string
       exitCode: number | null
       stderr: string
+      stdout?: string
       timedOut: boolean
     }) {
       super(`opencode ${args.command} failed`)
       this.command = args.command
       this.exitCode = args.exitCode
       this.stderr = args.stderr
+      this.stdout = args.stdout ?? ''
       this.timedOut = args.timedOut
     }
   },
@@ -377,6 +380,7 @@ describe('e2e: full A/B pipeline via runCli', () => {
           command: 'version',
           exitCode: 1,
           stderr: 'opencode not installed',
+          stdout: '',
           timedOut: false,
         }),
       ),

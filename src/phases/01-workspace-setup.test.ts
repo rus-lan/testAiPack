@@ -170,7 +170,7 @@ describe('workspaceSetup — manifest', () => {
 
   it('falls back to "unknown" when the opencode version probe fails', async () => {
     versionMock.mockReturnValue(
-      Effect.fail(new OpencodeError({ command: 'version', exitCode: 1, stderr: 'not found', timedOut: false })),
+      Effect.fail(new OpencodeError({ command: 'version', exitCode: 1, stderr: 'not found', stdout: '', timedOut: false })),
     )
     const { workspacePath } = await freshProject()
     const result = await runP(

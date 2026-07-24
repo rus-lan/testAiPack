@@ -24,17 +24,20 @@ vi.mock('../opencode/cli.js', () => ({
     readonly command: string
     readonly exitCode: number | null
     readonly stderr: string
+    readonly stdout: string
     readonly timedOut: boolean
     constructor(args: {
       command: string
       exitCode: number | null
       stderr: string
+      stdout?: string
       timedOut: boolean
     }) {
       super(`opencode ${args.command} failed`)
       this.command = args.command
       this.exitCode = args.exitCode
       this.stderr = args.stderr
+      this.stdout = args.stdout ?? ''
       this.timedOut = args.timedOut
     }
   },
@@ -266,7 +269,7 @@ describe('phase 06 — run-side', () => {
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     runMock.mockImplementation(() =>
       Effect.fail(
-        new OpencodeError({ command: 'run', exitCode: 1, stderr: 'boom', timedOut: false }),
+        new OpencodeError({ command: 'run', exitCode: 1, stderr: 'boom', stdout: '', timedOut: false }),
       ),
     )
     const result = await runP(runSide(buildInput(root)))
@@ -305,7 +308,7 @@ describe('phase 06 — run-side', () => {
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     runMock.mockImplementation(() =>
       Effect.fail(
-        new OpencodeError({ command: 'run', exitCode: null, stderr: '', timedOut: true }),
+        new OpencodeError({ command: 'run', exitCode: null, stderr: '', stdout: '', timedOut: true }),
       ),
     )
     const result = await runP(runSide(buildInput(root)))
@@ -417,7 +420,7 @@ describe('phase 06 — run-side', () => {
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     exportMock.mockImplementation(() =>
       Effect.fail(
-        new OpencodeError({ command: 'export', exitCode: 1, stderr: 'no session', timedOut: false }),
+        new OpencodeError({ command: 'export', exitCode: 1, stderr: 'no session', stdout: '', timedOut: false }),
       ),
     )
     const err = await runFlip(runSide(buildInput(root)))

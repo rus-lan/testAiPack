@@ -19,17 +19,20 @@ vi.mock('../opencode/cli.js', () => ({
     readonly command: string
     readonly exitCode: number | null
     readonly stderr: string
+    readonly stdout: string
     readonly timedOut: boolean
     constructor(args: {
       command: string
       exitCode: number | null
       stderr: string
+      stdout?: string
       timedOut: boolean
     }) {
       super(`opencode ${args.command} failed`)
       this.command = args.command
       this.exitCode = args.exitCode
       this.stderr = args.stderr
+      this.stdout = args.stdout ?? ''
       this.timedOut = args.timedOut
     }
   },
@@ -261,6 +264,7 @@ describe('phase 04 — homeIsolation', () => {
           command: 'plugin',
           exitCode: 1,
           stderr: 'package not found',
+          stdout: '',
           timedOut: false,
         }),
       ),

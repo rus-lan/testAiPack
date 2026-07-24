@@ -14,17 +14,20 @@ vi.mock('../opencode/cli.js', () => ({
     readonly command: string
     readonly exitCode: number | null
     readonly stderr: string
+    readonly stdout: string
     readonly timedOut: boolean
     constructor(args: {
       command: string
       exitCode: number | null
       stderr: string
+      stdout?: string
       timedOut: boolean
     }) {
       super(`opencode ${args.command} failed`)
       this.command = args.command
       this.exitCode = args.exitCode
       this.stderr = args.stderr
+      this.stdout = args.stdout ?? ''
       this.timedOut = args.timedOut
     }
   },
@@ -256,6 +259,7 @@ describe('phase 05 — preflight', () => {
           command: 'version',
           exitCode: 1,
           stderr: 'command not found',
+          stdout: '',
           timedOut: false,
         }),
       ),
@@ -275,6 +279,7 @@ describe('phase 05 — preflight', () => {
           command: 'run',
           exitCode: null,
           stderr: '',
+          stdout: '',
           timedOut: true,
         }),
       ),
@@ -294,6 +299,7 @@ describe('phase 05 — preflight', () => {
           command: 'run',
           exitCode: 1,
           stderr: 'ANTHROPIC_API_KEY is not set',
+          stdout: '',
           timedOut: false,
         }),
       ),
@@ -524,6 +530,7 @@ describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {
               command: 'version',
               exitCode: 1,
               stderr: 'crash in new HOME',
+              stdout: '',
               timedOut: false,
             }),
           )
@@ -546,6 +553,7 @@ describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {
               command: 'run',
               exitCode: 1,
               stderr: 'HTTP 429 rate limited in new HOME',
+              stdout: '',
               timedOut: false,
             }),
           )

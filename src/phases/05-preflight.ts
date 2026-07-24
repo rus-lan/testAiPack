@@ -58,7 +58,7 @@ const dockerFromInput = (input: PreflightInputExt): DockerExec | undefined =>
     ? { image: input.dockerImage ?? DEFAULT_OPENCODE_IMAGE }
     : undefined
 
-const AUTH_MISSING_RE = /API_KEY|credentials?\s+(not|missing|absent|are\s+not)|not authenticated|no.*provider/i
+const AUTH_MISSING_RE = /API_KEY|credentials?\s+(not|missing|absent|are\s+not)|not authenticated|no\s+provider\b/i
 
 type GateName = PreflightCheck['name']
 
@@ -106,7 +106,8 @@ const writeLog = (logPath: string, line: string): Effect.Effect<void, PhaseError
   )
 
 const isTimeout = (e: OpencodeError): boolean => e.timedOut
-const stderrOf = (e: OpencodeError): string => e.stderr
+const stderrOf = (e: OpencodeError): string =>
+  e.stderr || e.stdout || ''
 
 // ---- gates -----------------------------------------------------------------
 

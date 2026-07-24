@@ -46,6 +46,7 @@ export class OpencodeError extends Data.TaggedError('OpencodeError')<{
   readonly command: string
   readonly exitCode: number | null
   readonly stderr: string
+  readonly stdout: string
   readonly timedOut: boolean
 }> {}
 
@@ -88,6 +89,7 @@ const dockerErrorToOpencode =
       command,
       exitCode: d.exitCode,
       stderr: d.stderr,
+      stdout: '',
       timedOut: d.timedOut,
     })
 
@@ -203,6 +205,7 @@ export const run = (
           command: 'run',
           exitCode: null,
           stderr: out.stderr,
+          stdout: out.stdout,
           timedOut: true,
         }),
       )
@@ -213,6 +216,7 @@ export const run = (
           command: 'run',
           exitCode: out.exitCode,
           stderr: out.stderr,
+          stdout: out.stdout,
           timedOut: false,
         }),
       )
@@ -230,7 +234,7 @@ export const run = (
 
 const failOnNonZero = (
   command: string,
-  out: { readonly exitCode: number; readonly stderr: string },
+  out: { readonly exitCode: number; readonly stderr: string; readonly stdout: string },
 ): Effect.Effect<void, OpencodeError> =>
   out.exitCode === 0
     ? Effect.sync(() => undefined)
@@ -239,6 +243,7 @@ const failOnNonZero = (
           command,
           exitCode: out.exitCode,
           stderr: out.stderr,
+          stdout: out.stdout,
           timedOut: false,
         }),
       )
@@ -304,7 +309,19 @@ export const exportSession = (
       ...(docker === undefined ? {} : { docker }),
     })
     yield* failOnNonZero('export', out)
-    return out.stdout
+    const trimmed = out.stdout.trim()
+    if (trimmed === '') {
+      yield* Effect.fail(
+        new OpencodeError({
+          command: 'export',
+          exitCode: 0,
+          stderr: `opencode export returned empty stdout for session ${sessionId}`,
+          stdout: out.stdout,
+          timedOut: false,
+        }),
+      )
+    }
+    return trimmed
   })
 
 export const installPlugin = (
@@ -362,6 +379,7 @@ export const dbQuery = (
           command: 'db',
           exitCode: out.exitCode,
           stderr: `json parse failed: ${String(e)}`,
+          stdout: '',
           timedOut: false,
         }),
     })

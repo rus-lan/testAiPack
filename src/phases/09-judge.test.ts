@@ -142,9 +142,9 @@ const succeedWith = (stdout: string) =>
   (): Effect.Effect<OpencodeRunResult, OpencodeError> =>
     Effect.succeed(okResult(stdout))
 
-const failWith = (args: { readonly exitCode: number | null; readonly stderr: string; readonly timedOut: boolean }) =>
+const failWith = (args: { readonly exitCode: number | null; readonly stderr: string; readonly stdout?: string; readonly timedOut: boolean }) =>
   (): Effect.Effect<OpencodeRunResult, OpencodeError> =>
-    Effect.fail(new OpencodeError({ command: 'run', ...args }))
+    Effect.fail(new OpencodeError({ command: 'run', stdout: '', ...args }))
 
 beforeEach(() => {
   runMock.mockReset()

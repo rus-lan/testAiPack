@@ -25,6 +25,17 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.3.2 (bugfixes)
+
+- OpencodeError now captures stdout alongside stderr — fixes silent error loss when opencode writes diagnostics to stdout as JSON
+- `failOnNonZero` preserves stdout in error context (was hardcoded to `''`)
+- `exportSession` detects empty stdout and fails with descriptive message including session ID
+- Export error context in phase 06 now includes exitCode + stdout for better diagnostics
+- Preflight `stderrOf()` falls back to stdout when stderr is empty
+- Auth-missing regex tightened to avoid false positives on "no provider"
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.3.1...v0.3.2
+
 ## v0.3.1 (bugfixes)
 
 - `--version` / `-v` flag in CLI (install.sh post-install check was failing)

@@ -585,7 +585,9 @@ export const runSide = (
       Effect.mapError((err: OpencodeError) =>
         fail('opencode export produced no data', 'E_RUN_CRASH', side, runIndex, {
           sessionId: exportSessionId,
+          exitCode: err.exitCode,
           stderr: err.stderr,
+          stdout: err.stdout,
         }),
       ),
       Effect.timeout(exportTimeoutMs),
