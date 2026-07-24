@@ -24,7 +24,7 @@ import type {
   SuccessRank,
 } from '@generated/types'
 import { opencodeExportSchema } from '@generated/schemas'
-import { run as opencodeRun, exportSession } from '../opencode/cli.js'
+import { run as opencodeRun, exportSession, sessionIdFromEvent } from '../opencode/cli.js'
 import type { DockerExec, OpencodeError, OpencodeRunOptions, OpencodeRunResult } from '../opencode/cli.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import { spawnProcess } from '../opencode/spawn.js'
@@ -572,6 +572,16 @@ export const runSide = (
     const anyTimedOut = runResults.some((r) => r.timedOut)
     const anyWatchdog = runResults.some((r) => r.watchdogTriggered)
     const anyTotal = runResults.some((r) => r.totalTimedOut)
+
+    if (realSessionId === undefined) {
+      for (let i = state.events.length - 1; i >= 0; i--) {
+        const id = sessionIdFromEvent(state.events[i]!)
+        if (id !== undefined) {
+          realSessionId = id
+          break
+        }
+      }
+    }
 
     const ndjson =
       state.events.length === 0

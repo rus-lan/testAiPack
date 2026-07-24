@@ -46,6 +46,13 @@ vi.mock('../opencode/cli.js', () => ({
   installPlugin: vi.fn(),
   exportSession: vi.fn(),
   listMcp: vi.fn(),
+  sessionIdFromEvent: (ev: unknown) => {
+    if (typeof ev !== 'object' || ev === null) return undefined
+    const r = ev as Record<string, unknown>
+    if (typeof r['sessionID'] === 'string') return r['sessionID']
+    if (typeof r['sessionId'] === 'string') return r['sessionId']
+    return undefined
+  },
 }))
 
 vi.mock('../opencode/spawn.js', () => ({

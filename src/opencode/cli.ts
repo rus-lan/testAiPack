@@ -106,7 +106,7 @@ export const buildRunArgs = (opts: OpencodeRunOptions): readonly string[] => [
   'json',
 ]
 
-const sessionIdFromEvent = (ev: unknown): string | undefined => {
+export const sessionIdFromEvent = (ev: unknown): string | undefined => {
   if (!isRecord(ev)) return undefined
   // opencode streams the session id as top-level `sessionID` (capital ID); older
   // mock fixtures used `sessionId`. Accept both, plus the nested shapes.
