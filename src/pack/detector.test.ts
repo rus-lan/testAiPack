@@ -146,4 +146,36 @@ describe('detectPack', () => {
     const err = await runFlip(detectPack('foo/bar'))
     expect(err).toBeInstanceOf(PackDetectError)
   })
+
+  describe('graphify pack URL formats (3 git-source formats)', () => {
+    it('https://github.com/Graphify-Labs/graphify (HTTPS, no .git) → Skill/git', async () => {
+      const r = await run(detectPack('https://github.com/Graphify-Labs/graphify'))
+      expect(r).toMatchObject({
+        type: 'skill',
+        source: 'git',
+        name: 'graphify',
+        url: 'https://github.com/Graphify-Labs/graphify',
+      })
+    })
+
+    it('github:Graphify-Labs/graphify (github short form) → Skill/git, url normalized to .git', async () => {
+      const r = await run(detectPack('github:Graphify-Labs/graphify'))
+      expect(r).toMatchObject({
+        type: 'skill',
+        source: 'git',
+        name: 'graphify',
+        url: 'https://github.com/Graphify-Labs/graphify.git',
+      })
+    })
+
+    it('https://github.com/Graphify-Labs/graphify.git (HTTPS with .git) → Skill/git', async () => {
+      const r = await run(detectPack('https://github.com/Graphify-Labs/graphify.git'))
+      expect(r).toMatchObject({
+        type: 'skill',
+        source: 'git',
+        name: 'graphify',
+        url: 'https://github.com/Graphify-Labs/graphify.git',
+      })
+    })
+  })
 })

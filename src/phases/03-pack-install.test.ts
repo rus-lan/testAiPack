@@ -373,6 +373,52 @@ describe('phase 03 — packInstall', () => {
     expect(err.code).toBe('E_PACK_INVALID_REF')
   })
 
+  it('skill: lowercase skill.md at root → mirrored to uppercase SKILL.md', async () => {
+    cloneMock.mockImplementation(materializeClone({ 'skill.md': '# lower\n' }))
+    const built = await buildInput({ packRef: 'github:owner/lower' })
+    const result = await runP(packInstall(built.input))
+    expect(result.detectedType).toBe('skill')
+    const expected = path.join(built.packDir, 'lower')
+    expect(result.packPath).toBe(expected)
+    expect(await runP(exists(path.join(expected, 'SKILL.md')))).toBe(true)
+    expect(await runP(readFile(path.join(expected, 'SKILL.md')))).toBe('# lower\n')
+    expect(result.instructions).toEqual([
+      { kind: 'symlink', name: 'lower', target: expected },
+    ])
+  })
+
+  it('skill: SKILL.md nested in subdir named after pack → symlink targets subdir', async () => {
+    cloneMock.mockImplementation(
+      materializeClone({ 'graphify/SKILL.md': '# nested\n', 'README.md': 'r' }),
+    )
+    const built = await buildInput({ packRef: 'github:owner/graphify' })
+    const result = await runP(packInstall(built.input))
+    expect(result.detectedType).toBe('skill')
+    const nested = path.join(built.packDir, 'graphify', 'graphify')
+    expect(result.packPath).toBe(nested)
+    expect(await runP(exists(path.join(nested, 'SKILL.md')))).toBe(true)
+    expect(result.instructions).toEqual([
+      { kind: 'symlink', name: 'graphify', target: nested },
+    ])
+  })
+
+  it('skill: lowercase skill.md nested in subdir → mirrored + symlink targets subdir', async () => {
+    cloneMock.mockImplementation(
+      materializeClone({ 'graphify/skill.md': '# lower nested\n' }),
+    )
+    const built = await buildInput({ packRef: 'github:owner/gfnested' })
+    const result = await runP(packInstall(built.input))
+    expect(result.detectedType).toBe('skill')
+    const nested = path.join(built.packDir, 'gfnested', 'graphify')
+    expect(result.packPath).toBe(nested)
+    expect(await runP(exists(path.join(nested, 'SKILL.md')))).toBe(true)
+    expect(await runP(readFile(path.join(nested, 'SKILL.md')))).toBe('# lower nested\n')
+    expect(result.instructions[0]!.kind).toBe('symlink')
+    if (result.instructions[0]!.kind === 'symlink') {
+      expect(result.instructions[0]!.target).toBe(nested)
+    }
+  })
+
   it('invalid packRef format → E_PACK_INVALID_REF', async () => {
     const built = await buildInput({ packRef: 'foo bar baz garbage' })
     const err = await runFlip(packInstall(built.input))

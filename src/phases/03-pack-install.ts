@@ -169,6 +169,51 @@ const deliverDir = (
     yield* withTimeout(copyDir(src, dest).pipe(Effect.mapError(mapCopyError(src))), seconds, src, 'copy')
   })
 
+/**
+ * Skill markdown file names opencode accepts, in priority order. opencode's
+ * loader scans for uppercase `SKILL.md`; lowercase `skill.md` is tolerated on
+ * input (some repos, e.g. graphify, ship lowercase) and mirrored to uppercase
+ * before registration.
+ */
+const SKILL_FILE_NAMES = ['SKILL.md', 'skill.md'] as const
+
+interface SkillRoot {
+  readonly root: string
+  readonly file: string
+}
+
+/**
+ * Locate the skill markdown inside a freshly delivered pack. Looks at the pack
+ * root first (the common case), then one directory level deep — many skill
+ * repos nest the file under a top-level folder named after the skill. Prefers a
+ * folder whose name matches the pack, then falls back to alphabetical order.
+ */
+const resolveSkillRoot = (
+  dest: string,
+  name: string,
+): Effect.Effect<SkillRoot | null, PhaseError> =>
+  Effect.gen(function* () {
+    for (const fname of SKILL_FILE_NAMES) {
+      const p = path.join(dest, fname)
+      if (yield* exists(p)) return { root: dest, file: p }
+    }
+    const entries = yield* scanDir(dest)
+    const ordered = [
+      ...entries.filter((e) => e === name),
+      ...entries.filter((e) => e !== name).sort(),
+    ]
+    for (const sub of ordered) {
+      const subDir = path.join(dest, sub)
+      const kind = yield* pathKind(subDir)
+      if (kind !== 'dir') continue
+      for (const fname of SKILL_FILE_NAMES) {
+        const p = path.join(subDir, fname)
+        if (yield* exists(p)) return { root: subDir, file: p }
+      }
+    }
+    return null
+  })
+
 const deliverSkill = (
   ref: PackRef,
   packDir: string,
@@ -177,16 +222,36 @@ const deliverSkill = (
   Effect.gen(function* () {
     const dest = path.join(packDir, ref.name)
     yield* deliverDir(ref, dest, seconds)
-    const skillMd = path.join(dest, 'SKILL.md')
-    if (!(yield* exists(skillMd))) {
+    const resolved = yield* resolveSkillRoot(dest, ref.name)
+    if (resolved === null) {
       yield* failPack('E_PACK_INVALID_REF', `SKILL.md missing in pack ${ref.name}`, ref.raw, {
-        expected: skillMd,
+        expected: path.join(dest, 'SKILL.md'),
       })
     }
+    const skillRoot = resolved === null ? dest : resolved.root
+    const skillFile = resolved === null ? path.join(dest, 'SKILL.md') : resolved.file
+    // opencode only discovers uppercase SKILL.md; mirror a lowercase skill.md.
+    const upperSkill = path.join(skillRoot, 'SKILL.md')
+    if (skillFile !== upperSkill) {
+      const body = yield* readFile(skillFile).pipe(
+        Effect.mapError((e: FsError) =>
+          packInstallError(`cannot read skill file: ${e.path}`, 'E_INSTALL_FAILED', {
+            path: e.path,
+          }),
+        ),
+      )
+      yield* writeFile(upperSkill, body).pipe(
+        Effect.mapError((e: FsError) =>
+          packInstallError(`cannot write SKILL.md: ${e.path}`, 'E_INSTALL_FAILED', {
+            path: e.path,
+          }),
+        ),
+      )
+    }
     return {
-      packPath: dest,
+      packPath: skillRoot,
       registeredIn: ['skills'],
-      instructions: [{ kind: 'symlink', name: ref.name, target: dest }],
+      instructions: [{ kind: 'symlink', name: ref.name, target: skillRoot }],
     }
   })
 
