@@ -25,6 +25,16 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.3.1 (bugfixes)
+
+- `--version` / `-v` flag in CLI (install.sh post-install check was failing)
+- pack-detector: git URLs without `.git` suffix now accepted (`https://github.com/owner/repo`, `git+https://...`, SCP `git@...:owner/repo`)
+- pack-detector: `git+` prefix stripped before clone (npm convention, git itself rejects it)
+- pack-install: skill.md resolved case-insensitively (graphify pack has `graphify/skill.md`, opencode scans only uppercase `**/SKILL.md`)
+- real e2e verified with live graphify skill pack
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.3.0...v0.3.1
+
 ## Платформы
 
 Бинарники собраны под:
