@@ -104,7 +104,7 @@ describe('cli/doctor — runDoctor', () => {
     execMock.mockImplementation((input) => out(`${input.command} 1.0`))
     existsMock.mockImplementation(() => Effect.succeed(false))
     const checks = await runP(runDoctor('/cwd'))
-    const auth = checks.find((c) => c.name.startsWith('auth'))
+    const auth = checks.find((c) => c.name.startsWith('opencode auth'))
     expect(auth?.status).toBe('warn')
   })
 })

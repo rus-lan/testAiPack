@@ -229,8 +229,8 @@ model ExportCache {
 }
 
 model ExportTimeRange {
-  created: int64;
-  updated: int64;
+  created: safeint;
+  updated: safeint;
 }
 
 model ExportMessage {
@@ -244,7 +244,7 @@ model ExportMessageInfo {
   "model"?: { providerID: string; modelID: string };
   cost?: float64;
   tokens?: ExportTokens & { total?: int32 };
-  time: { created: int64; completed?: int64 };
+  time: { created: safeint; completed?: safeint };
   finish?: FinishCause;
   path?: { cwd: string; root: string };
   parentID?: string;
@@ -262,6 +262,12 @@ union ExportPart {
   tool: ExportToolPart;
   "step-start": ExportStepStartPart;
   "step-finish": ExportStepFinishPart;
+  patch: ExportPatchPart;
+  // Tolerant catch-all: opencode may emit part types beyond the modelled set
+  // (e.g. future part kinds). Listing it last keeps the typed members first so
+  // the Zod union still resolves them; anything else falls through here instead
+  // of failing validation. Extraction/timeline ignore unrecognised parts.
+  other: ExportUnknownPart;
 }
 
 model ExportTextPart {
@@ -273,7 +279,7 @@ model ExportTextPart {
 model ExportReasoningPart {
   type: "reasoning";
   text: string;
-  time: { start: int64; end: int64 };
+  time: { start: safeint; end: safeint };
   id: string;
 }
 
@@ -291,7 +297,7 @@ model ExportToolState {
   output?: string;
   metadata?: Record<unknown>;
   title?: string;
-  time?: { start: int64; end: int64 };
+  time?: { start: safeint; end: safeint };
 }
 
 model ExportStepStartPart {
@@ -306,6 +312,18 @@ model ExportStepFinishPart {
   snapshot?: string;
   tokens?: ExportTokens & { total?: int32 };
   cost?: float64;
+  id: string;
+}
+
+model ExportPatchPart {
+  type: "patch";
+  hash: string;
+  files: string[];
+  id: string;
+}
+
+model ExportUnknownPart {
+  type: string;
   id: string;
 }
 

@@ -325,7 +325,7 @@ describe('phase 05 — preflight', () => {
     expect(err.context?.['check']).toBe('pack-visibility')
   })
 
-  it('pack-visibility skill fail (probe does not mention name) → E_PREFLIGHT_PACK_INVISIBLE', async () => {
+  it('pack-visibility skill success (SKILL.md present) → visible regardless of LLM output', async () => {
     const homes = await buildHomes()
     const packDir = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(packDir))
@@ -341,8 +341,9 @@ describe('phase 05 — preflight', () => {
       }),
     )
     const input = buildInput(homes, {}, skillOutcome(packDir))
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(result.allPassed).toBe(true)
   })
 
   it('pack-visibility plugin success (plugin file present on new side)', async () => {

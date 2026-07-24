@@ -80,7 +80,7 @@ export const runDoctor = (cwd: string): Effect.Effect<readonly DoctorCheck[]> =>
       probeCmd('node', 'node', ['--version'], cwd),
       probeCmd('bun', 'bun', ['--version'], cwd),
       probeCmd('docker', 'docker', ['info'], cwd),
-      checkAuthDir('auth ~/.opencode', '.opencode'),
+      checkAuthDir('opencode auth.json', '.local/share/opencode/auth.json'),
     ],
     { concurrency: 4 },
   )

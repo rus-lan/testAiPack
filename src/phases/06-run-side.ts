@@ -141,13 +141,22 @@ const finishFromEvent = (ev: unknown): FinishCause | undefined => {
       if (m !== undefined) return m
     }
   }
+  // opencode streams two shapes that carry a finish reason:
+  //  - export part: { type: "step-finish", reason }
+  //  - streamed run event: { type: "step_finish", part: { type: "step-finish", reason } }
+  const part = ev['part']
+  const reasonFromPart = isRecord(part) && typeof part['reason'] === 'string' ? part['reason'] : undefined
   const t = ev['type']
-  if (typeof t === 'string' && t === 'step-finish') {
-    const reason = ev['reason']
+  if (typeof t === 'string' && (t === 'step-finish' || t === 'step_finish')) {
+    const reason = typeof ev['reason'] === 'string' ? ev['reason'] : reasonFromPart
     if (typeof reason === 'string') {
       const m = mapReasonToFinish(reason)
       if (m !== undefined) return m
     }
+  }
+  if (reasonFromPart !== undefined && isRecord(part) && part['type'] === 'step-finish') {
+    const m = mapReasonToFinish(reasonFromPart)
+    if (m !== undefined) return m
   }
   return undefined
 }
@@ -167,8 +176,20 @@ export const computeMaxConsecutiveSameTool = (events: readonly unknown[]): numbe
   let prev: string | undefined
   for (const ev of events) {
     if (!isRecord(ev)) continue
-    if (ev['type'] !== 'tool') continue
-    const tool = ev['tool']
+    // streamed run event: { type: "tool_use", part: { type: "tool", tool } }
+    // export part: { type: "tool", tool }
+    const part = ev['part']
+    const isToolEvent =
+      ev['type'] === 'tool' ||
+      ev['type'] === 'tool_use' ||
+      (isRecord(part) && part['type'] === 'tool')
+    if (!isToolEvent) continue
+    const tool =
+      typeof ev['tool'] === 'string'
+        ? ev['tool']
+        : isRecord(part) && typeof part['tool'] === 'string'
+          ? part['tool']
+          : undefined
     if (typeof tool !== 'string') continue
     if (tool === prev) {
       cur += 1
@@ -333,6 +354,7 @@ interface OnceResult {
   readonly watchdogTriggered: boolean
   readonly totalTimedOut: boolean
   readonly durationMs: number
+  readonly sessionId?: string
 }
 
 const makeWatchdog = (state: RunState, watchdogMs: number): Effect.Effect<void> =>
@@ -421,6 +443,7 @@ const runOnce = (
       watchdogTriggered: false,
       totalTimedOut: false,
       durationMs: e.right.durationMs,
+      ...(e.right.sessionId === undefined ? {} : { sessionId: e.right.sessionId }),
     }
   })
 
@@ -478,7 +501,15 @@ export const runSide = (
       return { timeoutMs: runMs, totalBound: false }
     }
 
-    const baseOpts = (prompt: string, continueSession: boolean): OpencodeRunOptions => ({
+    // opencode assigns the session id when it CREATES a session; `--session` is
+    // only valid to CONTINUE an existing one (else "Session not found"). So a
+    // new run passes no session, we capture the real id from the event stream,
+    // and only the prompt-after-init continuation passes --session <realId>.
+    const baseOpts = (
+      prompt: string,
+      continueSession: boolean,
+      sessionToContinue: string | undefined,
+    ): OpencodeRunOptions => ({
       homeDir: homeEnv.HOME,
       cwd: appCwd,
       ...(homeEnv.OPENCODE_CONFIG_CONTENT === undefined
@@ -486,8 +517,9 @@ export const runSide = (
         : { configContent: homeEnv.OPENCODE_CONFIG_CONTENT }),
       agent: 'build',
       prompt,
-      session: sessionId,
-      continueSession,
+      ...(continueSession && sessionToContinue !== undefined
+        ? { session: sessionToContinue, continueSession: true }
+        : {}),
       auto: true,
       ...(homeEnv.OPENCODE_PURE ? { pure: true } : {}),
       env: envRecord,
@@ -496,6 +528,7 @@ export const runSide = (
 
     const state: RunState = { events: [], lastEvent: { time: startedAt } }
     const runResults: OnceResult[] = []
+    let realSessionId: string | undefined
 
     const hasInit = runInput.init !== undefined && runInput.init !== ''
     if (hasInit) {
@@ -503,7 +536,7 @@ export const runSide = (
       state.lastEvent.time = Date.now()
       const b = budget()
       const r = yield* runOnce(
-        baseOpts(runInput.init ?? '', false),
+        baseOpts(runInput.init ?? '', false, undefined),
         state,
         watchdogMs,
         b.timeoutMs,
@@ -511,8 +544,9 @@ export const runSide = (
         totalDeadline,
       )
       runResults.push(r)
+      realSessionId = r.sessionId
       yield* log(
-        `[INIT_DONE] exitCode=${String(r.exitCode)} timedOut=${String(r.timedOut)} watchdog=${String(r.watchdogTriggered)}`,
+        `[INIT_DONE] exitCode=${String(r.exitCode)} timedOut=${String(r.timedOut)} watchdog=${String(r.watchdogTriggered)} sessionId=${realSessionId ?? 'n/a'}`,
       )
     }
 
@@ -520,7 +554,7 @@ export const runSide = (
     state.lastEvent.time = Date.now()
     const bp = budget()
     const pr = yield* runOnce(
-      baseOpts(runInput.prompt, hasInit),
+      baseOpts(runInput.prompt, hasInit, realSessionId),
       state,
       watchdogMs,
       bp.timeoutMs,
@@ -528,8 +562,9 @@ export const runSide = (
       totalDeadline,
     )
     runResults.push(pr)
+    if (pr.sessionId !== undefined) realSessionId = pr.sessionId
     yield* log(
-      `[PROMPT_DONE] exitCode=${String(pr.exitCode)} timedOut=${String(pr.timedOut)} watchdog=${String(pr.watchdogTriggered)}`,
+      `[PROMPT_DONE] exitCode=${String(pr.exitCode)} timedOut=${String(pr.timedOut)} watchdog=${String(pr.watchdogTriggered)} sessionId=${realSessionId ?? 'n/a'}`,
     )
 
     const lastResult = runResults[runResults.length - 1]
@@ -545,10 +580,11 @@ export const runSide = (
     yield* writeFile(eventsLogPath, ndjson).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
 
     const exportTimeoutMs = runMs
-    const exportStr: string = yield* exportSession(homeEnv.HOME, sessionId, docker).pipe(
+    const exportSessionId = realSessionId ?? sessionId
+    const exportStr: string = yield* exportSession(homeEnv.HOME, exportSessionId, docker).pipe(
       Effect.mapError((err: OpencodeError) =>
         fail('opencode export produced no data', 'E_RUN_CRASH', side, runIndex, {
-          sessionId,
+          sessionId: exportSessionId,
           stderr: err.stderr,
         }),
       ),
@@ -556,7 +592,7 @@ export const runSide = (
       Effect.catchTag('TimeoutException', () =>
         Effect.fail(
           fail('opencode export timed out', 'E_RUN_TIMEOUT', side, runIndex, {
-            sessionId,
+            sessionId: exportSessionId,
             timeoutMs: exportTimeoutMs,
           }),
         ),

@@ -35,6 +35,13 @@ import { preflightError } from '../errors.js'
 export interface PreflightInputExt extends PreflightInput {
   readonly packInstall?: PackInstallOutcome
   readonly dockerImage?: string
+  /**
+   * The generated opencode configs (baseline for old, pack-augmented for new)
+   * produced by phase 04. Forwarded as OPENCODE_CONFIG_CONTENT to the auth-ping
+   * so it runs with the same model/provider the actual runs will use; without
+   * it opencode has no model and falls back to an unauthenticated default.
+   */
+  readonly configs?: { readonly old: string; readonly new: string }
 }
 
 /** opencode layout: skills/agents/plugins are plural, command is singular. */
@@ -159,6 +166,7 @@ const runAuthPing = (
   homeDir: string,
   side: Side,
   model: string | undefined,
+  configContent: string | undefined,
   timeoutMs: number,
   docker: DockerExec | undefined,
   checks: readonly PreflightCheck[],
@@ -170,6 +178,7 @@ const runAuthPing = (
       cwd: homeDir,
       agent: 'build',
       ...(model === undefined ? {} : { model }),
+      ...(configContent === undefined ? {} : { configContent }),
       prompt: 'reply with the single word OK',
       timeoutMs,
       ...(docker === undefined ? {} : { docker }),
@@ -196,8 +205,9 @@ const gateAuthPing = (
     const model = input.runInput.preflightModel
     const timeoutMs = input.runInput.timeouts.preflightSeconds * 1000
     const docker = dockerFromInput(input)
-    const oldCheck = yield* runAuthPing(input.homePaths.old, 'old', model, timeoutMs, docker, checks)
-    const newCheck = yield* runAuthPing(input.homePaths.new, 'new', model, timeoutMs, docker, checks)
+    const configs = input.configs
+    const oldCheck = yield* runAuthPing(input.homePaths.old, 'old', model, configs?.old, timeoutMs, docker, checks)
+    const newCheck = yield* runAuthPing(input.homePaths.new, 'new', model, configs?.new, timeoutMs, docker, checks)
     return [oldCheck, newCheck]
   })
 
@@ -246,23 +256,6 @@ const instructionName = (inst: RegistrationInstruction): string => {
   }
 }
 
-const probeSkillName = (
-  homePaths: PreflightInput['homePaths'],
-  name: string,
-  docker: DockerExec | undefined,
-): Effect.Effect<boolean> =>
-  opencodeRun({
-    homeDir: homePaths.new,
-    cwd: homePaths.new,
-    agent: 'build',
-    prompt: 'list available skills',
-    timeoutMs: 30_000,
-    ...(docker === undefined ? {} : { docker }),
-  }).pipe(
-    Effect.map((out) => out.stdout.includes(name) || out.stderr.includes(name)),
-    Effect.catchAll(() => Effect.succeed(false)),
-  )
-
 const mcpPresentIn = (
   homeDir: string,
   name: string,
@@ -283,13 +276,15 @@ const mcpPresentIn = (
 const instructionVisible = (
   inst: RegistrationInstruction,
   homePaths: PreflightInput['homePaths'],
-  docker: DockerExec | undefined,
 ): Effect.Effect<boolean> =>
   Effect.gen(function* () {
     if (inst.kind === 'symlink') {
-      const hasMd = yield* exists(path.join(inst.target, 'SKILL.md'))
-      if (!hasMd) return false
-      return yield* probeSkillName(homePaths, inst.name, docker)
+      // A skill is registered as a symlink under .config/opencode/skills/<name>
+      // → <pack>/SKILL.md. The deterministic visibility signal is that the
+      // symlink resolves to a readable SKILL.md. We deliberately do NOT probe
+      // the LLM with "list available skills": opencode only surfaces built-in
+      // skills that way, so the probe would always fail for user packs.
+      return yield* exists(path.join(inst.target, 'SKILL.md'))
     }
     if (inst.kind === 'file') {
       return yield* exists(
@@ -321,9 +316,8 @@ const gatePackVisibility = (
         },
       ]
     }
-    const docker = dockerFromInput(input)
     for (const inst of pack.instructions) {
-      const visible = yield* instructionVisible(inst, input.homePaths, docker)
+      const visible = yield* instructionVisible(inst, input.homePaths)
       if (!visible) {
         yield* fail(
           'E_PREFLIGHT_PACK_INVISIBLE',
@@ -373,7 +367,7 @@ const gateBaselineIdentical = (
     const timeoutMs = input.runInput.timeouts.preflightSeconds * 1000
     const docker = dockerFromInput(input)
     yield* runOpencodeLaunch(input.homePaths.old, 'old', docker, checks)
-    yield* runAuthPing(input.homePaths.old, 'old', model, timeoutMs, docker, checks)
+    yield* runAuthPing(input.homePaths.old, 'old', model, input.configs?.old, timeoutMs, docker, checks)
     yield* runBuildAgent(input.homePaths.old, 'old', checks)
     // Pack-leak assertion: no pack files/symlinks may have landed on the old side.
     const pack = input.packInstall

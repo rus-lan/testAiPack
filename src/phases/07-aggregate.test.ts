@@ -121,7 +121,7 @@ const exportJson = (o: ExportOpts): Record<string, unknown> => ({
     summary: o.summary ?? { additions: 0, deletions: 0, files: 0 },
     cost: o.cost ?? 0,
     tokens: { input: o.totalTokens ?? 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    time: { created: String(o.tStart ?? 0), updated: String(o.tEnd ?? 0) },
+    time: { created: o.tStart ?? 0, updated: o.tEnd ?? 0 },
   },
   messages: o.messages ?? [],
 })
@@ -396,7 +396,7 @@ describe('aggregate — secondary aggregation', () => {
     const tree = await makeWorkspace(2)
     const runInput = makeRunInput({ runs: 2 })
     const msg = (toolName: string, status: 'completed' | 'error', finish: string, id: string): Record<string, unknown> => ({
-      info: { role: 'assistant', time: { created: '0' }, finish },
+      info: { role: 'assistant', time: { created: 0 }, finish },
       parts: [toolPart(toolName, status, id)],
     })
     await writeRaw(tree, 'old', 1, exportJson({ messages: [msg('bash', 'completed', 'stop', 'a')] }))
@@ -425,7 +425,7 @@ describe('aggregate — secondary aggregation', () => {
     const tree = await makeWorkspace(1)
     const runInput = makeRunInput({ runs: 1 })
     const msg: Record<string, unknown> = {
-      info: { role: 'assistant', time: { created: '0' } },
+      info: { role: 'assistant', time: { created: 0 } },
       parts: [1, 2, 3, 4, 5].map((i) => toolPart('bash', 'completed', `b${String(i)}`)),
     }
     await writeRaw(tree, 'old', 1, exportJson({ messages: [msg] }))

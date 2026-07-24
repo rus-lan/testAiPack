@@ -112,7 +112,7 @@ const okDocker = (overrides: Partial<DockerRunResult> = {}): DockerRunResult => 
 describe('opencode cli — buildRunArgs', () => {
   it('emits positional prompt + --format json + --auto by default', () => {
     const args = buildRunArgs({ ...baseOpts })
-    expect(args).toEqual(['fix the bug', '--auto', '--format', 'json'])
+    expect(args).toEqual(['run', 'fix the bug', '--auto', '--format', 'json'])
   })
 
   it('forwards agent/model/session/--continue/--pure when provided', () => {
@@ -125,6 +125,7 @@ describe('opencode cli — buildRunArgs', () => {
       pure: true,
     })
     expect(args).toEqual([
+      'run',
       'fix the bug',
       '--agent', 'coder',
       '--model', 'glm-5.2',
@@ -147,7 +148,7 @@ describe('opencode cli — run', () => {
     await runP(run({ ...baseOpts, agent: 'coder', model: 'glm-5.2' }))
     expect(lastSpawn?.command).toBe('opencode')
     expect(lastSpawn?.args).toEqual([
-      'fix the bug', '--agent', 'coder', '--model', 'glm-5.2', '--auto', '--format', 'json',
+      'run', 'fix the bug', '--agent', 'coder', '--model', 'glm-5.2', '--auto', '--format', 'json',
     ])
     expect(lastSpawn?.cwd).toBe('/work/app')
   })
@@ -226,6 +227,20 @@ describe('opencode cli — run', () => {
     })
     const result = await runP(run({ ...baseOpts }))
     expect(result.sessionId).toBe('sess-nested')
+  })
+
+  it('extracts sessionID (capital ID) — the real opencode run --format json shape', async () => {
+    sp.mockImplementation((input) => {
+      lastSpawn = input
+      return Effect.succeed(
+        okSpawn({
+          stdout:
+            '{"type":"step_start","sessionID":"ses_real123","part":{"sessionID":"ses_real123","type":"step-start"}}\n',
+        }),
+      )
+    })
+    const result = await runP(run({ ...baseOpts }))
+    expect(result.sessionId).toBe('ses_real123')
   })
 
   it('returns no sessionId when stdout has no recognizable event', async () => {
@@ -326,7 +341,7 @@ describe('opencode cli — docker mode', () => {
     expect(lastDocker?.cwd).toBe('/work/app')
     expect(lastDocker?.homeDir).toBe('/home/test')
     expect(lastDocker?.command).toEqual([
-      'opencode', 'fix the bug', '--agent', 'coder', '--auto', '--format', 'json',
+      'opencode', 'run', 'fix the bug', '--agent', 'coder', '--auto', '--format', 'json',
     ])
   })
 

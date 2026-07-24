@@ -117,7 +117,7 @@ type PartBuilder = Record<string, unknown>
 
 const textPart = (text: string, id = 't1'): PartBuilder => ({ type: 'text', text, id })
 const reasoningPart = (start: number, end: number, id = 'r1'): PartBuilder => ({
-  type: 'reasoning', text: 'thinking', time: { start: String(start), end: String(end) }, id,
+  type: 'reasoning', text: 'thinking', time: { start, end }, id,
 })
 const toolPart = (
   tool: string,
@@ -132,7 +132,7 @@ const toolPart = (
   state: {
     status,
     input: {},
-    ...(start !== undefined && end !== undefined ? { time: { start: String(start), end: String(end) } } : {}),
+    ...(start !== undefined && end !== undefined ? { time: { start, end } } : {}),
   },
   id,
 })
@@ -164,14 +164,14 @@ const makeExport = (o: ExportOpts): Record<string, unknown> => ({
     summary: { additions: 0, deletions: 0, files: 0 },
     cost: 0,
     tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    time: { created: String(o.created ?? 0), updated: String(o.created ?? 0) },
+    time: { created: o.created ?? 0, updated: o.created ?? 0 },
   },
   messages: (o.messages ?? []).map((m) => ({
     info: {
       role: m.role,
       time: {
-        created: String(m.created),
-        ...(m.completed !== undefined ? { completed: String(m.completed) } : {}),
+        created: m.created,
+        ...(m.completed !== undefined ? { completed: m.completed } : {}),
       },
     },
     parts: m.parts,

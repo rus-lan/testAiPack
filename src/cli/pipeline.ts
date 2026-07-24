@@ -255,6 +255,7 @@ export const runPipeline = (
         manifest,
         homePaths,
         packInstall: pack,
+        configs: { old: home.generatedConfigs.baseline, new: home.generatedConfigs.new },
         ...(home.dockerImage === undefined ? {} : { dockerImage: home.dockerImage }),
       }),
       reporter,

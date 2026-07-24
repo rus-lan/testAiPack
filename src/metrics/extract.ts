@@ -74,7 +74,7 @@ const isTool = (p: ExportPart): p is ExportToolPart => p.type === 'tool'
 const isReasoning = (p: ExportPart): p is ExportReasoningPart => p.type === 'reasoning'
 const isStepFinish = (p: ExportPart): p is ExportStepFinishPart => p.type === 'step-finish'
 
-const durationOf = (start: string, end: string): number => {
+const durationOf = (start: number | string, end: number | string): number => {
   const d = toNum(end) - toNum(start)
   return d > 0 ? d : 0
 }
@@ -163,12 +163,11 @@ const stepDurations = (exp: OpencodeExport): readonly number[] =>
           : { open: false, current: 0, out: st.out }
       }
       if (!st.open) return st
-      const dur =
-        p.type === 'reasoning'
-          ? durationOf(p.time.start, p.time.end)
-          : p.type === 'tool' && p.state.time
-            ? durationOf(p.state.time.start, p.state.time.end)
-            : 0
+      const dur = isReasoning(p)
+        ? durationOf(p.time.start, p.time.end)
+        : isTool(p) && p.state.time
+          ? durationOf(p.state.time.start, p.state.time.end)
+          : 0
       return { open: st.open, current: st.current + dur, out: st.out }
     }, { open: false, current: 0, out: [] as readonly number[] })
     return folded.out
@@ -178,7 +177,7 @@ const maxConsecutiveSameTool = (parts: readonly ExportPart[]): number =>
   parts
     .reduce<{ readonly name: string | null; readonly run: number; readonly best: number }>(
       (st, p) => {
-        if (p.type !== 'tool') return { name: null, run: 0, best: st.best }
+        if (!isTool(p)) return { name: null, run: 0, best: st.best }
         const name = p.tool
         if (st.name === name) {
           const run = st.run + 1

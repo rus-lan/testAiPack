@@ -16,7 +16,7 @@ const toolPart = (
     input: {},
     ...(opts.start === undefined || opts.end === undefined
       ? {}
-      : { time: { start: String(opts.start), end: String(opts.end) } }),
+      : { time: { start: opts.start, end: opts.end } }),
   },
   id: opts.id ?? `id-${name}`,
 })
@@ -24,7 +24,7 @@ const toolPart = (
 const reasoningPart = (start: number, end: number, id = 'r1') => ({
   type: 'reasoning' as const,
   text: 'think',
-  time: { start: String(start), end: String(end) },
+  time: { start, end },
   id,
 })
 
@@ -34,8 +34,8 @@ const stepFinish = (id = 'sf1') => ({ type: 'step-finish' as const, id })
 const message = (parts: readonly Record<string, unknown>[], finish?: string): OpencodeExport['messages'][number] => {
   const info =
     finish === undefined
-      ? { role: 'assistant' as const, time: { created: '0' } }
-      : { role: 'assistant' as const, time: { created: '0' }, finish }
+      ? { role: 'assistant' as const, time: { created: 0 } }
+      : { role: 'assistant' as const, time: { created: 0 }, finish }
   return {
     info,
     parts: parts as unknown as OpencodeExport['messages'][number]['parts'],
@@ -68,7 +68,7 @@ const makeExport = (over: {
       reasoning: over.tokens?.reasoning ?? 50,
       cache: { read: over.tokens?.cacheRead ?? 10, write: over.tokens?.cacheWrite ?? 5 },
     },
-    time: { created: String(over.tStart ?? 1000), updated: String(over.tEnd ?? 4000) },
+    time: { created: over.tStart ?? 1000, updated: over.tEnd ?? 4000 },
   },
   messages: over.messages ?? [],
 })

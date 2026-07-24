@@ -151,6 +151,12 @@ const restoreHome = (): void => {
   savedHome = undefined
 }
 
+const seedOpencodeAuth = (h: string) =>
+  Effect.gen(function* () {
+    yield* ensureDir(path.join(h, '.local', 'share', 'opencode'))
+    yield* writeFile(path.join(h, '.local', 'share', 'opencode', 'auth.json'), '{}')
+  })
+
 const writePackSkill = async (name = 'myskill'): Promise<string> => {
   const packDir = makeTempDir('testaipack-pack-src-')
   await runP(ensureDir(packDir))
@@ -193,8 +199,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('happy-path skill: N=1 builds both HOMEs, new gets symlink, auth copied', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
-      await runP(writeFile(path.join(h, '.opencode', 'auth.json'), '{}'))
+      await runP(seedOpencodeAuth(h))
     })
     const packDir = await writePackSkill('myskill')
     const input = buildInput({}, skillOutcome(packDir))
@@ -208,12 +213,12 @@ describe('phase 04 — homeIsolation', () => {
     const linkPath = path.join(newHome, '.config', 'opencode', 'skills', 'myskill')
     expect(await runP(exists(linkPath))).toBe(true)
     expect(await runP(readSymlink(linkPath))).toBe(packDir)
-    expect(result.homeTrees.new[0]!.copiedAuth).toContain('.opencode')
+    expect(result.homeTrees.new[0]!.copiedAuth).toContain('.local/share/opencode/auth.json')
   })
 
   it('smoke-test (no packInstall): no symlink, no plugin install, identical configs', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput({}, undefined)
     const result = await runP(homeIsolation(input))
@@ -225,7 +230,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('plugin install success → installPlugin called per new run', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput({}, pluginOutcome('myplugin'))
     const result = await runP(homeIsolation(input))
@@ -237,7 +242,7 @@ describe('phase 04 — homeIsolation', () => {
   it('plugin install timeout → E_PACK_INSTALL_TIMEOUT', async () => {
     installMock.mockImplementation(() => Effect.sleep('200 millis'))
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput(
       { timeouts: { ...baseTimeouts, installSeconds: 0.05 } },
@@ -261,7 +266,7 @@ describe('phase 04 — homeIsolation', () => {
       ),
     )
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput({}, pluginOutcome('myplugin'))
     const err = await runFlip(homeIsolation(input))
@@ -315,7 +320,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('envVars: old has PURE+DISABLE flags, new does not', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput({}, undefined)
     const result = await runP(homeIsolation(input))
@@ -333,24 +338,51 @@ describe('phase 04 — homeIsolation', () => {
     expect(newEnv.HOME).toBe(input.workspace.homeNew[0])
   })
 
-  it('generatedConfigs differ for old/new when a pack is present', async () => {
+  it('skill pack → baseline and new configs identical (pack lives on the filesystem, not the config)', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const packDir = await writePackSkill('myskill')
     const input = buildInput({}, skillOutcome(packDir))
     const result = await runP(homeIsolation(input))
-    expect(result.generatedConfigs.baseline).not.toBe(result.generatedConfigs.new)
-    expect(result.generatedConfigs.new).toContain('myskill')
+    expect(result.generatedConfigs.baseline).toBe(result.generatedConfigs.new)
+    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
+    expect(baselineJson['agent']).toBeDefined()
+    expect(baselineJson['testaipack']).toBeUndefined()
+  })
+
+  it('propagates the model from the source opencode.json into both configs', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+      await runP(ensureDir(path.join(h, '.config', 'opencode')))
+      await runP(
+        writeFile(
+          path.join(h, '.config', 'opencode', 'opencode.json'),
+          '{"model":"zai-coding-plan/glm-5.2"}',
+        ),
+      )
+    })
+    const input = buildInput({}, undefined)
+    const result = await runP(homeIsolation(input))
     const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
     const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
-    expect(baselineJson['agent']).toBeDefined()
-    expect(newJson['agent']).toBeDefined()
+    expect(baselineJson['model']).toBe('zai-coding-plan/glm-5.2')
+    expect(newJson['model']).toBe('zai-coding-plan/glm-5.2')
+  })
+
+  it('omits model from both configs when the source opencode.json has none', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const input = buildInput({}, undefined)
+    const result = await runP(homeIsolation(input))
+    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
+    expect(baselineJson['model']).toBeUndefined()
   })
 
   it('writes config/baseline.json and config/new.json to disk', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const packDir = await writePackSkill('myskill')
     const input = buildInput({}, skillOutcome(packDir))
@@ -364,16 +396,13 @@ describe('phase 04 — homeIsolation', () => {
     expect(baselineOnDisk).toEqual(JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>)
     expect(newOnDisk).toEqual(JSON.parse(result.generatedConfigs.new) as Record<string, unknown>)
     expect(baselineOnDisk['testaipack']).toBeUndefined()
-    const packMeta = newOnDisk['testaipack'] as Record<string, unknown>
-    expect(packMeta).toBeDefined()
-    expect(packMeta['packName']).toBe('myskill')
-    expect(packMeta['packType']).toBe('skill')
+    expect(newOnDisk['testaipack']).toBeUndefined()
     expect(newOnDisk['agent']).toBeDefined()
   })
 
   it('smoke-test writes identical baseline.json and new.json (no pack metadata)', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput({}, undefined)
     await runP(homeIsolation(input))
@@ -388,7 +417,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('N=3 → three homeTrees per side, three envVars per side', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput({ runs: 3 }, undefined, 3)
     const result = await runP(homeIsolation(input))
@@ -403,7 +432,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('agent file instruction → .md copied into agents/ on new side only', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const mdSrc = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(mdSrc))
@@ -433,7 +462,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('command file instruction → .md copied into command/ (singular dir) on new side', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const mdSrc = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(mdSrc))
@@ -468,7 +497,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('mcp config instruction → writes mcp.<name> into opencode.json on new side', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const outcome: PackInstallOutcome = {
       packPath: '',
@@ -512,7 +541,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('mcp config extends an existing opencode.json instead of overwriting', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const outcome: PackInstallOutcome = {
       packPath: '',
@@ -540,7 +569,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('docker isolation (v0.3) builds HOMEs and records isolation/dockerImage', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput({ isolation: 'docker' }, undefined)
     const result = await runP(homeIsolation(input))
@@ -552,7 +581,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('docker isolation honours a custom --docker-image override', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input: HomeIsolationInputExt = {
       ...buildInput({ isolation: 'docker' }, undefined),
@@ -564,7 +593,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('home isolation records isolation="home" and no dockerImage', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput({ isolation: 'home' }, undefined)
     const result = await runP(homeIsolation(input))
@@ -574,7 +603,7 @@ describe('phase 04 — homeIsolation', () => {
 
   it('build.md written into every HOME (for preflight gate 3)', async () => {
     await useFakeHome(async (h) => {
-      await runP(ensureDir(path.join(h, '.opencode')))
+      await runP(seedOpencodeAuth(h))
     })
     const input = buildInput({}, undefined)
     await runP(homeIsolation(input))

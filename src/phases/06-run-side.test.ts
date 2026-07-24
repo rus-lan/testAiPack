@@ -146,7 +146,7 @@ const validExport = (): string =>
       summary: { additions: 0, deletions: 0, files: 0 },
       cost: 0,
       tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
-      time: { created: '0', updated: '0' },
+      time: { created: 0, updated: 0 },
     },
     messages: [],
   })
@@ -447,21 +447,35 @@ describe('phase 06 — run-side', () => {
   // sessionId
   // -------------------------------------------------------------------------
 
-  it('sessionId passed → used as-is in opencode.run and export', async () => {
+  it('new session → opencode.run gets no --session; streamed id drives the export', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
-    const sid = 'my-explicit-session-42'
-    await runP(runSide(buildInput(root, { sessionId: sid })))
-    expect(runMock.mock.calls[0]?.[0]?.session).toBe(sid)
-    expect(exportMock.mock.calls[0]?.[1]).toBe(sid)
+    runMock.mockImplementation((opts: OpencodeRunOptions) =>
+      Effect.sync(() => {
+        opts.onEvent?.(stepFinish('stop'))
+        return {
+          exitCode: 0,
+          stdout: '',
+          stderr: '',
+          durationMs: 5,
+          timedOut: false,
+          sessionId: 'streamed-sid',
+        }
+      }),
+    )
+    await runP(runSide(buildInput(root, { sessionId: 'planned-label' })))
+    expect(runMock.mock.calls[0]?.[0]?.session).toBeUndefined()
+    expect(runMock.mock.calls[0]?.[0]?.continueSession).toBeFalsy()
+    expect(exportMock.mock.calls[0]?.[1]).toBe('streamed-sid')
   })
 
-  it('sessionId empty → generated as <runId>-<side>-<runIndex>-<rand6hex>', async () => {
+  it('no streamed id → export falls back to the generated <runId>-<side>-<runIndex>-<rand> id', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     await runP(runSide(buildInput(root, { sessionId: '' })))
-    const sid = runMock.mock.calls[0]?.[0]?.session as string
-    expect(sid).toMatch(/^rid-abc-old-1-[0-9a-f]{6,}$/)
+    expect(runMock.mock.calls[0]?.[0]?.session).toBeUndefined()
+    const exportSid = exportMock.mock.calls[0]?.[1] as string
+    expect(exportSid).toMatch(/^rid-abc-old-1-[0-9a-f]{6,}$/)
   })
 
   // -------------------------------------------------------------------------
@@ -536,7 +550,7 @@ describe('phase 06 — run-side', () => {
     expect(log).toContain('finish=stop')
   })
 
-  it('init + prompt → run called twice, second with continueSession=true', async () => {
+  it('init + prompt → run called twice, second continues the init session', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     const calls: OpencodeRunOptions[] = []
@@ -544,18 +558,29 @@ describe('phase 06 — run-side', () => {
       Effect.sync(() => {
         calls.push(opts)
         opts.onEvent?.(stepFinish('stop'))
-        return { exitCode: 0, stdout: '', stderr: '', durationMs: 5, timedOut: false }
+        // opencode streams the real session id from the init run; the prompt
+        // run must continue THAT id (not a pre-assigned testaipack label).
+        return {
+          exitCode: 0,
+          stdout: '',
+          stderr: '',
+          durationMs: 5,
+          timedOut: false,
+          sessionId: 'real-opencode-session',
+        }
       }),
     )
     await runP(
       runSide(buildInput(root, { runInput: { init: 'do setup', prompt: 'do real work' } })),
     )
     expect(calls.length).toBe(2)
-    expect(calls[0]?.continueSession).toBe(false)
+    expect(calls[0]?.continueSession).toBeFalsy()
+    expect(calls[0]?.session).toBeUndefined()
     expect(calls[0]?.prompt).toBe('do setup')
     expect(calls[1]?.continueSession).toBe(true)
+    expect(calls[1]?.session).toBe('real-opencode-session')
     expect(calls[1]?.prompt).toBe('do real work')
-    expect(calls[1]?.session).toBe(calls[0]?.session)
+    expect(exportMock.mock.calls[0]?.[1]).toBe('real-opencode-session')
   })
 
   // -------------------------------------------------------------------------
@@ -578,7 +603,7 @@ describe('phase 06 — run-side', () => {
     {
       name: 'export-message info.finish=stop → 4',
       input: {
-        events: [ev('message', { info: { finish: 'stop', role: 'assistant', time: { created: '0' } } })],
+        events: [ev('message', { info: { finish: 'stop', role: 'assistant', time: { created: 0 } } })],
         exitCode: 0,
         timedOut: false,
         watchdogTriggered: false,
@@ -684,6 +709,32 @@ describe('phase 06 — run-side', () => {
     ).toBe(3)
     expect(computeMaxConsecutiveSameTool([])).toBe(0)
     expect(computeMaxConsecutiveSameTool([ev('text', { text: 'x' })])).toBe(0)
+  })
+
+  it('computeMaxConsecutiveSameTool reads tool_use streamed events (part.tool)', () => {
+    // real `opencode run --format json` shape: { type: "tool_use", part: { type: "tool", tool } }
+    const toolUse = (name: string): unknown => ({
+      type: 'tool_use',
+      part: { type: 'tool', tool: name, callID: 'c', state: { status: 'completed', input: {} } },
+    })
+    expect(computeMaxConsecutiveSameTool([toolUse('read'), toolUse('read'), toolUse('edit')])).toBe(2)
+  })
+
+  it('resolveFinish reads a streamed step_finish event (part.reason)', () => {
+    // real streamed shape: { type: "step_finish", part: { type: "step-finish", reason: "stop" } }
+    const streamedStop = {
+      type: 'step_finish',
+      part: { type: 'step-finish', reason: 'stop', id: 'p' },
+    }
+    const out = analyzeOutcome({
+      events: [streamedStop],
+      exitCode: 0,
+      timedOut: false,
+      watchdogTriggered: false,
+      doomLoopThreshold: DOOM_LOOP_THRESHOLD,
+    })
+    expect(out.finish).toBe('stop')
+    expect(out.rank).toBe(4)
   })
 
   it('hasRateLimitSignal detects 429 / rate-limit wording, ignores clean events', () => {

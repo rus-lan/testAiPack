@@ -85,7 +85,11 @@ interface AuthEntry {
 }
 
 const AUTH_TABLE: readonly AuthEntry[] = [
-  { flag: 'opencode', src: '.opencode', dst: '.opencode' },
+  // opencode stores provider credentials in $XDG_DATA_HOME/opencode/auth.json
+  // (default ~/.local/share/opencode/auth.json). Only auth.json is needed — the
+  // sibling opencode.db holds session history and can be multi-GB, so we never
+  // copy the whole data dir. The dst dir is created by SKELETON_DIRS.
+  { flag: 'opencode', src: '.local/share/opencode/auth.json', dst: '.local/share/opencode/auth.json' },
   { flag: 'npmrc', src: '.npmrc', dst: '.npmrc' },
   { flag: 'anthropic', src: '.config/anthropic', dst: '.config/anthropic' },
   { flag: 'openai', src: '.config/openai', dst: '.config/openai' },
@@ -178,6 +182,29 @@ const readOpendcodeConfig = (
       return isRecord(obj) ? obj : {}
     } catch {
       return {}
+    }
+  })
+
+/**
+ * Read the `model` field from the user's source opencode.json so the isolated
+ * runs use the same authenticated provider/model the user configured. Without
+ * this, OPENCODE_CONFIG_CONTENT replaces the config with a model-less one and
+ * opencode falls back to its default provider, which is typically not
+ * authenticated for the isolated HOME (e.g. GitHub Copilot → 400). Returns
+ * undefined when the source config is absent or has no `model`.
+ */
+const readSourceModel = (sourceHome: string): Effect.Effect<string | undefined, PhaseError> =>
+  Effect.gen(function* () {
+    const cfgPath = path.join(sourceHome, '.config/opencode/opencode.json')
+    if (!(yield* exists(cfgPath))) return undefined
+    const raw = yield* readFile(cfgPath).pipe(Effect.catchAll(() => Effect.succeed('')))
+    if (raw === '') return undefined
+    try {
+      const obj = JSON.parse(raw) as unknown
+      const m = isRecord(obj) ? obj['model'] : undefined
+      return typeof m === 'string' ? m : undefined
+    } catch {
+      return undefined
     }
   })
 
@@ -298,9 +325,11 @@ const buildConfigObject = (
   side: Side,
   pack: PackInfo | undefined,
   mcpServers: Record<string, unknown>,
+  model: string | undefined,
 ): Record<string, unknown> => {
   const base: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
+    ...(model === undefined ? {} : { model }),
     agent: {
       build: {
         mode: 'primary',
@@ -309,16 +338,9 @@ const buildConfigObject = (
     },
   }
   if (side === 'new' && pack !== undefined && pack.type !== null) {
-    const withPack: Record<string, unknown> = {
-      ...base,
-      testaipack: {
-        packName: pack.name,
-        packType: pack.type,
-        registeredIn: [...pack.registeredIn],
-      },
-      ...(Object.keys(mcpServers).length > 0 ? { mcp: { ...mcpServers } } : {}),
-    }
-    return withPack
+    return Object.keys(mcpServers).length > 0
+      ? { ...base, mcp: { ...mcpServers } }
+      : base
   }
   return base
 }
@@ -356,8 +378,9 @@ export const homeIsolation = (
     const packOutcome = input.packInstall
     const packInfo = packOutcome === undefined ? undefined : packInfoFrom(packOutcome)
     const mcpServers = collectMcpServers(packOutcome?.instructions)
-    const baselineObj = buildConfigObject('old', packInfo, mcpServers)
-    const newObj = buildConfigObject('new', packInfo, mcpServers)
+    const sourceModel = yield* readSourceModel(sourceHome)
+    const baselineObj = buildConfigObject('old', packInfo, mcpServers, sourceModel)
+    const newObj = buildConfigObject('new', packInfo, mcpServers, sourceModel)
     const baselineCfg = JSON.stringify(baselineObj, null, 2)
     const newCfg = JSON.stringify(newObj, null, 2)
 

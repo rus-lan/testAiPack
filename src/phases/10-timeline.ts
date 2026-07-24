@@ -13,6 +13,10 @@ import { Effect, Either } from 'effect'
 import path from 'node:path'
 import type {
   ExportPart,
+  ExportReasoningPart,
+  ExportStepFinishPart,
+  ExportTextPart,
+  ExportToolPart,
   OpencodeExport,
   RunSideResult,
   Side,
@@ -36,7 +40,7 @@ import type { SessionTreeNode } from '../metrics/extract.js'
 // Pure: event extraction from a single export
 // ---------------------------------------------------------------------------
 
-const toMs = (s: string | undefined, fallback: number): number => {
+const toMs = (s: number | string | undefined, fallback: number): number => {
   if (s === undefined) return fallback
   const n = Number(s)
   return Number.isFinite(n) ? n : fallback
@@ -64,6 +68,14 @@ const eventBase = (
   ...(parentSessionId === null ? {} : { parentSessionId }),
 })
 
+// Type guards. The ExportPart union includes a tolerant catch-all whose
+// `type` is a plain string, so a literal `part.type === 'tool'` check no longer
+// narrows the union — these predicates restore the narrowing.
+const isTextPart = (p: ExportPart): p is ExportTextPart => p.type === 'text'
+const isReasoningPart = (p: ExportPart): p is ExportReasoningPart => p.type === 'reasoning'
+const isToolPart = (p: ExportPart): p is ExportToolPart => p.type === 'tool'
+const isStepFinishPart = (p: ExportPart): p is ExportStepFinishPart => p.type === 'step-finish'
+
 /** Map one export part to 0..n timeline events (pre-normalization). */
 const partToEvents = (
   part: ExportPart,
@@ -71,62 +83,63 @@ const partToEvents = (
   msgCompleted: number | undefined,
   base: EventBase,
 ): readonly TimelineEvent[] => {
-  switch (part.type) {
-    case 'text':
-      return [
-        {
-          ...base,
-          tStart: String(msgCreated),
-          tEnd: String(msgCreated),
-          type: 'text',
-        },
-      ]
-    case 'reasoning':
-      return [
-        {
-          ...base,
-          tStart: String(toMs(part.time.start, msgCreated)),
-          tEnd: String(toMs(part.time.end, msgCreated)),
-          type: 'reasoning',
-        },
-      ]
-    case 'tool': {
-      const start = part.state.time !== undefined ? toMs(part.state.time.start, msgCreated) : msgCreated
-      const end = part.state.time !== undefined ? toMs(part.state.time.end, start) : start
-      const callEvent: TimelineEvent = {
+  if (isTextPart(part)) {
+    return [
+      {
         ...base,
-        tStart: String(start),
+        tStart: String(msgCreated),
+        tEnd: String(msgCreated),
+        type: 'text',
+      },
+    ]
+  }
+  if (isReasoningPart(part)) {
+    return [
+      {
+        ...base,
+        tStart: String(toMs(part.time.start, msgCreated)),
+        tEnd: String(toMs(part.time.end, msgCreated)),
+        type: 'reasoning',
+      },
+    ]
+  }
+  if (isToolPart(part)) {
+    const start = part.state.time !== undefined ? toMs(part.state.time.start, msgCreated) : msgCreated
+    const end = part.state.time !== undefined ? toMs(part.state.time.end, start) : start
+    const callEvent: TimelineEvent = {
+      ...base,
+      tStart: String(start),
+      tEnd: String(end),
+      type: 'tool-call',
+      tool: part.tool,
+      status: part.state.status,
+    }
+    if (part.state.status === 'completed' || part.state.status === 'error') {
+      const resultEvent: TimelineEvent = {
+        ...base,
+        tStart: String(end),
         tEnd: String(end),
-        type: 'tool-call',
+        type: 'tool-result',
         tool: part.tool,
         status: part.state.status,
       }
-      if (part.state.status === 'completed' || part.state.status === 'error') {
-        const resultEvent: TimelineEvent = {
-          ...base,
-          tStart: String(end),
-          tEnd: String(end),
-          type: 'tool-result',
-          tool: part.tool,
-          status: part.state.status,
-        }
-        return [callEvent, resultEvent]
-      }
-      return [callEvent]
+      return [callEvent, resultEvent]
     }
-    case 'step-finish':
-      return [
-        {
-          ...base,
-          tStart: String(msgCreated),
-          tEnd: String(msgCompleted ?? msgCreated),
-          type: 'step-finish',
-          ...(part.tokens?.total !== undefined ? { tokens: part.tokens.total } : {}),
-        },
-      ]
-    case 'step-start':
-      return []
+    return [callEvent]
   }
+  if (isStepFinishPart(part)) {
+    return [
+      {
+        ...base,
+        tStart: String(msgCreated),
+        tEnd: String(msgCompleted ?? msgCreated),
+        type: 'step-finish',
+        ...(part.tokens?.total !== undefined ? { tokens: part.tokens.total } : {}),
+      },
+    ]
+  }
+  // step-start, patch, and any unrecognised part kind contribute no events.
+  return []
 }
 
 export const extractEventsFromExport = (

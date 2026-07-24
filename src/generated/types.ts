@@ -378,8 +378,8 @@ export type ExportTokens = {
 }
 
 export type ExportTimeRange = {
-  created: string
-  updated: string
+  created: number
+  updated: number
 }
 
 export type ExportInfo = {
@@ -413,8 +413,8 @@ export type ExportMessageInfo = {
     total?: number
   }
   time: {
-    created: string
-    completed?: string
+    created: number
+    completed?: number
   }
   finish?: FinishCause
   path?: {
@@ -434,8 +434,8 @@ export type ExportReasoningPart = {
   type: 'reasoning'
   text: string
   time: {
-    start: string
-    end: string
+    start: number
+    end: number
   }
   id: string
 }
@@ -447,8 +447,8 @@ export type ExportToolState = {
   metadata?: RecordUnknown
   title?: string
   time?: {
-    start: string
-    end: string
+    start: number
+    end: number
   }
 }
 
@@ -481,8 +481,26 @@ export type ExportStepFinishPart = {
   id: string
 }
 
+export type ExportPatchPart = {
+  type: 'patch'
+  hash: string
+  files: Array<string>
+  id: string
+}
+
+export type ExportUnknownPart = {
+  type: string
+  id: string
+}
+
 export type ExportPart =
-  ExportTextPart | ExportReasoningPart | ExportToolPart | ExportStepStartPart | ExportStepFinishPart
+  | ExportTextPart
+  | ExportReasoningPart
+  | ExportToolPart
+  | ExportStepStartPart
+  | ExportStepFinishPart
+  | ExportPatchPart
+  | ExportUnknownPart
 
 export type ExportMessage = {
   info: ExportMessageInfo

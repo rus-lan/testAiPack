@@ -92,6 +92,7 @@ const dockerErrorToOpencode =
     })
 
 export const buildRunArgs = (opts: OpencodeRunOptions): readonly string[] => [
+  'run',
   opts.prompt,
   ...(opts.agent !== undefined ? ['--agent', opts.agent] : []),
   ...(opts.model !== undefined ? ['--model', opts.model] : []),
@@ -104,13 +105,19 @@ export const buildRunArgs = (opts: OpencodeRunOptions): readonly string[] => [
 ]
 
 const sessionIdFromEvent = (ev: unknown): string | undefined => {
-  if (isRecord(ev) && typeof ev['sessionId'] === 'string') return ev['sessionId']
-  if (
-    isRecord(ev) &&
-    isRecord(ev['session']) &&
-    typeof ev['session']['id'] === 'string'
-  ) {
-    return ev['session']['id']
+  if (!isRecord(ev)) return undefined
+  // opencode streams the session id as top-level `sessionID` (capital ID); older
+  // mock fixtures used `sessionId`. Accept both, plus the nested shapes.
+  const topId = ev['sessionID']
+  if (typeof topId === 'string') return topId
+  const lowerId = ev['sessionId']
+  if (typeof lowerId === 'string') return lowerId
+  const part = ev['part']
+  if (isRecord(part) && typeof part['sessionID'] === 'string') return part['sessionID']
+  if (isRecord(part) && typeof part['sessionId'] === 'string') return part['sessionId']
+  const session = ev['session']
+  if (isRecord(session) && typeof session['id'] === 'string') {
+    return session['id']
   }
   return undefined
 }

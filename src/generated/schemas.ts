@@ -386,8 +386,8 @@ export const exportTokensSchema = z.object({
 })
 
 export const exportTimeRangeSchema = z.object({
-  created: z.string(),
-  updated: z.string(),
+  created: z.number().int(),
+  updated: z.number().int(),
 })
 
 export const exportInfoSchema = z.object({
@@ -425,8 +425,8 @@ export const exportMessageInfoSchema = z.object({
     })
     .optional(),
   time: z.object({
-    created: z.string(),
-    completed: z.string().optional(),
+    created: z.number().int(),
+    completed: z.number().int().optional(),
   }),
   finish: finishCauseSchema.optional(),
   path: z
@@ -448,8 +448,8 @@ export const exportReasoningPartSchema = z.object({
   type: z.literal('reasoning'),
   text: z.string(),
   time: z.object({
-    start: z.string(),
-    end: z.string(),
+    start: z.number().int(),
+    end: z.number().int(),
   }),
   id: z.string(),
 })
@@ -467,8 +467,8 @@ export const exportToolStateSchema = z.object({
   title: z.string().optional(),
   time: z
     .object({
-      start: z.string(),
-      end: z.string(),
+      start: z.number().int(),
+      end: z.number().int(),
     })
     .optional(),
 })
@@ -504,12 +504,26 @@ export const exportStepFinishPartSchema = z.object({
   id: z.string(),
 })
 
+export const exportPatchPartSchema = z.object({
+  type: z.literal('patch'),
+  hash: z.string(),
+  files: z.array(z.string()),
+  id: z.string(),
+})
+
+export const exportUnknownPartSchema = z.object({
+  type: z.string(),
+  id: z.string(),
+})
+
 export const exportPartSchema = z.union([
   exportTextPartSchema,
   exportReasoningPartSchema,
   exportToolPartSchema,
   exportStepStartPartSchema,
   exportStepFinishPartSchema,
+  exportPatchPartSchema,
+  exportUnknownPartSchema,
 ])
 
 export const exportMessageSchema = z.object({

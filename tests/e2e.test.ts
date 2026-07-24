@@ -89,25 +89,25 @@ const buildExport = (variant: 'same' | 'better'): string => {
       summary: { additions: 5, deletions: 1, files: 1 },
       cost: 0.01,
       tokens,
-      time: { created: '0', updated: '2000' },
+      time: { created: 0, updated: 2000 },
     },
     messages: [
       {
-        info: { role: 'user', time: { created: '0' } },
+        info: { role: 'user', time: { created: 0 } },
         parts: [{ type: 'text', text: 'do the thing', id: 'p1' }],
       },
       {
         info: {
           role: 'assistant',
           finish: 'stop',
-          time: { created: '0', completed: '2000' },
+          time: { created: 0, completed: 2000 },
         },
         parts: [
           { type: 'step-start', id: 'p2' },
           {
             type: 'reasoning',
             text: 'thinking',
-            time: { start: '100', end: '500' },
+            time: { start: 100, end: 500 },
             id: 'p3',
           },
           {
@@ -117,7 +117,7 @@ const buildExport = (variant: 'same' | 'better'): string => {
             state: {
               status: 'completed',
               input: {},
-              time: { start: '500', end: '1500' },
+              time: { start: 500, end: 1500 },
             },
             id: 'p4',
           },
@@ -176,7 +176,8 @@ const realHome = process.env['HOME']
 
 const withFakeHome = async (fn: () => Promise<void>): Promise<void> => {
   const fakeHome = makeTempDir()
-  await runP(ensureDir(path.join(fakeHome, '.opencode')))
+  await runP(ensureDir(path.join(fakeHome, '.local', 'share', 'opencode')))
+  await runP(writeFile(path.join(fakeHome, '.local', 'share', 'opencode', 'auth.json'), '{}'))
   process.env['HOME'] = fakeHome
   try {
     await fn()
