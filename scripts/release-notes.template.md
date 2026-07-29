@@ -29,6 +29,13 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.5.2 (installer)
+
+- The installer no longer talks to the GitHub API at all — it downloads directly through GitHub's `releases/latest/download/<asset>` redirect. That means the anonymous API's 60-requests/hour-per-IP limit can no longer break an install, which mattered most on a shared IP (office, CI, VPN).
+- `TESTAIPACK_VERSION=0.5.0 sh install.sh` installs a specific version instead of latest.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.5.1...v0.5.2
+
 ## v0.5.1 (install fix)
 
 - **The one-line install command from the README has been broken since v0.5.0 (and v0.4.0 before it)** — `curl -fsSL .../releases/latest/download/install.sh | sh` returned a 404, because `install.sh` was never attached as a release asset. It is now: `install.sh` is built into every release alongside the binaries.
