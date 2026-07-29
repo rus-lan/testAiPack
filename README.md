@@ -78,7 +78,17 @@ curl -fsSL https://github.com/rus-lan/testAiPack/releases/latest/download/instal
 Скрипт определит платформу (linux/darwin/windows × x64/arm64), скачает
 бинарник из [последнего релиза](https://github.com/rus-lan/testAiPack/releases/latest)
 и установит его в `~/.local/bin/testaipack`. Если каталога нет в `PATH` —
-подскажет, какую строку добавить в rc-файл оболочки.
+подскажет, какую строку добавить в rc-файл оболочки. Скачанный бинарник
+сверяется с `checksums-sha256.txt` из того же релиза; при несовпадении
+установка прерывается. Скачивание идёт напрямую через
+`releases/latest/download/<asset>` — без обращений к GitHub API, так что
+никакой rate limit скрипту не грозит.
+
+Поставить конкретную версию вместо latest:
+
+```bash
+TESTAIPACK_VERSION=0.5.0 sh install.sh
+```
 
 ### Готовый бинарник из releases
 

@@ -1,9 +1,14 @@
 #!/usr/bin/env sh
-# testaipack installer — downloads the latest release binary for your platform.
+# testaipack installer — downloads the release binary for your platform
+# straight from GitHub's release-download redirect
+# (github.com/OWNER/REPO/releases/latest/download/<asset>), never the REST
+# API — so the installer is never subject to the API's 60 requests/hour
+# per-IP rate limit.
 # Usage: curl -fsSL https://github.com/rus-lan/testAiPack/releases/latest/download/install.sh | sh
 #   or:  wget -qO- https://github.com/rus-lan/testAiPack/releases/latest/download/install.sh | sh
 #
-# Override the install dir with:  INSTALL_DIR=/opt/bin sh install.sh
+# Override the install dir with:   INSTALL_DIR=/opt/bin sh install.sh
+# Pin a specific version with:     TESTAIPACK_VERSION=0.5.0 sh install.sh
 set -eu
 
 OWNER="rus-lan"
@@ -33,34 +38,18 @@ else
   asset="${BINARY_NAME}-${os}-${arch}"
 fi
 
-# --- find the latest release's download URL for our asset ---
-echo "testaipack: resolving latest release..."
-API_URL="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
-
-RELEASE_JSON=$(curl -fsSL "$API_URL" 2>/dev/null || true)
-if [ -z "$RELEASE_JSON" ]; then
-  RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/${OWNER}/${REPO}/releases" 2>/dev/null | head -c 200000)
+# --- resolve the release path: latest, or a pinned TESTAIPACK_VERSION ---
+# `releases/latest/download/<asset>` itself resolves "latest" to the real tag
+# as part of the download redirect — there is nothing to look up in advance.
+if [ -n "${TESTAIPACK_VERSION:-}" ]; then
+  echo "testaipack: installing pinned version v${TESTAIPACK_VERSION}..."
+  RELEASE_PATH="releases/download/v${TESTAIPACK_VERSION}"
+else
+  echo "testaipack: installing latest release..."
+  RELEASE_PATH="releases/latest/download"
 fi
-
-if [ -z "$RELEASE_JSON" ]; then
-  echo "testaipack: could not reach GitHub API. Check your network connection." >&2
-  exit 1
-fi
-
-# Extract the browser_download_url whose path ends with our asset name.
-# grep/sed parsing avoids a hard dependency on jq.
-DOWNLOAD_URL=$(printf '%s\n' "$RELEASE_JSON" \
-  | grep -o '"browser_download_url":[[:space:]]*"https://[^"]*"' \
-  | grep -o "https://[^\"' ]*/${asset}\"" \
-  | sed 's/"$//' \
-  | head -1)
-
-if [ -z "$DOWNLOAD_URL" ]; then
-  echo "testaipack: asset '$asset' not found in the latest release." >&2
-  echo "Available assets:" >&2
-  printf '%s\n' "$RELEASE_JSON" | grep -o '"name":[[:space:]]*"[^"]*"' | head -20 >&2
-  exit 1
-fi
+BASE_URL="https://github.com/${OWNER}/${REPO}/${RELEASE_PATH}"
+DOWNLOAD_URL="${BASE_URL}/${asset}"
 
 # --- install ---
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
@@ -75,7 +64,17 @@ TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/testaipack-dl.XXXXXX")
 trap 'rm -f "$TMP_FILE"' EXIT
 
 echo "testaipack: downloading $asset..."
-curl -fsSL -o "$TMP_FILE" "$DOWNLOAD_URL"
+if ! curl -fsSL -o "$TMP_FILE" "$DOWNLOAD_URL"; then
+  echo "testaipack: could not download $asset from $DOWNLOAD_URL" >&2
+  if [ -n "${TESTAIPACK_VERSION:-}" ]; then
+    echo "testaipack: check that release v${TESTAIPACK_VERSION} exists and includes this asset:" >&2
+    echo "  https://github.com/${OWNER}/${REPO}/releases/tag/v${TESTAIPACK_VERSION}" >&2
+  else
+    echo "testaipack: check your network connection, or browse releases at:" >&2
+    echo "  https://github.com/${OWNER}/${REPO}/releases/latest" >&2
+  fi
+  exit 1
+fi
 
 # --- verify checksum against checksums-sha256.txt from the same release ---
 # Best-effort: a missing checksums asset or a missing sha256sum/shasum
@@ -91,34 +90,25 @@ else
 fi
 
 if [ -n "$SHA_CMD" ]; then
-  CHECKSUMS_URL=$(printf '%s\n' "$RELEASE_JSON" \
-    | grep -o '"browser_download_url":[[:space:]]*"https://[^"]*"' \
-    | grep -o "https://[^\"' ]*/checksums-sha256\.txt\"" \
-    | sed 's/"$//' \
-    | head -1)
-
-  if [ -z "$CHECKSUMS_URL" ]; then
-    echo "testaipack: WARNING: checksums-sha256.txt not found in this release — skipping integrity check." >&2
+  CHECKSUMS_URL="${BASE_URL}/checksums-sha256.txt"
+  TMP_CHECKSUMS=$(mktemp "${TMPDIR:-/tmp}/testaipack-sha.XXXXXX")
+  if ! curl -fsSL -o "$TMP_CHECKSUMS" "$CHECKSUMS_URL" 2>/dev/null; then
+    echo "testaipack: WARNING: could not download checksums-sha256.txt — skipping integrity check." >&2
+    rm -f "$TMP_CHECKSUMS"
   else
-    TMP_CHECKSUMS=$(mktemp "${TMPDIR:-/tmp}/testaipack-sha.XXXXXX")
-    if ! curl -fsSL -o "$TMP_CHECKSUMS" "$CHECKSUMS_URL" 2>/dev/null; then
-      echo "testaipack: WARNING: could not download checksums-sha256.txt — skipping integrity check." >&2
-      rm -f "$TMP_CHECKSUMS"
+    EXPECTED=$(grep -E "  ${asset}\$" "$TMP_CHECKSUMS" | awk '{print $1}' | head -1)
+    rm -f "$TMP_CHECKSUMS"
+    if [ -z "$EXPECTED" ]; then
+      echo "testaipack: WARNING: no checksum entry for '$asset' — skipping integrity check." >&2
     else
-      EXPECTED=$(grep -E "  ${asset}\$" "$TMP_CHECKSUMS" | awk '{print $1}' | head -1)
-      rm -f "$TMP_CHECKSUMS"
-      if [ -z "$EXPECTED" ]; then
-        echo "testaipack: WARNING: no checksum entry for '$asset' — skipping integrity check." >&2
-      else
-        ACTUAL=$($SHA_CMD "$TMP_FILE" | awk '{print $1}')
-        if [ "$EXPECTED" != "$ACTUAL" ]; then
-          echo "testaipack: checksum mismatch for $asset — aborting install." >&2
-          echo "  expected: $EXPECTED" >&2
-          echo "  actual:   $ACTUAL" >&2
-          exit 1
-        fi
-        echo "testaipack: checksum verified ($asset)."
+      ACTUAL=$($SHA_CMD "$TMP_FILE" | awk '{print $1}')
+      if [ "$EXPECTED" != "$ACTUAL" ]; then
+        echo "testaipack: checksum mismatch for $asset — aborting install." >&2
+        echo "  expected: $EXPECTED" >&2
+        echo "  actual:   $ACTUAL" >&2
+        exit 1
       fi
+      echo "testaipack: checksum verified ($asset)."
     fi
   fi
 fi
