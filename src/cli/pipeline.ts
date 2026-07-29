@@ -44,6 +44,7 @@ import { reportRender } from '../phases/11-report-render.js'
 import { reviewWorkspace } from '../phases/12-review-workspace.js'
 import { cleanup } from '../phases/13-cleanup.js'
 import { buildReportSummary } from './summary.js'
+import { withLogLevel } from './progress.js'
 import type { ProgressReporter } from './progress.js'
 
 /** 14 phases: cli-parse(00) \u2026 cleanup(13). */
@@ -171,9 +172,11 @@ export const runPipeline = (
   opts: PipelineOptions,
 ): Effect.Effect<PipelineOutcome, PhaseError> =>
   Effect.gen(function* () {
-    const reporter = opts.reporter
+    const rawReporter = opts.reporter
 
-    // 00 cli-parse
+    // 00 cli-parse — runs before the log level itself is known, so this one
+    // call always uses the unfiltered reporter (only matters at a stricter
+    // level than the default `info`, and it is a single progress line).
     const parsed = yield* timedPhase(
       0,
       'cli-parse',
@@ -182,9 +185,10 @@ export const runPipeline = (
         cwd: opts.cwd,
         ...(opts.configFile === undefined ? {} : { configFile: opts.configFile }),
       }),
-      reporter,
+      rawReporter,
     )
     const baseRunInput = parsed.runInput
+    const reporter = withLogLevel(rawReporter, baseRunInput.logLevel)
 
     const dockerWarning = dockerDowngradeWarning(parsed.flagDefaults)
     if (dockerWarning !== undefined) reporter.log(dockerWarning)

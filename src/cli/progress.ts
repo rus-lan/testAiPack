@@ -8,6 +8,8 @@
  * (production wires `process.stderr.write`, tests capture into an array). A
  * `silent` flag disables info output while still allowing error lines through.
  */
+import type { LogLevel } from '@generated/types'
+
 export type ProgressSink = (line: string) => void
 
 export interface PhaseDone {
@@ -76,6 +78,58 @@ export const createProgressReporter = (
     },
     done: (summary) => {
       emit(`${RULE}\nDone. ${summary}`)
+    },
+  }
+}
+
+/**
+ * Severity each reporter method carries, and the rank `--log-level` filters
+ * against (message shown when the configured level's rank <= the message's
+ * rank — the usual leveled-logger model):
+ * - `header`/`phaseDone`/`sub` are per-phase progress chatter → `info`.
+ * - `log` (warnings, e.g. the docker-downgrade notice) and `done` (the final
+ *   result line) → `warn`.
+ * - `error` is always shown, at every configured level.
+ *
+ * `debug` and `info` end up identical: nothing the reporter emits today is
+ * held back at `info` and only unlocked at `debug` — there is no extra detail
+ * to show. `debug` is accepted and behaves like `info` rather than inventing
+ * a distinction the reporter cannot express.
+ */
+const LOG_LEVEL_RANK: Readonly<Record<LogLevel, number>> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+}
+
+const MESSAGE_RANK = {
+  progress: LOG_LEVEL_RANK.info,
+  result: LOG_LEVEL_RANK.warn,
+} as const
+
+/** Wraps a reporter so each method only forwards when `level` allows it. */
+export const withLogLevel = (reporter: ProgressReporter, level: LogLevel): ProgressReporter => {
+  const configured = LOG_LEVEL_RANK[level]
+  const allow = (msgRank: number): boolean => configured <= msgRank
+  return {
+    header: (runId) => {
+      if (allow(MESSAGE_RANK.progress)) reporter.header(runId)
+    },
+    phaseDone: (phase) => {
+      if (allow(MESSAGE_RANK.progress)) reporter.phaseDone(phase)
+    },
+    sub: (label, durationMs, detail) => {
+      if (allow(MESSAGE_RANK.progress)) reporter.sub(label, durationMs, detail)
+    },
+    log: (msg) => {
+      if (allow(MESSAGE_RANK.result)) reporter.log(msg)
+    },
+    error: (msg) => {
+      reporter.error(msg)
+    },
+    done: (summary) => {
+      if (allow(MESSAGE_RANK.result)) reporter.done(summary)
     },
   }
 }

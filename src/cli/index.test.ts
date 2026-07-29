@@ -76,6 +76,11 @@ describe('cli/index — run --help flag table', () => {
     for (const flag of Object.keys(BOOLEAN_FLAGS)) {
       expect(text).toContain(flag)
     }
+    // A flag can print its own name (from VALUE_FLAGS/BOOLEAN_FLAGS) with no
+    // real description behind it — the check above alone would not catch
+    // that. Fail on the fallback placeholder too, since a missing
+    // FLAG_DESCRIPTIONS entry is the actual documentation gap.
+    expect(text).not.toContain('(no description yet)')
   })
 
   it('lists the four orchestrator flags with their defaults', async () => {

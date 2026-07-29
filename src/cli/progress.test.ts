@@ -2,8 +2,10 @@ import { describe, it, expect } from 'vitest'
 import {
   createProgressReporter,
   formatPhaseLine,
+  withLogLevel,
   type PhaseDone,
 } from './progress.js'
+import type { LogLevel } from '@generated/types'
 
 const collect = (): { readonly sink: (l: string) => void; readonly lines: string[] } => {
   const lines: string[] = []
@@ -81,5 +83,71 @@ describe('cli/progress — reporter', () => {
     const out = c.lines.join('')
     expect(out).toContain('Done.')
     expect(out).toContain('2 improvements')
+  })
+})
+
+describe('cli/progress — withLogLevel', () => {
+  const phase: PhaseDone = { index: 0, total: 14, label: 'cli-parse', durationMs: 1 }
+
+  const fireAll = (r: ReturnType<typeof createProgressReporter>): void => {
+    r.header('run-xyz')
+    r.phaseDone(phase)
+    r.sub('old/run-1/3', 100)
+    r.log('warning: docker downgraded')
+    r.done('1 improvement(s)')
+    r.error('boom')
+  }
+
+  it('info (unset default) is byte-identical to the unwrapped reporter', () => {
+    const plain = collect()
+    fireAll(createProgressReporter(plain.sink, false))
+
+    const leveled = collect()
+    fireAll(withLogLevel(createProgressReporter(leveled.sink, false), 'info'))
+
+    expect(leveled.lines).toEqual(plain.lines)
+  })
+
+  it('debug behaves exactly like info — nothing extra to unlock today', () => {
+    const info = collect()
+    fireAll(withLogLevel(createProgressReporter(info.sink, false), 'info'))
+
+    const debug = collect()
+    fireAll(withLogLevel(createProgressReporter(debug.sink, false), 'debug'))
+
+    expect(debug.lines).toEqual(info.lines)
+  })
+
+  it('warn: no per-phase progress chatter, but warnings/result/error still show', () => {
+    const c = collect()
+    fireAll(withLogLevel(createProgressReporter(c.sink, false), 'warn'))
+    const out = c.lines.join('')
+    expect(out).not.toContain('testaipack run')
+    expect(out).not.toContain('[1/14]')
+    expect(out).not.toContain('old/run-1/3')
+    expect(out).toContain('warning: docker downgraded')
+    expect(out).toContain('1 improvement(s)')
+    expect(out).toContain('error: boom')
+  })
+
+  it('error: only the error line, nothing else — including on a successful run', () => {
+    const c = collect()
+    fireAll(withLogLevel(createProgressReporter(c.sink, false), 'error'))
+    const out = c.lines.join('')
+    expect(out).not.toContain('testaipack run')
+    expect(out).not.toContain('[1/14]')
+    expect(out).not.toContain('old/run-1/3')
+    expect(out).not.toContain('warning: docker downgraded')
+    expect(out).not.toContain('improvement')
+    expect(out).toBe('error: boom\n')
+  })
+
+  it('error is never suppressed, at every level', () => {
+    const levels: readonly LogLevel[] = ['debug', 'info', 'warn', 'error']
+    for (const level of levels) {
+      const c = collect()
+      withLogLevel(createProgressReporter(c.sink, false), level).error('boom')
+      expect(c.lines.join('')).toContain('error: boom')
+    }
   })
 })
