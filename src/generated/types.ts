@@ -108,7 +108,7 @@ export type WorkspaceTree = {
 
 export type SuccessRank = number
 
-export type FinishCause = 'stop' | 'tool-calls' | 'length' | 'error' | 'other'
+export type FinishCause = 'stop' | 'tool-calls' | 'length' | 'error' | 'other' | 'unknown'
 
 export type RunSideResult = {
   side: Side

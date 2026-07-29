@@ -113,7 +113,7 @@ const failFs = (
 // Pure outcome analysis
 // ---------------------------------------------------------------------------
 
-const FINISH_VALUES: readonly string[] = ['stop', 'tool-calls', 'length', 'error', 'other']
+const FINISH_VALUES: readonly string[] = ['stop', 'tool-calls', 'length', 'error', 'other', 'unknown']
 
 const mapReasonToFinish = (raw: string): FinishCause | undefined => {
   const r = raw.toLowerCase()
@@ -296,9 +296,16 @@ export interface AnalyzeOutcome {
  *
  * Precedence (highest first): hard timeout → rate-limit → watchdog → crash
  * (non-zero exit) → finish-based (stop=4 / tool-calls=3 / length=2) →
- * doom-loop (1) → unknown (0). Every rank-0 branch also sets `errorCode` so
- * downstream (phase 07) can record the precise cause; length (2) and doom-loop
- * (1) are valid outcomes and carry no errorCode.
+ * doom-loop (1) → everything else (0). Only the four early-return branches
+ * set `errorCode` here; the rank-0 fallback below carries none — phase 07
+ * backfills `E_RUN_CRASH` for it (`errorCode ?? 'E_RUN_CRASH'`). Length (2)
+ * and doom-loop (1) are valid outcomes and carry no errorCode either way.
+ *
+ * `finish: 'unknown'` (opencode's own catch-all when it can't classify how a
+ * message ended) is deliberately not given its own case — it falls into the
+ * same default branch as `'other'` and is scored identically. Neither is
+ * evidence the run ended well, and testaipack has no information opencode
+ * itself lacked to rank one above the other.
  */
 export const analyzeOutcome = (input: AnalyzeInput): AnalyzeOutcome => {
   const maxConsecutiveSameTool = computeMaxConsecutiveSameTool(input.events)

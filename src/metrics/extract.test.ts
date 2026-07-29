@@ -237,6 +237,19 @@ describe('extractMetrics — secondary', () => {
     expect(secondary.finishCauseDistribution['tool-calls']).toBe(1)
   })
 
+  it('finishCauseDistribution counts `unknown` like any other cause — no special-casing needed', () => {
+    const exp = makeExport({
+      messages: [
+        message([], 'stop'),
+        message([], 'unknown'),
+        message([], 'unknown'),
+      ],
+    })
+    const { secondary } = extractMetrics(exp, null, 4)
+    expect(secondary.finishCauseDistribution['stop']).toBe(1)
+    expect(secondary.finishCauseDistribution['unknown']).toBe(2)
+  })
+
   it('stepLatency sums timed parts inside each step region; P50/P95 reflect it', () => {
     const exp = makeExport({
       messages: [

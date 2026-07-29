@@ -110,7 +110,14 @@ export const workspaceTreeSchema = z.object({
 
 export const successRankSchema = z.number().int()
 
-export const finishCauseSchema = z.enum(['stop', 'tool-calls', 'length', 'error', 'other'])
+export const finishCauseSchema = z.enum([
+  'stop',
+  'tool-calls',
+  'length',
+  'error',
+  'other',
+  'unknown',
+])
 
 export const runSideResultSchema = z.object({
   side: sideSchema,

@@ -46,6 +46,7 @@ enum FinishCause {
   Length: "length";
   Error: "error";
   Other: "other";
+  Unknown: "unknown";
 }
 
 // 0 = crash, 1 = doom-loop, 2 = length-limit, 3 = tool-calls -> stop, 4 = clean stop.

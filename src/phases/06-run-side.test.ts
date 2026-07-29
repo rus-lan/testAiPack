@@ -467,6 +467,35 @@ describe('phase 06 — run-side', () => {
     expect(exportMock.mock.calls.length).toBe(EXPORT_VALIDATION_MAX_RETRIES + 1)
   })
 
+  it('export carrying messages[].info.finish="unknown" parses — no longer E_EXPORT_INVALID', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const exportWithUnknownFinish = JSON.stringify({
+      info: {
+        id: 'sess-1',
+        slug: 's1',
+        projectID: 'p1',
+        directory: '/app',
+        title: 't',
+        agent: 'build',
+        model: { id: 'm1', providerID: 'anthropic' },
+        version: '1.18.4',
+        summary: { additions: 0, deletions: 0, files: 0 },
+        cost: 0,
+        tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+        time: { created: 0, updated: 0 },
+      },
+      messages: [
+        { info: { role: 'assistant', time: { created: 0 }, finish: 'unknown' }, parts: [] },
+      ],
+    })
+    exportMock.mockImplementation(() => Effect.succeed(exportWithUnknownFinish))
+    const result = await runP(runSide(buildInput(root)))
+    expect(result.successRank).toBe(4)
+    const exported = await runP(readFile(result.exportPath))
+    expect(exported).toBe(exportWithUnknownFinish)
+  })
+
   it('export retries past truncated/invalid JSON and succeeds once a fresh export is valid', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
@@ -723,6 +752,35 @@ describe('phase 06 — run-side', () => {
       input: { events: [], exitCode: 0, timedOut: false, watchdogTriggered: false, doomLoopThreshold: DOOM_LOOP_THRESHOLD },
       rank: 0,
       finish: 'other',
+    },
+    {
+      // opencode's own catch-all when it can't classify how a message ended.
+      // Scored identically to 'other' — no dedicated case, no special errorCode.
+      name: 'export-message info.finish=unknown → 0, same as other',
+      input: {
+        events: [ev('message', { info: { finish: 'unknown', role: 'assistant', time: { created: 0 } } })],
+        exitCode: 0,
+        timedOut: false,
+        watchdogTriggered: false,
+        doomLoopThreshold: DOOM_LOOP_THRESHOLD,
+      },
+      rank: 0,
+      finish: 'unknown',
+    },
+    {
+      name: 'finish=unknown + doom-loop → still reclassified to tool-calls @ 1, same as other would be',
+      input: {
+        events: [
+          ...Array.from({ length: 15 }, () => tool('bash')),
+          ev('message', { info: { finish: 'unknown', role: 'assistant', time: { created: 0 } } }),
+        ],
+        exitCode: 0,
+        timedOut: false,
+        watchdogTriggered: false,
+        doomLoopThreshold: 10,
+      },
+      rank: 1,
+      finish: 'tool-calls',
     },
     {
       name: 'stop beats doom-loop (high consec tool but clean stop) → 4',
