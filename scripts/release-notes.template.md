@@ -29,6 +29,13 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.5.5 (docker export validation fix)
+
+- **Anyone on `--isolation docker` is currently losing every run**: opencode 1.18.4 (baked into the docker image) writes `finish: "unknown"` into a session, and our export validation — built against 1.18.3 — rejected it outright. `unknown` is now an accepted, valid outcome (treated the same as `other`: not a clean success, not a crash).
+- The docker image now pins its opencode version explicitly (`OPENCODE_VERSION` build arg) instead of resolving `latest` at build time — upstream had already moved four releases past what's actually baked in, and that kind of silent drift is exactly what caused the bug above. Override it for a one-off test build via `scripts/build-docker-image.sh`'s third argument or `--build-arg OPENCODE_VERSION=X.Y.Z`.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.5.4...v0.5.5
+
 ## v0.5.4 (docker export fix, cleanup)
 
 - **Anyone using `--isolation docker` on a non-trivial session could lose runs**: `opencode export` output was truncated by a container-teardown race — the throwaway container was removed before its output finished draining through the pipe. Reproduced 5/5 with a plain `docker run`, and the existing retry couldn't help since it just repeated the same doomed operation. Export now writes to a file inside the isolated `$HOME` and is read back from the host — 5/5 complete, byte-identical to the native (non-docker) path.

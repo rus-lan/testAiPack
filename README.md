@@ -147,7 +147,13 @@ bash scripts/build-docker-image.sh
 
 Скрипт соберёт образ `testaipack-opencode:latest` (ставит opencode из GitHub
 releases поверх `node:22-slim`) и проверит, что `opencode --version` работает.
-После этого:
+Версия opencode внутри образа зафиксирована явно (`ARG OPENCODE_VERSION` в
+`Dockerfile.opencode`, сейчас `1.18.4`) — образ больше не тянет
+`releases/latest` при каждой пересборке, так что пересборка не подсунет
+незамеченную более новую версию. Собрать на другой версии для теста:
+`bash scripts/build-docker-image.sh testaipack-opencode latest 1.18.9`
+(или `docker build --build-arg OPENCODE_VERSION=1.18.9 ...` напрямую, не
+трогая файл). После этого:
 
 ```bash
 ./dist/testaipack run <repo> \
