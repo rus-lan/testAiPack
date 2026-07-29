@@ -48,6 +48,12 @@ auth_curl() {
 
 # --- tag ---
 if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+  if [ -z "$(git config user.name 2>/dev/null || true)" ] || [ -z "$(git config user.email 2>/dev/null || true)" ]; then
+    echo "git identity not configured (user.name / user.email) — required to create an annotated tag." >&2
+    echo "Locally: git config user.name \"Your Name\" && git config user.email \"you@example.com\"" >&2
+    echo "In CI: configure it as a workflow step before calling this script." >&2
+    exit 1
+  fi
   echo "Creating tag $TAG..."
   git tag -a "$TAG" -m "Release $TAG"
   git push origin "$TAG"
