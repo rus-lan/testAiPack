@@ -29,6 +29,13 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.5.1 (install fix)
+
+- **The one-line install command from the README has been broken since v0.5.0 (and v0.4.0 before it)** — `curl -fsSL .../releases/latest/download/install.sh | sh` returned a 404, because `install.sh` was never attached as a release asset. It is now: `install.sh` is built into every release alongside the binaries.
+- The installer now verifies the downloaded binary against the published `checksums-sha256.txt` and fails loudly on a mismatch, instead of installing whatever it downloaded unchecked.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.5.0...v0.5.1
+
 ## v0.5.0 (docker fixes, feature)
 
 - **`--isolation docker` was broken for everyone, regardless of networking** — the container ran as the wrong user and couldn't write into the isolated HOME mounted from the host, failing every docker-mode run at preflight with a permission error. Fixed: the container now runs as your host uid/gid (Linux/macOS).
