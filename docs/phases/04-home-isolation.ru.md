@@ -37,6 +37,14 @@ Namespace: `TestAiPack.HomeIsolation` (см.
     (pure-baseline).
   - `generatedConfigs.new` — строка с `OPENCODE_CONFIG_CONTENT` для new
     (включает mcp-блок, если pack — mcp).
+  - Оба блока содержат поле `model`, если модель прогона определена (см. шаг 3
+    ниже) — идентичное на обеих сторонах.
+  - Оба блока содержат поля `provider`, `small_model`, `enabled_providers`,
+    `disabled_providers`, если они заданы у пользователя в реальном
+    `~/.config/opencode/opencode.json` (например, кастомный provider для
+    локального ollama-сервера, свой allow/deny-список провайдеров) —
+    копируются как есть, без фильтрации, и идентично на обеих сторонах (см.
+    шаг 3).
 - Ошибки: `@error HomeIsolationError` — `{ code, message, context? }`, где
   `code` принимает только значения:
   - `E_HOME_SETUP_FAILED` — нельзя создать структуру HOME, нет прав на
@@ -103,21 +111,48 @@ Namespace: `TestAiPack.HomeIsolation` (см.
    Существующий symlink/файл перезаписывается. Сбой symlink (ROFS) →
    `E_HOME_SETUP_FAILED`.
    Для `side = old` pack **не применяется** — pack там отсутствует.
-3. Сгенерировать `generatedConfigs.baseline` — `OPENCODE_CONFIG_CONTENT` для
+3. Определить модель и connectivity-настройки прогона одним чтением реального
+   `~/.config/opencode/opencode.json` (`readSourceConnectivity`, читается один
+   раз на весь прогон, не зависит от `side`/`n`; отсутствие файла, пустой файл
+   или битый JSON — не ошибка фазы, просто все поля ниже остаются
+   неопределены):
+   - `runModel = runInput.model ?? sourceConnectivity.model`. `runInput.model`
+     приходит из фазы 00 (`--model` / config-file / не задан — см.
+     `docs/phases/00-cli-parse.ru.md`). Если он не задан, `runModel =
+     sourceConnectivity.model`, то есть поведение полностью совпадает с
+     состоянием до появления флага `--model`.
+   - `provider`, `small_model`, `enabled_providers`, `disabled_providers` — те
+     же поля из исходного конфига, но **без** CLI-переопределения: каждое
+     либо есть в исходном конфиге целиком (`provider` — без фильтрации полей,
+     `enabled_providers`/`disabled_providers` — как массив строк, иначе
+     считается отсутствующим), либо отсутствует. Изолированный `opencode.json`
+     строится с нуля, поэтому без этого шага кастомный provider (например,
+     локальный ollama-сервер) или собственный allow/deny-список провайдеров
+     пользователя невидимы внутри HOME вообще — даже если `model` указывает
+     именно на такой provider.
+4. Сгенерировать `generatedConfigs.baseline` — `OPENCODE_CONFIG_CONTENT` для
    old:
    - минимальный `opencode.json` с одним агентом `build` по стандартному
      шаблону оркестратора;
+   - поле `model: runModel`, если `runModel` определён (иначе поле
+     отсутствует);
+   - поля `provider`, `small_model`, `enabled_providers`, `disabled_providers`
+     из шага 3 — каждое только если определено (иначе поле отсутствует);
    - пустые секции `skills`, `agents`, `plugins`, `command`, `mcp`.
    Сериализация через `JSON.stringify` (stable keys).
-4. Сгенерировать `generatedConfigs.new` — то же, что baseline, плюс:
+5. Сгенерировать `generatedConfigs.new` — то же, что baseline (те же самые
+   значения `runModel` и connectivity-полей), плюс:
    - для plugin: ничего дополнительно (pack уже установлен в
      `home/new/run-N/.config/opencode/plugins/`);
    - для mcp: вставить блок из инструкции в секцию `mcp`;
    - для skill/agent/command: ничего дополнительно в конфиге не нужно
      (видимость через файлы/симлинки).
-5. Собрать `EnvVarSet` для каждой пары (см. секцию 2). На каждую пару — один
+   Поскольку `runModel` и все connectivity-поля — одни и те же значения для
+   обеих сторон, единственная разница baseline/new остаётся в pack-секции —
+   ничто из них её не расширяет и не ломает `--pure-baseline`.
+6. Собрать `EnvVarSet` для каждой пары (см. секцию 2). На каждую пару — один
    `EnvVarSet`; все наборы собираются в двумерный массив `envVars[side][run]`.
-6. Вернуть `HomeIsolationResult { homeTrees, envVars, generatedConfigs }`.
+7. Вернуть `HomeIsolationResult { homeTrees, envVars, generatedConfigs }`.
 
 ## 4. Входные/выходные файлы
 
@@ -178,6 +213,28 @@ Namespace: `TestAiPack.HomeIsolation` (см.
 - ✅ smoke-test: pack отсутствует → new-сторона получает структуру,
   идентичную old (кроме pure-baseline флагов).
 - ✅ symlink failure ROFS: целевая FS read-only → throw `E_HOME_SETUP_FAILED`.
+- ✅ `runInput.model` override: задан `runInput.model` → и `generatedConfigs.baseline`,
+  и `generatedConfigs.new` содержат это значение в поле `model`, даже если
+  ambient-модель в `~/.config/opencode/opencode.json` другая.
+- ✅ `runInput.model` не задан: оба конфига берут `model` из ambient
+  `~/.config/opencode/opencode.json` (или не содержат поля `model` вовсе, если
+  ambient-конфига тоже нет) — поведение как до появления флага.
+- ✅ `runInput.model` + mcp-pack (`--pure-baseline`): `baseline` и `new`
+  по-прежнему совпадают во всём, кроме секции `mcp` — модель не создаёт новой
+  разницы между сторонами.
+- ✅ custom provider: в реальном `~/.config/opencode/opencode.json` заданы
+  `provider`, `small_model`, `enabled_providers`, `disabled_providers`
+  (например, кастомный ollama + свой allow/deny-список) → оба
+  `generatedConfigs.baseline` и `generatedConfigs.new` содержат все четыре
+  поля целиком и идентично.
+- ✅ custom provider не задан: оба конфига не содержат ни одного из четырёх
+  полей вовсе — поведение совпадает с состоянием до появления этого шага.
+- ✅ `enabled_providers`/`disabled_providers`/`small_model` неожиданной формы
+  (не массив строк / не строка) → поле трактуется как отсутствующее, так же
+  как если бы его не было в исходном конфиге вовсе — не throw.
+- ✅ custom provider + mcp-pack: `baseline` и `new` по-прежнему совпадают во
+  всём, кроме секции `mcp` — ни одно из четырёх connectivity-полей не создаёт
+  новой разницы между сторонами.
 - ❌ НЕ покрыто (ticket): изоляция под macOS с sandbox-exec (v0.3).
 - ❌ НЕ покрыто (ticket): docker-isolation happy-path (v0.3) — здесь только
   home-mode.
@@ -196,6 +253,14 @@ Namespace: `TestAiPack.HomeIsolation` (см.
   добавлены pure-baseline флаги.
 - Whitelist копируется идентично во все `home/<side>/run-N/` (детерминизм
   auth-состояния между прогонами).
+- Модель прогона (`runInput.model ?? sourceConnectivity.model`) и все
+  connectivity-поля (`provider`, `small_model`, `enabled_providers`,
+  `disabled_providers` — копируются как есть, без CLI-переопределения)
+  применяются **идентично** к обеим сторонам: `generatedConfigs.baseline` и
+  `.new` могут отличаться только pack-секцией (`mcp` и т.п.), никогда этими
+  полями. Это гарантирует, что `--pure-baseline` / gate 5
+  (`baseline-identical`, см. `docs/phases/05-preflight.ru.md`) не ломается на
+  несовпадении модели или connectivity-настроек между сторонами.
 
 ## 8. Зависимости от других фаз
 

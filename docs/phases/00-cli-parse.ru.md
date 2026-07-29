@@ -25,8 +25,11 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
   принимает только значения:
   - `E_CONFIG_INVALID` — `.testaipack/config.json` есть, но не парсится или
     нарушает Zod-схему `ConfigFile`.
-  - `E_MODEL_UNAVAILABLE` — запрошенная модель недоступна у провайдера auth
-    (определяется заранее по whitelist auth).
+  - `E_MODEL_UNAVAILABLE` — значение `--model` или `--preflight-model` не
+    соответствует паттерну `provider/model` / `provider:model`
+    (`MODEL_REF_PATTERN`). Это только проверка формата: фактическую
+    доступность модели у провайдера эта фаза не проверяет — этим займётся
+    `05 preflight`.
   - Прочие ошибки валидации (`--prompt` обязателен, `--runs` ≥ 1, `--isolation`
     ∈ {home, docker}, неизвестный флаг, неразрешимый `@file`) тоже уходят в
     `CliParseError` с кодом `E_CONFIG_INVALID`, детальным `message` и exit code
@@ -36,7 +39,7 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
 `packType?`, `prompt`, `promptFiles?`, `init?`, `initFiles?`, `verify?`, `runs`
 (int32), `isolation` (`IsolationMode`), `opencodeVersion?`, `auth`
 (`AuthWhitelist`), `pureBaseline` (boolean), `judge?`, `judgeFiles?`,
-`preflightEnabled` (boolean), `preflightModel?`, `formats` (`OutputFormat[]`),
+`preflightEnabled` (boolean), `preflightModel?`, `model?`, `formats` (`OutputFormat[]`),
 `outputPath`, `diffHtml` (boolean), `collapseRepeats` (boolean), `timelineMode`
 (`TimelineMode`), `timeouts` (`TimeoutConfig`), `workspacePath`, `logLevel`
 (`LogLevel`), `pricingPath?`. Все поля обязательные, кроме явно помеченных `?`.
@@ -57,6 +60,15 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
 - `timeouts` (`TimeoutConfig`) — `preflightSeconds`, `runSeconds`,
   `verifySeconds`, `installSeconds`, `watchdogSeconds`, опциональный
   `totalSeconds`.
+- `model` — необязательная модель (`provider/model` или `provider:model`) для
+  **обеих** сторон прогона. Приоритет: `--model` (CLI) > `model` в
+  `.testaipack/config.json` > ambient-модель из реального
+  `~/.config/opencode/opencode.json` пользователя — второй уровень fallback
+  применяется уже в фазе 04 (см. `docs/phases/04-home-isolation.ru.md`), эта
+  фаза лишь передаёт значение (или его отсутствие) дальше. Флаг не задан ⇒
+  `RunInput.model === undefined` ⇒ поведение полностью совпадает с состоянием
+  до появления флага. Валидируется тем же паттерном, что и `preflightModel`
+  (см. `E_MODEL_UNAVAILABLE` выше).
 
 ## 3. Шаги алгоритма
 
@@ -89,7 +101,12 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
    `E_CONFIG_INVALID`. Выбор IDE для review-workspace (`vscode | cursor |
    code-insiders`) и параметр `--review-run` живут в `flagDefaults` и фазой 00
    отдельно не валидируются.
-8. Определить `packType` (если не задан `--pack-type` явно) по префиксу
+8. Валидировать `--model <provider/model>` (и независимо `--preflight-model`)
+   тем же паттерном `provider/model` / `provider:model`; несоответствие формату
+   → `E_MODEL_UNAVAILABLE`. Слияние `--model` ← config-file `model` ← default
+   идёт по общему правилу шага 3 (CLI побеждает); при отсутствии обоих
+   `RunInput.model` не задаётся.
+9. Определить `packType` (если не задан `--pack-type` явно) по префиксу
    `packRef`:
    - `npm:<name>` → `plugin`
    - `mcp:<name>` → `mcp`
@@ -97,9 +114,9 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
    - `https://…git`, `git@…`, `github:…` → `skill` (дефолтный для git-like refs)
    - `/abs/path` или `./rel` → `skill` (локальный)
    - `--pack` отсутствует → `packRef` не задаётся (smoke-test).
-9. Проверить, что хотя бы один формат отчёта указан (`--format` по умолчанию
-   `["md"]`); `all` раскрывается в `["md","html","json","yaml"]`.
-10. Вернуть `CliParseResult { runInput, configSource }`.
+10. Проверить, что хотя бы один формат отчёта указан (`--format` по умолчанию
+    `["md"]`); `all` раскрывается в `["md","html","json","yaml"]`.
+11. Вернуть `CliParseResult { runInput, configSource }`.
 
 ## 4. Входные/выходные файлы
 
@@ -145,8 +162,15 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
 - ✅ invalid `--runs 0` → throw `E_CONFIG_INVALID`, exit 64.
 - ✅ invalid `@file` path → throw `E_CONFIG_INVALID`.
 - ✅ invalid `--isolation foo` → throw `E_CONFIG_INVALID`.
-- ✅ model unavailable: запрошена модель, для которой нет auth у провайдера →
-  throw `E_MODEL_UNAVAILABLE`.
+- ✅ model format invalid: `--model` или `--preflight-model` не соответствует
+  паттерну `provider/model` / `provider:model` → throw `E_MODEL_UNAVAILABLE`.
+- ✅ `--model` flag: `--model anthropic/claude-x` → `RunInput.model =
+  "anthropic/claude-x"`.
+- ✅ `--model` через config-file: `.testaipack/config.json` задаёт `model`,
+  `--model` в CLI не передан → `RunInput.model` берётся из файла; если оба
+  заданы — CLI побеждает.
+- ✅ `--model` не задан (ни CLI, ни config-file) → `RunInput.model` остаётся
+  `undefined`, downstream-поведение (фаза 04) не меняется.
 - ❌ НЕ покрыто (ticket): `compare <id1> <id2>` — валидация существования обоих
   run-id делается в отдельной субкоманде, не в этой фазе.
 

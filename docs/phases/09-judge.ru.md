@@ -65,8 +65,15 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
    - третий блок: `<OLD_PATCH>...</OLD_PATCH>`.
    - четвёртый блок: `<NEW_PATCH>...</NEW_PATCH>`.
 4. Запустить судью:
-   `HOME=<judge-home> opencode run --agent build --format json --auto "<prompt>"`,
-   с дешёвой моделью (та же, что preflight; задаётся `runInput.preflightModel`).
+   `HOME=<real $HOME> opencode run --agent plan --format json "<prompt>"`
+   (без `--auto`), с моделью `runInput.preflightModel` (эта опция теперь
+   выбирает только модель судьи — не связана с моделью самого прогона,
+   которую пингует preflight). `HOME` — реальный `$HOME` пользователя
+   (там лежат креды opencode для авторизации у провайдера); `cwd` — отдельная
+   одноразовая scratch-директория (`<tmpdir>/testaipack-judge/<runId>`,
+   создаётся перед запуском и удаляется после), а не `$HOME` — агент `plan`
+   read-only по `edit`, но diff-контент в промпте не должен получать доступ
+   ни к чему ценному через `cwd`, даже случайно.
    Таймаут `runInput.timeouts.runSeconds`, watchdog
    `runInput.timeouts.watchdogSeconds`.
 5. Собрать assistant-message из стрима.
@@ -80,8 +87,11 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
    - Успех → использовать распарсенные поля.
    - Провал парсинга → `verdict = "unclear"`, `oldQuality = 0`, `newQuality = 0`,
      `explanation = rawResponse`.
-7. Валидация диапазонов: `oldQuality`, `newQuality` ∈ [0,10]. Если вне
-   диапазона → clamp + warning.
+7. Валидация диапазонов: `oldQuality`, `newQuality` — любое конечное число
+   (модель может вернуть дробное значение, например `8.5`), клампится в
+   [0,10] и округляется до целого (контракт хранит `int32`). Если вне
+   диапазона → clamp + warning. Если поле вообще не число (строка,
+   отсутствует) — весь ответ считается невалидным (см. шаг 6).
 8. Записать `results/judge.json` (сериализованный `JudgeResult` с
    `modelUsed` и `timestamp`) и вернуть `JudgeResultOutput { judge: <result> }`.
 
@@ -103,6 +113,8 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
 | Ответ модели — невалидный JSON                       | `verdict = "unclear"`, `explanation = raw`      | —                          |
 | Ответ — JSON в code-fence                            | извлекаем и парсим                              | —                          |
 | `oldQuality = 15` (вне диапазона)                    | clamp до 10, warning                            | —                          |
+| `oldQuality = 8.5` (дробное)                          | принимается, округляется до 8 или 9             | —                          |
+| `oldQuality = "8"` (не число)                         | весь ответ невалиден → `verdict = "unclear"`    | —                          |
 | Модель недоступна у провайдера auth                  | throw                                           | `E_MODEL_UNAVAILABLE`      |
 | Таймаут / crash / 429 у судьи                        | `verdict = "unclear"` с описанием сбоя (не throw) | —                        |
 | Оба патча очень большие (>100KB)                    | truncate до 50KB каждый, warning                | —                          |
@@ -123,6 +135,16 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
   `explanation` = сырой текст.
 - ✅ JSON in code-fence: ответ ` ```json {…} ``` ` → успешно распарсено.
 - ✅ out-of-range score: `oldQuality = 15` → clamp до 10, warning.
+- ✅ fractional score: `oldQuality = 8.5` → принимается и округляется
+  (было: отклонялось как невалидный ответ).
+- ✅ non-numeric score: `oldQuality = "8"` (строка) → всё ещё невалидно,
+  `verdict = "unclear"`.
+- ✅ agent/isolation: запрос к opencode собирается с `agent: "plan"`,
+  `auto: false` и `cwd`, отличным от `homeDir` (scratch-директория,
+  содержащая `testaipack-judge` в пути); `homeDir` остаётся реальным
+  `$HOME`.
+- ✅ scratch cleanup: scratch-директория `cwd` удаляется после завершения
+  вызова судьи.
 - ✅ model unavailable: модель судьи недоступна → throw `E_MODEL_UNAVAILABLE`.
 - ✅ judge timeout: судья висит > `timeouts.runSeconds` → НЕ throw,
   `verdict = "unclear"` с описанием.
@@ -142,11 +164,19 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
 - Если `verdict ≠ "unclear"`, то `oldQuality` и `newQuality` ∈ [0, 10].
 - `modelUsed` фиксирует, какая модель судила; `timestamp` — момент вердикта.
 - `rawResponse` сохраняется (optional) для отладки и аудита.
+- Судья всегда запускается с read-only агентом `plan` и `auto: false` — она
+  получает в промпт непроверенный diff-контент агента под тестом, и не
+  должна иметь возможность что-то менять. `cwd` — одноразовая
+  scratch-директория, никогда не `homeDir`; `homeDir` остаётся реальным
+  `$HOME` — только там есть креды opencode, нужные, чтобы судья вообще
+  смогла авторизоваться у провайдера.
 
 ## 8. Зависимости от других фаз
 
 - Зависит от: **08 diff** (нужны `diff/<side>/run-N/full.patch`), **00
-  cli-parse** (`runInput.judge`), **04 home-isolation** (HOME для запуска судьи).
+  cli-parse** (`runInput.judge`, `runInput.preflightModel`). От **04
+  home-isolation** судья не зависит — она запускается в реальном `$HOME`
+  пользователя, а не в одном из изолированных HOME фазы 04.
 - Блокирует: **11 report-render** (блок «LLM-судья» в отчёте показывается
   только если `JudgeResultOutput.judge !== null`).
 - Параллелизуется с: **07 aggregate**, **08 diff** — все читают независимые

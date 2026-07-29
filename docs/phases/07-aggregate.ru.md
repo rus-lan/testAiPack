@@ -28,8 +28,13 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
     (`totalTokens`, `wallClockMs`, `costUsd`, `stepCount`, `toolCallCount`,
     `successRank`, `maxParallelism`).
   - `rawAggregates` — те же `SideAggregates` по сторонам (для отладки/отчёта).
-  - `MetricDelta = { absolute: float64, percent: float64, significant: boolean,
-    better: "better" | "worse" | "neutral" | "context-dependent" }`.
+  - `MetricDelta = { absolute: float64, percent?: float64, significant:
+    boolean, better: "better" | "worse" | "neutral" | "context-dependent" }`.
+    `percent` опционален: переход `0 → 0` даёт `percent = 0` (реально нет
+    изменения), переход `0 → ненулевое` **не** имеет осмысленного процента
+    (математически бесконечность) — поле опускается целиком, а не
+    выставляется в обманчивый `0`. Рендер отчёта показывает «n/a» вместо
+    процента, когда поле отсутствует.
 - Ошибки: `@error AggregateError` — `{ code, message, side: Side, runIndex?:
   int32, context? }`, где `code` принимает только одно значение:
   - `E_EXPORT_INVALID` — `raw/<side>/run-N.json` не проходит схему
@@ -49,7 +54,12 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
   `reasoningTokens`, `cacheReadTokens`, `perTool: Record<toolName,
   {count, errorRate, avgDurationMs}>`, `reasoningTimeMs`, `stepLatencyP50Ms`,
   `stepLatencyP95Ms`, `toolLatencyAvgMs`, `finishCauseDistribution`,
-  `fileDiffStats`, `maxConsecutiveSameTool`.
+  `maxConsecutiveSameTool`. Файловые дельты (additions/deletions/filesChanged)
+  сюда не входят — `SecondaryMetrics` больше не несёт `fileDiffStats` (поле
+  было убрано: оно строилось из `info.summary` экспорта opencode, а этот
+  API реальными числами не заполняется, и фаза 07 в принципе не может увидеть
+  результат фазы 08). Единственный источник этих чисел — `report.diff` из
+  фазы 08 (см. `docs/phases/08-diff.ru.md`); рендереры читают их оттуда.
 - `stats: AggregateStats` — полное распределение (`MetricDistribution`:
   `median`/`min`/`max`/`iqr?`/`samples[]`) по N прогонам для каждой первичной
   метрики (`totalTokens`, `wallClockMs`, `costUsd`, `stepCount`,
@@ -99,7 +109,10 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
      имеют пустой набор успешных прогонов.
 3. Вычислить `MetricDelta` для каждой первичной метрики (`PrimaryDeltas`):
    - `absolute = new.primary.<m> − old.primary.<m>`.
-   - `percent = absolute / old.primary.<m> * 100` (если old ≠ 0).
+   - `percent`: если `old.primary.<m> = 0` — `0`, когда `absolute` тоже `0`
+     (действительно нет изменения), и **опущен** (не задан), когда
+     `absolute ≠ 0` (переход из нуля не выражается в процентах). Иначе
+     `absolute / old.primary.<m> * 100`.
    - `significant: boolean` — (v0.1) `false` либо (v0.2) `|absolute| > 1.5 ×
      old.stats.<m>.iqr` (если `iqr` есть).
    - `better` ∈ `"better" | "worse" | "neutral" | "context-dependent"` — для
@@ -132,6 +145,8 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
 | `info.cost` есть                                    | используется как `costUsd` (приоритет над pricing) | —                    |
 | `N < 4`                                             | `iqr` не задаётся в `MetricDistribution`           | —                    |
 | `totalTokens = 0` (пустой прогон)                   | валидное значение 0, не fail                       | —                    |
+| `old.primary.<m> = 0`, `new.primary.<m> ≠ 0`         | `deltas.<m>.percent` не задан (не `0`)              | —                    |
+| `old.primary.<m> = 0`, `new.primary.<m> = 0`         | `deltas.<m>.percent = 0`                            | —                    |
 | (v0.2) дерево сессий с циклом по parent_id          | visited-set обрывает цикл, warning                 | —                    |
 
 ## 6. Тест-кейсы (по одному на ветку контракта)
@@ -156,6 +171,11 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
   в `stats.successRank`.
 - ✅ perTool aggregation: три прогона с разными наборами tool-ов →
   объединённый `perTool` с усреднённым `errorRate`.
+- ✅ percent omitted on 0→N: `old.primary.totalTokens = 0`,
+  `new.primary.totalTokens > 0` → `deltas.totalTokens.percent` не задан
+  (не `0`); рендер отчёта показывает «n/a».
+- ✅ percent zero on 0→0: обе стороны `totalTokens = 0` →
+  `deltas.totalTokens.percent = 0` (реальное отсутствие изменения).
 - ❌ НЕ покрыто (ticket): значимость через bootstrap CI (v0.2.1).
 - ❌ НЕ покрыто (ticket): `maxParallelism` при очень глубоком дереве (>100
   сессий) — ticket по производительности обхода.
@@ -170,7 +190,8 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
 - `MetricDistribution.samples` либо содержит N значений (есть хотя бы один
   успешный прогон), либо пуст (все прогоны стороны failed).
 - `deltas` для каждой первичной метрики определён (`MetricDelta` с
-  `absolute`, `percent`, `significant`, `better`); если одна сторона failed,
+  `absolute`, `significant`, `better`, и `percent`, если он осмысленен —
+  переход `0 → ненулевое` его не задаёт); если одна сторона failed,
   `better = "neutral"`.
 - `MetricsDiff.bothFailed = true` ⇔ обе стороны не имеют успешных прогонов.
 - Происхождение `costUsd` фиксировано приоритетом в реализации:

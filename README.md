@@ -20,6 +20,7 @@
 - [Максимальный запуск](#максимальный-запуск)
 - [Команды CLI](#команды-cli)
 - [Параметры команды `run`](#параметры-команды-run)
+- [Устранение неполадок](#устранение-неполадок)
 - [Форматы `--pack`](#форматы---pack)
 - [Сравнение двух прогонов (`compare`)](#сравнение-двух-прогонов-compare)
 - [Структура результатов](#структура-результатов)
@@ -38,7 +39,10 @@
 - **Изоляция окружения**: фейковый `$HOME` без сторонних плагинов/скиллов
   (`--isolation=home`) или throwaway Docker-контейнер (`--isolation=docker`).
 - **Усреднение по медиане**: несколько прогонов на сторону, правило 1.5×IQR
-  для判定 значимости дельт.
+  для определения значимости дельт.
+- **Контроль модели прогона**: `--model` фиксирует модель для обеих сторон и
+  проверяется preflight-ом до дорогих N×2 прогонов — не только на глаз после
+  того, как прогон уже упал.
 - **Мультиформатный отчёт**: Markdown, HTML, JSON, YAML — выберите любой набор.
 - **LLM-судья** (опционально): semantic diff между сторонами через промпт-оценщик.
 - **Cross-run сравнение**: команда `compare` сопоставляет любые два прогона
@@ -160,7 +164,7 @@ releases поверх `node:22-slim`) и проверит, что `opencode --ve
 ```
 
 Первый прогон создаст `./.testaipack/` с деревом рабочих директорий и положит
-отчёт в `./.testaipack/<run-id>/report/`.
+отчёт в `./.testaipack/<run-id>/results/` (см. [структуру результатов](#структура-результатов)).
 
 > Smoke-test без пакета: `testaipack run <repo> --prompt "do the thing"` —
 > прогонится только baseline-сторона.
@@ -181,12 +185,13 @@ releases поверх `node:22-slim`) и проверит, что `opencode --ve
   --isolation home \
   --docker-image testaipack-opencode:latest \
   --opencode-version 0.5.0 \
-  --aws --ssh --git \
+  --auth aws --auth ssh --auth git \
   --pure-baseline \
   --runs 5 \
   --judge @prompts/judge.md \
+  --model anthropic/claude-sonnet-4-5 \
   --preflight-model anthropic/claude-3-5-haiku-20241022 \
-  --format md html json \
+  --format md --format html --format json \
   --output ./.testaipack/last/report \
   --collapse-repeats \
   --timeline-mode side-by-side \
@@ -197,7 +202,7 @@ releases поверх `node:22-slim`) и проверит, что `opencode --ve
   --workspace ./.testaipack \
   --review-run 1 \
   --ide vscode \
-  --pricing ./pricing.json \
+  --pricing-path ./pricing.json \
   --log-level info \
   --ephemeral
 ```
@@ -231,7 +236,7 @@ releases поверх `node:22-slim`) и проверит, что `opencode --ve
 | Команда    | Описание                                                                     |
 | ---------- | ---------------------------------------------------------------------------- |
 | `doctor`   | Проверить зависимости (opencode, git, node, bun).                            |
-| `init`     | Инициализировать `<workspace>/.testaipack/`.                                 |
+| `init --workspace <path>` | Создать каталог `<path>` (по умолчанию `.testaipack/`) с дефолтным `config.json` и добавить `<path>/` в `.gitignore` рядом с ним. |
 
 ```bash
 ./dist/testaipack --help        # обзор всех команд
@@ -266,27 +271,145 @@ releases поверх `node:22-slim`) и проверит, что `opencode --ve
 | `--verify <cmd>`           | `string`                                  | —                             | Опц. shell-команда после работы агента (например `npm test`). Учитывается в метриках успеха.                     |
 | `--isolation <mode>`       | `home\|docker`                            | `home`                        | Режим изоляции. `docker` запускает opencode в `docker run --rm` контейнере (v0.3); при недоступном Docker daemon молча откатывается на `home`. |
 | `--docker-image <image>`   | `string`                                  | `testaipack-opencode:latest`  | Образ для `--isolation=docker`. Игнорируется в режиме `home`.                    |
-| `--opencode-version <ver>` | `string`                                  | latest                        | Пин версии opencode для обеих сторон.                                                                            |
-| `--aws`                    | флаг                                      | off                           | Добавить AWS-credentials (`~/.aws/`) в whitelist изоляции.                                                       |
-| `--ssh`                    | флаг                                      | off                           | Добавить SSH-ключи (`~/.ssh/`) в whitelist.                                                                      |
-| `--git`                    | флаг                                      | off                           | Добавить git-credentials (`~/.gitconfig`, credential helper) в whitelist.                                        |
-| `--pure-baseline`          | флаг                                      | on                            | Запускать обе стороны в `--pure` режиме (без сторонних плагинов/скиллов, кроме тестируемого на «новой» стороне). |
+| `--opencode-version <ver>` | `string`                                  | — (детектируется `opencode --version`) | Пин версии opencode для обеих сторон.                                                                 |
+| `--auth <kind>` (повторяется) | `opencode\|npmrc\|anthropic\|openai\|gemini\|aws\|ssh\|git` | `opencode`,`npmrc` = on; остальные off | Добавить `<kind>` в whitelist изоляции (копирует credentials в изолированный HOME): `opencode`→`~/.local/share/opencode/auth.json`, `npmrc`→`~/.npmrc`, `anthropic`→`~/.config/anthropic`, `openai`→`~/.config/openai`, `gemini`→`~/.config/gemini`, `aws`→`~/.aws/`, `ssh`→`~/.ssh/`, `git`→`~/.gitconfig`. Флаг повторяется для нескольких kind, например `--auth aws --auth ssh`. |
+| `--no-auth-<kind>`         | тот же список `kind`                      | —                             | Убрать `<kind>` из whitelist — обычно чтобы отключить `opencode`/`npmrc`, включённые по умолчанию.                |
+| `--pure-baseline` / `--no-pure-baseline` | флаг         | on                            | Запускать baseline-сторону в `--pure` режиме (без сторонних плагинов/скиллов). Уже включено по умолчанию; `--no-pure-baseline` выключает. |
 | `--runs <N>`               | `int ≥ 1`                                 | `3`                           | Число прогонов на каждую сторону (усреднение по медиане).                                                        |
-| `--judge <text\|@file>`    | `string`                                  | —                             | Промпт для LLM-судьи: оценит semantic diff между сторонами.                                                      |
-| `--no-preflight`           | флаг                                      | off                           | Пропустить pre-flight стадию (пинг модели, проверка пакета).                                                     |
-| `--preflight-model <m>`    | `string`                                  | из конфига                    | Модель для pre-flight ping.                                                                                      |
-| `--format <f>...`          | `md\|html\|json\|yaml` (повторяется)      | `md`                          | Форматы отчёта. Несколько через пробел.                                                                          |
-| `--output <path>`          | `string`                                  | `<workspace>/<run-id>/results` | Куда писать отчётные артефакты (report, metrics, timeline, diff, judge, gc.log и т.п.). Manifest и рабочее дерево остаются в `<workspace>/<run-id>`. |
-| `--no-diff-html`           | флаг                                      | off                           | Не генерировать HTML side-by-side diff.                                                                          |
-| `--collapse-repeats`       | флаг                                      | off                           | Сжимать повторяющиеся tool-call последовательности в карте.                                                      |
+| `--judge <text\|@file>`    | `string`                                  | —                             | Промпт для LLM-судьи: сравнит diff двух сторон и вынесет вердикт (`ok\|fail\|unclear`) в `results/judge.json`. Судья работает read-only агентом `plan` в одноразовом scratch-каталоге (не в клоне репозитория), а модель для него берётся из `--preflight-model` (см. ниже), если задан. |
+| `--no-preflight`           | флаг                                      | preflight: on                 | Preflight-стадия (пинг модели, проверка пакета) включена по умолчанию; этот флаг её отключает.                    |
+| `--model <id>`             | `string`                                  | — (модель из `~/.config/opencode/opencode.json`) | Модель для самого прогона — одна и та же на обеих сторонах, запекается в сгенерированные opencode-конфиги (phase-04). Приоритет: CLI `--model` > `model` в `.testaipack/config.json` > модель из реального `~/.config/opencode/opencode.json`. Без флага и без `model` в config.json — поведение не меняется (ambient-модель, как сегодня). Preflight (если включён) пингует именно эту модель — см. пояснение ниже. |
+| `--preflight-model <m>`    | `string`                                  | — (без переопределения)       | Модель **только для LLM-судьи** (`--judge`). На preflight-пинг и на модель самого прогона больше не влияет (см. пояснение ниже) — несмотря на название, это не модель preflight-а. |
+| `--format <f>...`          | `md\|html\|json\|yaml` (повторяется)      | `md`                          | Форматы отчёта. Флаг повторяется для нескольких форматов, например `--format md --format html`.                  |
+| `--output <path>`          | `string`                                  | `<workspace>/<run-id>/results` | Куда писать отчётные артефакты (report, metrics, timeline, diff, judge, gc.log и т.п.). Manifest и рабочее дерево остаются в `<workspace>/<run-id>`. **С этим флагом `testaipack report <run-id>` и `compare` не найдут прогон** — они всегда читают канонический `<workspace>/<run-id>/results/`, а не кастомный путь (см. troubleshooting ниже). |
+| `--diff-html` / `--no-diff-html` | флаг                                | off                           | Дополнительно сгенерировать `results/diff/<side>/run-N/side.html` (HTML-версия diff) рядом с `full.patch`. По умолчанию выключено. |
+| `--collapse-repeats` / `--no-collapse-repeats` | флаг                  | off                           | Схлопывать подряд идущие одинаковые tool-call в один блок на таймлайне (только `tool-call`; `tool-result` и другие события не трогает, ошибки остаются видны).      |
 | `--timeline-mode <m>`      | `side-by-side\|tree-diff\|merged`         | `side-by-side`                | Режим отображения таймлайна.                                                                                     |
+| `--timeout-preflight <sec>` | `int`                                    | `60`                          | Таймаут pre-flight стадии (сек).                                                                                 |
 | `--timeout-run <sec>`      | `int`                                     | `600`                         | Таймаут одного прогона агента (сек).                                                                             |
 | `--timeout-verify <sec>`   | `int`                                     | `300`                         | Таймаут `--verify` команды (сек).                                                                                |
 | `--timeout-install <sec>`  | `int`                                     | `300`                         | Таймаут установки пакета (сек).                                                                                  |
 | `--watchdog <sec>`         | `int`                                     | `90`                          | Watchdog: прогон считается зависшим, если нет вывода столько секунд.                                             |
+| `--timeout-total <sec>`    | `int`                                     | — (без лимита)                | Общий таймаут прогона (сек) поверх остальных таймаутов.                                                          |
 | `--workspace <path>`       | `string`                                  | `./.testaipack`               | Корень рабочего дерева testaipack.                                                                               |
-| `--pricing <path>`         | `string`                                  | встроенный                    | Своё дерево цен (USD за 1M токенов).                                                                             |
+| `--pricing-path <path>`    | `string`                                  | встроенный                    | Своё дерево цен (USD за 1M токенов).                                                                             |
 | `--log-level <lvl>`        | `debug\|info\|warn\|error`                | `info`                        | Уровень логирования.                                                                                             |
+
+### Какая модель за что отвечает
+
+Два разных флага контролируют две разные модели — их легко перепутать:
+
+| Флаг               | Чья это модель                          | Если флаг не задан                                    |
+| ------------------- | ---------------------------------------- | ------------------------------------------------------ |
+| `--model`           | Модель самого прогона (обе стороны)     | Ambient-модель из `~/.config/opencode/opencode.json`   |
+| `--preflight-model` | Модель только для LLM-судьи (`--judge`) | Судья идёт без явной модели (ambient-дефолт opencode)  |
+
+Preflight (если не отключён `--no-preflight`) пингует **ровно ту модель, которую
+получит сам прогон** — то есть `--model`, если он задан, иначе ту же
+ambient-модель, что и прогон. Раньше preflight пинговал `--preflight-model`, а
+прогон при этом молча уходил на ambient-модель — здоровый дешёвый пинг мог
+пройти, пока сам прогон падал на исчерпанной/неаутентифицированной модели, и это
+обнаруживалось только косвенно: через 90-секундный watchdog на каждом из N×2
+прогонов. Теперь такое рассогласование ловится preflight-ом за ≤60 секунд, а не
+после того как деньги и время на прогон уже потрачены — если вы явно
+переключаете провайдера/модель для прогона, задавайте `--model`, а не
+`--preflight-model`.
+
+---
+
+## Устранение неполадок
+
+**`E_EXPORT_INVALID` (изредка, на прогонах без других ошибок).** `opencode
+export` иногда отдаёт обрезанный JSON сразу после чистого завершения прогона —
+внутреннее хранилище сессии ещё не успело дозаписаться. Фаза `run-side`
+переспрашивает export с ограниченным экспоненциальным backoff (несколько
+попыток, буквально пара секунд суммарно) и только если export по-прежнему
+невалиден после всех попыток — фейлит прогон этим кодом. Если вы видите
+`E_EXPORT_INVALID` — это не транзиентный сбой самого testaipack, а то, что
+export оставался обрезанным ещё через несколько попыток; стоит проверить
+версию/состояние `opencode`.
+
+**Здоровый прогон помечен `rateLimited`/провалом, хотя видимых проблем нет.**
+Детекция rate-limit смотрит только на текст ассистента и на вывод упавшего
+tool-вызова — не на весь JSON события целиком. Если раньше у вас бывали
+прогоны, ошибочно помеченные rate-limit-ом просто из-за случайной подстроки
+«429» где-то в данных (например, в `callID` или в содержимом прочитанного
+файла) — так больше не происходит; если флаг всё-таки выставлен, значит в
+потоке действительно был текст, похожий на ошибку rate-limit.
+
+**Прогон завис/упал по watchdog, хотя preflight прошёл успешно.** Скорее
+всего preflight пинговал не ту модель, которую увидел сам прогон — см.
+[«Какая модель за что отвечает»](#какая-модель-за-что-отвечает) выше и задайте
+`--model` явно.
+
+**В логах/ошибках больше не видно секретов из `mcp:`-пакетов и приватных
+git-URL.** Если пакет задан как `mcp:<name>:{...}` с токеном в секции `env`,
+или репозиторий клонируется по URL с `user:token@host` — ни то ни другое
+теперь не попадает в текст ошибки или в `install.log`: `mcp`-рефы в
+диагностике усечены до `mcp:<name>`, а credentials из URL вычищены. Если для
+диагностики реально нужен полный конфиг pack-а — смотрите его в
+`config/new.json` (там он уже применён, а не в сыром виде).
+
+**`testaipack report <run-id>` / `compare` не находят прогон, сделанный с
+`--output`.** `--output <path>` переносит `report.*`, `metrics.json`,
+`timeline.*` и `diff/` в указанный каталог, но команды `report`/`compare`/
+`review`/`list` всегда читают отчёт по канонической схеме
+`<workspace>/<run-id>/results/report.json` — про кастомный `--output`-путь они
+не знают вообще. Если нужно смотреть прогон через `report`/`compare` по его
+run-id — не используйте `--output`; если `--output` всё же нужен (например,
+чтобы сложить отчёт в определённое место для CI), читайте его оттуда
+напрямую, а не через run-id-команды.
+
+### Локальные / self-hosted модели (например, ollama)
+
+Чтобы прогнать testaipack на локальной модели, нужны две вещи одновременно —
+без любой из них прогон либо не увидит модель, либо упадёт ещё до первого
+реального прогона.
+
+**1. Модель и её provider должны быть в реальном
+`~/.config/opencode/opencode.json`.** С этой версии фаза home-isolation копирует
+поля `provider`, `small_model`, `enabled_providers`, `disabled_providers` из
+этого файла в изолированные HOME обеих сторон — целиком и идентично на обеих
+сторонах (см. [«Структура результатов»](#структура-результатов)). Раньше
+локально настроенный provider внутри изолированного прогона был не виден
+вообще, даже если `model` указывал именно на него. Пример конфига с ollama:
+
+```json
+{
+  "model": "ollama/qwen3.5:9b",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": { "baseURL": "http://localhost:11434/v1" },
+      "models": { "qwen3.5:9b": { "name": "Qwen3.5 9B" } }
+    }
+  }
+}
+```
+
+**2. Модель для самого прогона задаётся флагом `--model <provider>/<model>`** —
+той же моделью пингует и preflight, см.
+[«Какая модель за что отвечает»](#какая-модель-за-что-отвечает) выше.
+
+**3. `--timeout-preflight` — отдельный таймаут, про него легко забыть.**
+Preflight-гейт `auth-ping` отправляет тривиальный промпт «reply with the single
+word OK», но у него свой собственный таймаут — `--timeout-preflight` (по
+умолчанию `60` сек), никак не связанный с `--timeout-run` или `--watchdog`.
+Reasoning-тяжёлые модели (в том числе многие локальные) могут потратить на
+рассуждение перед этим единственным словом-ответом заметно больше 60 секунд —
+тогда прогон падает с `E_PREFLIGHT_TIMEOUT: auth-ping timed out`, не дойдя ни
+до одного реального прогона. Для медленной локальной модели поднимайте
+`--timeout-preflight` **вместе с** `--timeout-run`/`--watchdog`, а не вместо
+них:
+
+```bash
+./dist/testaipack run <repo> --prompt "реализуй фичу X" \
+  --model ollama/qwen3.5:9b \
+  --timeout-preflight 300 \
+  --timeout-run 1800 \
+  --watchdog 300
+```
 
 ---
 
@@ -302,6 +425,7 @@ releases поверх `node:22-slim`) и проверит, что `opencode --ve
 | `command:./run.md`                                    | `command`| одиночная команда (`.md`).                                                  |
 | `mcp:myserver:{"command":"npx","args":["-y","srv"]}` | `mcp`    | MCP-сервер: конфиг инлайн (v0.3).                                           |
 | `mcp:myserver:@./mcp.json`                            | `mcp`    | MCP-сервер: конфиг из файла (v0.3).                                         |
+| `--pack-type all` (в паре с git-URL/лок. путём репо) | `all`    | Весь репозиторий пакета целиком: обходит стандартные подпапки `skills/`, `agents/`, `commands/`, `plugins/` и регистрирует каждую найденную секцию. |
 
 MCP-конфиг вписывается в секцию `mcp` сгенерированного `opencode.json` на «новой»
 стороне (`mcp.<name>`); на baseline-стороне MCP-сервер отсутствует.
@@ -342,30 +466,46 @@ MCP-конфиг вписывается в секцию `mcp` сгенериро
 .testaipack/
 └── <run-id>/                      # 2026-07-23_10-15-0a1b2c
     ├── manifest.json              # конфигурация прогона (фаза 01)
-    ├── apps/                      # клоны репозитория
-    │   ├── old/run-{1..N}/
-    │   └── new/run-{1..N}/
+    ├── apps/
+    │   ├── source/                # один clone репозитория (шаблон для копий ниже)
+    │   ├── oldVersion/run-{1..N}/ # рабочие копии для baseline-стороны
+    │   └── newVersion/run-{1..N}/ # рабочие копии для стороны с pack-ом
     ├── pack/                      # установленный тестируемый пакет
     ├── home/                      # фейковые $HOME (изоляция)
     │   ├── old/run-{1..N}/
     │   └── new/run-{1..N}/
-    ├── config/                    # сгенерированные opencode.json и env
-    ├── raw/                       # opencode export сырых прогонов
-    │   ├── old/run-N.json
-    │   └── new/run-N.json
-    ├── diff/                      # git-diff результаты (фаза 08)
-    ├── timeline.json              # карта событий (фаза 10)
-    ├── timeline.html
-    ├── report/                    # отчёты во всех запрошенных форматах
-    │   ├── report.md
-    │   ├── report.html
-    │   ├── report.json
-    │   └── report.yaml
-    └── review.code-workspace     # multi-root VSCode workspace (фаза 12)
+    ├── config/                    # сгенерированные opencode.json (baseline.json, new.json)
+    └── results/                   # все отчётные артефакты (переезжают вместе с --output)
+        ├── raw/                   # opencode export сырых прогонов (фаза 06; НЕ переезжает с --output)
+        │   ├── old/run-N.json, run-N.events.ndjson, run-N.log
+        │   └── new/...
+        ├── diff/                  # git-diff по прогонам (фаза 08)
+        │   ├── old/run-N/full.patch, summary.json (+ side.html при --diff-html)
+        │   └── new/...
+        ├── metrics.json           # агрегированные метрики (фаза 07)
+        ├── timeline.json          # карта событий (фаза 10)
+        ├── timeline.html
+        ├── report.md              # отчёты во всех запрошенных форматах (фаза 11)
+        ├── report.html
+        ├── report.json
+        ├── report.yaml
+        ├── judge.json             # вердикт LLM-судьи, если задан --judge (фаза 09)
+        ├── install.log            # лог доставки pack-а (фаза 03)
+        ├── preflight.log          # лог preflight-гейтов (фаза 05), если он включён
+        ├── gc.log                 # лог удаления при --ephemeral (фаза 13)
+        └── review.code-workspace  # multi-root VSCode workspace (фаза 12)
 ```
 
 Флаг `--ephemeral` удаляет `apps/`, `home/`, `pack/` сразу после прогона, оставляя
-`results/` (`raw/`, `diff/`, `report/`, `manifest.json`).
+`results/` (включая `raw/`) и `manifest.json`.
+
+`--output <path>` перенаправляет отчётные артефакты (`report.*`, `metrics.json`,
+`timeline.*`, `diff/`, `judge.json`, `review.code-workspace`, `preflight.log`,
+`install.log`, `gc.log`) в указанный каталог вместо `results/`. Manifest и всё
+рабочее дерево (`apps/`, `home/`, `pack/`, `config/`) остаются под
+`<workspace>/<run-id>/`, а вот `raw/` (сырые opencode-экспорты) — особый случай:
+он физически лежит внутри `results/` и с `--output` НЕ переезжает, оставаясь по
+пути `<workspace>/<run-id>/results/raw/`.
 
 ---
 

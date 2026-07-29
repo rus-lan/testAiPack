@@ -37,12 +37,17 @@ Namespace: `TestAiPack.ReportRender` (см.
   - `stdoutFormat` — что печатается в stdout (`"md"` всегда; `"json"` — если
     пользователь явно попросил JSON-вывод через CLI флаг).
 - Ошибки: `@error ReportRenderError` — `{ code, message, context? }`, где
-  `code` принимает только одно значение:
+  `code`:
   - `E_DISK_FULL` — нет места писать отчёт (`ENOSPC`).
+  - `E_EXPORT_INVALID` — собранный `Report` не прошёл собственную
+    `reportSchema` перед сериализацией в JSON/YAML (внутреннее рассогласование
+    контракта выше по цепочке фаз, а не ошибка пользователя). Раньше это было
+    непойманным `throw` внутри `Effect.gen` — теперь корректный
+    `Effect.fail(reportRenderError(..., "E_EXPORT_INVALID"))`.
 
   Неверное значение в `formats` или пустой `formats` здесь **не** выделены в
   отдельный код — они клирятся в фазе 00 (`runInput.formats: OutputFormat[]`
-  уже отвалидирован). Контракт 11 имеет только `E_DISK_FULL`.
+  уже отвалидирован).
 
 ## 3. Шаги алгоритма
 
@@ -80,7 +85,9 @@ Namespace: `TestAiPack.ReportRender` (см.
    интерактивный отчёт, встраивающий `timeline.html` (через iframe на
    file://-путь или inline). Главная таблица дельт с теми же ✓/⚠/—, блоки
    Failed runs, Карта, LLM-судья. Self-contained, vanilla JS.
-7. `ENOSPC` на любой записи → throw `ReportRenderError({ code: "E_DISK_FULL" })`.
+7. `ENOSPC` на любой записи → `ReportRenderError({ code: "E_DISK_FULL" })`.
+   `Report` не проходит `reportSchema` перед сериализацией (json/yaml) →
+   `ReportRenderError({ code: "E_EXPORT_INVALID" })`.
 8. Вернуть `ReportRenderResult { formats, paths, stdoutFormat }`.
 
 ## 4. Входные/выходные файлы
@@ -107,7 +114,8 @@ Namespace: `TestAiPack.ReportRender` (см.
 | `judge === undefined` (судья не запрашивалась)      | секция LLM-судья не показывается                   | —                    |
 | `judge.verdict = "unclear"`                          | секция показывается с пометкой unclear             | —                    |
 | `metricsDiff.bothFailed = true`                     | в таблице Δ показываем 0/null, вердикт «—»         | —                    |
-| Нет места писать отчёт                              | throw                                              | `E_DISK_FULL`        |
+| Нет места писать отчёт                              | fail                                               | `E_DISK_FULL`        |
+| Собранный `Report` не проходит `reportSchema`       | fail (до записи файла)                             | `E_EXPORT_INVALID`   |
 | `timeline.html` отсутствует (фаза 10 упала)         | `report.html` без timeline-блока, warning          | —                    |
 | Очень большая `perTool` (>50 tool-ов)                | показываем топ-20, остальные в раскрытии           | —                    |
 
@@ -134,7 +142,10 @@ Namespace: `TestAiPack.ReportRender` (см.
   warning.
 - ✅ formats all: `["md","html","json","yaml"]` → все 4 файла существуют,
   `ReportRenderResult.paths` заполнен полностью.
-- ✅ disk full: `ENOSPC` → throw `E_DISK_FULL`.
+- ✅ disk full: `ENOSPC` → fail `E_DISK_FULL`.
+- ✅ invalid report schema: собранный `Report` не проходит `reportSchema` →
+  fail `E_EXPORT_INVALID` (проверено на уровне `renderJson`/`renderYaml` и на
+  уровне всей фазы `reportRender`, до записи файла).
 - ❌ НЕ покрыто (ticket): PDF-экспорт отчёта — ticket про v0.3.
 
 ## 7. Инварианты

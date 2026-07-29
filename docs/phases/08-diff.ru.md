@@ -53,8 +53,10 @@ Namespace: `TestAiPack.Diff` (см. `contract/phases/08-diff.tsp`).
    d. Выполнить `git -C <destDir> diff --cached` → записать stdout в
       `diff/<side>/run-<n>/full.patch`. `ENOSPC` → throw
       `DiffError({ code: "E_DISK_FULL", side, runIndex: n })`.
-   e. Выполнить `git -C <destDir> diff --cached --stat` → распарсить в
-      `DiffSummary` (`filesChanged`, `additions`, `deletions`, `perFile`).
+   e. Выполнить `git -C <destDir> diff --cached --numstat` (машинно
+      парсимый построчный формат `additions\tdeletions\tpath`, не
+      человекочитаемый `--stat`) → распарсить в `DiffSummary`
+      (`filesChanged`, `additions`, `deletions`, `perFile`).
    f. Если `full.patch` пустой → `noChanges = true`.
    g. Если `runInput.diffHtml === true`: сгенерировать `side.html` через
       `diff2html` (self-contained HTML с встроенным CSS/JS), путь приписать в
@@ -84,8 +86,9 @@ Namespace: `TestAiPack.Diff` (см. `contract/phases/08-diff.tsp`).
 | Нет места писать `full.patch`                       | throw                                           | `E_DISK_FULL`        |
 | `runInput.diffHtml === false`                       | `htmlPath` не задаётся                          | —                    |
 | Очень большой diff (>10MB)                          | пишем как есть, warning в логе                  | —                    |
-| Бинарный файл в diff                                | `git diff` пишет `Binary files … differ`,       | —                    |
-|                                                     | `perFile` помечает `binary: true`               |                      |
+| Бинарный файл в diff                                | `git diff --numstat` пишет `-`/`-` для счётчиков | —                   |
+|                                                     | этого файла → в `perFile` `additions: 0,`       |                      |
+|                                                     | `deletions: 0` (у `FileChange` нет поля `binary`) |                    |
 | Untracked файлы (созданы агентом)                   | попадают в diff через `git add -A`              | —                    |
 | Удалённые файлы                                     | попадают в diff                                 | —                    |
 
@@ -104,8 +107,9 @@ Namespace: `TestAiPack.Diff` (см. `contract/phases/08-diff.tsp`).
 - ✅ disk full: `ENOSPC` на записи патча → throw `E_DISK_FULL` с `runIndex`.
 - ✅ untracked files: агент создал `new-file.ts` → файл в diff через
   `git add -A`.
-- ✅ binary file: добавлен PNG → `perFile` помечает `binary: true`, патч
-  содержит `Binary files differ`.
+- ✅ binary file: добавлен PNG → патч содержит `Binary files ... differ`,
+  `perFile` для этого файла даёт `additions: 0, deletions: 0` (нет
+  отдельного поля `binary` в `FileChange`).
 - ❌ НЕ покрыто (ticket): семантический diff (AST-level) вместо текстового —
   ticket про v0.3.
 
@@ -125,6 +129,8 @@ Namespace: `TestAiPack.Diff` (см. `contract/phases/08-diff.tsp`).
 - Зависит от: **02 repo-clone** (рабочие деревья с `.git`), **06 run-side**
   (агент должен был модифицировать дерево; diff пустой, если не модифицировал).
 - Блокирует: **09 judge** (судье нужны `fullPatch` с обеих сторон),
-  **11 report-render** (в отчёте видны `fileDiffStats` из `summary`).
+  **11 report-render** (Diff summary и файловые дельты в Secondary metrics
+  рендерятся из `DiffSummary` этой фазы — единственный надёжный источник
+  этих чисел, см. `docs/phases/07-aggregate.ru.md`).
 - Параллелизуется с: **07 aggregate**, **09 judge** — все три читают независимые
   артефакты фазы 06.

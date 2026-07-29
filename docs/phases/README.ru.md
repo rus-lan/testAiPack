@@ -128,9 +128,18 @@
   `repoUrl`, `packRef?`, `packType?`, `prompt`, `promptFiles?`, `init?`,
   `initFiles?`, `verify?`, `runs`, `isolation`, `opencodeVersion?`, `auth`
   (`AuthWhitelist`), `pureBaseline`, `judge?`, `judgeFiles?`,
-  `preflightEnabled`, `preflightModel?`, `formats` (`OutputFormat[]`),
-  `outputPath`, `diffHtml`, `collapseRepeats`, `timelineMode`, `timeouts`
-  (`TimeoutConfig`), `workspacePath`, `logLevel`, `pricingPath?`.
+  `preflightEnabled`, `preflightModel?`, `model?`, `formats`
+  (`OutputFormat[]`), `outputPath`, `diffHtml`, `collapseRepeats`,
+  `timelineMode`, `timeouts` (`TimeoutConfig`), `workspacePath`, `logLevel`,
+  `pricingPath?`.
+  - **Два разных «model»:** `model?` (флаг `--model`) — модель самого
+    прогона (обеих сторон); запекается в сгенерированные конфиги фазой 04,
+    и именно её проверяет auth-ping в фазе 05 (gate 2 и повтор в gate 5).
+    `preflightModel?` (флаг `--preflight-model`) — теперь выбирает только
+    модель LLM-судьи (фаза 09); на auth-ping она больше не влияет. Не
+    задан `model` — auth-ping идёт без явного `--model`, беря модель из
+    сгенерированного конфига (ambient-модель из реального
+    `~/.config/opencode/opencode.json`).
 - `AuthWhitelist` — boolean-флаги на каждый источник auth: `opencode`,
   `npmrc`, `anthropic`, `openai`, `gemini`, `aws`, `ssh`, `git`.
 - `TimeoutConfig` — `preflightSeconds`, `runSeconds`, `verifySeconds`,
@@ -162,7 +171,9 @@
   `rawRunIds`.
 - `MetricsDiff` — `old`, `new` (обе `SideAggregates`), `deltas`
   (`PrimaryDeltas` — построчно `MetricDelta`), `bothFailed`.
-- `MetricDelta` — `absolute`, `percent`, `significant: boolean`, `better`.
+- `MetricDelta` — `absolute`, `percent?` (опционален — не задан для перехода
+  `0 → ненулевое`, рендер отчёта показывает «n/a»), `significant: boolean`,
+  `better`.
 - `TimelineEvent` / `Timeline` — модель событий таймлайна (см. фазу 10).
 - `DiffResult` / `DiffRunResult` / `DiffSummary` — модель git-diff (см. фазу 08).
 - `JudgeResult` — модель вердикта LLM-судьи (см. фазу 09).

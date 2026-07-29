@@ -22,6 +22,7 @@ vitest.config.*
 coverage/
 .testaipack/
 screenshots/
+.research/
 
 # Editor / OS
 .vscode/*
@@ -45,3 +46,4 @@ npm-debug.log*
 .turbo/
 .eslintcache
 results/
+.testaipack-cloud/

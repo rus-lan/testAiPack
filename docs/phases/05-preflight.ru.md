@@ -52,8 +52,13 @@ Namespace: `TestAiPack.Preflight` (см. `contract/phases/05-preflight.tsp`).
 **Gate 2 — auth-ping** (для old **и** new, n=1):
 
 3. Запустить
-   `HOME=<homeDir> opencode run --agent build --format json --preflight-model <m> "reply with the single word OK"`
-   с таймаутом 30s (`--preflight-model` — самая дешёвая).
+   `HOME=<homeDir> opencode run --agent build --format json "reply with the single word OK"`,
+   с `--model <runInput.model>`, если пользователь задал `--model` (или
+   `model` в config-файле) — иначе без явного `--model`: модель приходит из
+   сгенерированного конфига (`OPENCODE_CONFIG_CONTENT`), т.е. пинг всегда
+   бьёт по той же модели, что будет использовать сам прогон.
+   Таймаут 30s. `--preflight-model` на этот gate больше **не** влияет — он
+   выбирает только модель LLM-судьи (фаза 09).
 4. Стримить JSON; ждать первого assistant-message. Если за 30s его нет →
    `PreflightError({ code: "E_PREFLIGHT_TIMEOUT", check: "auth-ping", side })`.
    Если в стриме есть HTTP 429 / auth error →
@@ -94,7 +99,8 @@ Namespace: `TestAiPack.Preflight` (см. `contract/phases/05-preflight.tsp`).
 
 **Gate 5 — baseline-identical** (side: old, n=1):
 
-11. Повторить gates 1–3 для `side = old`. Дополнительно — assert, что в
+11. Повторить gates 1–3 для `side = old` (auth-ping снова целится в
+    `runInput.model`, как и в gate 2). Дополнительно — assert, что в
     `home/old/run-1/.config/opencode/` нет pack-файлов/симлинков (pack должен
     быть изолирован на old). Провал →
     `PreflightError({ code: "E_PREFLIGHT_FAILED", check: "baseline-identical", side: "old" })`.
@@ -150,6 +156,12 @@ Namespace: `TestAiPack.Preflight` (см. `contract/phases/05-preflight.tsp`).
 - ✅ gate 5 leak: на old случайно остался pack-симлинк → throw
   `E_PREFLIGHT_FAILED` с `check: "baseline-identical"`.
 - ✅ smoke-test gate 4: `packRef` отсутствует → gate 4 проходит тривиально.
+- ✅ gate 2 model targeting: `runInput.model` задан → auth-ping вызывается с
+  этой моделью на обеих сторонах, `preflightModel` игнорируется.
+- ✅ gate 2 model unset: `runInput.model` не задан (даже если `preflightModel`
+  задан) → auth-ping идёт без явного `--model`.
+- ✅ gate 5 model targeting: повторный auth-ping на old внутри gate 5 тоже
+  целится в `runInput.model`.
 - ❌ НЕ покрыто (ticket): поведение `mcp list` при частичном запуске серверов
   (v0.3).
 
@@ -164,8 +176,14 @@ Namespace: `TestAiPack.Preflight` (см. `contract/phases/05-preflight.tsp`).
 - Проверки идут на `n=1` только (по `homePaths.old` / `homePaths.new`) —
   предполагается, что все `run-N` одной стороны идентичны (гарантируется
   фазой 04).
-- `runInput.preflightModel` задаётся пользователем; если не задан, берётся
-  дешёвая default-модель из `pricing.json`.
+- Gate 2 и gate 5 проверяют модель самого прогона: `runInput.model`, если
+  пользователь его задал (флаг `--model` или `model` в config-файле); если
+  не задан — auth-ping идёт без явного `--model`, беря модель из
+  сгенерированного конфига (ambient-модель из `~/.config/opencode/opencode.json`,
+  запечённая фазой 04 в оба HOME). Это гарантирует, что preflight провалится
+  на той же модели, на которой упадёт сам прогон, а не на посторонней.
+- `runInput.preflightModel` на auth-ping больше не влияет — он используется
+  только для выбора модели LLM-судьи (фаза 09 judge).
 
 ## 8. Зависимости от других фаз
 

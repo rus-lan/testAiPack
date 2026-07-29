@@ -37,8 +37,11 @@ Namespace: `TestAiPack.PackInstall` (см.
 - Ошибки: `@error PackInstallError` — `{ code, message, packRef, context? }`,
   где `code` принимает только значения:
   - `E_PACK_INVALID_REF` — `packRef` не парсится ни одним правилом (см.
-    алгоритм). Smoke-test (`packRef` отсутствует) сюда **не** попадает — это
-    no-op без ошибки.
+    алгоритм); либо детектированное `name` не является безопасным именем
+    (см. security-примечание ниже); либо конечный путь доставки (`dest`)
+    вышел за пределы `pack/` (defense-in-depth проверка `isPathWithin`
+    перед любым `removeDir`). Smoke-test (`packRef` отсутствует) сюда
+    **не** попадает — это no-op без ошибки.
   - `E_PACK_UNKNOWN_TYPE` — `--pack-type` указан как несуществующий тип.
   - `E_INSTALL_TIMEOUT` — таймаут доставки pack-а в `pack/` (git clone / copy
     превысили `runInput.timeouts.installSeconds`).
@@ -47,6 +50,26 @@ Namespace: `TestAiPack.PackInstall` (см.
 
   Ошибки собственно plugin-установки (`opencode plugin <name>`) здесь **не**
   возникают — они в фазе 04 (`E_PACK_INSTALL_TIMEOUT` / `E_PACK_INSTALL_FAILED`).
+
+  **Security — валидация имени и редактирование ошибок:**
+  - `name`, полученное при детекции (`detectPack`, общая логика с фазой 00),
+    должно быть одним безопасным сегментом пути: `/^[A-Za-z0-9._-]+$/`, и не
+    `.`/`..` (для npm-плагинов проверка мягче — `name` может быть
+    scoped-именем `@scope/name`, так как оно никогда не становится сегментом
+    пути на диске, а передаётся прямо в `opencode plugin <name>`). Если имя
+    небезопасно (например, резолвится в `..`) — `E_PACK_INVALID_REF` **до**
+    любой файловой операции; раньше это не проверялось, и такое имя могло
+    привести к тому, что `pack/<name>/` резолвился за пределы `pack/`, а
+    последующая очистка каталога перед доставкой рекурсивно удаляла не то,
+    что предполагалось (вплоть до корня рабочего дерева прогона).
+  - Отдельно, перед любым `removeDir` конечного каталога доставки, есть
+    рантайм-проверка `isPathWithin(packDir, dest)` — второй, независимый
+    слой защиты на случай, если что-то всё же обошло валидацию имени.
+  - Сообщения об ошибках никогда не несут секреты: inline `mcp:<name>:<config>`
+    pack ref (конфиг может содержать API-ключи в `env`-блоке) усечён до
+    `mcp:<name>` во всех контекстах ошибок; учётные данные, встроенные в
+    clone URL (`https://user:token@host/...`), вырезаны из текста ошибки и
+    stderr git.
 
 ## 3. Шаги алгоритма
 
@@ -84,6 +107,9 @@ Namespace: `TestAiPack.PackInstall` (см.
    - **all**: клонировать репо в `workspace.pack/<name>/`, обойти стандартные
      подпапки `skills/`, `agents/`, `commands/`, `plugins/`; для каждого
      найденного элемента добавить соответствующую секцию в `registeredIn`.
+     `plugins/` сканируется **по расширению файла** — только записи вида
+     `<name>.js` / `.mjs` / `.ts` / `.mts` / `.cjs`, и только реальные файлы
+     (не подкаталоги); имя плагина — та же запись без расширения.
 4. Дописать в `results/install.log` итог этапа доставки: тип, name, источник,
    длительность клон/копии, exit code. Строк про plugin-установку здесь ещё
    нет — их добавит фаза 04 после применения.
@@ -116,6 +142,9 @@ HOME-скелета.
 | `--pack-type xyz` невалидный                             | fail                                                 | `E_PACK_UNKNOWN_TYPE`    |
 | `--pack-type all`, но в репо нет стандартных подпапок    | warning + пустое `registeredIn`, но не fail          | —                        |
 | plugin install (таймаут/сбой)                            | обрабатывается в **фазе 04** при применении          | — (через 04)             |
+| `plugins/` содержит подкаталог `foo.js/` (не файл)       | пропускается, не регистрируется                      | —                        |
+| `packRef` резолвится в небезопасное имя (например `..`)  | fail до файловых операций                            | `E_PACK_INVALID_REF`     |
+| `dest` доставки вышел за пределы `pack/` (defense-in-depth) | fail, `removeDir` не вызывается                    | `E_PACK_INVALID_REF`     |
 
 > Примечание: ошибки собственно plugin-установки (`opencode plugin <name>`)
 > относятся к фазе 04 (`E_PACK_INSTALL_TIMEOUT` / `E_PACK_INSTALL_FAILED`) — там,
@@ -141,6 +170,14 @@ HOME-скелета.
   `E_INSTALL_FAILED`.
 - ✅ invalid local path: `--pack ./nope` → throw `E_PACK_INVALID_REF`.
 - ✅ unknown pack-type: `--pack-type xyz` → throw `E_PACK_UNKNOWN_TYPE`.
+- ✅ unsafe pack name: ref резолвится в имя `..` (или другое небезопасное) →
+  throw `E_PACK_INVALID_REF` до любой файловой операции.
+- ✅ plugin scan by extension: `plugins/` содержит `a.js`, `b.mjs`, `c.txt`,
+  подкаталог `d.js/` → регистрируются только `a` и `b`.
+- ✅ error redaction: ошибка с inline `mcp:name:{"env":{"KEY":"secret"}}` в
+  контексте содержит только `mcp:name`; ошибка git clone с
+  `https://user:token@host/repo` в URL не содержит `user:token@` в
+  сообщении/контексте.
 - ❌ НЕ покрыто (ticket): полная mcp-семантика (v0.3) — фаза mcp возвращает
   `detectedType = "mcp"`, `registeredIn = ["mcp"]` и помечается
   `mcpUnsupported: true` в логе.
@@ -160,6 +197,11 @@ HOME-скелета.
   baseline-identical gate).
 - `results/install.log` существует и содержит хотя бы одну запись (даже в
   smoke-test режиме).
+- Доставка пакета никогда не пишет/не удаляет что-либо за пределами
+  `pack/<name>/` — имя проверяется на безопасность при детекции, и
+  дополнительно рантайм-проверкой перед любым `removeDir`.
+- Сообщения об ошибках и контекст ошибок никогда не содержат секретов из
+  inline `mcp:`-конфига или credentials из clone URL.
 
 ## 8. Зависимости от других фаз
 

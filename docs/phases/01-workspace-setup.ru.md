@@ -87,9 +87,12 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
    apps/oldVersion/run-1, …, run-<runs>]` и аналогично `appsNew`, `homeOld`,
    `homeNew` (на этом шаге это только планируемые пути — каталогов run-N ещё
    нет; фазы 02/04 их создадут и будут использовать эти записи).
-7. Обновить корневой `.gitignore` проекта: добавить строку `.testaipack/`,
-   если её ещё нет. Файл `.gitignore` создаётся при отсутствии. Ошибка записи
-   gitignore — warning, не фейлит прогон (workspace уже работает).
+7. Обновить корневой `.gitignore` проекта: добавить строку `<basename
+   workspaceDir>/` (basename реальной директории `runInput.workspacePath` —
+   по умолчанию `.testaipack/`, но для `--workspace foo` это будет `foo/`, а
+   не хардкод `.testaipack/`), если её ещё нет. Файл `.gitignore` создаётся
+   при отсутствии. Ошибка записи gitignore — warning, не фейлит прогон
+   (workspace уже работает).
 8. Вернуть `WorkspaceSetupResult { manifest, rootPath, treePaths }`.
 
 ## 4. Входные/выходные файлы
@@ -97,7 +100,7 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
 | Файл                       | Чтение/Запись | Схема (TypeSpec/Zod) |
 | -------------------------- | ------------- | -------------------- |
 | `<workspaceRoot>/manifest.json` | Запись   | `Manifest`           |
-| `.gitignore` (в корне cwd) | Чтение+Запись | текст, `.testaipack/` добавляется один раз |
+| `.gitignore` (в корне cwd) | Чтение+Запись | текст, `<basename workspaceDir>/` добавляется один раз |
 
 ## 5. Edge-cases и ошибки
 
@@ -108,9 +111,10 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
 | Нельзя создать каталог (ROFS / нет прав)            | Fail прогона                                      | `E_HOME_SETUP_FAILED`|
 | `config.workspace` указывает на файл, не каталог    | Fail прогона                                      | `E_HOME_SETUP_FAILED`|
 | Коллизия run-id (крайне маловероятно)               | Fail прогона с явным сообщением                   | `E_HOME_SETUP_FAILED`|
-| `.gitignore` уже содержит `.testaipack/`            | Не дублируем                                      | —                    |
-| `.gitignore` не существует                          | Создаём с одной строкой `.testaipack/`            | —                    |
+| `.gitignore` уже содержит `<basename workspaceDir>/` | Не дублируем                                     | —                    |
+| `.gitignore` не существует                          | Создаём с одной строкой `<basename workspaceDir>/` | —                   |
 | `.gitignore` нельзя записать                        | Warning, прогон продолжается                      | —                    |
+| `--workspace foo` (не `.testaipack`)                | В `.gitignore` пишется `foo/`, а не `.testaipack/` | —                    |
 
 ## 6. Тест-кейсы (по одному на ветку контракта)
 
@@ -118,6 +122,9 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
   создаётся скелет, `manifest.json` соответствует Zod-схеме `Manifest`,
   `.gitignore` пополняется строкой `.testaipack/`, `WorkspaceSetupResult`
   содержит `manifest`, `rootPath` и заполненный `treePaths`.
+- ✅ custom workspace name: `runInput.workspacePath` указывает на каталог
+  `myworkspace` (не `.testaipack`) → `.gitignore` пополняется строкой
+  `myworkspace/`, не `.testaipack/`.
 - ✅ run-id формат (если генерируется вызывающей стороной): регулярка
   `^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[0-9a-f]{6}$`.
 - ✅ idempotent empty dir: повторный запуск с тем же `runId` поверх пустого
@@ -130,6 +137,9 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
   добавления нет, остальные строки сохранены.
 - ✅ gitignore missing: `.gitignore` не существует → создаётся с единственной
   строкой.
+- ✅ gitignore uses actual entry: `updateGitignore` вызывается с записью,
+  вычисленной из `path.basename(workspaceDir)`, а не с зашитым по умолчанию
+  значением.
 - ❌ НЕ покрыто (ticket): создание каталогов на сетевой FS с race-condition
   между `stat` и `mkdir` (отдельный ticket по сетевой FS).
 
@@ -142,8 +152,9 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
 - `WorkspaceTree` содержит абсолютные пути ко всем поддиректориям скелета;
   записи `appsOld/appsNew/homeOld/homeNew` — это **планируемые** пути run-N
   (сами каталоги создаются фазами 02 и 04).
-- `.gitignore` проекта содержит `.testaipack/` (если только не было ошибки
-  записи — тогда warning в логах, но инвариант ослаблен).
+- `.gitignore` проекта содержит `<basename workspaceDir>/` — фактическое имя
+  используемой рабочей директории, а не всегда `.testaipack/` (если только
+  не было ошибки записи — тогда warning в логах, но инвариант ослаблен).
 - `runId` глобально уникален в пределах машины на момент создания (timestamp +
   6 hex с энтропией ≈ 16 млн на секунду).
 

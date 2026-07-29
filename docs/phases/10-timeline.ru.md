@@ -35,8 +35,8 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
 `TimelineEvent`:
 ```jsonc
 {
-  "tStart": 1234,                // int64, ms от старта run
-  "tEnd":   1500,
+  "tStart": "1234",              // int64, ms от старта run (int64 на wire — строка)
+  "tEnd":   "1500",
   "side":   "old" | "new",
   "runIndex": 1,
   "sessionId": "...",            // root или дочерняя
@@ -63,17 +63,26 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
    - timestamps относительно `min(time_created)` run-а.
 3. **v0.2 (swimlane):** рекурсивный обход дерева сессий:
    a. Найти root-сессию (`parent_id = null`).
-   b. Для каждой сессии query к opencode db: `WHERE parent_id = ?` (через
-      `opencode db query` или прямой SQLite-доступ к cache).
+   b. Для каждой сессии query к opencode db: `opencode db "SELECT id FROM
+      session WHERE parent_id = '<id>'" --format json` (SQL — прямой
+      позиционный аргумент `db`, подкоманды `query` у opencode нет).
+      `<id>` — id родительской сессии; перед интерполяцией в SQL-строку он
+      проверяется по `/^[A-Za-z0-9_-]+$/` (реальные id opencode таковы), а
+      несовпадающий id трактуется как «нет детей» (без реального запроса к
+      БД), а не интерполируется как есть.
    c. Visited-set защищает от циклов по `parent_id`.
    d. Каждая дочерняя сессия = отдельная swimlane; `parentSessionId`
       привязывает её к родительской сессии вертикальной пунктирной линией
       (задаётся в `timeline.html` рендером). `swimlaneDepth` растёт с глубиной.
    e. Число swimlane определяется числом уникальных `sessionId` в деревьях
       всех run-ов (выводится из `TimelineEvent[]` на стороне рендера).
-4. `runInput.collapseRepeats`: если `true`, сжать последовательности
-   одинаковых `type = "tool-call"` с одним и тем же `tool` в один event с
-   меткой `repeat ×N` (сохранить min `tStart`, max `tEnd`, сумму токенов).
+4. `runInput.collapseRepeats`: если `true`, сжать подряд идущие события
+   строго `type = "tool-call"` (не `tool-result`!) с одним и тем же `tool`,
+   `side`, `runIndex` и `sessionId` в одно событие: `tStart` — от первого,
+   `tEnd` — max по всем, `tokens` — сумма. Никакой отдельной метки/счётчика
+   повторов в событии нет — просто один более длинный `tool-call`.
+   `tool-result` в это схлопывание никогда не попадает (и с ним не
+   схлопывается), поэтому статус `error` на результате всегда виден.
    Полезно против doom-loop визуализации.
 5. Нормализовать все events в два плоских массива `Timeline.old[]` и
    `Timeline.new[]` с метаданными `(side, runIndex)`. `Timeline.mode` =
@@ -106,7 +115,9 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
 | Цикл по parent_id (v0.2)                            | visited-set обрывает, warning                      | —                    |
 | Очень глубокое дерево (v0.2, >50 сессий)            | ограничение глубины 50, warning                    | —                    |
 | `runInput.collapseRepeats = true`, повторов нет     | ничего не сжимается, просто идёт по ordinary path  | —                    |
-| `runInput.collapseRepeats = true`, 20 одинаковых Read подряд | один event `repeat ×20`                    | —                    |
+| `runInput.collapseRepeats = true`, 20 одинаковых `tool-call` Read подряд | схлопываются в один `tool-call` (без метки счётчика) | —          |
+| `runInput.collapseRepeats = true`, `tool-call` + его `tool-result` | НЕ схлопываются (разный `type`)            | —                    |
+| id родительской сессии не проходит `/^[A-Za-z0-9_-]+$/` (v0.2) | трактуется как «нет детей», запрос к БД не идёт | —              |
 | `runInput.timelineMode` неизвестен                  | клирится в фазе 00 (enum `TimelineMode`)           | — (через 00)         |
 | `merged` при рассинхроне (N=1 vs N=2)               | throw с детальным `message`                        | `E_EXPORT_INVALID`   |
 | HTML > 5MB (огромный run)                           | пишем как есть, warning                            | —                    |
@@ -119,8 +130,14 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
 - ✅ event types: проверяем что `reasoning`/`tool-call`/`tool-result`/
   `step-finish`/`text` все представлены в events.
 - ✅ timestamps relative: все `tStart ≥ 0`, `tEnd ≥ tStart`, минимум = 0.
-- ✅ collapse-repeats: 5 одинаковых Bash подряд → один event `repeat ×5`.
+- ✅ collapse-repeats: 5 одинаковых `tool-call` Bash подряд → один event
+  (без метки счётчика повторов — такого поля не существует).
 - ✅ collapse-repeats off: те же 5 Bash → 5 отдельных events.
+- ✅ collapse-repeats не трогает tool-result: `tool-call` + его `tool-result`
+  (тот же tool) не схлопываются; `status: "error"` на `tool-result` не
+  теряется.
+- ✅ id родительской сессии с недопустимыми символами (v0.2) → не доходит до
+  `dbQuery`, дерево трактуется как «нет детей» для этого узла.
 - ✅ side-by-side: HTML содержит две колонки с подписями OLD/NEW.
 - ✅ merged mode: HTML содержит одну ось, цвета различают side.
 - ✅ v0.2 swimlane: дерево из 3 сессий → 3 уникальных `sessionId` в
@@ -148,7 +165,9 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
 - Число уникальных `sessionId` в `TimelineEvent[]` (v0.2) определяет количество
   swimlane на стороне рендера.
 - `runInput.collapseRepeats` не теряет информацию: суммарные токены и интервал
-  сохранены в сжатом event-е.
+  сохранены в сжатом event-е; событие остаётся `type: "tool-call"` — соседний
+  `tool-result` в схлопывание не попадает, его `status` (в т.ч. `"error"`)
+  всегда доходит до рендера.
 
 ## 8. Зависимости от других фаз
 

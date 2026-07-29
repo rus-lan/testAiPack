@@ -37,8 +37,9 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
   - `E_VERIFY_TIMEOUT` — `verify` превысил `runInput.timeouts.verifySeconds`.
   - `E_VERIFY_FAILED` — `verify` завершился с exit ≠ 0 (не фатально для
     прогона — понижает `successRank`, но не фейлит фазу; см. edge-cases).
-  - `E_RATE_LIMIT_EXHAUSTED` — в стриме присутствует устойчивый HTTP 429,
-    который opencode уже не может ретраить.
+  - `E_RATE_LIMIT_EXHAUSTED` — в стриме встретился признак 429/rate-limit
+    (см. ниже про область сканирования; одного совпадения достаточно,
+    «серия» не требуется).
   - `E_OOM` — процесс убит ядром по OOM (сигнал/статус показывает out-of-memory).
   - `E_DISK_FULL` — `ENOSPC` при записи логов/export.
   - `E_PORT_CONFLICT` — opencode пытается занятый порт (для plugin/mcp с
@@ -86,15 +87,33 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
       исчерпан → `E_TOTAL_TIMEOUT`.
    f. По завершении процесса (normal / killed): выполнить
       `HOME=<env> opencode export <sessionId>` → записать в
-      `raw/<side>/run-<runIndex>.json`. Если export падает или не валиден по
-      схеме `OpencodeExport` → код `E_EXPORT_INVALID` (см. фазу 07).
+      `raw/<side>/run-<runIndex>.json`, прочитать и провалидировать по схеме
+      `OpencodeExport`. Сразу после завершения прогона сессия иногда ещё
+      дописывается на диск, и export может вернуть усечённый/невалидный
+      JSON — если провал именно на этом шаге (схема не сошлась), делается
+      **ограниченный retry** свежего `opencode export` с экспоненциальным
+      backoff (до 3 попыток, старт 200ms, потолок ожидания 3s). Если сам
+      `opencode export` падает как процесс (ошибка запуска) или не
+      укладывается в таймаут — retry **не** делается, сразу `E_RUN_CRASH` /
+      `E_RUN_TIMEOUT` соответственно. Если после исчерпания retry export
+      всё ещё невалиден по схеме → `E_EXPORT_INVALID` (см. фазу 07).
    g. Определить `finishCause` из последнего `step-finish` event-а:
       `stop` / `tool-calls` / `length` / `error`. Определить `successRank` по
-      правилам выше. Non-zero exit opencode → `E_RUN_CRASH` + `successRank = 0`
-      (НЕ retry).
-   h. Rate-limit: если в стриме видим серию HTTP 429 и opencode уже не может
-      ретраить → `E_RATE_LIMIT_EXHAUSTED`, `successRank = 0`. НЕ retry на
-      уровне оркестратора.
+      правилам выше. Итоговый `exitCode` в `RunSideResult` — «combined»: если
+      хотя бы один из вызовов opencode (`--init`, если был, и `--prompt`)
+      завершился с ненулевым кодом, берётся код **первого** такого вызова;
+      если оба завершились нулём — код последнего вызова (`--prompt`, либо
+      `--init`, если `--prompt` почему-то не выполнялся). Non-zero exit
+      opencode → `E_RUN_CRASH` + `successRank = 0` (НЕ retry).
+   h. Rate-limit: сканируется не весь стрим целиком, а только два вида полей
+      на событии — текст assistant text-part и `output` **упавшего**
+      tool-call (`state.status === "error"`); всё остальное (callID,
+      sessionId, счётчики токенов, содержимое **успешно** прочитанного
+      файла) никогда не сканируется, чтобы случайное «429» в полезной
+      нагрузке не считалось сигналом лимита. Совпадение с
+      `429`/`rate limit`/`rate_limit`/`too many requests` в этих полях →
+      `E_RATE_LIMIT_EXHAUSTED`, `successRank = 0`. НЕ retry на уровне
+      оркестратора.
    i. Process killed by OOM (статус/сигнал показывает out-of-memory) →
       `E_OOM`, `successRank = 0`.
    j. Context-overflow (`finishCause = "length"`) — **валидный** результат,
@@ -133,7 +152,11 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
 | `--verify` exit ≠ 0                                 | понижение `successRank`, не фатально              | `E_VERIFY_FAILED`          |
 | `--verify` таймаут                                  | `successRank = 0`, failed                         | `E_VERIFY_TIMEOUT`         |
 | `--init` без `--prompt` (невозможно, клирится в 00) | ошибка контракта                                  | — (через 00)               |
-| `opencode export` упал                              | прогон failed, но данные в `.events.ndjson` живут | `E_EXPORT_INVALID`         |
+| `opencode export` вернул невалидный по схеме JSON (первые попытки) | ограниченный retry с backoff (до 3 раз) | —              |
+| `opencode export` невалиден и после исчерпания retry | прогон failed, данные в `.events.ndjson` живут   | `E_EXPORT_INVALID`         |
+| `opencode export` падает как процесс / таймаут       | retry не делается, сразу fail                     | `E_RUN_CRASH` / `E_RUN_TIMEOUT` |
+| «429» встретился в успешном выводе tool (не в тексте/ошибке) | НЕ засчитывается как rate-limit           | —                          |
+| `--init` упал (non-zero), `--prompt` после него завершился нулём | итоговый `exitCode` = код `--init` (первый non-zero) | `E_RUN_CRASH` |
 | Процесс убит по OOM                                 | `successRank = 0`                                 | `E_OOM`                    |
 | `ENOSPC` при записи логов/export                    | `successRank = 0`, failed                         | `E_DISK_FULL`              |
 | Plugin/mcp пытается занять занятый порт             | `successRank = 0`, failed                         | `E_PORT_CONFLICT`          |
@@ -151,12 +174,21 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
 - ✅ total-timeout: `timeouts.totalSeconds` исчерпан → kill, `E_TOTAL_TIMEOUT`.
 - ✅ watchdog: `timeouts.watchdogSeconds` без событий → kill,
   `E_RUN_HANG_WATCHDOG`.
-- ✅ rate-limit exhausted: серия 429 → `E_RATE_LIMIT_EXHAUSTED`,
-  `successRank = 0`.
+- ✅ rate-limit exhausted: 429 в assistant-тексте или в выводе упавшего tool
+  → `E_RATE_LIMIT_EXHAUSTED`, `successRank = 0`.
+- ✅ rate-limit false-positive guard: «429» в выводе **успешного** tool-call
+  (например, содержимое прочитанного файла) → НЕ засчитывается.
 - ✅ OOM kill: процесс убит ядром по OOM → `E_OOM`, `successRank = 0`.
 - ✅ disk full: `ENOSPC` при записи лога → `E_DISK_FULL`.
 - ✅ port conflict: plugin требует занятый порт → `E_PORT_CONFLICT`.
-- ✅ export invalid: `opencode export` упал/невалиден → `E_EXPORT_INVALID`.
+- ✅ export invalid, retry exhausted: `opencode export` возвращает невалидный
+  JSON на всех попытках → retry с backoff исчерпан → `E_EXPORT_INVALID`.
+- ✅ export invalid, retry recovers: первая попытка невалидна, повторная —
+  валидна → прогон не падает, export принят со второй попытки.
+- ✅ export process failure: сам `opencode export` падает как процесс →
+  `E_RUN_CRASH` немедленно, без retry.
+- ✅ combined exit code: `--init` падает (non-zero), `--prompt` после него
+  завершается нулём → `RunSideResult.exitCode` = код `--init`.
 - ✅ `--init` then `--prompt`: два вызова opencode с одним `--session`,
   `--continue` на втором.
 - ✅ `--verify` ok: verify exit 0 → `successRank` без изменений.
