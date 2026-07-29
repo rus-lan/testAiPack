@@ -3,15 +3,26 @@ import functional from 'eslint-plugin-functional'
 
 export default [
   {
+    // Allowlist, not a denylist: ignore everything, then un-ignore only the
+    // project's own source locations (bin/, contract/, scripts/, src/,
+    // tests/, the two root config files). A run workspace is excluded by
+    // construction regardless of what `--workspace <name>` calls it —
+    // `updateGitignore()` writes the real name into .gitignore for git, but
+    // eslint has no such per-run mechanism, so the allowlist has to be the
+    // fixed, known-good set instead of guessing at workspace names.
     ignores: [
-      'dist/**',
-      'node_modules/**',
+      '**',
+      '!bin/**',
+      '!contract/**',
+      '!scripts/**',
+      '!src/**',
+      '!tests/**',
+      '!eslint.config.js',
+      '!vitest.config.ts',
       'contract/node_modules/**',
       'contract/dist/**',
       'src/generated/**',
       'src/**/*.d.ts',
-      '.testaipack*/**',
-      'coverage/**',
     ],
   },
   ...tseslint.configs.strictTypeChecked,

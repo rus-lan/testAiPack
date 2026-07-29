@@ -786,7 +786,7 @@ class DoctorCommand extends Command {
   static override paths = [['doctor']]
   static override usage = Command.Usage({
     category: 'Setup',
-    description: 'Check that opencode, git, node and bun are available.',
+    description: 'Check that opencode, git, node and docker are available (bun is optional — only needed to build from source).',
   })
 
   async execute(): Promise<number> {

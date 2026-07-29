@@ -1,8 +1,13 @@
 /**
  * `testaipack doctor` \u2014 environment diagnostics. Probes the tools testaipack
- * shells out to (opencode, git, node, bun, docker) and the opencode auth
+ * shells out to at runtime (opencode, git, node, docker) and the opencode auth
  * directory, and reports an ok/fail/warn verdict per check. Every probe is
  * isolated: a failure is reported, never thrown.
+ *
+ * `bun` is checked too but never as a runtime dependency: the released binary
+ * is a standalone `bun build --compile` output and never shells out to `bun`.
+ * It only matters to someone building from source (`npm run build`), so a
+ * missing/broken `bun` is reported as `warn`, never `fail`.
  */
 import { Effect } from 'effect'
 import os from 'node:os'
@@ -25,6 +30,9 @@ const fail = (name: string, detail: string): DoctorCheck => ({
 })
 
 const KEEP_ENV = new Set(['PATH', 'LANG', 'LC_ALL', 'HOME'])
+
+/** First non-empty line, so multi-line command output never spills across a table row. */
+const firstLine = (s: string): string => s.trim().split('\n', 1)[0] ?? ''
 
 const cleanEnv: Record<string, string> = Object.entries(process.env).reduce<
   Record<string, string>
@@ -49,17 +57,30 @@ const probeCmd = (
           : fail(name, `${command} failed to run (${out.spawnErrorCode ?? 'unknown error'})`)
       }
       if (out.exitCode !== 0) {
-        const stderr = out.stderr.trim()
+        const stderr = firstLine(out.stderr)
         return {
           name,
           status: 'fail',
           detail: stderr === '' ? `exit ${String(out.exitCode)}` : stderr.slice(0, 120),
         }
       }
-      return { name, status: 'ok', detail: out.stdout.trim().slice(0, 80) }
+      return { name, status: 'ok', detail: firstLine(out.stdout).slice(0, 80) }
     }),
     Effect.catchAll((e) =>
       Effect.succeed(fail(name, `${command} timed out (${String(e)})`)),
+    ),
+  )
+
+/**
+ * `bun` is a build-time-only dependency (see module docstring) — any probe
+ * failure is downgraded to `warn` so it never reads as a broken environment.
+ */
+const checkBun = (cwd: string): Effect.Effect<DoctorCheck> =>
+  probeCmd('bun', 'bun', ['--version'], cwd).pipe(
+    Effect.map((c): DoctorCheck =>
+      c.status === 'ok'
+        ? c
+        : { name: 'bun', status: 'warn', detail: 'not needed to run testaipack, only to build it from source' },
     ),
   )
 
@@ -80,7 +101,7 @@ export const runDoctor = (cwd: string): Effect.Effect<readonly DoctorCheck[]> =>
       probeCmd('opencode', process.env['OPENCODE_BIN'] ?? 'opencode', ['--version'], cwd),
       probeCmd('git', 'git', ['--version'], cwd),
       probeCmd('node', 'node', ['--version'], cwd),
-      probeCmd('bun', 'bun', ['--version'], cwd),
+      checkBun(cwd),
       probeCmd('docker', 'docker', ['info'], cwd),
       checkAuthDir('opencode auth.json', '.local/share/opencode/auth.json'),
     ],

@@ -41,7 +41,58 @@ describe('cli/doctor — runDoctor', () => {
     expect(names).toContain('node')
     expect(names).toContain('bun')
     expect(names).toContain('docker')
+    expect(checks.find((c) => c.name === 'bun')?.status).toBe('ok')
     expect(hasCriticalFailure(checks)).toBe(false)
+  })
+
+  it('bun missing (ENOENT) → warn, not fail, and not critical', async () => {
+    execMock.mockImplementation((input) =>
+      Effect.succeed({
+        stdout: '',
+        stderr: '',
+        exitCode: input.command === 'bun' ? -1 : 0,
+        ...(input.command === 'bun' ? { spawnErrorCode: 'ENOENT' } : {}),
+      }),
+    )
+    existsMock.mockImplementation(() => Effect.succeed(true))
+    const checks = await runP(runDoctor('/cwd'))
+    const bun = checks.find((c) => c.name === 'bun')
+    expect(bun?.status).toBe('warn')
+    expect(bun?.detail).toContain('only to build it from source')
+    expect(hasCriticalFailure(checks)).toBe(false)
+  })
+
+  it('bun non-zero exit → still warn, not fail', async () => {
+    execMock.mockImplementation((input) =>
+      Effect.succeed({
+        stdout: '',
+        stderr: '',
+        exitCode: input.command === 'bun' ? 1 : 0,
+      }),
+    )
+    existsMock.mockImplementation(() => Effect.succeed(true))
+    const checks = await runP(runDoctor('/cwd'))
+    const bun = checks.find((c) => c.name === 'bun')
+    expect(bun?.status).toBe('warn')
+  })
+
+  it('docker info returns multi-line output → detail is the first line only', async () => {
+    execMock.mockImplementation((input) =>
+      Effect.succeed({
+        stdout:
+          input.command === 'docker'
+            ? 'Client:\n Version:    29.6.2\n Context:    default\n Debug Mode: false\n'
+            : `${input.command} 1.0`,
+        stderr: '',
+        exitCode: 0,
+      }),
+    )
+    existsMock.mockImplementation(() => Effect.succeed(true))
+    const checks = await runP(runDoctor('/cwd'))
+    const docker = checks.find((c) => c.name === 'docker')
+    expect(docker?.status).toBe('ok')
+    expect(docker?.detail).toBe('Client:')
+    expect(docker?.detail).not.toContain('\n')
   })
 
   it('opencode missing (ENOENT, exit < 0) → fail "not found" + critical', async () => {
