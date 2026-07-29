@@ -1,16 +1,8 @@
 {
   "name": "testaipack",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "A/B tester for opencode integrations — compares work before/after installing a pack (skill/plugin/agent/command/mcp)",
   "type": "module",
-  "bin": {
-    "testaipack": "./bin/testaipack.js"
-  },
-  "main": "./dist/index.js",
-  "exports": {
-    ".": "./dist/index.js",
-    "./package.json": "./package.json"
-  },
   "scripts": {
     "build": "bun build --compile --outfile=dist/testaipack bin/testaipack.ts",
     "build:all": "bash scripts/release.sh",
