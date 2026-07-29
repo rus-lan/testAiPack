@@ -183,6 +183,14 @@ const pluginOutcome = (name = 'myplugin'): PackInstallOutcome => ({
   instructions: [{ kind: 'plugin', name }],
 })
 
+const localPluginOutcome = (target: string, name = 'myplugin'): PackInstallOutcome => ({
+  packPath: '',
+  detectedType: 'all',
+  installLogPath: '/tmp/install.log',
+  registeredIn: ['plugins'],
+  instructions: [{ kind: 'plugin', name, target }],
+})
+
 const agentOutcome = (mdPath: string, name = 'build'): PackInstallOutcome => ({
   packPath: mdPath,
   detectedType: 'agent',
@@ -302,6 +310,38 @@ describe('phase 04 — homeIsolation', () => {
     const input = buildInput({ isolation: 'home', dockerNetwork: 'host' }, pluginOutcome('myplugin'))
     await runP(homeIsolation(input))
     expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin')
+  })
+
+  it('local plugin file (target set): copied into new HOME plugins/ + registered as a local spec, installPlugin NOT called', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const srcDir = makeTempDir('testaipack-plugin-src-')
+    await runP(ensureDir(srcDir))
+    const srcFile = path.join(srcDir, 'myplugin.js')
+    await runP(writeFile(srcFile, 'module.exports = {}'))
+    const input = buildInput({}, localPluginOutcome(srcFile, 'myplugin'))
+    await runP(homeIsolation(input))
+    const dstFile = path.join(input.workspace.homeNew[0]!, '.config/opencode/plugins/myplugin.js')
+    expect(await runP(exists(dstFile))).toBe(true)
+    const cfgPath = path.join(input.workspace.homeNew[0]!, '.config/opencode/opencode.json')
+    const cfg = JSON.parse(await runP(readFile(cfgPath))) as { plugin?: readonly string[] }
+    expect(cfg.plugin).toEqual([dstFile])
+    expect(installMock).not.toHaveBeenCalled()
+  })
+
+  it('local plugin file: old (baseline) side never gets the file or a plugin instruction applied', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const srcDir = makeTempDir('testaipack-plugin-src-')
+    await runP(ensureDir(srcDir))
+    const srcFile = path.join(srcDir, 'myplugin.js')
+    await runP(writeFile(srcFile, 'module.exports = {}'))
+    const input = buildInput({}, localPluginOutcome(srcFile, 'myplugin'))
+    await runP(homeIsolation(input))
+    const oldDstFile = path.join(input.workspace.homeOld[0]!, '.config/opencode/plugins/myplugin.js')
+    expect(await runP(exists(oldDstFile))).toBe(false)
   })
 
   it('plugin install timeout → E_PACK_INSTALL_TIMEOUT', async () => {

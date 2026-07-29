@@ -169,6 +169,14 @@ const pluginOutcome = (name = 'myplugin'): PackInstallOutcome => ({
   instructions: [{ kind: 'plugin', name }],
 })
 
+const localPluginOutcome = (target: string, name = 'myplugin'): PackInstallOutcome => ({
+  packPath: '',
+  detectedType: 'all',
+  installLogPath: '/tmp/install.log',
+  registeredIn: ['plugins'],
+  instructions: [{ kind: 'plugin', name, target }],
+})
+
 const configOutcome = (name = 'myserver'): PackInstallOutcome => ({
   packPath: '',
   detectedType: 'mcp',
@@ -419,6 +427,27 @@ describe('phase 05 — preflight', () => {
     expect(err.context?.['exitCode']).toBe(3)
   })
 
+  it('pack-visibility local plugin (target set) success — checks the exact delivered filename, not <name>.js', async () => {
+    const homes = await buildHomes()
+    // target's basename is myplugin.mjs, not <name>.js — proves the check
+    // uses the delivered filename, not a `${name}.js` guess.
+    const srcFile = path.join(homes.root, 'src', 'myplugin.mjs')
+    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.mjs'), 'export default {}'))
+    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(result.allPassed).toBe(true)
+  })
+
+  it('pack-visibility local plugin (target set) invisible when the file was never delivered → E_PREFLIGHT_PACK_INVISIBLE', async () => {
+    const homes = await buildHomes()
+    const srcFile = path.join(homes.root, 'src-myplugin.js')
+    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
+    expect(err.context?.['exitCode']).toBe(3)
+  })
+
   it('pack-visibility mcp visible (opencode.json has mcp.<name> on new side) → exitCode=0', async () => {
     const homes = await buildHomes()
     await writeMcpConfig(homes.new, 'myserver')
@@ -480,6 +509,22 @@ describe('phase 05 — preflight', () => {
       Effect.succeed({ exitCode: 0, stdout: 'OK', stderr: '', durationMs: 5, timedOut: false }),
     )
     const input = buildInput(homes, {}, pluginOutcome('myplugin'))
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
+    expect(err.context?.['check']).toBe('baseline-identical')
+    expect(err.context?.['exitCode']).toBe(2)
+  })
+
+  it('baseline-identical leak (local plugin file, target set) on old side → E_PREFLIGHT_FAILED, exitCode=2', async () => {
+    const homes = await buildHomes()
+    const srcFile = path.join(homes.root, 'src', 'myplugin.js')
+    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
+    // leak: same delivered filename accidentally on old side
+    await runP(writeFile(path.join(homes.old, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
+    runMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: 'OK', stderr: '', durationMs: 5, timedOut: false }),
+    )
+    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_FAILED')
     expect(err.context?.['check']).toBe('baseline-identical')

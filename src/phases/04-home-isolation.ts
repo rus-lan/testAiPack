@@ -246,6 +246,23 @@ const mergeMcpServer = (
   return { ...existing, mcp: { ...prevMcp, [name]: json } }
 }
 
+/**
+ * opencode's config `plugin` array accepts a local file spec as a plain
+ * absolute path (also `file://…` or a `.`-relative path, but absolute needs
+ * no resolution and works regardless of the process's cwd) — verified in the
+ * opencode binary's plugin-spec resolver, which recognizes any entry that
+ * `path.isAbsolute()`s, starts with `file://`, or starts with `.`. This is a
+ * different path from `opencode plugin <module>`, which only ever installs
+ * an npm package and never accepts a local file.
+ */
+const addLocalPlugin = (
+  existing: Record<string, unknown>,
+  absPath: string,
+): Record<string, unknown> => {
+  const prev = isStringArray(existing['plugin']) ? existing['plugin'] : []
+  return prev.includes(absPath) ? existing : { ...existing, plugin: [...prev, absPath] }
+}
+
 const applyInstruction = (
   inst: RegistrationInstruction,
   homeDir: string,
@@ -293,25 +310,57 @@ const applyInstruction = (
           ),
         )
       })
-    case 'plugin':
-      return installPlugin(homeDir, inst.name, ...(docker === undefined ? [] : [docker])).pipe(
-        Effect.mapError((e: OpencodeError) =>
-          homeIsolationError(`opencode plugin failed: ${e.stderr}`, 'E_PACK_INSTALL_FAILED', {
-            module: inst.name,
-            exitCode: e.exitCode,
-          }),
-        ),
-        Effect.timeout(Duration.seconds(installSeconds)),
-        Effect.catchTag('TimeoutException', () =>
-          Effect.fail(
-            homeIsolationError(
-              `opencode plugin timed out after ${String(installSeconds)}s`,
-              'E_PACK_INSTALL_TIMEOUT',
-              { module: inst.name },
+    case 'plugin': {
+      const target = inst.target
+      if (target === undefined) {
+        return installPlugin(homeDir, inst.name, ...(docker === undefined ? [] : [docker])).pipe(
+          Effect.mapError((e: OpencodeError) =>
+            homeIsolationError(`opencode plugin failed: ${e.stderr}`, 'E_PACK_INSTALL_FAILED', {
+              module: inst.name,
+              exitCode: e.exitCode,
+            }),
+          ),
+          Effect.timeout(Duration.seconds(installSeconds)),
+          Effect.catchTag('TimeoutException', () =>
+            Effect.fail(
+              homeIsolationError(
+                `opencode plugin timed out after ${String(installSeconds)}s`,
+                'E_PACK_INSTALL_TIMEOUT',
+                { module: inst.name },
+              ),
             ),
           ),
-        ),
-      )
+        )
+      }
+      // Local plugin file: never an npm fetch. Delivered as a file and
+      // registered with a local spec in the plugin's own config array —
+      // `opencode plugin <module>` has no path that accepts a local file.
+      return Effect.gen(function* () {
+        const pluginsDir = path.join(homeDir, '.config/opencode/plugins')
+        yield* ensureDir(pluginsDir).pipe(
+          Effect.mapError((e: FsError) =>
+            setupFail(`cannot create plugins dir: ${e.path}`, { path: e.path }),
+          ),
+        )
+        const dstFile = path.join(pluginsDir, path.basename(target))
+        yield* copyFile(target, dstFile).pipe(
+          Effect.mapError((e: FsError) =>
+            setupFail(`cannot place plugin file: ${e.path}`, {
+              source: target,
+              path: e.path,
+            }),
+          ),
+        )
+        const cfgPath = path.join(homeDir, '.config/opencode/opencode.json')
+        const existing = yield* readOpendcodeConfig(cfgPath)
+        const merged = addLocalPlugin(existing, dstFile)
+        yield* writeFile(cfgPath, `${JSON.stringify(merged, null, 2)}\n`).pipe(
+          Effect.mapError((e: FsError) =>
+            setupFail(`cannot write opencode.json: ${e.path}`, { path: e.path }),
+          ),
+        )
+      })
+    }
     case 'config':
       return Effect.gen(function* () {
         const cfgPath = path.join(homeDir, '.config/opencode/opencode.json')

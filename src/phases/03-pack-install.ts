@@ -50,7 +50,16 @@ export type RegistrationInstruction =
       readonly name: string
       readonly target: string
     }
-  | { readonly kind: 'plugin'; readonly name: string }
+  | {
+      readonly kind: 'plugin'
+      readonly name: string
+      /**
+       * Absolute path to a local plugin file (from a pack's `plugins/` dir).
+       * Undefined for an `npm:`-form plugin ref, which has no local file and
+       * is installed via `opencode plugin <module>` instead (phase 04).
+       */
+      readonly target?: string
+    }
   | { readonly kind: 'config'; readonly section: 'mcp'; readonly name: string; readonly json: unknown }
 
 /**
@@ -398,10 +407,11 @@ const scanPlugins = (pluginsDir: string): Effect.Effect<ScanResult, PhaseError> 
       (entry) =>
         Effect.gen(function* () {
           if (!PLUGIN_FILE_RE.test(entry)) return [] as readonly RegistrationInstruction[]
-          const kind = yield* pathKind(path.join(pluginsDir, entry))
+          const target = path.join(pluginsDir, entry)
+          const kind = yield* pathKind(target)
           if (kind !== 'file') return [] as readonly RegistrationInstruction[]
           const name = entry.replace(PLUGIN_FILE_RE, '')
-          return [{ kind: 'plugin', name }] as readonly RegistrationInstruction[]
+          return [{ kind: 'plugin', name, target }] as readonly RegistrationInstruction[]
         }),
       { concurrency: 1 },
     )

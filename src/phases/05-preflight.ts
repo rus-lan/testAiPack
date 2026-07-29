@@ -301,6 +301,9 @@ const instructionVisible = (
     }
     if (inst.kind === 'plugin') {
       const dir = path.join(homePaths.new, '.config/opencode/plugins')
+      if (inst.target !== undefined) {
+        return yield* exists(path.join(dir, path.basename(inst.target)))
+      }
       return (yield* exists(path.join(dir, `${inst.name}.js`))) || (yield* exists(path.join(dir, inst.name)))
     }
     return yield* mcpPresentIn(homePaths.new, inst.name)
@@ -358,6 +361,9 @@ const leakedOntoOld = (
     }
     if (inst.kind === 'plugin') {
       const dir = path.join(homePaths.old, '.config/opencode/plugins')
+      if (inst.target !== undefined) {
+        return yield* exists(path.join(dir, path.basename(inst.target)))
+      }
       return (yield* exists(path.join(dir, `${inst.name}.js`))) || (yield* exists(path.join(dir, inst.name)))
     }
     return yield* mcpPresentIn(homePaths.old, inst.name)

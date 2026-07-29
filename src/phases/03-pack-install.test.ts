@@ -551,7 +551,7 @@ describe('phase 03 — packInstall', () => {
     expect(err.code).toBe('E_PACK_INVALID_REF')
   })
 
-  it('all with plugins/ subdir → plugins section + plugin instruction', async () => {
+  it('all with plugins/ subdir → plugins section + plugin instruction with target', async () => {
     cloneMock.mockImplementation(
       materializeClone({
         'skills/cool/SKILL.md': '# cool\n',
@@ -565,6 +565,10 @@ describe('phase 03 — packInstall', () => {
     expect(pluginInst).toBeDefined()
     if (pluginInst?.kind === 'plugin') {
       expect(pluginInst.name).toBe('myplugin')
+      expect(pluginInst.target).toBe(
+        path.join(built.packDir, 'megapack', 'plugins', 'myplugin.js'),
+      )
+      expect(await runP(exists(pluginInst.target!))).toBe(true)
     }
   })
 

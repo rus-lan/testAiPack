@@ -127,8 +127,12 @@ npm run build                # → dist/testaipack (нужен bun)
 ### Проверка установки
 
 ```bash
-testaipack doctor     # opencode, git, node, bun — всё на месте?
+testaipack doctor     # opencode, git, node, docker — всё на месте?
 ```
+
+`doctor` заодно проверяет `bun`, но только информационно (`warn`, не `fail`) —
+собранному бинарнику `bun` не нужен вообще, он важен только для сборки из
+исходников (`npm run build`).
 
 ### Docker-изоляция (опционально)
 
@@ -352,7 +356,7 @@ run-N`, `PACK source (read-only)`.
 
 | Команда    | Описание                                                                     |
 | ---------- | ---------------------------------------------------------------------------- |
-| `doctor`   | Проверить зависимости (opencode, git, node, bun).                            |
+| `doctor`   | Проверить зависимости (opencode, git, node, docker; `bun` — информационно, нужен только для сборки из исходников). |
 | `init --workspace <path>` | Создать каталог `<path>` (по умолчанию `.testaipack/`) с дефолтным `config.json` и добавить `<path>/` в `.gitignore` рядом с ним. |
 
 ```bash
