@@ -29,6 +29,16 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.5.4 (docker export fix, cleanup)
+
+- **Anyone using `--isolation docker` on a non-trivial session could lose runs**: `opencode export` output was truncated by a container-teardown race — the throwaway container was removed before its output finished draining through the pipe. Reproduced 5/5 with a plain `docker run`, and the existing retry couldn't help since it just repeated the same doomed operation. Export now writes to a file inside the isolated `$HOME` and is read back from the host — 5/5 complete, byte-identical to the native (non-docker) path.
+- `--log-level` is no longer a dead flag — it now controls testaipack's own output verbosity (`info`/`debug`/`warn`/`error`; `debug` is currently the same as `info`).
+- Fixed four wrong or missing descriptions in `run --help` (`--preflight-model`, `--pure-baseline`, `--opencode-version`, `--docker-network`).
+- `package.json` no longer claims an `npm install -g` / import path that never worked — distribution is release binaries + `install.sh`, nothing else.
+- README audit: corrected a stale claim that `npm install` runs codegen automatically, documented `gc --aggressive` and `install.sh`'s `INSTALL_DIR`, and removed a broken file reference.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.5.3...v0.5.4
+
 ## v0.5.3 (security, fixes)
 
 - **Security**: a local plugin file in a pack (`plugins/<name>.js`) could be silently replaced by an unrelated npm package sharing its name — plugin installation resolved local plugin names through `opencode plugin <name>`, which always treats its argument as an npm module specifier. Local plugin files are now delivered and registered directly by path, with no npm resolution involved at all.
