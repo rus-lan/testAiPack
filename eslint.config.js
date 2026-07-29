@@ -10,7 +10,7 @@ export default [
       'contract/dist/**',
       'src/generated/**',
       'src/**/*.d.ts',
-      '.testaipack/**',
+      '.testaipack*/**',
       'coverage/**',
     ],
   },
