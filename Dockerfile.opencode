@@ -14,15 +14,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install opencode by fetching the release binary directly from GitHub. We do
-# NOT use the official `curl https://opencode.ai/install | bash` here because it
-# calls the GitHub REST API to resolve the latest version, and that endpoint is
-# rate-limited (HTTP 403) inside CI / Docker builds. The `releases/latest/download`
-# URL redirects to the asset without hitting the API.
+# Pinned opencode version — bump deliberately, not by rebuilding against
+# whatever upstream latest happens to be that day. `releases/latest` used to
+# be resolved at build time; that let the image silently drift ahead of the
+# schema this project validates exports against (contract/main.tsp), which is
+# exactly what broke `--isolation docker` runs when a `finish: "unknown"`
+# value from a newer opencode hit an older schema (see CHANGELOG). Override
+# for a one-off test build without editing this file:
+#   docker build --build-arg OPENCODE_VERSION=1.18.9 -f Dockerfile.opencode .
+ARG OPENCODE_VERSION=1.18.4
+
+# Install opencode by fetching the pinned release binary directly from GitHub
+# (not the official `curl https://opencode.ai/install | bash`, which calls the
+# GitHub REST API to resolve a version and is rate-limited (HTTP 403) inside
+# CI / Docker builds — a tagged `releases/download/vX.Y.Z` URL redirects to
+# the asset without hitting the API).
 # Asset name matches the official installer: opencode-<os>-<arch>.tar.gz (linux).
 RUN ARCH=x64 \
     && curl -fsSL -o /tmp/opencode.tar.gz \
-        "https://github.com/anomalyco/opencode/releases/latest/download/opencode-linux-${ARCH}.tar.gz" \
+        "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${ARCH}.tar.gz" \
     && tar -xzf /tmp/opencode.tar.gz -C /tmp \
     && install -m 0755 /tmp/opencode /usr/local/bin/opencode \
     && rm -f /tmp/opencode /tmp/opencode.tar.gz \
