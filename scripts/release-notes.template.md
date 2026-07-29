@@ -29,6 +29,15 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.5.0 (docker fixes, feature)
+
+- **`--isolation docker` was broken for everyone, regardless of networking** — the container ran as the wrong user and couldn't write into the isolated HOME mounted from the host, failing every docker-mode run at preflight with a permission error. Fixed: the container now runs as your host uid/gid (Linux/macOS).
+- `--docker-network <mode>` — set the container's network mode (e.g. `host`), needed to reach a host-local model server (ollama) from `--isolation docker`, since a bridged container's `localhost` is itself. Linux-specific: Docker Desktop on Mac/Windows doesn't expose the host loopback the same way.
+- Falling back from `--isolation docker` to `home` (when Docker isn't available) now prints a warning instead of silently changing what actually ran.
+- README gained a "Проверенные примеры" section with five real, verified end-to-end commands, and a dedicated section on running local/self-hosted models (ollama and friends).
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.4.0...v0.5.0
+
 ## v0.4.0 (features, fixes, security)
 
 - `--model <provider/model>` — pin the model for both sides of a run (baseline and patched), baked into the generated opencode configs.
