@@ -48,3 +48,4 @@ npm-debug.log*
 results/
 .testaipack-cloud/
 .testaipack-docker/
+.testaipack-installed/

@@ -23,6 +23,7 @@ mkdir -p "$OUT_DIR"
 
 BUN="./node_modules/.bin/bun"
 ENTRY="bin/testaipack.ts"
+INSTALL_SCRIPT="install.sh"
 
 if [ ! -x "$BUN" ]; then
   echo "bun not found at $BUN" >&2
@@ -32,6 +33,13 @@ if [ ! -f "$ENTRY" ]; then
   echo "entry not found: $ENTRY" >&2
   exit 1
 fi
+if [ ! -f "$INSTALL_SCRIPT" ]; then
+  echo "install script not found: $INSTALL_SCRIPT" >&2
+  exit 1
+fi
+
+echo "Copying $INSTALL_SCRIPT..."
+cp "$INSTALL_SCRIPT" "$OUT_DIR/install.sh"
 
 echo "Building testaipack v${VERSION} for 5 platforms..."
 

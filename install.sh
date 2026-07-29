@@ -71,8 +71,59 @@ if [ "$os" = "windows" ]; then
   TARGET="${TARGET}.exe"
 fi
 
+TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/testaipack-dl.XXXXXX")
+trap 'rm -f "$TMP_FILE"' EXIT
+
 echo "testaipack: downloading $asset..."
-curl -fsSL -o "$TARGET" "$DOWNLOAD_URL"
+curl -fsSL -o "$TMP_FILE" "$DOWNLOAD_URL"
+
+# --- verify checksum against checksums-sha256.txt from the same release ---
+# Best-effort: a missing checksums asset or a missing sha256sum/shasum
+# degrades to a warning and the install proceeds anyway. An actual mismatch
+# is always fatal — a corrupted or tampered binary must never be installed.
+SHA_CMD=""
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA_CMD="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA_CMD="shasum -a 256"
+else
+  echo "testaipack: WARNING: neither sha256sum nor shasum is available — skipping integrity check." >&2
+fi
+
+if [ -n "$SHA_CMD" ]; then
+  CHECKSUMS_URL=$(printf '%s\n' "$RELEASE_JSON" \
+    | grep -o '"browser_download_url":[[:space:]]*"https://[^"]*"' \
+    | grep -o "https://[^\"' ]*/checksums-sha256\.txt\"" \
+    | sed 's/"$//' \
+    | head -1)
+
+  if [ -z "$CHECKSUMS_URL" ]; then
+    echo "testaipack: WARNING: checksums-sha256.txt not found in this release — skipping integrity check." >&2
+  else
+    TMP_CHECKSUMS=$(mktemp "${TMPDIR:-/tmp}/testaipack-sha.XXXXXX")
+    if ! curl -fsSL -o "$TMP_CHECKSUMS" "$CHECKSUMS_URL" 2>/dev/null; then
+      echo "testaipack: WARNING: could not download checksums-sha256.txt — skipping integrity check." >&2
+      rm -f "$TMP_CHECKSUMS"
+    else
+      EXPECTED=$(grep -E "  ${asset}\$" "$TMP_CHECKSUMS" | awk '{print $1}' | head -1)
+      rm -f "$TMP_CHECKSUMS"
+      if [ -z "$EXPECTED" ]; then
+        echo "testaipack: WARNING: no checksum entry for '$asset' — skipping integrity check." >&2
+      else
+        ACTUAL=$($SHA_CMD "$TMP_FILE" | awk '{print $1}')
+        if [ "$EXPECTED" != "$ACTUAL" ]; then
+          echo "testaipack: checksum mismatch for $asset — aborting install." >&2
+          echo "  expected: $EXPECTED" >&2
+          echo "  actual:   $ACTUAL" >&2
+          exit 1
+        fi
+        echo "testaipack: checksum verified ($asset)."
+      fi
+    fi
+  fi
+fi
+
+mv "$TMP_FILE" "$TARGET"
 chmod +x "$TARGET" 2>/dev/null || true
 
 # --- PATH hint ---

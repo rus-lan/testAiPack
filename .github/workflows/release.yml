@@ -91,6 +91,8 @@ jobs:
           test -f dist/release/testaipack-darwin-arm64
           test -f dist/release/testaipack-windows-x64.exe
           test -f dist/release/checksums-sha256.txt
+          test -f dist/release/install.sh
+          grep -q "install.sh" dist/release/checksums-sha256.txt
 
       - name: Smoke-test binary
         run: ./dist/release/testaipack-linux-x64 --help
