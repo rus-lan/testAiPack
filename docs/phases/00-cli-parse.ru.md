@@ -37,8 +37,8 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
 
 `RunInput` (общий тип из `contract/main.tsp`) содержит: `repoUrl`, `packRef?`,
 `packType?`, `prompt`, `promptFiles?`, `init?`, `initFiles?`, `verify?`, `runs`
-(int32), `isolation` (`IsolationMode`), `opencodeVersion?`, `auth`
-(`AuthWhitelist`), `pureBaseline` (boolean), `judge?`, `judgeFiles?`,
+(int32), `isolation` (`IsolationMode`), `dockerNetwork?`, `opencodeVersion?`,
+`auth` (`AuthWhitelist`), `pureBaseline` (boolean), `judge?`, `judgeFiles?`,
 `preflightEnabled` (boolean), `preflightModel?`, `model?`, `formats` (`OutputFormat[]`),
 `outputPath`, `diffHtml` (boolean), `collapseRepeats` (boolean), `timelineMode`
 (`TimelineMode`), `timeouts` (`TimeoutConfig`), `workspacePath`, `logLevel`
@@ -69,6 +69,15 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
   `RunInput.model === undefined` ⇒ поведение полностью совпадает с состоянием
   до появления флага. Валидируется тем же паттерном, что и `preflightModel`
   (см. `E_MODEL_UNAVAILABLE` выше).
+- `dockerNetwork` — необязательный `docker run --network <mode>` для
+  `--isolation=docker` (флаг `--docker-network`). Свободная строка, не enum:
+  Docker принимает `bridge`/`host`/`none`, `container:<name>` и произвольные
+  имена пользовательских сетей — enum сузил бы это без пользы, а невалидное
+  значение всё равно упадёт с понятной ошибкой на `docker run`. Флаг не задан
+  ⇒ `RunInput.dockerNetwork === undefined` ⇒ `--network` вообще не передаётся
+  в `docker run` (сегодняшнее поведение, дефолтный bridge Docker). Игнорируется
+  в `home`-изоляции. Потребляется фазами 04/05/06 (см. `docker-runner.ts`
+  `buildDockerRunArgs`).
 
 ## 3. Шаги алгоритма
 
@@ -92,10 +101,13 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
    `CliParseError({ code: "E_CONFIG_INVALID", context: { reason: "--prompt required" } })`.
 5. Валидировать `--runs ≥ 1`; иначе `E_CONFIG_INVALID({ reason: "runs must be ≥1" })`.
 6. Валидировать `--isolation ∈ {home, docker}`. Если `docker`, но демон не
-   отвечает на `docker info` (быстрая проверка с таймаутом 3s) — выдать
-   warning в stderr и прозрачно понизить до `home`, не фейля прогон. В `RunInput`
-   записать уже пониженное значение, а в `flagDefaults` (поле `Manifest`, см.
-   фазу 01) приписать флаг `dockerDowngraded: true`.
+   отвечает на `docker info` (быстрая проверка с таймаутом 3s) — понизить до
+   `home`, не фейля прогон. В `RunInput` записать уже пониженное значение, а в
+   `flagDefaults` (поле `Manifest`, см. фазу 01) приписать флаг
+   `dockerDowngraded: true`. Фаза 00 сама остаётся чистой (никаких
+   `console`/stderr здесь) — фактический warning печатает orchestrator
+   (`src/cli/pipeline.ts`, `dockerDowngradeWarning`), читая этот флаг сразу
+   после вызова `cliParse`, до `reporter.header`.
 7. Валидировать `--timeline-mode ∈ {side-by-side, tree-diff, merged}`,
    `--log-level ∈ {debug, info, warn, error}`. Любое нарушение →
    `E_CONFIG_INVALID`. Выбор IDE для review-workspace (`vscode | cursor |
@@ -152,8 +164,12 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
 - ✅ `@file` промпт: `--prompt @prompts/fix.md` → `prompt` содержит
   содержимое файла, путь приписан в `promptFiles`; несколько файлов
   конкатенированы в порядке флагов.
-- ✅ docker-downgrade: `--isolation docker`, демон не отвечает → warning в
-  stderr, `RunInput.isolation = "home"`, `flagDefaults.dockerDowngraded = true`.
+- ✅ docker-downgrade (эта фаза, `00-cli-parse.test.ts`): `--isolation docker`,
+  демон не отвечает → `RunInput.isolation = "home"`,
+  `flagDefaults.dockerDowngraded = true`. Сам stderr-warning — не эта фаза, см.
+  `dockerDowngradeWarning` в `src/cli/pipeline.test.ts`.
+- ✅ `--docker-network host` парсится в `RunInput.dockerNetwork = "host"`;
+  без флага поле отсутствует.
 - ✅ smoke-test: `run <url> --prompt "x"` без `--pack` → поле `packRef`
   отсутствует.
 - ✅ pack-type auto-detect: `--pack npm:myplugin` → `packType = "plugin"`;

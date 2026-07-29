@@ -18,6 +18,7 @@
 - [Установка](#установка)
 - [Быстрый старт](#быстрый-старт)
 - [Максимальный запуск](#максимальный-запуск)
+- [Проверенные примеры](#проверенные-примеры)
 - [Команды CLI](#команды-cli)
 - [Параметры команды `run`](#параметры-команды-run)
 - [Устранение неполадок](#устранение-неполадок)
@@ -141,9 +142,17 @@ releases поверх `node:22-slim`) и проверит, что `opencode --ve
 ```
 
 При недоступном Docker daemon (`docker info` не отвечает) фаза 00 автоматически
-откатится на `home`-изоляцию. Если образ не собран, preflight (gate 1) выдаст
-понятную ошибку с подсказкой собрать его через `bash scripts/build-docker-image.sh`
-или переопределить через `--docker-image`.
+откатится на `home`-изоляцию и напечатает предупреждение в stderr — прогон не
+станет docker-изолированным незаметно для пользователя. Если образ не собран,
+preflight (gate 1) выдаст понятную ошибку с подсказкой собрать его через
+`bash scripts/build-docker-image.sh` или переопределить через `--docker-image`.
+
+Локальный модельный сервер (например ollama), слушающий только
+`127.0.0.1` на хосте, из контейнера недоступен через дефолтный bridge —
+на Linux добавьте `--docker-network host`, чтобы контейнер делил сетевой
+стек с хостом (см. раздел «Локальные / self-hosted модели» ниже).
+**Это Linux-специфично**: Docker Desktop для Mac/Windows не шарит loopback
+хоста через `--network host` так же — там это не работает.
 
 
 ---
@@ -209,6 +218,104 @@ releases поверх `node:22-slim`) и проверит, что `opencode --ve
 
 ---
 
+## Проверенные примеры
+
+Пять сценариев, реально прогнанных и сверенных — команды ниже не выдуманы,
+все флаги сверены с [таблицей параметров](#параметры-команды-run). Про
+разложенные по дискам артефакты — см.
+[«Структура результатов»](#структура-результатов) ниже.
+
+### 1. Полный A/B на облачной модели, skill-пакет
+
+Каноничный сценарий: сравнить репозиторий до/после установки skill-пакета.
+
+```bash
+./dist/testaipack run https://github.com/tarsy-club/TarSy-Bot \
+  --pack "https://github.com/Graphify-Labs/graphify" --pack-type skill \
+  --prompt "составь подробную карту проекта и сохрани ее в файл MAP.md" \
+  --model opencode/deepseek-v4-flash-free \
+  --preflight-model opencode/deepseek-v4-flash-free \
+  --pure-baseline --runs 2 --format html --collapse-repeats \
+  --timeout-run 900 --timeout-verify 300 --timeout-install 300 --watchdog 90 \
+  --workspace ./.testaipack --log-level info
+```
+
+Демонстрирует полный happy-path: клон → установка пакета → 2 прогона на
+сторону → отчёт. `--pack-type skill` здесь явный, хотя git-URL и без него
+детектируется как `skill` автоматически (см.
+[«Форматы `--pack`»](#форматы---pack)). Артефакты: `MAP.md` появится внутри
+`apps/newVersion/run-{1,2}/` (агент пишет его прямо в клон репозитория),
+сравнительный отчёт — в
+`.testaipack/<run-id>/results/{report.md,report.json,report.html}`.
+
+### 2. Локальная модель (ollama), home-изоляция
+
+```bash
+./dist/testaipack run https://github.com/octocat/Hello-World \
+  --prompt "Опиши в двух предложениях, что содержит этот репозиторий, и сохрани в файл SUMMARY.md" \
+  --model ollama/qwen3.5-9b-32k --preflight-model ollama/qwen3.5-9b-32k \
+  --runs 1 --pure-baseline --format html \
+  --timeout-preflight 900 --timeout-run 1800 --watchdog 300 \
+  --workspace ./.testaipack --log-level info
+```
+
+Ловушка: `--timeout-preflight` — отдельный таймаут auth-ping'а, не связанный
+с `--timeout-run`/`--watchdog` (подробнее — в разделе «Локальные /
+self-hosted модели» ниже, там же про поле `provider` в конфиге). На дефолте
+`60` сек эта команда реально падала с
+`E_PREFLIGHT_TIMEOUT: auth-ping timed out` — рассуждающая локальная модель не
+укладывается в минуту даже с ответом в одно слово. Команда выше уже поднимает
+таймаут заранее. Ожидайте: локальная модель заметно медленнее облачной —
+закладывайте кратно больше времени, точных цифр не фиксировали.
+
+### 3. Локальная модель в docker-изоляции
+
+```bash
+./dist/testaipack run https://github.com/octocat/Hello-World \
+  --prompt "Опиши в двух предложениях, что содержит этот репозиторий, и сохрани в файл SUMMARY.md" \
+  --model ollama/qwen3.5-9b-32k --preflight-model ollama/qwen3.5-9b-32k \
+  --runs 1 --pure-baseline --format html \
+  --timeout-preflight 900 --timeout-run 1800 --watchdog 300 \
+  --isolation docker --docker-network host \
+  --ide vscode --review-run 1 \
+  --workspace ./.testaipack-docker --log-level info
+```
+
+Тот же прогон, что и в примере 2, но в `--isolation docker`. `--docker-network
+host` здесь обязателен: ollama слушает только `127.0.0.1` хоста, а без
+`--network host` bridge-контейнер видит под `localhost` только сам себя, так
+что preflight падает на auth-ping с connection refused. **Только Linux**: на
+Docker Desktop для Mac/Windows `--network host` не даёт контейнеру loopback
+хоста так же — там нужен другой путь.
+
+### 4. Открыть результат в VS Code
+
+```bash
+./dist/testaipack review <run-id> --ide vscode --workspace ./.testaipack-docker
+```
+
+Двухшаговый процесс, который не очевиден: `--ide`/`--review-run` в `run`
+только запекают предпочтение в `results/review.code-workspace` — сама
+команда `run` редактор не запускает (фаза 12 всегда возвращает
+`opened: false`). Реально открывает редактор отдельная команда `review` —
+она делает `spawn(<ide-binary>, [review.code-workspace])`. Сгенерированный
+workspace содержит три root'а: `OLD (baseline) run-N`, `NEW (with pack)
+run-N`, `PACK source (read-only)`.
+
+### 5. Дешёвый smoke с JSON на stdout
+
+```bash
+./dist/testaipack run https://github.com/octocat/Hello-World \
+  --prompt "reply with the word OK" --format json > report.json
+```
+
+`--format json` без `md` печатает в stdout содержимое `report.json`
+байт-в-байт (весь progress уходит в stderr — см. `src/cli/progress.ts`),
+поэтому команда пайпится в файл или дальше по конвейеру без хвостов
+прогресс-лога.
+
+---
+
 ## Команды CLI
 
 Восемь команд, сгруппированных по назначению.
@@ -269,8 +376,9 @@ releases поверх `node:22-slim`) и проверит, что `opencode --ve
 | `--prompt <text\|@file>`   | `string`                                  | — (обязательный)              | Промпт для агента на стороне сборки. `@file` читает содержимое файла.                                            |
 | `--init <text\|@file>`     | `string`                                  | —                             | Опц. промпт, запускаемый ДО `--prompt` в той же сессии (подготовка окружения).                                   |
 | `--verify <cmd>`           | `string`                                  | —                             | Опц. shell-команда после работы агента (например `npm test`). Учитывается в метриках успеха.                     |
-| `--isolation <mode>`       | `home\|docker`                            | `home`                        | Режим изоляции. `docker` запускает opencode в `docker run --rm` контейнере (v0.3); при недоступном Docker daemon молча откатывается на `home`. |
+| `--isolation <mode>`       | `home\|docker`                            | `home`                        | Режим изоляции. `docker` запускает opencode в `docker run --rm` контейнере (v0.3); при недоступном Docker daemon откатывается на `home` и печатает предупреждение в stderr. |
 | `--docker-image <image>`   | `string`                                  | `testaipack-opencode:latest`  | Образ для `--isolation=docker`. Игнорируется в режиме `home`.                    |
+| `--docker-network <mode>`  | `string`                                  | — (Docker default bridge)     | `docker run --network <mode>` для `--isolation=docker`, например `bridge`, `host`, `none`, `container:<name>` или своя сеть. Без флага `--network` не передаётся вовсе — поведение как раньше. Игнорируется в режиме `home`. |
 | `--opencode-version <ver>` | `string`                                  | — (детектируется `opencode --version`) | Пин версии opencode для обеих сторон.                                                                 |
 | `--auth <kind>` (повторяется) | `opencode\|npmrc\|anthropic\|openai\|gemini\|aws\|ssh\|git` | `opencode`,`npmrc` = on; остальные off | Добавить `<kind>` в whitelist изоляции (копирует credentials в изолированный HOME): `opencode`→`~/.local/share/opencode/auth.json`, `npmrc`→`~/.npmrc`, `anthropic`→`~/.config/anthropic`, `openai`→`~/.config/openai`, `gemini`→`~/.config/gemini`, `aws`→`~/.aws/`, `ssh`→`~/.ssh/`, `git`→`~/.gitconfig`. Флаг повторяется для нескольких kind, например `--auth aws --auth ssh`. |
 | `--no-auth-<kind>`         | тот же список `kind`                      | —                             | Убрать `<kind>` из whitelist — обычно чтобы отключить `opencode`/`npmrc`, включённые по умолчанию.                |
@@ -391,6 +499,14 @@ run-id — не используйте `--output`; если `--output` всё ж
 **2. Модель для самого прогона задаётся флагом `--model <provider>/<model>`** —
 той же моделью пингует и preflight, см.
 [«Какая модель за что отвечает»](#какая-модель-за-что-отвечает) выше.
+
+**С `--isolation docker` на Linux добавьте `--docker-network host`** —
+иначе контейнер обращается к `http://localhost:11434` сам к себе, а не к
+хосту, потому что ollama слушает только `127.0.0.1` хоста и не виден через
+дефолтный bridge. **Только Linux**: на Docker Desktop для Mac/Windows
+`--network host` не даёт контейнеру loopback хоста так же — там это не
+работает, нужен другой способ (например `host.docker.internal`, если
+сервер слушает не только `127.0.0.1`).
 
 **3. `--timeout-preflight` — отдельный таймаут, про него легко забыть.**
 Preflight-гейт `auth-ping` отправляет тривиальный промпт «reply with the single
