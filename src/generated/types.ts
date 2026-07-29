@@ -57,6 +57,7 @@ export type RunInput = {
   verify?: string
   runs: number
   isolation: IsolationMode
+  dockerNetwork?: string
   opencodeVersion?: string
   auth: AuthWhitelist
   pureBaseline: boolean

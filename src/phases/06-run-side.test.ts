@@ -1000,4 +1000,23 @@ describe('phase 06 — run-side docker threading', () => {
     const runCalls = runMock.mock.calls.map((c) => c[0])
     expect((runCalls[0] as OpencodeRunOptions).docker?.image).toBe(DEFAULT_OPENCODE_IMAGE)
   })
+
+  it('isolation=docker with runInput.dockerNetwork ⇒ opencode run called with the network', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, { runInput: { isolation: 'docker', dockerNetwork: 'host' } })
+    await runP(runSide(input))
+    const runCalls = runMock.mock.calls.map((c) => c[0])
+    expect(runCalls.length).toBeGreaterThan(0)
+    expect(runCalls.every((o) => o.docker?.network === 'host')).toBe(true)
+  })
+
+  it('isolation=docker without dockerNetwork ⇒ no network on the docker spec', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, { runInput: { isolation: 'docker' } })
+    await runP(runSide(input))
+    const runCalls = runMock.mock.calls.map((c) => c[0])
+    expect((runCalls[0] as OpencodeRunOptions).docker?.network).toBeUndefined()
+  })
 })

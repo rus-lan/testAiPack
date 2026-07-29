@@ -423,7 +423,11 @@ export const homeIsolation = (
     const isolation = input.runInput.isolation
     const dockerImage =
       isolation === 'docker' ? (input.dockerImage ?? DEFAULT_OPENCODE_IMAGE) : undefined
-    const docker: DockerExec | undefined = dockerImage === undefined ? undefined : { image: dockerImage }
+    const dockerNetwork = isolation === 'docker' ? input.runInput.dockerNetwork : undefined
+    const docker: DockerExec | undefined =
+      dockerImage === undefined
+        ? undefined
+        : { image: dockerImage, ...(dockerNetwork === undefined ? {} : { network: dockerNetwork }) }
     const runs = input.runInput.runs
     const sourceHome = os.homedir()
     const authFlags = input.runInput.auth

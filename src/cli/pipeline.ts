@@ -73,6 +73,18 @@ export interface PipelineOutcome {
 const range = (n: number): readonly number[] =>
   Array.from({ length: n }, (_, i) => i)
 
+/**
+ * `resolveIsolation` (phase 00) falls back to `home` isolation when Docker is
+ * unavailable and records `dockerDowngraded` in `flagDefaults`. That alone is
+ * silent — this turns it into the stderr line the user actually sees.
+ */
+export const dockerDowngradeWarning = (
+  flagDefaults: Readonly<Record<string, unknown>>,
+): string | undefined =>
+  flagDefaults['dockerDowngraded'] === true
+    ? 'warning: --isolation docker requested but Docker is unavailable — falling back to --isolation home'
+    : undefined
+
 const timedPhase = <A>(
   index: number,
   label: string,
@@ -173,6 +185,9 @@ export const runPipeline = (
       reporter,
     )
     const baseRunInput = parsed.runInput
+
+    const dockerWarning = dockerDowngradeWarning(parsed.flagDefaults)
+    if (dockerWarning !== undefined) reporter.log(dockerWarning)
 
     const runId = yield* generateRunId()
     reporter.header(runId)

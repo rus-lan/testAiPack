@@ -59,6 +59,7 @@ export const runInputSchema = z.object({
   verify: z.string().optional(),
   runs: z.number().int(),
   isolation: isolationModeSchema,
+  dockerNetwork: z.string().optional(),
   opencodeVersion: z.string().optional(),
   auth: authWhitelistSchema,
   pureBaseline: z.boolean(),

@@ -511,7 +511,10 @@ export const runSide = (
 
     const docker: DockerExec | undefined =
       runInput.isolation === 'docker'
-        ? { image: input.dockerImage ?? DEFAULT_OPENCODE_IMAGE }
+        ? {
+            image: input.dockerImage ?? DEFAULT_OPENCODE_IMAGE,
+            ...(runInput.dockerNetwork === undefined ? {} : { network: runInput.dockerNetwork }),
+          }
         : undefined
 
     const sideRawDir = path.join(workspace.raw, side)

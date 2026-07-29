@@ -280,6 +280,30 @@ describe('phase 04 — homeIsolation', () => {
     })
   })
 
+  it('docker isolation with --docker-network threads it into plugin install', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const input: HomeIsolationInputExt = {
+      ...buildInput({ isolation: 'docker', dockerNetwork: 'host' }, pluginOutcome('myplugin')),
+      dockerImage: 'registry.example/oc:dev',
+    }
+    await runP(homeIsolation(input))
+    expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin', {
+      image: 'registry.example/oc:dev',
+      network: 'host',
+    })
+  })
+
+  it('home isolation ignores dockerNetwork (no docker exec at all)', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const input = buildInput({ isolation: 'home', dockerNetwork: 'host' }, pluginOutcome('myplugin'))
+    await runP(homeIsolation(input))
+    expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin')
+  })
+
   it('plugin install timeout → E_PACK_INSTALL_TIMEOUT', async () => {
     installMock.mockImplementation(() => Effect.sleep('200 millis'))
     await useFakeHome(async (h) => {

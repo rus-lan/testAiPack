@@ -566,6 +566,32 @@ describe('phase 05 — preflight', () => {
       DEFAULT_OPENCODE_IMAGE,
     )
   })
+
+  it('docker mode with --docker-network: auth-ping runs with the network in the docker spec', async () => {
+    const homes = await buildHomes()
+    runMock.mockImplementation((opts: { docker?: { image: string; network?: string } }) =>
+      Effect.succeed({
+        exitCode: 0,
+        stdout: opts.docker !== undefined ? 'OK-docker' : 'OK',
+        stderr: '',
+        durationMs: 5,
+        timedOut: false,
+      }),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker', dockerNetwork: 'host' }, undefined),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    const dockerRunCalls = runMock.mock.calls.filter(
+      (c) => (c[0] as { docker?: { image: string; network?: string } } | undefined)?.docker !== undefined,
+    )
+    expect(dockerRunCalls.length).toBeGreaterThan(0)
+    expect(
+      (dockerRunCalls[0]?.[0] as { docker: { image: string; network?: string } }).docker.network,
+    ).toBe('host')
+  })
 })
 
 describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {

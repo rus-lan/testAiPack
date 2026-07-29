@@ -14,6 +14,7 @@ import type { DockerError } from '../isolation/docker-runner.js'
  */
 export interface DockerExec {
   readonly image: string
+  readonly network?: string
 }
 
 export interface OpencodeRunOptions {
@@ -175,6 +176,7 @@ export const run = (
         homeDir: opts.homeDir,
         env: buildDockerEnv(opts),
         command: [OPENCODE_BIN, ...args],
+        ...(opts.docker.network === undefined ? {} : { network: opts.docker.network }),
         ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
         ...(onLine === undefined ? {} : { onStdoutLine: onLine }),
       }).pipe(Effect.mapError(dockerErrorToOpencode('run')))
@@ -270,6 +272,7 @@ const runSimpleOpencode = (
         cwd: spec.homeDir,
         homeDir: spec.homeDir,
         command: [OPENCODE_BIN, ...spec.args],
+        ...(spec.docker.network === undefined ? {} : { network: spec.docker.network }),
       }).pipe(Effect.mapError(dockerErrorToOpencode(spec.command)))
       return { stdout: dres.stdout, stderr: dres.stderr, exitCode: dres.exitCode }
     }

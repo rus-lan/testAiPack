@@ -51,6 +51,8 @@ export interface DockerRunOptions {
   readonly homeDir: string
   /** Extra env vars passed into the container (NOT `HOME` — set internally). */
   readonly env?: Record<string, string>
+  /** `docker run --network <mode>`. Omitted ⇒ Docker's default bridge network. */
+  readonly network?: string
   /** Command vector executed inside the container (e.g. `['opencode','--version']`). */
   readonly command: readonly string[]
   /** Hard timeout. On expiry the container is `docker kill`-ed best-effort. */
@@ -71,6 +73,22 @@ const dockerEnv = (): Record<string, string> => inheritEnv(DOCKER_ENV_KEYS)
 
 const makeContainerName = (): string => `testaipack-${randomBytes(6).toString('hex')}`
 
+/**
+ * `homeDir` and `cwd` are directories phase 04 created on the host, owned by
+ * the host user. The image's baked-in non-root user (see Dockerfile.opencode)
+ * has a different uid/gid, so without `--user` it can't write into either
+ * bind mount. `process.getuid`/`getgid` are POSIX-only; on platforms without
+ * them (Windows) the flag is omitted and the container falls back to its
+ * default user.
+ */
+const hostUser = (): string | undefined => {
+  const getuid = process.getuid
+  const getgid = process.getgid
+  return typeof getuid === 'function' && typeof getgid === 'function'
+    ? `${String(getuid())}:${String(getgid())}`
+    : undefined
+}
+
 export const buildDockerRunArgs = (
   opts: DockerRunOptions,
   containerName: string,
@@ -79,11 +97,13 @@ export const buildDockerRunArgs = (
     '-e',
     `${k}=${v}`,
   ])
+  const user = hostUser()
   return [
     'run',
     '--rm',
     '--name',
     containerName,
+    ...(opts.network === undefined ? [] : ['--network', opts.network]),
     '-v',
     `${opts.cwd}:/workspace`,
     '-v',
@@ -92,6 +112,7 @@ export const buildDockerRunArgs = (
     '/workspace',
     '-e',
     'HOME=/home/opencode',
+    ...(user === undefined ? [] : ['--user', user]),
     ...envFlags,
     opts.image,
     ...opts.command,

@@ -47,3 +47,4 @@ npm-debug.log*
 .eslintcache
 results/
 .testaipack-cloud/
+.testaipack-docker/

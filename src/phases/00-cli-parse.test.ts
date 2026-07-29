@@ -354,6 +354,25 @@ describe('cliParse — docker downgrade', () => {
     const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
     expect(result.dockerImage).toBeUndefined()
   })
+
+  it('--docker-network is parsed onto runInput.dockerNetwork', async () => {
+    dockerMock.mockReturnValue(Effect.succeed(true))
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({
+        argv: ['run', REPO, '--prompt', 'x', '--isolation', 'docker', '--docker-network', 'host'],
+        cwd,
+      }),
+    )
+    expect(result.runInput.dockerNetwork).toBe('host')
+  })
+
+  it('without --docker-network runInput.dockerNetwork is absent', async () => {
+    dockerMock.mockReturnValue(Effect.succeed(false))
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.runInput.dockerNetwork).toBeUndefined()
+  })
 })
 
 describe('cliParse — result shape', () => {

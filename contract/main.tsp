@@ -123,6 +123,7 @@ model RunInput {
   verify?: string;
   runs: int32;
   isolation: IsolationMode;
+  dockerNetwork?: string;
   opencodeVersion?: string;
   auth: AuthWhitelist;
   pureBaseline: boolean;

@@ -55,7 +55,12 @@ const sectionDir = (section: 'agents' | 'commands'): string =>
  */
 const dockerFromInput = (input: PreflightInputExt): DockerExec | undefined =>
   input.runInput.isolation === 'docker'
-    ? { image: input.dockerImage ?? DEFAULT_OPENCODE_IMAGE }
+    ? {
+        image: input.dockerImage ?? DEFAULT_OPENCODE_IMAGE,
+        ...(input.runInput.dockerNetwork === undefined
+          ? {}
+          : { network: input.runInput.dockerNetwork }),
+      }
     : undefined
 
 const AUTH_MISSING_RE = /API_KEY|credentials?\s+(not|missing|absent|are\s+not)|not authenticated|no\s+provider\b/i

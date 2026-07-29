@@ -96,6 +96,7 @@ const configFileSchema = z
     runs: z.number().int().optional(),
     isolation: isolationModeSchema.optional(),
     dockerImage: z.string().optional(),
+    dockerNetwork: z.string().optional(),
     opencodeVersion: z.string().optional(),
     pureBaseline: z.boolean().optional(),
     preflightEnabled: z.boolean().optional(),
@@ -125,6 +126,7 @@ interface CliRaw {
   readonly runs?: number
   readonly isolation?: IsolationMode
   readonly dockerImage?: string
+  readonly dockerNetwork?: string
   readonly packRef?: string
   readonly packType?: PackType
   readonly formats: readonly (OutputFormat | 'all')[]
@@ -169,6 +171,7 @@ export const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '-n': 'runs',
   '--isolation': 'isolation',
   '--docker-image': 'dockerImage',
+  '--docker-network': 'dockerNetwork',
   '--pack': 'packRef',
   '--pack-type': 'packType',
   '--timeline-mode': 'timelineMode',
@@ -306,6 +309,7 @@ const parseValueFlag = (
     }
     if (dest === 'packRef') return setScalar(acc, 'packRef', raw)
     if (dest === 'dockerImage') return setScalar(acc, 'dockerImage', raw)
+    if (dest === 'dockerNetwork') return setScalar(acc, 'dockerNetwork', raw)
     if (dest === 'outputPath') return setScalar(acc, 'outputPath', raw)
     if (dest === 'workspacePath') return setScalar(acc, 'workspacePath', raw)
     if (dest === 'opencodeVersion') return setScalar(acc, 'opencodeVersion', raw)
@@ -624,6 +628,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const { isolation, dockerDowngraded } = isolationResolved
 
     const dockerImagePick = pick(cli.dockerImage, cfg?.dockerImage)
+    const dockerNetworkPick = pick(cli.dockerNetwork, cfg?.dockerNetwork)
 
     const packRefPick = pick(cli.packRef, cfg?.packRef)
     const explicitPackType = pick(cli.packType, cfg?.packType)
@@ -716,6 +721,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       preflightModelPick.src,
       modelPick.src,
       pricingPick.src,
+      dockerNetworkPick.src,
     ]
     const hasCli = sources.includes('cli')
     const hasConfig = sources.includes('config')
@@ -752,6 +758,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       ...(preflightModelPick.value !== undefined ? { preflightModel: preflightModelPick.value } : {}),
       ...(modelPick.value !== undefined ? { model: modelPick.value } : {}),
       ...(pricingPick.value !== undefined ? { pricingPath: pricingPick.value } : {}),
+      ...(dockerNetworkPick.value !== undefined ? { dockerNetwork: dockerNetworkPick.value } : {}),
     }
 
     const zodResult = runInputSchema.safeParse(runInput)

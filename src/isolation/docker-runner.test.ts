@@ -63,6 +63,11 @@ const baseOpts = {
   command: ['opencode', '--version'],
 }
 
+const hostUserFlag = (): string[] =>
+  typeof process.getuid === 'function' && typeof process.getgid === 'function'
+    ? ['--user', `${String(process.getuid())}:${String(process.getgid())}`]
+    : []
+
 describe('docker-runner — buildDockerRunArgs', () => {
   it('mounts cwd→/workspace and homeDir→/home/opencode, sets -w and HOME', () => {
     const args = buildDockerRunArgs(baseOpts, 'cnt-1')
@@ -72,9 +77,15 @@ describe('docker-runner — buildDockerRunArgs', () => {
       '-v', '/host/home:/home/opencode',
       '-w', '/workspace',
       '-e', 'HOME=/home/opencode',
+      ...hostUserFlag(),
       DEFAULT_OPENCODE_IMAGE,
       'opencode', '--version',
     ])
+  })
+
+  it('runs as the host uid:gid so it can write into the bind-mounted, host-owned dirs', () => {
+    const args = buildDockerRunArgs(baseOpts, 'cnt-1')
+    expect(args).toEqual(expect.arrayContaining(hostUserFlag()))
   })
 
   it('emits -e K=V for every extra env var (after HOME, before image)', () => {
@@ -98,6 +109,27 @@ describe('docker-runner — buildDockerRunArgs', () => {
   it('omits env flags when no extra env provided', () => {
     const args = buildDockerRunArgs(baseOpts, 'cnt-1')
     expect(args).not.toContain('FOO=bar')
+  })
+
+  it('omits --network when unset — byte-identical to the pre-network arg list', () => {
+    const args = buildDockerRunArgs(baseOpts, 'cnt-1')
+    expect(args).toEqual([
+      'run', '--rm', '--name', 'cnt-1',
+      '-v', '/host/workspace:/workspace',
+      '-v', '/host/home:/home/opencode',
+      '-w', '/workspace',
+      '-e', 'HOME=/home/opencode',
+      ...hostUserFlag(),
+      DEFAULT_OPENCODE_IMAGE,
+      'opencode', '--version',
+    ])
+  })
+
+  it('emits --network <mode> right after --name when set', () => {
+    const args = buildDockerRunArgs({ ...baseOpts, network: 'host' }, 'cnt-1')
+    const nameIdx = args.indexOf('cnt-1')
+    expect(args[nameIdx + 1]).toBe('--network')
+    expect(args[nameIdx + 2]).toBe('host')
   })
 })
 
