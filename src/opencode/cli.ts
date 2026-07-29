@@ -1,9 +1,13 @@
 import { Data, Effect } from 'effect'
+import path from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { spawnProcess, execCmd } from './spawn.js'
 import type { ExecOutput } from './spawn.js'
 import { inheritEnv } from '../util/env.js'
 import { isRecord } from '../util/types.js'
-import { dockerRun } from '../isolation/docker-runner.js'
+import { exists, readFile, removeDir } from '../util/fs.js'
+import type { FsError } from '../util/fs.js'
+import { dockerRun, dockerRunToFile } from '../isolation/docker-runner.js'
 import type { DockerError } from '../isolation/docker-runner.js'
 
 /**
@@ -299,17 +303,92 @@ export const version = (
     return parseVersion(out.stdout)
   })
 
+/**
+ * `opencode export` writes its whole payload to stdout in one blob. In docker
+ * mode that stdout has to survive a `--rm` container → dockerd → docker CLI
+ * attach pipe, and a short-lived container can be reaped before a large write
+ * finishes draining it — the tail is silently lost (see `dockerRunToFile` for
+ * the full mechanism). Routing the export through a file inside the
+ * bind-mounted home dir instead avoids the pipe entirely.
+ */
+const exportSessionDocker = (
+  homeDir: string,
+  sessionId: string,
+  docker: DockerExec,
+): Effect.Effect<string, OpencodeError> =>
+  Effect.gen(function* () {
+    const fileName = `.testaipack-export-${randomBytes(6).toString('hex')}.json`
+    const hostPath = path.join(homeDir, fileName)
+    const cleanup = removeDir(hostPath).pipe(Effect.ignore)
+
+    const dres = yield* dockerRunToFile(
+      {
+        image: docker.image,
+        cwd: homeDir,
+        homeDir,
+        command: [OPENCODE_BIN, 'export', sessionId],
+        ...(docker.network === undefined ? {} : { network: docker.network }),
+      },
+      `/home/opencode/${fileName}`,
+    ).pipe(
+      Effect.mapError(dockerErrorToOpencode('export')),
+      Effect.tapError(() => cleanup),
+    )
+
+    const has = yield* exists(hostPath)
+    if (!has) {
+      return yield* Effect.fail(
+        new OpencodeError({
+          command: 'export',
+          exitCode: dres.exitCode,
+          stderr: `opencode export produced no output file for session ${sessionId}`,
+          stdout: '',
+          timedOut: false,
+        }),
+      )
+    }
+
+    const content = yield* readFile(hostPath).pipe(
+      Effect.mapError(
+        (e: FsError): OpencodeError =>
+          new OpencodeError({
+            command: 'export',
+            exitCode: dres.exitCode,
+            stderr: `cannot read export file: ${e.path}`,
+            stdout: '',
+            timedOut: false,
+          }),
+      ),
+      Effect.tapError(() => cleanup),
+    )
+    yield* cleanup
+
+    const trimmed = content.trim()
+    if (trimmed === '') {
+      return yield* Effect.fail(
+        new OpencodeError({
+          command: 'export',
+          exitCode: dres.exitCode,
+          stderr: `opencode export returned empty stdout for session ${sessionId}`,
+          stdout: '',
+          timedOut: false,
+        }),
+      )
+    }
+    return trimmed
+  })
+
 export const exportSession = (
   homeDir: string,
   sessionId: string,
   docker?: DockerExec,
-): Effect.Effect<string, OpencodeError> =>
-  Effect.gen(function* () {
+): Effect.Effect<string, OpencodeError> => {
+  if (docker !== undefined) return exportSessionDocker(homeDir, sessionId, docker)
+  return Effect.gen(function* () {
     const out = yield* runSimpleOpencode({
       command: 'export',
       args: ['export', sessionId],
       homeDir,
-      ...(docker === undefined ? {} : { docker }),
     })
     yield* failOnNonZero('export', out)
     const trimmed = out.stdout.trim()
@@ -326,6 +405,7 @@ export const exportSession = (
     }
     return trimmed
   })
+}
 
 export const installPlugin = (
   homeDir: string,

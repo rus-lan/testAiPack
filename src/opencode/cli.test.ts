@@ -8,6 +8,7 @@ vi.mock('./spawn.js', () => ({
 
 vi.mock('../isolation/docker-runner.js', () => ({
   dockerRun: vi.fn(),
+  dockerRunToFile: vi.fn(),
   DockerError: class extends Error {
     readonly _tag = 'DockerError'
     readonly command: string
@@ -30,9 +31,16 @@ vi.mock('../isolation/docker-runner.js', () => ({
   },
 }))
 
+vi.mock('../util/fs.js', async () => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  const actual = await vi.importActual<typeof import('../util/fs.js')>('../util/fs.js')
+  return { ...actual, exists: vi.fn(), readFile: vi.fn(), removeDir: vi.fn() }
+})
+
 import { spawnProcess, execCmd } from './spawn.js'
-import { dockerRun } from '../isolation/docker-runner.js'
+import { dockerRun, dockerRunToFile } from '../isolation/docker-runner.js'
 import type { DockerRunOptions, DockerRunResult } from '../isolation/docker-runner.js'
+import { exists, readFile, removeDir, FsError } from '../util/fs.js'
 import {
   run,
   version,
@@ -48,6 +56,10 @@ import type { SpawnInput, SpawnOutput, ExecOutput } from './spawn.js'
 const sp = vi.mocked(spawnProcess)
 const ex = vi.mocked(execCmd)
 const dr = vi.mocked(dockerRun)
+const dtf = vi.mocked(dockerRunToFile)
+const fsExists = vi.mocked(exists)
+const fsReadFile = vi.mocked(readFile)
+const fsRemoveDir = vi.mocked(removeDir)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> =>
@@ -78,14 +90,38 @@ const baseOpts = {
 let lastSpawn: SpawnInput | undefined
 let lastExec: Parameters<typeof execCmd>[0] | undefined
 let lastDocker: DockerRunOptions | undefined
+let lastDockerToFile: { readonly opts: DockerRunOptions; readonly containerFilePath: string } | undefined
+let lastFsPath: string | undefined
 
 beforeEach(() => {
   lastSpawn = undefined
   lastExec = undefined
   lastDocker = undefined
+  lastDockerToFile = undefined
+  lastFsPath = undefined
   sp.mockReset()
   ex.mockReset()
   dr.mockReset()
+  dtf.mockReset()
+  fsExists.mockReset()
+  fsReadFile.mockReset()
+  fsRemoveDir.mockReset()
+  fsExists.mockImplementation((p) => {
+    lastFsPath = p
+    return Effect.succeed(true)
+  })
+  fsReadFile.mockImplementation((p) => {
+    lastFsPath = p
+    return Effect.succeed('{"info":{}}')
+  })
+  fsRemoveDir.mockImplementation((p) => {
+    lastFsPath = p
+    return Effect.succeed(undefined)
+  })
+  dtf.mockImplementation((opts, containerFilePath) => {
+    lastDockerToFile = { opts, containerFilePath }
+    return Effect.succeed(okDocker())
+  })
   sp.mockImplementation((input) => {
     lastSpawn = input
     return Effect.succeed(okSpawn())
@@ -282,6 +318,14 @@ describe('opencode cli — auxiliary commands', () => {
     expect(await runP(exportSession('/h', 'sess-9'))).toBe('{"info":{}}')
   })
 
+  it('exportSession without docker never touches the file-based path (byte-identical to before)', async () => {
+    ex.mockImplementation(() => Effect.succeed(okExec({ stdout: '{"info":{}}' })))
+    await runP(exportSession('/h', 'sess-9'))
+    expect(dtf).not.toHaveBeenCalled()
+    expect(fsReadFile).not.toHaveBeenCalled()
+    expect(fsRemoveDir).not.toHaveBeenCalled()
+  })
+
   it('listMcp returns the mcp list stdout', async () => {
     ex.mockImplementation(() => Effect.succeed(okExec({ stdout: 'mcpA\nmcpB\n' })))
     expect(await runP(listMcp('/h'))).toBe('mcpA\nmcpB\n')
@@ -404,13 +448,84 @@ describe('opencode cli — docker mode', () => {
     expect(lastDocker?.homeDir).toBe('/home/iso')
   })
 
-  it('exportSession(docker) runs `opencode export <id>` in the container', async () => {
-    dr.mockImplementation((input) => {
-      lastDocker = input
-      return Effect.succeed(okDocker({ stdout: '{"info":{}}' }))
+  // The container's stdout attach pipe can truncate a large single-blob
+  // write (container reaped before the pipe finishes draining, see
+  // `dockerRunToFile`) — export goes through a bind-mounted file instead of
+  // `dockerRun`'s captured stdout, and never through the plain `dockerRun`.
+  it('exportSession(docker) writes via dockerRunToFile, never dockerRun, and reads the result back from the host', async () => {
+    fsReadFile.mockImplementation((p) => {
+      lastFsPath = p
+      return Effect.succeed('{"info":{}}')
     })
+    const result = await runP(exportSession('/home/iso', 'sess-3', dockerImg))
+    expect(result).toBe('{"info":{}}')
+    expect(dr).not.toHaveBeenCalled()
+    expect(dtf).toHaveBeenCalledTimes(1)
+    expect(lastDockerToFile?.opts.command).toEqual(['opencode', 'export', 'sess-3'])
+    expect(lastDockerToFile?.opts.cwd).toBe('/home/iso')
+    expect(lastDockerToFile?.opts.homeDir).toBe('/home/iso')
+    expect(lastDockerToFile?.containerFilePath).toMatch(/^\/home\/opencode\/.+\.json$/)
+    expect(fsReadFile).toHaveBeenCalledTimes(1)
+    expect(lastFsPath).toBe(`/home/iso/${lastDockerToFile?.containerFilePath.split('/').pop() ?? ''}`)
+  })
+
+  it('exportSession(docker) cleans up the export file after a successful read', async () => {
+    await runP(exportSession('/home/iso', 'sess-3', dockerImg))
+    expect(fsRemoveDir).toHaveBeenCalledTimes(1)
+    expect(lastFsPath).toBe(`/home/iso/${lastDockerToFile?.containerFilePath.split('/').pop() ?? ''}`)
+  })
+
+  it('exportSession(docker) trims the file content the same way the native path trims stdout', async () => {
+    fsReadFile.mockImplementation(() => Effect.succeed('\n{"info":{}}\n\n'))
     expect(await runP(exportSession('/home/iso', 'sess-3', dockerImg))).toBe('{"info":{}}')
-    expect(lastDocker?.command).toEqual(['opencode', 'export', 'sess-3'])
+  })
+
+  it('exportSession(docker) fails distinctly when the export file never appears', async () => {
+    fsExists.mockImplementation(() => Effect.succeed(false))
+    const err = await runFlip(exportSession('/home/iso', 'sess-3', dockerImg))
+    expect(err).toBeInstanceOf(OpencodeError)
+    expect(err.command).toBe('export')
+    expect(err.stderr).toContain('no output file')
+    expect(fsReadFile).not.toHaveBeenCalled()
+  })
+
+  it('exportSession(docker) fails when the export file is empty (distinct from a missing file)', async () => {
+    fsReadFile.mockImplementation(() => Effect.succeed('   \n'))
+    const err = await runFlip(exportSession('/home/iso', 'sess-3', dockerImg))
+    expect(err).toBeInstanceOf(OpencodeError)
+    expect(err.command).toBe('export')
+    expect(err.stderr).toContain('empty stdout')
+    expect(err.stderr).not.toContain('no output file')
+  })
+
+  it('exportSession(docker) fails distinctly when the file exists but cannot be read', async () => {
+    fsReadFile.mockImplementation((p) =>
+      Effect.fail(new FsError({ path: p, operation: 'readFile', cause: new Error('EIO') })),
+    )
+    const err = await runFlip(exportSession('/home/iso', 'sess-3', dockerImg))
+    expect(err).toBeInstanceOf(OpencodeError)
+    expect(err.command).toBe('export')
+    expect(err.stderr).toContain('cannot read export file')
+  })
+
+  it('exportSession(docker) maps a container failure (e.g. session not found) to OpencodeError, same as before', async () => {
+    const { DockerError } = await import('../isolation/docker-runner.js')
+    dtf.mockImplementation(() =>
+      Effect.fail(
+        new DockerError({ command: 'run', exitCode: 1, stderr: 'Session not found', timedOut: false }),
+      ),
+    )
+    const err = await runFlip(exportSession('/home/iso', 'sess-3', dockerImg))
+    expect(err).toBeInstanceOf(OpencodeError)
+    expect(err.command).toBe('export')
+    expect(err.exitCode).toBe(1)
+    expect(err.stderr).toBe('Session not found')
+    expect(fsReadFile).not.toHaveBeenCalled()
+  })
+
+  it('exportSession(docker) forwards --docker-network the same way run(docker) does', async () => {
+    await runP(exportSession('/home/iso', 'sess-3', { image: 'img', network: 'host' }))
+    expect(lastDockerToFile?.opts.network).toBe('host')
   })
 
   it('installPlugin(docker) runs `opencode plugin <module>` in the container', async () => {

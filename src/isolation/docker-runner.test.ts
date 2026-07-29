@@ -10,6 +10,7 @@ import { spawnProcess, execCmd } from '../opencode/spawn.js'
 import type { SpawnInput, SpawnOutput, ExecInput, ExecOutput } from '../opencode/spawn.js'
 import {
   dockerRun,
+  dockerRunToFile,
   pullImage,
   imageExists,
   ensureImage,
@@ -219,6 +220,46 @@ describe('docker-runner — dockerRun', () => {
     expect(err).toBeInstanceOf(DockerError)
     expect(err.timedOut).toBe(false)
     expect(err.stderr).toContain('not found')
+  })
+})
+
+describe('docker-runner — dockerRunToFile', () => {
+  it('wraps the command in `sh -c \'"$@" > "<path>"\'` so stdout lands in a file, not the attach pipe', async () => {
+    await runP(dockerRunToFile(baseOpts, '/home/opencode/export.json'))
+    expect(lastSpawn?.args).toContain('sh')
+    const shIdx = lastSpawn?.args.indexOf('sh') ?? -1
+    expect(lastSpawn?.args[shIdx + 1]).toBe('-c')
+    expect(lastSpawn?.args[shIdx + 2]).toBe('"$@" > "/home/opencode/export.json"')
+    // "$@" placeholder ($0) plus the real command, in order, unchanged
+    expect(lastSpawn?.args.slice(shIdx + 3)).toEqual(['sh', 'opencode', '--version'])
+  })
+
+  it('still mounts cwd/homeDir and runs --rm like a normal dockerRun call', async () => {
+    await runP(dockerRunToFile(baseOpts, '/home/opencode/export.json'))
+    expect(lastSpawn?.args).toContain('--rm')
+    expect(lastSpawn?.args).toContain('/host/workspace:/workspace')
+    expect(lastSpawn?.args).toContain('/host/home:/home/opencode')
+  })
+
+  it('exit code and stderr reflect the wrapped command — redirection does not swallow them', async () => {
+    sp.mockImplementation((input) => {
+      lastSpawn = input
+      return Effect.succeed(okSpawn({ exitCode: 1, stderr: 'Session not found' }))
+    })
+    const err = await runFlip(dockerRunToFile(baseOpts, '/home/opencode/export.json'))
+    expect(err).toBeInstanceOf(DockerError)
+    expect(err.exitCode).toBe(1)
+    expect(err.stderr).toBe('Session not found')
+  })
+
+  it('the returned stdout is whatever the spawner captured — callers read the file, not this', async () => {
+    sp.mockImplementation((input) => {
+      lastSpawn = input
+      return Effect.succeed(okSpawn({ stdout: '' }))
+    })
+    const result = await runP(dockerRunToFile(baseOpts, '/home/opencode/export.json'))
+    expect(result.stdout).toBe('')
+    expect(result.exitCode).toBe(0)
   })
 })
 

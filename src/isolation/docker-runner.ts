@@ -119,6 +119,28 @@ export const buildDockerRunArgs = (
   ]
 }
 
+/**
+ * Like `dockerRun`, but the command's stdout is redirected to a file inside
+ * the container at `containerFilePath` (which must resolve into one of the
+ * bind mounts) instead of captured through the `docker run` attach pipe.
+ *
+ * A short-lived `--rm` container can be reaped before a large single-blob
+ * stdout write finishes draining through the multi-hop attach pipe (container
+ * → dockerd → docker CLI → our capture), silently truncating it at a clean
+ * 32 KiB boundary. Writing straight into a bind-mounted file has no such race
+ * — the caller reads the file back from the host side of the same mount.
+ * `stdout` on the result is always empty; only `exitCode`/`stderr` reflect
+ * the wrapped command (redirection does not change its exit status).
+ */
+export const dockerRunToFile = (
+  opts: DockerRunOptions,
+  containerFilePath: string,
+): Effect.Effect<DockerRunResult, DockerError> =>
+  dockerRun({
+    ...opts,
+    command: ['sh', '-c', `"$@" > "${containerFilePath}"`, 'sh', ...opts.command],
+  })
+
 const killContainer = (name: string, cwd: string): Effect.Effect<void> =>
   execCmd({
     command: 'docker',
