@@ -29,6 +29,14 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.5.3 (security, fixes)
+
+- **Security**: a local plugin file in a pack (`plugins/<name>.js`) could be silently replaced by an unrelated npm package sharing its name — plugin installation resolved local plugin names through `opencode plugin <name>`, which always treats its argument as an npm module specifier. Local plugin files are now delivered and registered directly by path, with no npm resolution involved at all.
+- `doctor` no longer reports a missing `bun` as a failure — it's a build-from-source-only dependency, irrelevant if you installed the release binary.
+- `doctor`: the `docker` row no longer spills multi-line output across the table.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.5.2...v0.5.3
+
 ## v0.5.2 (installer)
 
 - The installer no longer talks to the GitHub API at all — it downloads directly through GitHub's `releases/latest/download/<asset>` redirect. That means the anonymous API's 60-requests/hour-per-IP limit can no longer break an install, which mattered most on a shared IP (office, CI, VPN).
