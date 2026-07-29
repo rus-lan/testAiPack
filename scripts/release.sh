@@ -6,8 +6,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION="${1:-}"
+PKG_VERSION=$(node -p "require('./package.json').version")
 if [ -z "$VERSION" ]; then
-  VERSION=$(node -p "require('./package.json').version")
+  VERSION="$PKG_VERSION"
+elif [ "$VERSION" != "$PKG_VERSION" ]; then
+  echo "VERSION argument ($VERSION) does not match package.json version ($PKG_VERSION)." >&2
+  echo "The binaries would still self-report $PKG_VERSION — bin/testaipack.ts reads its" >&2
+  echo "version from package.json at build time, not from this argument. Bump" >&2
+  echo "package.json to $VERSION first, or pass no argument to build the current version." >&2
+  exit 1
 fi
 
 OUT_DIR="dist/release"

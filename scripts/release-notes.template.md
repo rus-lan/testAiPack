@@ -1,3 +1,7 @@
+<!-- Hand-maintained. Add a new "## vX.Y.Z" section here for every release,
+     kept in sync with CHANGELOG.md — this template is what actually ships
+     as the GitHub release body; nothing reads CHANGELOG.md automatically. -->
+
 # testaipack v{{VERSION}}
 
 **A/B-тестер для opencode-интеграций.** Сравнивает работу AI-агента до и после установки пакета (skill/plugin/agent/command/mcp): клонирует репозиторий, прогоняет одинаковый промпт на «чистой» и «патченной» стороне, собирает метрики (токены, время, стоимость, шаги, tool-calls) и рендерит сравнительный отчёт.
@@ -24,6 +28,21 @@ testaipack doctor
 ```
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
+
+## v0.4.0 (features, fixes, security)
+
+- `--model <provider/model>` — pin the model for both sides of a run (baseline and patched), baked into the generated opencode configs.
+- Local and self-hosted providers (ollama and friends) are now usable: isolation copies your real `provider`, `small_model`, `enabled_providers` and `disabled_providers` config into both sides identically, so a custom provider no longer vanishes inside the run's isolated HOME.
+- `--model` / `--preflight-model` now accept ollama's `provider/model:tag` naming (`ollama/qwen3.5:9b`, `ollama/llama3.1:8b`) — previously rejected.
+- Preflight now checks auth against the model the run itself will use, instead of a separate `--preflight-model` — no more preflight passing on a healthy model while the real run fails on a different one.
+- `--ephemeral`, `--config`, `--ide`, `--review-run` were dead flags that broke the run — now work as documented.
+- `--help` documents all orchestrator-level flags.
+- Secrets (inline `mcp:` pack refs, clone-URL credentials) no longer reach reports, error messages, logs, or the judge prompt.
+- A pack ref resolving to `..` could delete the whole run workspace — fixed.
+- The LLM judge no longer runs a write-enabled agent in your real `$HOME` — it's read-only now, in an isolated scratch directory.
+- Per-file diff totals (`fileDiffStats`) are no longer reported — the field always read as zero from opencode's own export summary and could never carry real numbers; `report.md`'s existing diff summary already shows the real per-side totals.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.3.4...v0.4.0
 
 ## v0.3.4 (bugfix)
 
