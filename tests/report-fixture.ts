@@ -109,7 +109,6 @@ const defaultSecondary: SecondaryMetrics = {
   stepLatencyP95Ms: '5000',
   toolLatencyAvgMs: '200',
   finishCauseDistribution: { stop: 10, 'tool-calls': 2 },
-  fileDiffStats: { additions: 20, deletions: 5, filesChanged: 3 },
   maxConsecutiveSameTool: 3,
 }
 

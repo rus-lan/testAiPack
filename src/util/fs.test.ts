@@ -20,6 +20,7 @@ import {
   readDir,
   copyFile,
   pathKind,
+  isPathWithin,
 } from './fs.js'
 
 const run = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
@@ -143,5 +144,22 @@ describe('fs utils', () => {
     expect(await run(pathKind(f))).toBe('file')
     expect(await run(pathKind(d))).toBe('dir')
     expect(await run(pathKind(path.join(d, 'absent')))).toBe('missing')
+  })
+
+  it('isPathWithin accepts a plain child directory', () => {
+    expect(isPathWithin('/a/pack', '/a/pack/myskill')).toBe(true)
+  })
+
+  it('isPathWithin rejects the parent itself (not a child)', () => {
+    expect(isPathWithin('/a/pack', '/a/pack')).toBe(false)
+  })
+
+  it('isPathWithin rejects a dest that escapes via ..', () => {
+    expect(isPathWithin('/a/pack', '/a/pack/..')).toBe(false)
+    expect(isPathWithin('/a/pack', '/a/pack/../..')).toBe(false)
+  })
+
+  it('isPathWithin rejects an unrelated sibling directory with a matching prefix', () => {
+    expect(isPathWithin('/a/pack', '/a/pack-evil/myskill')).toBe(false)
   })
 })

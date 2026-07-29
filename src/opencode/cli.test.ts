@@ -289,14 +289,14 @@ describe('opencode cli — auxiliary commands', () => {
 })
 
 describe('opencode cli — dbQuery', () => {
-  it('calls `opencode db query <sql> --format json` in the isolated HOME', async () => {
+  it('calls `opencode db <sql> --format json` in the isolated HOME', async () => {
     ex.mockImplementation((input) => {
       lastExec = input
       return Effect.succeed(okExec({ stdout: '[]' }))
     })
     await runP(dbQuery('/home/iso', 'SELECT id FROM session'))
     expect(lastExec?.command).toBe('opencode')
-    expect(lastExec?.args).toEqual(['db', 'query', 'SELECT id FROM session', '--format', 'json'])
+    expect(lastExec?.args).toEqual(['db', 'SELECT id FROM session', '--format', 'json'])
     expect(lastExec?.cwd).toBe('/home/iso')
     expect(lastExec?.env['HOME']).toBe('/home/iso')
   })
@@ -418,14 +418,14 @@ describe('opencode cli — docker mode', () => {
     expect(lastDocker?.command).toEqual(['opencode', 'plugin', 'myplugin'])
   })
 
-  it('dbQuery(docker) runs `opencode db query <sql> --format json` in the container', async () => {
+  it('dbQuery(docker) runs `opencode db <sql> --format json` in the container', async () => {
     dr.mockImplementation((input) => {
       lastDocker = input
       return Effect.succeed(okDocker({ stdout: '[{"id":"a"}]' }))
     })
     expect(await runP(dbQuery('/home/iso', 'SELECT id', dockerImg))).toEqual([{ id: 'a' }])
     expect(lastDocker?.command).toEqual([
-      'opencode', 'db', 'query', 'SELECT id', '--format', 'json',
+      'opencode', 'db', 'SELECT id', '--format', 'json',
     ])
   })
 

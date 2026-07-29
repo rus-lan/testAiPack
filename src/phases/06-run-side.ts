@@ -11,7 +11,7 @@
  * @see docs/phases/06-run-side.ru.md
  * @see contract/phases/06-run-side.tsp
  */
-import { Effect } from 'effect'
+import { Effect, Schedule } from 'effect'
 import type { Either } from 'effect'
 import path from 'node:path'
 import type {
@@ -37,6 +37,21 @@ import { runSideError } from '../errors.js'
 export const DOOM_LOOP_THRESHOLD = 10
 /** Watchdog poll interval (ms). The loop also resets on every streamed event. */
 const WATCHDOG_POLL_MS = 100
+
+/**
+ * `opencode export` can return truncated JSON when invoked immediately after a
+ * clean run finishes — the session store is still flushing. A fresh export
+ * moments later reads back valid; bound the retry so a genuinely broken
+ * export still fails fast.
+ */
+export const EXPORT_VALIDATION_MAX_RETRIES = 3
+const EXPORT_VALIDATION_BASE_DELAY = '200 millis'
+const EXPORT_VALIDATION_MAX_WAIT = '3 seconds'
+
+const exportRetrySchedule = Schedule.exponential(EXPORT_VALIDATION_BASE_DELAY).pipe(
+  Schedule.intersect(Schedule.recurs(EXPORT_VALIDATION_MAX_RETRIES)),
+  Schedule.upTo(EXPORT_VALIDATION_MAX_WAIT),
+)
 
 type RunSideErrorCode =
   | 'E_RUN_TIMEOUT'
@@ -203,24 +218,58 @@ export const computeMaxConsecutiveSameTool = (events: readonly unknown[]): numbe
   return max
 }
 
-const RATE_LIMIT_PATTERNS: readonly string[] = [
-  '429',
-  'rate limit',
-  'rate_limit',
-  'ratelimit',
-  'too many requests',
-]
+const RATE_LIMIT_PATTERNS: readonly RegExp[] = [/\b429\b/, /rate[ _]?limit/i, /too many requests/i]
+
+/**
+ * Pulls the one string on an event that can genuinely carry a provider/error
+ * message: an assistant text part, a top-level provider-error event
+ * (`{type:"error", error:{name, data:{message}}}`, printed by opencode's own
+ * `Z()` formatter for a `session.error`), or a failed tool call's error text
+ * (`state.error`, a plain string on the `ToolStateError` variant — that
+ * variant has no `output` field at all, `output` only exists on a completed
+ * tool call). Everything else on an event (callIDs, session ids, token
+ * counts, a successfully read file's content) is left unscanned so a stray
+ * "429" there is never mistaken for a rate-limit signal.
+ */
+const errorTextFromEvent = (raw: unknown): string | undefined => {
+  if (!isRecord(raw)) return undefined
+  const part = raw['part']
+  const partRecord = isRecord(part) ? part : undefined
+
+  if (raw['type'] === 'text' || partRecord?.['type'] === 'text') {
+    const direct = raw['text']
+    if (typeof direct === 'string') return direct
+    const nested = partRecord?.['text']
+    if (typeof nested === 'string') return nested
+  }
+
+  if (raw['type'] === 'error') {
+    const err = raw['error']
+    if (isRecord(err)) {
+      const data = err['data']
+      const message = isRecord(data) ? data['message'] : undefined
+      if (typeof message === 'string') return message
+      const name = err['name']
+      if (typeof name === 'string') return name
+    }
+  }
+
+  const nestedState = partRecord === undefined ? undefined : partRecord['state']
+  const state = isRecord(raw['state']) ? raw['state'] : isRecord(nestedState) ? nestedState : undefined
+  if (state !== undefined && state['status'] === 'error') {
+    const error = state['error']
+    if (typeof error === 'string') return error
+    const output = state['output']
+    if (typeof output === 'string') return output
+  }
+  return undefined
+}
 
 export const hasRateLimitSignal = (events: readonly unknown[]): boolean => {
   for (const ev of events) {
-    let text: string
-    try {
-      text = JSON.stringify(ev)
-    } catch {
-      text = String(ev)
-    }
-    const lower = text.toLowerCase()
-    if (RATE_LIMIT_PATTERNS.some((p) => lower.includes(p))) return true
+    const text = errorTextFromEvent(ev)
+    if (text === undefined) continue
+    if (RATE_LIMIT_PATTERNS.some((p) => p.test(text))) return true
   }
   return false
 }
@@ -568,14 +617,20 @@ export const runSide = (
     )
 
     const lastResult = runResults[runResults.length - 1]
-    const combinedExit = lastResult === undefined ? 0 : lastResult.exitCode
+    const firstFailedResult = runResults.find((r) => r.exitCode !== 0)
+    const combinedExit =
+      firstFailedResult !== undefined
+        ? firstFailedResult.exitCode
+        : lastResult === undefined
+          ? 0
+          : lastResult.exitCode
     const anyTimedOut = runResults.some((r) => r.timedOut)
     const anyWatchdog = runResults.some((r) => r.watchdogTriggered)
     const anyTotal = runResults.some((r) => r.totalTimedOut)
 
     if (realSessionId === undefined) {
       for (let i = state.events.length - 1; i >= 0; i--) {
-        const id = sessionIdFromEvent(state.events[i]!)
+        const id = sessionIdFromEvent(state.events[i])
         if (id !== undefined) {
           realSessionId = id
           break
@@ -591,38 +646,53 @@ export const runSide = (
 
     const exportTimeoutMs = runMs
     const exportSessionId = realSessionId ?? sessionId
-    const exportStr: string = yield* exportSession(homeEnv.HOME, exportSessionId, docker).pipe(
-      Effect.mapError((err: OpencodeError) =>
-        fail('opencode export produced no data', 'E_RUN_CRASH', side, runIndex, {
-          sessionId: exportSessionId,
-          exitCode: err.exitCode,
-          stderr: err.stderr,
-          stdout: err.stdout,
-        }),
-      ),
-      Effect.timeout(exportTimeoutMs),
-      Effect.catchTag('TimeoutException', () =>
-        Effect.fail(
-          fail('opencode export timed out', 'E_RUN_TIMEOUT', side, runIndex, {
+
+    let exportAttempt = 0
+    const exportOnce: Effect.Effect<void, PhaseError> = Effect.gen(function* () {
+      exportAttempt += 1
+      yield* log(`[EXPORT] attempt ${String(exportAttempt)}: requesting opencode export`)
+      const exportStr: string = yield* exportSession(homeEnv.HOME, exportSessionId, docker).pipe(
+        Effect.mapError((err: OpencodeError) =>
+          fail('opencode export produced no data', 'E_RUN_CRASH', side, runIndex, {
             sessionId: exportSessionId,
-            timeoutMs: exportTimeoutMs,
+            exitCode: err.exitCode,
+            stderr: err.stderr,
+            stdout: err.stdout,
           }),
         ),
-      ),
-    )
-    yield* writeFile(exportPath, exportStr).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
-    yield* log(`[EXPORT] written to ${exportPath}`)
+        Effect.timeout(exportTimeoutMs),
+        Effect.catchTag('TimeoutException', () =>
+          Effect.fail(
+            fail('opencode export timed out', 'E_RUN_TIMEOUT', side, runIndex, {
+              sessionId: exportSessionId,
+              timeoutMs: exportTimeoutMs,
+            }),
+          ),
+        ),
+      )
+      yield* writeFile(exportPath, exportStr).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
+      yield* log(`[EXPORT] attempt ${String(exportAttempt)}: written to ${exportPath}`)
 
-    yield* readJson(exportPath, opencodeExportSchema).pipe(
-      Effect.mapError((e) => {
-        const tag = (e as { readonly _tag?: string })._tag
-        const detail =
-          tag === 'ParseError'
-            ? (e as { readonly reason: string }).reason
-            : `fs:${(e as { readonly operation: string }).operation}`
-        return fail(`export.json invalid: ${detail}`, 'E_EXPORT_INVALID', side, runIndex, {
-          path: exportPath,
-        })
+      yield* readJson(exportPath, opencodeExportSchema).pipe(
+        Effect.mapError((e) => {
+          const tag = (e as { readonly _tag?: string })._tag
+          const detail =
+            tag === 'ParseError'
+              ? (e as { readonly reason: string }).reason
+              : `fs:${(e as { readonly operation: string }).operation}`
+          return fail(`export.json invalid: ${detail}`, 'E_EXPORT_INVALID', side, runIndex, {
+            path: exportPath,
+            attempt: exportAttempt,
+          })
+        }),
+        Effect.tapError((e) => log(`[EXPORT] attempt ${String(exportAttempt)}: ${e.message}`)),
+      )
+    })
+
+    yield* exportOnce.pipe(
+      Effect.retry({
+        schedule: exportRetrySchedule,
+        while: (e: PhaseError) => e.code === 'E_EXPORT_INVALID',
       }),
     )
 

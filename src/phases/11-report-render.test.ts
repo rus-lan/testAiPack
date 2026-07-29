@@ -13,7 +13,9 @@ import {
   makeReportRenderInput,
   makeRunInput,
   makeReport,
+  makeSummary,
 } from '../../tests/report-fixture.js'
+import type { ReportSummary } from '@generated/types'
 
 vi.mock('../util/fs.js', async () => {
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -76,7 +78,7 @@ describe('reportRender — format selection', () => {
     expect(result.formats).toEqual(['md', 'html', 'json', 'yaml'])
   })
 
-  it('md is always written even when not requested', async () => {
+  it('md is always written even when not requested, but stdout follows the user\'s actual request', async () => {
     const out = makeTempDir()
     const input = makeReportRenderInput({
       runInput: makeRunInput({ formats: ['json'], outputPath: out }),
@@ -84,6 +86,10 @@ describe('reportRender — format selection', () => {
     const result = await runP(reportRender(input))
     expect(existsSync(`${out}/report.md`)).toBe(true)
     expect(result.formats).toContain('md')
+    // md is force-added to `formats` (file output), but the user only asked
+    // for json — stdout must reflect that, not the force-added md.
+    expect(result.stdoutFormat).toBe('json')
+    expect(result.stdoutMd).toBeUndefined()
   })
 })
 
@@ -120,6 +126,37 @@ describe('reportRender — stdout Markdown', () => {
     })
     const result = await runP(reportRender(input))
     expect(result.stdoutMd).toBeDefined()
+  })
+})
+
+describe('reportRender — stdout JSON', () => {
+  it('result carries stdoutJson (matching report.json on disk) when only json is requested', async () => {
+    const out = makeTempDir()
+    const input = makeReportRenderInput({
+      runInput: makeRunInput({ formats: ['json'], outputPath: out }),
+    })
+    const result = await runP(reportRender(input))
+    expect(result.stdoutJson).toBeDefined()
+    expect(result.stdoutMd).toBeUndefined()
+    const onDisk = await runP(readFile(`${out}/report.json`))
+    expect(result.stdoutJson).toBe(onDisk)
+  })
+
+  it('result omits stdoutJson when md is requested (alone or alongside json)', async () => {
+    const out1 = makeTempDir()
+    const mdOnly = await runP(
+      reportRender(makeReportRenderInput({ runInput: makeRunInput({ formats: ['md'], outputPath: out1 }) })),
+    )
+    expect(mdOnly.stdoutJson).toBeUndefined()
+
+    const out2 = makeTempDir()
+    const mdAndJson = await runP(
+      reportRender(
+        makeReportRenderInput({ runInput: makeRunInput({ formats: ['md', 'json'], outputPath: out2 }) }),
+      ),
+    )
+    expect(mdAndJson.stdoutJson).toBeUndefined()
+    expect(mdAndJson.stdoutMd).toBeDefined()
   })
 })
 
@@ -190,7 +227,6 @@ describe('reportRender — markdown content', () => {
             stepLatencyP95Ms: '5000',
             toolLatencyAvgMs: '200',
             finishCauseDistribution: {},
-            fileDiffStats: { additions: 0, deletions: 0, filesChanged: 0 },
             maxConsecutiveSameTool: 0,
           },
           stats: {
@@ -233,7 +269,6 @@ describe('reportRender — markdown content', () => {
             stepLatencyP95Ms: '5000',
             toolLatencyAvgMs: '200',
             finishCauseDistribution: {},
-            fileDiffStats: { additions: 0, deletions: 0, filesChanged: 0 },
             maxConsecutiveSameTool: 0,
           },
           stats: {
@@ -362,10 +397,24 @@ describe('reportRender — disk full', () => {
   })
 })
 
+describe('reportRender — invalid report schema', () => {
+  it('a Report that fails its own schema fails the phase with E_EXPORT_INVALID, not an uncaught defect', async () => {
+    const out = makeTempDir()
+    const badSummary = { ...makeSummary(), headlineResult: 123 } as unknown as ReportSummary
+    const input = makeReportRenderInput({
+      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
+      summary: badSummary,
+    })
+    const err = await runFlip(reportRender(input))
+    expect(err.code).toBe('E_EXPORT_INVALID')
+    expect(err.phase).toBe('report-render')
+  })
+})
+
 describe('renderJson — pure round-trip', () => {
-  it('renderJson output parses back into the same report', () => {
+  it('renderJson output parses back into the same report', async () => {
     const report = makeReport()
-    const text = renderJson(report)
+    const text = await runP(renderJson(report))
     const parsed = JSON.parse(text) as unknown
     expect(reportSchema.safeParse(parsed).success).toBe(true)
     expect((parsed as { manifest: { runId: string } }).manifest.runId).toBe(report.manifest.runId)

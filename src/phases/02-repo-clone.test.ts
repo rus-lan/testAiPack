@@ -166,6 +166,22 @@ describe('repoClone — clone failed', () => {
     expect(err.context?.['repoUrl']).toBe(runInput.repoUrl)
   })
 
+  it('clone failure with credentials in repoUrl → error context leaks neither the token nor the userinfo', async () => {
+    const { tree } = await makeWorkspace(1)
+    const url = 'https://user:sk-fake-token@example.invalid/repo.git'
+    const runInput = makeRunInput({ repoUrl: url, runs: 1 })
+    cloneMock.mockImplementation(() =>
+      Effect.fail(new GitError({ command: 'clone', exitCode: 128, stderr: 'fatal: not found' })),
+    )
+    const err = await runFlip(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_REPO_CLONE_FAILED')
+    expect(err.context?.['repoUrl']).toBe('https://example.invalid/repo.git')
+    const contextStr = JSON.stringify(err.context ?? {})
+    expect(contextStr).not.toContain('sk-fake-token')
+    expect(contextStr).not.toContain('user:')
+  })
+
   it('generic non-zero exit → E_REPO_CLONE_FAILED', async () => {
     const { tree } = await makeWorkspace(1)
     const runInput = makeRunInput({ repoUrl: 'https://example.com/missing.git', runs: 1 })

@@ -81,7 +81,7 @@ export interface GcPlan {
   readonly pruneHome: readonly string[]
 }
 
-const parseOlderThan = (spec: string): number | null => {
+export const parseOlderThan = (spec: string): number | null => {
   const m = /^(\d+)\s*(d|h|days?|hours?|m|minutes?)?$/i.exec(spec.trim())
   if (m === null || m[1] === undefined) return null
   const n = Number.parseInt(m[1], 10)

@@ -64,6 +64,7 @@ export type RunInput = {
   judgeFiles?: Array<string>
   preflightEnabled: boolean
   preflightModel?: string
+  model?: string
   formats: Array<OutputFormat>
   outputPath: string
   diffHtml: boolean
@@ -151,19 +152,6 @@ export type RecordToolStat = Record<string, ToolStat>
 
 export type RecordInt32 = Record<string, number>
 
-export type FileChange = {
-  path: string
-  additions: number
-  deletions: number
-}
-
-export type FileDiffStats = {
-  additions: number
-  deletions: number
-  filesChanged: number
-  perFile?: Array<FileChange>
-}
-
 export type SecondaryMetrics = {
   inputTokens: string
   outputTokens: string
@@ -175,7 +163,6 @@ export type SecondaryMetrics = {
   stepLatencyP95Ms: string
   toolLatencyAvgMs: string
   finishCauseDistribution: RecordInt32
-  fileDiffStats: FileDiffStats
   maxConsecutiveSameTool: number
 }
 
@@ -243,7 +230,7 @@ export type SideAggregates = {
 
 export type MetricDelta = {
   absolute: number
-  percent: number
+  percent?: number
   significant: boolean
   better: 'better' | 'worse' | 'neutral' | 'context-dependent'
 }
@@ -315,6 +302,12 @@ export type DiffInput = {
   runInput: RunInput
   manifest: Manifest
   workspace: WorkspaceTree
+}
+
+export type FileChange = {
+  path: string
+  additions: number
+  deletions: number
 }
 
 export type DiffSummary = {
@@ -707,7 +700,7 @@ export type Report = {
 }
 
 export type ReportRenderError = {
-  code: 'E_DISK_FULL'
+  code: 'E_DISK_FULL' | 'E_EXPORT_INVALID'
   message: string
   context?: RecordUnknown
 }

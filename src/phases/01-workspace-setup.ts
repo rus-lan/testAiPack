@@ -20,6 +20,8 @@ import { ensureDir, pathKind, readDir, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import { updateGitignore } from '../util/gitignore.js'
 import { version as opencodeVersionProbe } from '../opencode/cli.js'
+import { redactUrlCredentials } from '../util/redact.js'
+import { safeRefDisplay } from '../pack/detector.js'
 
 export type WorkspaceSetupInputExt = WorkspaceSetupInput & {
   readonly flagDefaults?: Readonly<Record<string, unknown>>
@@ -53,6 +55,12 @@ const probeOpencodeVersion = (probeHome: string): Effect.Effect<string> =>
     return 'unknown'
   })
 
+/**
+ * The manifest is a report/audit artifact (list, compare, report.md/json/html
+ * all read it), never the source of truth for re-running the pipeline (that
+ * stays on `runInput`) — so `repoUrl`/`packRef` are redacted here, at the one
+ * place all four shared artifacts trace back to, rather than in each renderer.
+ */
 const buildManifest = (
   runInput: RunInput,
   runId: string,
@@ -61,13 +69,15 @@ const buildManifest = (
 ): Manifest => ({
   runId,
   timestamp: new Date().toISOString(),
-  repoUrl: runInput.repoUrl,
+  repoUrl: redactUrlCredentials(runInput.repoUrl),
   prompt: runInput.prompt,
   runs: runInput.runs,
   isolation: runInput.isolation,
   opencodeVersion,
   flagDefaults,
-  ...(runInput.packRef !== undefined ? { packRef: runInput.packRef } : {}),
+  ...(runInput.packRef !== undefined
+    ? { packRef: safeRefDisplay(redactUrlCredentials(runInput.packRef)) }
+    : {}),
   ...(runInput.packType !== undefined ? { packType: runInput.packType } : {}),
   ...(runInput.init !== undefined ? { init: runInput.init } : {}),
   ...(runInput.verify !== undefined ? { verify: runInput.verify } : {}),
@@ -142,7 +152,7 @@ export const workspaceSetup = (
       Effect.mapError(mapFsTo('write-failed', path.join(rootPath, 'manifest.json'))),
     )
 
-    yield* updateGitignore(path.join(projectRoot, '.gitignore'))
+    yield* updateGitignore(path.join(projectRoot, '.gitignore'), `${path.basename(workspaceDir)}/`)
 
     const runs = runInput.runs
     const runPaths = (base: string) => range(runs).map((n) => path.join(base, `run-${n.toString()}`))

@@ -29,7 +29,7 @@ import {
   timeoutConfigSchema,
   timelineModeSchema,
 } from '@generated/schemas'
-import { detectPack } from '../pack/detector.js'
+import { detectPack, safeRefDisplay } from '../pack/detector.js'
 import type { PackDetectError } from '../pack/detector.js'
 import { cliParseError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
@@ -42,17 +42,20 @@ export type CliParseOutput = CliParseResult & {
   readonly outputPathProvided: boolean
 }
 
-const DEFAULT_RUNS = 3
-const DEFAULT_FORMATS: readonly OutputFormat[] = ['md']
+// Defaults applied when neither the CLI nor the config file set a value.
+// Named (not inlined at each `?? ...`) so the `run --help` flag table can
+// read the exact value the parser uses instead of a copy that could drift.
+export const DEFAULT_RUNS = 3
+export const DEFAULT_FORMATS: readonly OutputFormat[] = ['md']
 const ALL_FORMATS: readonly OutputFormat[] = ['md', 'html', 'json', 'yaml']
-const DEFAULT_TIMEOUTS: TimeoutConfig = {
+export const DEFAULT_TIMEOUTS: TimeoutConfig = {
   preflightSeconds: 60,
   runSeconds: 600,
   verifySeconds: 300,
   installSeconds: 300,
   watchdogSeconds: 90,
 }
-const DEFAULT_AUTH: AuthWhitelist = {
+export const DEFAULT_AUTH: AuthWhitelist = {
   opencode: true,
   npmrc: true,
   anthropic: false,
@@ -62,6 +65,15 @@ const DEFAULT_AUTH: AuthWhitelist = {
   ssh: false,
   git: false,
 }
+export const DEFAULT_ISOLATION: IsolationMode = 'home'
+export const DEFAULT_PURE_BASELINE = true
+export const DEFAULT_PREFLIGHT_ENABLED = true
+export const DEFAULT_DIFF_HTML = false
+export const DEFAULT_COLLAPSE_REPEATS = false
+export const DEFAULT_TIMELINE_MODE: TimelineMode = 'side-by-side'
+export const DEFAULT_LOG_LEVEL: LogLevel = 'info'
+export const DEFAULT_OUTPUT_PATH = './results'
+export const DEFAULT_WORKSPACE_PATH = './.testaipack'
 
 type TimeoutUpdate = { readonly [K in keyof TimeoutConfig]?: number | undefined }
 type AuthUpdate = { readonly [K in keyof AuthWhitelist]?: boolean | undefined }
@@ -88,6 +100,7 @@ const configFileSchema = z
     pureBaseline: z.boolean().optional(),
     preflightEnabled: z.boolean().optional(),
     preflightModel: z.string().optional(),
+    model: z.string().optional(),
     formats: z.union([z.array(outputFormatSchema), z.literal('all')]).optional(),
     outputPath: z.string().optional(),
     diffHtml: z.boolean().optional(),
@@ -125,6 +138,7 @@ interface CliRaw {
   readonly workspacePath?: string
   readonly opencodeVersion?: string
   readonly preflightModel?: string
+  readonly model?: string
   readonly pricingPath?: string
   readonly timeouts: TimeoutUpdate
   readonly auth: AuthUpdate
@@ -140,7 +154,9 @@ const EMPTY_CLI: CliRaw = {
   auth: {},
 }
 
-const VALUE_FLAGS: Readonly<Record<string, string>> = {
+// Exported so `run --help` can list every flag straight from this table —
+// see cli/index.ts's help builder.
+export const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '--prompt': 'prompts',
   '-p': 'prompts',
   '--init': 'inits',
@@ -163,6 +179,7 @@ const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '-w': 'workspacePath',
   '--opencode-version': 'opencodeVersion',
   '--preflight-model': 'preflightModel',
+  '--model': 'model',
   '--pricing-path': 'pricingPath',
   '--timeout-preflight': 'preflightSeconds',
   '--timeout-run': 'runSeconds',
@@ -172,8 +189,10 @@ const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '--timeout-total': 'totalSeconds',
 }
 
-const BOOLEAN_FLAGS: Readonly<
-  Record<string, { readonly key: 'pureBaseline' | 'preflightEnabled' | 'diffHtml' | 'collapseRepeats'; readonly value: boolean }>
+export type RunBooleanKey = 'pureBaseline' | 'preflightEnabled' | 'diffHtml' | 'collapseRepeats'
+
+export const BOOLEAN_FLAGS: Readonly<
+  Record<string, { readonly key: RunBooleanKey; readonly value: boolean }>
 > = {
   '--pure-baseline': { key: 'pureBaseline', value: true },
   '--no-pure-baseline': { key: 'pureBaseline', value: false },
@@ -185,7 +204,7 @@ const BOOLEAN_FLAGS: Readonly<
   '--no-collapse-repeats': { key: 'collapseRepeats', value: false },
 }
 
-const TIMEOUT_KEYS: ReadonlySet<string> = new Set([
+export const TIMEOUT_KEYS: ReadonlySet<string> = new Set([
   'preflightSeconds',
   'runSeconds',
   'verifySeconds',
@@ -194,11 +213,11 @@ const TIMEOUT_KEYS: ReadonlySet<string> = new Set([
   'totalSeconds',
 ])
 
-const AUTH_KEYS: ReadonlySet<keyof AuthWhitelist> = new Set([
+export const AUTH_KEYS: ReadonlySet<keyof AuthWhitelist> = new Set([
   'opencode', 'npmrc', 'anthropic', 'openai', 'gemini', 'aws', 'ssh', 'git',
 ])
 
-const NO_AUTH_PREFIX = '--no-auth-'
+export const NO_AUTH_PREFIX = '--no-auth-'
 
 const parseIntStrict = (s: string): number | undefined => {
   if (!/^\s*-?\d+\s*$/.test(s)) return undefined
@@ -221,7 +240,12 @@ const parseEnum = <T>(
     return r.data
   })
 
-const MODEL_REF_PATTERN = /^[a-zA-Z0-9._-]+[/:][a-zA-Z0-9._-]+$/
+// Three accepted shapes: `provider/model`, `provider/model:tag` (ollama's own
+// naming convention, e.g. `ollama/qwen3.5:9b`), and `provider:model`. A tag is
+// only valid after a `/`-separated model — `provider:model:tag` is not a
+// recognized shape, so it still errors.
+const MODEL_REF_PATTERN =
+  /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+(:[a-zA-Z0-9._-]+)?$|^[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+$/
 
 const isValidModelRef = (m: string): boolean => MODEL_REF_PATTERN.test(m)
 
@@ -240,7 +264,7 @@ const parseValueFlag = (
     if (dest === 'inits') return { ...acc, inits: [...acc.inits, raw] }
     if (dest === 'verifies') return { ...acc, verifies: [...acc.verifies, raw] }
     if (dest === 'judges') return { ...acc, judges: [...acc.judges, raw] }
-    if (dest === 'auth') return setAuth(acc, raw)
+    if (dest === 'auth') return yield* setAuth(acc, raw)
     if (TIMEOUT_KEYS.has(dest)) {
       const n = parseIntStrict(raw)
       if (n === undefined) {
@@ -280,23 +304,33 @@ const parseValueFlag = (
       const v = yield* parseEnum(raw, outputFormatSchema, '--format')
       return { ...acc, formats: [...acc.formats, v] }
     }
-    if (dest === 'repoUrl') return setScalar(acc, 'repoUrl', raw)
     if (dest === 'packRef') return setScalar(acc, 'packRef', raw)
     if (dest === 'dockerImage') return setScalar(acc, 'dockerImage', raw)
     if (dest === 'outputPath') return setScalar(acc, 'outputPath', raw)
     if (dest === 'workspacePath') return setScalar(acc, 'workspacePath', raw)
     if (dest === 'opencodeVersion') return setScalar(acc, 'opencodeVersion', raw)
     if (dest === 'preflightModel') return setScalar(acc, 'preflightModel', raw)
+    if (dest === 'model') return setScalar(acc, 'model', raw)
     if (dest === 'pricingPath') return setScalar(acc, 'pricingPath', raw)
     return yield* Effect.fail(
       cliParseError(`unknown flag destination: ${dest}`, 'E_CONFIG_INVALID', { dest }),
     )
   })
 
-const setAuth = (acc: CliRaw, kind: string): CliRaw => {
+const setAuth = (acc: CliRaw, kind: string): Effect.Effect<CliRaw, PhaseError> => {
   const k = kind as keyof AuthWhitelist
-  if (!AUTH_KEYS.has(k)) return acc
-  return { ...acc, auth: { ...acc.auth, [k]: true } }
+  if (!AUTH_KEYS.has(k)) {
+    return Effect.fail(
+      cliParseError(`unknown auth kind: ${kind}`, 'E_CONFIG_INVALID', { flag: '--auth', value: kind }),
+    )
+  }
+  return Effect.succeed({ ...acc, auth: { ...acc.auth, [k]: true } })
+}
+
+const isKnownFlagToken = (tok: string): boolean => {
+  const eq = tok.indexOf('=')
+  const bare = eq >= 0 ? tok.slice(0, eq) : tok
+  return VALUE_FLAGS[bare] !== undefined || BOOLEAN_FLAGS[bare] !== undefined || bare.startsWith(NO_AUTH_PREFIX)
 }
 
 const parseArgs = (args: readonly string[]): Effect.Effect<CliRaw, PhaseError> => {
@@ -333,7 +367,7 @@ const parseArgs = (args: readonly string[]): Effect.Effect<CliRaw, PhaseError> =
         const dest = VALUE_FLAGS[tok]
         if (dest !== undefined) {
           const rawNext = args[i + 1]
-          if (rawNext === undefined || rawNext === '' || rawNext.startsWith('-')) {
+          if (rawNext === undefined || rawNext === '' || isKnownFlagToken(rawNext)) {
             return yield* Effect.fail(
               cliParseError(`flag ${tok} requires a value`, 'E_CONFIG_INVALID', { flag: tok }),
             )
@@ -483,10 +517,19 @@ const mergeTimeouts = (cliT: TimeoutUpdate, cfgT: TimeoutUpdate | undefined): Ti
     ? { totalSeconds: cliT.totalSeconds }
     : cfgT?.totalSeconds !== undefined
       ? { totalSeconds: cfgT.totalSeconds }
-      : DEFAULT_TIMEOUTS.totalSeconds !== undefined
-        ? { totalSeconds: DEFAULT_TIMEOUTS.totalSeconds }
-        : {}),
+      : {}),
 })
+
+interface BadTimeout {
+  readonly key: string
+  readonly value: number
+}
+
+const firstNonPositiveTimeout = (timeouts: TimeoutConfig): BadTimeout | undefined => {
+  const entries = Object.entries(timeouts) as readonly (readonly [string, number])[]
+  const bad = entries.find(([, value]) => value <= 0)
+  return bad === undefined ? undefined : { key: bad[0], value: bad[1] }
+}
 
 const mergeAuth = (cliA: AuthUpdate, cfgA: AuthUpdate | undefined): AuthWhitelist => ({
   opencode: cliA.opencode ?? cfgA?.opencode ?? DEFAULT_AUTH.opencode,
@@ -575,7 +618,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const runs = runsPick.value ?? DEFAULT_RUNS
 
     const isolationPick = pick(cli.isolation, cfg?.isolation)
-    const requestedIsolation: IsolationMode = isolationPick.value ?? 'home'
+    const requestedIsolation: IsolationMode = isolationPick.value ?? DEFAULT_ISOLATION
 
     const isolationResolved = yield* resolveIsolation(requestedIsolation)
     const { isolation, dockerDowngraded } = isolationResolved
@@ -594,8 +637,8 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       const ref = packRefPick.value
       const detected = yield* detectPack(ref).pipe(
         Effect.mapError((e: PackDetectError) =>
-          cliParseError(`invalid --pack reference: ${ref}`, 'E_CONFIG_INVALID', {
-            packRef: ref,
+          cliParseError(`invalid --pack reference: ${safeRefDisplay(ref)}`, 'E_CONFIG_INVALID', {
+            packRef: safeRefDisplay(ref),
             reason: e.reason,
           }),
         ),
@@ -616,9 +659,20 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const workspacePick = pick(cli.workspacePath, cfg?.workspacePath)
     const opencodeVersionPick = pick(cli.opencodeVersion, cfg?.opencodeVersion)
     const preflightModelPick = pick(cli.preflightModel, cfg?.preflightModel)
+    const modelPick = pick(cli.model, cfg?.model)
     const pricingPick = pick(cli.pricingPath, cfg?.pricingPath)
 
     const timeouts = mergeTimeouts(cli.timeouts, cfg?.timeouts)
+    const badTimeout = firstNonPositiveTimeout(timeouts)
+    if (badTimeout !== undefined) {
+      return yield* Effect.fail(
+        cliParseError(
+          `timeout must be positive: ${badTimeout.key}=${String(badTimeout.value)}`,
+          'E_CONFIG_INVALID',
+          { key: badTimeout.key, value: badTimeout.value },
+        ),
+      )
+    }
     const auth = mergeAuth(cli.auth, cfg?.auth)
 
     const preflightModelValue = preflightModelPick.value
@@ -628,6 +682,17 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
           `model unavailable: ${preflightModelValue}`,
           'E_MODEL_UNAVAILABLE',
           { model: preflightModelValue, reason: 'unknown-model' },
+        ),
+      )
+    }
+
+    const modelValue = modelPick.value
+    if (modelValue !== undefined && !isValidModelRef(modelValue)) {
+      return yield* Effect.fail(
+        cliParseError(
+          `model unavailable: ${modelValue}`,
+          'E_MODEL_UNAVAILABLE',
+          { model: modelValue, reason: 'unknown-model' },
         ),
       )
     }
@@ -649,6 +714,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       workspacePick.src,
       opencodeVersionPick.src,
       preflightModelPick.src,
+      modelPick.src,
       pricingPick.src,
     ]
     const hasCli = sources.includes('cli')
@@ -662,16 +728,16 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       runs,
       isolation,
       auth,
-      pureBaseline: pureBaselinePick.value ?? true,
-      preflightEnabled: preflightPick.value ?? true,
+      pureBaseline: pureBaselinePick.value ?? DEFAULT_PURE_BASELINE,
+      preflightEnabled: preflightPick.value ?? DEFAULT_PREFLIGHT_ENABLED,
       formats: [...formats],
-      outputPath: outputPick.value ?? './results',
-      diffHtml: diffHtmlPick.value ?? false,
-      collapseRepeats: collapsePick.value ?? false,
-      timelineMode: timelinePick.value ?? 'side-by-side',
+      outputPath: outputPick.value ?? DEFAULT_OUTPUT_PATH,
+      diffHtml: diffHtmlPick.value ?? DEFAULT_DIFF_HTML,
+      collapseRepeats: collapsePick.value ?? DEFAULT_COLLAPSE_REPEATS,
+      timelineMode: timelinePick.value ?? DEFAULT_TIMELINE_MODE,
       timeouts,
-      workspacePath: workspacePick.value ?? './.testaipack',
-      logLevel: logPick.value ?? 'info',
+      workspacePath: workspacePick.value ?? DEFAULT_WORKSPACE_PATH,
+      logLevel: logPick.value ?? DEFAULT_LOG_LEVEL,
       ...(packRefPick.value !== undefined ? { packRef: packRefPick.value } : {}),
       ...(packTypeValue !== undefined ? { packType: packTypeValue } : {}),
       ...(promptResolved.files.length > 0 ? { promptFiles: [...promptResolved.files] } : {}),
@@ -684,6 +750,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
         : {}),
       ...(opencodeVersionPick.value !== undefined ? { opencodeVersion: opencodeVersionPick.value } : {}),
       ...(preflightModelPick.value !== undefined ? { preflightModel: preflightModelPick.value } : {}),
+      ...(modelPick.value !== undefined ? { model: modelPick.value } : {}),
       ...(pricingPick.value !== undefined ? { pricingPath: pricingPick.value } : {}),
     }
 

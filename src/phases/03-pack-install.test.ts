@@ -284,6 +284,44 @@ describe('phase 03 — packInstall', () => {
     expect(err.code).toBe('E_PACK_INVALID_REF')
   })
 
+  it('mcp ref with an unsafe name and an inline secret → detectPack failure leaks neither the secret nor the JSON body', async () => {
+    const secret = 'sk-fake-secret'
+    const built = await buildInput({ packRef: `mcp:../evil:{"env":{"KEY":"${secret}"}}` })
+    const err = await runFlip(packInstall(built.input))
+    expect(err.code).toBe('E_PACK_INVALID_REF')
+    expect(err.message).not.toContain(secret)
+    expect(err.message).not.toContain('KEY')
+    const contextStr = JSON.stringify(err.context ?? {})
+    expect(contextStr).not.toContain(secret)
+    expect(contextStr).not.toContain('KEY')
+  })
+
+  it('mcp (invalid json with an embedded secret) → error leaks neither the secret nor the raw config', async () => {
+    const secret = 'sk-test-FAKESECRET-1234567890'
+    const built = await buildInput({
+      packRef: `mcp:myserver:{"command":"npx","env":{"API_KEY":"${secret}"} not json}`,
+    })
+    const err = await runFlip(packInstall(built.input))
+    expect(err.code).toBe('E_PACK_INVALID_REF')
+    expect(err.message).not.toContain(secret)
+    expect(err.message).not.toContain('API_KEY')
+    const contextStr = JSON.stringify(err.context ?? {})
+    expect(contextStr).not.toContain(secret)
+    expect(contextStr).not.toContain('API_KEY')
+  })
+
+  it('mcp (invalid json starting with a secret, no JSON structure at all) → still leaks nothing', async () => {
+    // JSON.parse itself quotes a snippet of the input when the bad token is
+    // at position 0 (no valid JSON recognized yet) — this must not leak either.
+    const secret = 'sk-test-FAKESECRET-startofstring'
+    const built = await buildInput({ packRef: `mcp:myserver:${secret}-not-json-at-all` })
+    const err = await runFlip(packInstall(built.input))
+    expect(err.code).toBe('E_PACK_INVALID_REF')
+    expect(err.message).not.toContain(secret)
+    const contextStr = JSON.stringify(err.context ?? {})
+    expect(contextStr).not.toContain(secret)
+  })
+
   it('mcp (no config, no standard file) → E_PACK_INVALID_REF', async () => {
     const built = await buildInput({ packRef: 'mcp:myserver' })
     const err = await runFlip(packInstall(built.input))
@@ -366,11 +404,39 @@ describe('phase 03 — packInstall', () => {
     expect(err.code).toBe('E_INSTALL_FAILED')
   })
 
+  it('clone failure with credentials in the URL → error leaks neither the token nor the userinfo', async () => {
+    const url = 'https://user:sk-fake-token@example.invalid/repo.git'
+    cloneMock.mockImplementation(
+      failingClone(`fatal: unable to access '${url}/': The requested URL returned error: 403`),
+    )
+    const built = await buildInput({ packRef: url })
+    const err = await runFlip(packInstall(built.input))
+    expect(err.code).toBe('E_INSTALL_FAILED')
+    expect(err.message).not.toContain('sk-fake-token')
+    expect(err.message).not.toContain('user:')
+    const contextStr = JSON.stringify(err.context ?? {})
+    expect(contextStr).not.toContain('sk-fake-token')
+    expect(contextStr).not.toContain('user:')
+  })
+
   it('skill without SKILL.md → E_PACK_INVALID_REF', async () => {
     cloneMock.mockImplementation(materializeClone({ 'README.md': 'no skill' }))
     const built = await buildInput({ packRef: 'github:owner/noskillmd' })
     const err = await runFlip(packInstall(built.input))
     expect(err.code).toBe('E_PACK_INVALID_REF')
+  })
+
+  it('skill without SKILL.md, cloned from a URL with credentials → error leaks neither the token nor the userinfo', async () => {
+    const url = 'https://user:sk-fake-token@example.invalid/repo.git'
+    cloneMock.mockImplementation(materializeClone({ 'README.md': 'no skill' }))
+    const built = await buildInput({ packRef: url })
+    const err = await runFlip(packInstall(built.input))
+    expect(err.code).toBe('E_PACK_INVALID_REF')
+    expect(err.message).not.toContain('sk-fake-token')
+    expect(err.message).not.toContain('user:')
+    const contextStr = JSON.stringify(err.context ?? {})
+    expect(contextStr).not.toContain('sk-fake-token')
+    expect(contextStr).not.toContain('user:')
   })
 
   it('skill: lowercase skill.md at root → mirrored to uppercase SKILL.md', async () => {
@@ -431,6 +497,15 @@ describe('phase 03 — packInstall', () => {
     expect(err.code).toBe('E_PACK_INVALID_REF')
   })
 
+  it('pack ref whose name resolves to ".." → E_PACK_INVALID_REF, workspace untouched', async () => {
+    const built = await buildInput({ packRef: '../..' })
+    const err = await runFlip(packInstall(built.input))
+    expect(err.code).toBe('E_PACK_INVALID_REF')
+    expect(await runP(exists(built.root))).toBe(true)
+    expect(await runP(exists(built.packDir))).toBe(true)
+    expect(await runP(exists(built.resultsDir))).toBe(true)
+  })
+
   it('result exposes installLogPath inside workspace.results', async () => {
     const built = await buildInput({ packRef: 'npm:plug' })
     const result = await runP(packInstall(built.input))
@@ -480,13 +555,32 @@ describe('phase 03 — packInstall', () => {
     cloneMock.mockImplementation(
       materializeClone({
         'skills/cool/SKILL.md': '# cool\n',
-        'plugins/myplugin': 'module.exports={}',
+        'plugins/myplugin.js': 'module.exports={}',
       }),
     )
     const built = await buildInput({ packRef: 'github:owner/megapack', packType: 'all' })
     const result = await runP(packInstall(built.input))
     expect(result.registeredIn).toContain('plugins')
-    expect(result.instructions.some((i) => i.kind === 'plugin')).toBe(true)
+    const pluginInst = result.instructions.find((i) => i.kind === 'plugin')
+    expect(pluginInst).toBeDefined()
+    if (pluginInst?.kind === 'plugin') {
+      expect(pluginInst.name).toBe('myplugin')
+    }
+  })
+
+  it('all: plugins/ subdir ignores non-plugin files (README.md, .DS_Store, no-extension)', async () => {
+    cloneMock.mockImplementation(
+      materializeClone({
+        'plugins/myplugin.js': 'module.exports={}',
+        'plugins/README.md': '# plugins\n',
+        'plugins/.DS_Store': '',
+        'plugins/notes': 'no extension',
+      }),
+    )
+    const built = await buildInput({ packRef: 'github:owner/pluginjunk', packType: 'all' })
+    const result = await runP(packInstall(built.input))
+    const pluginNames = result.instructions.filter((i) => i.kind === 'plugin').map((i) => i.name)
+    expect(pluginNames).toEqual(['myplugin'])
   })
 
   it('skill local pointing at a file (not a dir) → E_PACK_INVALID_REF', async () => {

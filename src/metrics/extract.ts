@@ -14,7 +14,6 @@ import type {
   ExportReasoningPart,
   ExportStepFinishPart,
   ExportToolPart,
-  FileDiffStats,
   OpencodeExport,
   PrimaryMetrics,
   SecondaryMetrics,
@@ -61,13 +60,17 @@ export const computeMaxParallelism = (
     { t: s.timeUpdated, delta: -1 },
   ])
   const sorted = [...events].sort((a, b) => a.t - b.t || a.delta - b.delta)
-  return sorted.reduce<{ readonly cur: number; readonly max: number }>(
+  const swept = sorted.reduce<{ readonly cur: number; readonly max: number }>(
     (acc, e) => {
       const cur = acc.cur + e.delta
       return { cur, max: cur > acc.max ? cur : acc.max }
     },
     { cur: 0, max: 0 },
   ).max
+  // At least one session is present, so at least one was active — the
+  // close-before-open tiebreak (see above) can otherwise read a zero-duration
+  // session (timeCreated === timeUpdated) as never having been open at all.
+  return Math.max(1, swept)
 }
 
 const isTool = (p: ExportPart): p is ExportToolPart => p.type === 'tool'
@@ -105,36 +108,64 @@ interface PerToolAcc {
   readonly durN: number
 }
 
-type ToolMap = Readonly<Record<string, PerToolAcc>>
+interface ToolRunFold {
+  readonly key: string | null
+  readonly acc: PerToolAcc
+  readonly out: readonly (readonly [string, PerToolAcc])[]
+}
 
-const perToolStats = (tools: readonly ExportToolPart[]): Readonly<Record<string, ToolStat>> => {
-  const acc = tools.reduce<ToolMap>((m, p) => {
-    const name = p.tool
-    const prev = m[name] ?? { count: 0, errors: 0, durSum: 0, durN: 0 }
+const EMPTY_TOOL_ACC: PerToolAcc = { count: 0, errors: 0, durSum: 0, durN: 0 }
+
+const flushToolRun = (fold: ToolRunFold): readonly (readonly [string, PerToolAcc])[] =>
+  fold.key === null ? fold.out : [...fold.out, [fold.key, fold.acc] as const]
+
+/**
+ * Groups tool parts by name in one pass over a copy sorted by name: the
+ * output list only grows on a name change (bounded by distinct tool count),
+ * not once per part, so this stays O(n log n) instead of the "spread the
+ * whole map every part" O(n^2) shape.
+ */
+const groupToolRuns = (tools: readonly ExportToolPart[]): readonly (readonly [string, PerToolAcc])[] => {
+  const sorted = [...tools].sort((a, b) => (a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : 0))
+  const folded = sorted.reduce<ToolRunFold>((fold, p) => {
     const t = p.state.time
     const dur = t === undefined ? 0 : durationOf(t.start, t.end)
-    return {
-      ...m,
-      [name]: {
-        count: prev.count + 1,
-        errors: prev.errors + (p.state.status === 'error' ? 1 : 0),
-        durSum: prev.durSum + dur,
-        durN: prev.durN + (t === undefined ? 0 : 1),
-      },
+    const isError = p.state.status === 'error' ? 1 : 0
+    const hasDur = t === undefined ? 0 : 1
+    if (fold.key === p.tool) {
+      return {
+        ...fold,
+        acc: {
+          count: fold.acc.count + 1,
+          errors: fold.acc.errors + isError,
+          durSum: fold.acc.durSum + dur,
+          durN: fold.acc.durN + hasDur,
+        },
+      }
     }
-  }, {})
-  return Object.entries(acc).reduce<Readonly<Record<string, ToolStat>>>((out, [name, v]) => {
-    const avg = v.durN === 0 ? 0 : v.durSum / v.durN
     return {
-      ...out,
-      [name]: {
-        count: v.count,
-        errorRate: v.count === 0 ? 0 : v.errors / v.count,
-        avgDurationMs: String(Math.round(avg)),
-      },
+      key: p.tool,
+      acc: { count: 1, errors: isError, durSum: dur, durN: hasDur },
+      out: flushToolRun(fold),
     }
-  }, {})
+  }, { key: null, acc: EMPTY_TOOL_ACC, out: [] })
+  return flushToolRun(folded)
 }
+
+const perToolStats = (tools: readonly ExportToolPart[]): Readonly<Record<string, ToolStat>> =>
+  Object.fromEntries(
+    groupToolRuns(tools).map(([name, v]): readonly [string, ToolStat] => {
+      const avg = v.durN === 0 ? 0 : v.durSum / v.durN
+      return [
+        name,
+        {
+          count: v.count,
+          errorRate: v.count === 0 ? 0 : v.errors / v.count,
+          avgDurationMs: String(Math.round(avg)),
+        },
+      ]
+    }),
+  )
 
 const finishCauseDistribution = (exp: OpencodeExport): Readonly<Record<string, number>> =>
   exp.messages.reduce<Readonly<Record<string, number>>>((m, msg) => {
@@ -177,7 +208,7 @@ const maxConsecutiveSameTool = (parts: readonly ExportPart[]): number =>
   parts
     .reduce<{ readonly name: string | null; readonly run: number; readonly best: number }>(
       (st, p) => {
-        if (!isTool(p)) return { name: null, run: 0, best: st.best }
+        if (!isTool(p)) return st
         const name = p.tool
         if (st.name === name) {
           const run = st.run + 1
@@ -187,12 +218,6 @@ const maxConsecutiveSameTool = (parts: readonly ExportPart[]): number =>
       },
       { name: null, run: 0, best: 0 },
     ).best
-
-const fileDiffStats = (exp: OpencodeExport): FileDiffStats => ({
-  additions: exp.info.summary.additions,
-  deletions: exp.info.summary.deletions,
-  filesChanged: exp.info.summary.files,
-})
 
 const costFromPricing = (exp: OpencodeExport, pricing: PricingTable): number => {
   const price = lookupPrice(pricing, exp.info.model.providerID, exp.info.model.id)
@@ -234,9 +259,10 @@ export const extractMetrics = (
     stepCount: parts.filter(isStepFinish).length,
     toolCallCount: tools.length,
     successRank,
-    maxParallelism: computeMaxParallelism([
-      { timeCreated: toNum(exp.info.time.created), timeUpdated: toNum(exp.info.time.updated) },
-    ]),
+    // A single export is a single session — parallelism (sessions running at
+    // once) is a tree-level concept, only meaningful across siblings. See
+    // extractMetricsFromTree's own computeMaxParallelism call for that case.
+    maxParallelism: 1,
   }
 
   const secondary: SecondaryMetrics = {
@@ -250,7 +276,6 @@ export const extractMetrics = (
     stepLatencyP95Ms: String(Math.round(percentile(stepDur, 95))),
     toolLatencyAvgMs: String(Math.round(toolLatencyAverage(tools))),
     finishCauseDistribution: finishCauseDistribution(exp),
-    fileDiffStats: fileDiffStats(exp),
     maxConsecutiveSameTool: maxConsecutiveSameTool(parts),
   }
 
@@ -272,7 +297,6 @@ const emptySecondaryMetrics = (): SecondaryMetrics => ({
   stepLatencyP95Ms: '0',
   toolLatencyAvgMs: '0',
   finishCauseDistribution: {},
-  fileDiffStats: { additions: 0, deletions: 0, filesChanged: 0 },
   maxConsecutiveSameTool: 0,
 })
 
@@ -348,11 +372,6 @@ const mergeSecondaryAcrossNodes = (list: readonly SecondaryMetrics[]): Secondary
     stepLatencyP95Ms: maxStr(list, (s) => s.stepLatencyP95Ms),
     toolLatencyAvgMs: maxStr(list, (s) => s.toolLatencyAvgMs),
     finishCauseDistribution: mergeFinishCauseNodes(list.map((s) => s.finishCauseDistribution)),
-    fileDiffStats: {
-      additions: list.reduce((a, s) => a + s.fileDiffStats.additions, 0),
-      deletions: list.reduce((a, s) => a + s.fileDiffStats.deletions, 0),
-      filesChanged: list.reduce((a, s) => a + s.fileDiffStats.filesChanged, 0),
-    },
     maxConsecutiveSameTool: list.reduce((m, s) => Math.max(m, s.maxConsecutiveSameTool), 0),
   }
 }

@@ -355,7 +355,7 @@ export const listMcp = (
   })
 
 /**
- * `opencode db query <sql> --format json` — runs an SQL query against the
+ * `opencode db <sql> --format json` — runs an SQL query against the
  * opencode session database in an isolated HOME and parses the JSON result.
  * Used by v0.2 to walk the session tree via the `session.parent_id` column.
  */
@@ -367,7 +367,7 @@ export const dbQuery = (
   Effect.gen(function* () {
     const out = yield* runSimpleOpencode({
       command: 'db',
-      args: ['db', 'query', sql, '--format', 'json'],
+      args: ['db', sql, '--format', 'json'],
       homeDir,
       ...(docker === undefined ? {} : { docker }),
     })

@@ -293,6 +293,21 @@ describe('cliParse — pack', () => {
     )
     expect(result.runInput.packType).toBe('all')
   })
+
+  it('a --pack mcp: ref that fails detection never leaks its secret-bearing config', async () => {
+    const cwd = makeTempDir()
+    const secretRef = 'mcp::{"env":{"KEY":"sk-fake-secret"}}'
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--pack', secretRef], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+    expect(err.message).not.toContain('sk-fake-secret')
+    expect(err.message).not.toContain('"env"')
+    const contextJson = JSON.stringify(err.context)
+    expect(contextJson).not.toContain('sk-fake-secret')
+    expect(contextJson).not.toContain('"env"')
+  })
 })
 
 describe('cliParse — docker downgrade', () => {
@@ -383,6 +398,122 @@ describe('cliParse — model availability (E_MODEL_UNAVAILABLE)', () => {
     const cwd = makeTempDir()
     const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
     expect(result.runInput.preflightModel).toBeUndefined()
+  })
+
+  it('provider/model:tag form (ollama naming, e.g. ollama/qwen3.5:9b) → OK', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--preflight-model', 'ollama/qwen3.5:9b'], cwd }),
+    )
+    expect(result.runInput.preflightModel).toBe('ollama/qwen3.5:9b')
+  })
+
+  it('a second tagged ollama ref (ollama/llama3.1:8b) → OK', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--preflight-model', 'ollama/llama3.1:8b'], cwd }),
+    )
+    expect(result.runInput.preflightModel).toBe('ollama/llama3.1:8b')
+  })
+
+  it.each([
+    ['empty model segment (provider/)', 'ollama/'],
+    ['empty provider segment (/model)', '/qwen3.5:9b'],
+    ['a lone word with no separator', 'qwen3.5'],
+    ['whitespace inside the ref', 'ollama /qwen3.5:9b'],
+    ['a trailing separator (provider/model:)', 'ollama/qwen3.5:'],
+    ['a trailing slash (provider/model/)', 'ollama/qwen3.5/'],
+    ['a colon-form ref with an extra tag (provider:model:tag)', 'ollama:qwen3.5:9b'],
+  ])('%s → E_MODEL_UNAVAILABLE', async (_label, ref) => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--preflight-model', ref], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_MODEL_UNAVAILABLE')
+  })
+})
+
+describe('cliParse — --model run-model override', () => {
+  it('parses --model a/b into runInput.model', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--model', 'anthropic/claude-x'], cwd }),
+    )
+    expect(result.runInput.model).toBe('anthropic/claude-x')
+  })
+
+  it('parses the --model=a/b inline form', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--model=anthropic/claude-x'], cwd }),
+    )
+    expect(result.runInput.model).toBe('anthropic/claude-x')
+  })
+
+  it('--model with no value → E_CONFIG_INVALID', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(cliParse({ argv: ['run', REPO, '--prompt', 'x', '--model'], cwd }))
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('--model ollama/qwen3.5:9b (ollama tagged form) → OK, same validator as --preflight-model', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--model', 'ollama/qwen3.5:9b'], cwd }),
+    )
+    expect(result.runInput.model).toBe('ollama/qwen3.5:9b')
+  })
+
+  it('--model nope (no provider prefix) → E_MODEL_UNAVAILABLE', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--model', 'nope'], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_MODEL_UNAVAILABLE')
+  })
+
+  it('config-file model is accepted and used', async () => {
+    const cwd = makeTempDir()
+    await ensureDirP(path.join(cwd, '.testaipack'))
+    await writeFileP(
+      path.join(cwd, '.testaipack', 'config.json'),
+      JSON.stringify({ repoUrl: REPO, prompt: 'x', model: 'anthropic/from-config' }),
+    )
+    const result = await runP(cliParse({ argv: ['run'], cwd }))
+    expect(result.runInput.model).toBe('anthropic/from-config')
+  })
+
+  it('CLI --model overrides the config-file model', async () => {
+    const cwd = makeTempDir()
+    await ensureDirP(path.join(cwd, '.testaipack'))
+    await writeFileP(
+      path.join(cwd, '.testaipack', 'config.json'),
+      JSON.stringify({ repoUrl: REPO, prompt: 'x', model: 'anthropic/from-config' }),
+    )
+    const result = await runP(
+      cliParse({ argv: ['run', '--model', 'anthropic/from-cli'], cwd }),
+    )
+    expect(result.runInput.model).toBe('anthropic/from-cli')
+  })
+
+  it('unset --model leaves runInput.model absent and the RunInput still validates (no regression)', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.runInput.model).toBeUndefined()
+    const { runInputSchema } = await import('@generated/schemas')
+    expect(runInputSchema.safeParse(result.runInput).success).toBe(true)
+  })
+
+  it('--preflight-model alone does not set runInput.model (the two flags are independent)', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--preflight-model', 'anthropic/glm-5.2'], cwd }),
+    )
+    expect(result.runInput.preflightModel).toBe('anthropic/glm-5.2')
+    expect(result.runInput.model).toBeUndefined()
   })
 })
 
@@ -489,6 +620,74 @@ describe('cliParse — flags surface', () => {
   })
 })
 
+describe('cliParse — dash-prefixed value flags', () => {
+  it('a --prompt value starting with "-" parses (only known flag names are rejected as values)', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', '-fix the regression'], cwd }),
+    )
+    expect(result.runInput.prompt).toBe('-fix the regression')
+  })
+
+  it('a value flag followed by another known flag (no value given) still errors', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', '--runs', '3'], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('a value flag followed by a known flag in --flag=value form (no value given) still errors', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', '--model=anthropic/claude-x'], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+})
+
+describe('cliParse — timeout positivity', () => {
+  it('--timeout-run=-5 → E_CONFIG_INVALID', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--timeout-run=-5'], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('--timeout-run=0 → E_CONFIG_INVALID', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--timeout-run', '0'], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('a negative timeout from the config file also errors', async () => {
+    const cwd = makeTempDir()
+    await ensureDirP(path.join(cwd, '.testaipack'))
+    await writeFileP(
+      path.join(cwd, '.testaipack', 'config.json'),
+      JSON.stringify({ repoUrl: REPO, prompt: 'x', timeouts: { runSeconds: -1 } }),
+    )
+    const err = await runFlip(cliParse({ argv: ['run'], cwd }))
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('a positive --watchdog still works (no regression)', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--watchdog', '30'], cwd }),
+    )
+    expect(result.runInput.timeouts.watchdogSeconds).toBe(30)
+  })
+})
+
 describe('cliParse — auth whitelist', () => {
   it('default (no auth flags) → opencode=true, npmrc=true, rest false', async () => {
     const cwd = makeTempDir()
@@ -555,6 +754,15 @@ describe('cliParse — auth whitelist', () => {
     const cwd = makeTempDir()
     const err = await runFlip(
       cliParse({ argv: ['run', REPO, '--prompt', 'x', '--no-auth-bogus'], cwd }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('--auth bogus → E_CONFIG_INVALID (same as --no-auth-bogus, not silently ignored)', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--auth', 'bogus'], cwd }),
     )
     expect(err).toBeInstanceOf(PhaseError)
     expect(err.code).toBe('E_CONFIG_INVALID')

@@ -88,7 +88,8 @@ const renderPrimary = (report: Report): string => {
 const toolRows = (perTool: Readonly<Record<string, ToolStat>>): readonly string[] => {
   const entries = Object.entries(perTool)
   if (entries.length === 0) return ['  - _no tools_']
-  return entries
+  return [...entries]
+    .sort(([, a], [, b]) => b.count - a.count)
     .slice(0, 20)
     .map(
       ([name, s]) =>
@@ -96,19 +97,38 @@ const toolRows = (perTool: Readonly<Record<string, ToolStat>>): readonly string[
     )
 }
 
+/**
+ * Sums each run's `git diff --numstat`-derived summary (phase 08) for one
+ * side — the only real source of file-change counts (an opencode export's
+ * own `info.summary` is not populated with meaningful values, which is why
+ * `SecondaryMetrics` no longer carries a file-diff field of its own).
+ */
+const diffTotalsFor = (
+  report: Report,
+  side: Side,
+): { readonly files: number; readonly add: number; readonly del: number } =>
+  report.diff[side].runs.reduce(
+    (acc, r) => ({
+      files: acc.files + r.summary.filesChanged,
+      add: acc.add + r.summary.additions,
+      del: acc.del + r.summary.deletions,
+    }),
+    { files: 0, add: 0, del: 0 },
+  )
+
 const renderSecondary = (report: Report): string => {
   const renderSide = (side: Side): readonly string[] => {
     const sec = report.metricsDiff[side].secondary
     const finish = Object.entries(sec.finishCauseDistribution)
       .map(([k, v]) => `${k}=${String(v)}`)
       .join(', ')
-    const fds = sec.fileDiffStats
+    const fds = diffTotalsFor(report, side)
     return [
       `### ${side.toUpperCase()} secondary`,
       `- Finish causes: ${finish || '_none_'}`,
       `- Step latency: p50=${fmtInt(sec.stepLatencyP50Ms)}ms, p95=${fmtInt(sec.stepLatencyP95Ms)}ms`,
       `- Reasoning time: ${fmtInt(sec.reasoningTimeMs)}ms; tool avg: ${fmtInt(sec.toolLatencyAvgMs)}ms`,
-      `- File diff: +${String(fds.additions)} -${String(fds.deletions)} (${String(fds.filesChanged)} files)`,
+      `- File diff: +${String(fds.add)} -${String(fds.del)} (${String(fds.files)} files)`,
       `- Token breakdown: input=${fmtInt(sec.inputTokens)}, output=${fmtInt(sec.outputTokens)}, reasoning=${fmtInt(sec.reasoningTokens)}, cacheRead=${fmtInt(sec.cacheReadTokens)}`,
       '- Tools (top 20):',
       ...toolRows(sec.perTool),
@@ -177,17 +197,8 @@ const renderTimeline = (report: Report): string => {
 }
 
 const renderDiff = (report: Report): string => {
-  const totalsFor = (side: Side): { readonly files: number; readonly add: number; readonly del: number } =>
-    report.diff[side].runs.reduce(
-      (acc, r) => ({
-        files: acc.files + r.summary.filesChanged,
-        add: acc.add + r.summary.additions,
-        del: acc.del + r.summary.deletions,
-      }),
-      { files: 0, add: 0, del: 0 },
-    )
   const renderSide = (side: Side): readonly string[] => {
-    const t = totalsFor(side)
+    const t = diffTotalsFor(report, side)
     const runs = report.diff[side].runs
     const runLines = runs.map((r) => {
       const patch = `diff/${side}/run-${String(r.runIndex)}/full.patch`

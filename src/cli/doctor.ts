@@ -44,7 +44,9 @@ const probeCmd = (
     Effect.timeout(PROBE_TIMEOUT_MS),
     Effect.map((out): DoctorCheck => {
       if (out.exitCode < 0) {
-        return fail(name, `${command} not found`)
+        return out.spawnErrorCode === 'ENOENT'
+          ? fail(name, `${command} not found`)
+          : fail(name, `${command} failed to run (${out.spawnErrorCode ?? 'unknown error'})`)
       }
       if (out.exitCode !== 0) {
         const stderr = out.stderr.trim()

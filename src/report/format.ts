@@ -54,7 +54,8 @@ export const fmtSigned = (v: number, kind: MetricKind): string => {
   return body
 }
 
-export const fmtPct = (v: number): string => {
+export const fmtPct = (v: number | undefined): string => {
+  if (v === undefined) return 'n/a'
   if (!Number.isFinite(v)) return String(v)
   const body = v.toFixed(1)
   return v > 0 ? `+${body}%` : `${body}%`

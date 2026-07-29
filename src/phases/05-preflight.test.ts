@@ -310,6 +310,42 @@ describe('phase 05 — preflight', () => {
     expect(err.context?.['exitCode']).toBe(2)
   })
 
+  it('gate 2 (auth-ping) targets runInput.model when set, not preflightModel', async () => {
+    const homes = await buildHomes()
+    const input = buildInput(homes, { model: 'x/y', preflightModel: 'a/b' }, undefined)
+    await runP(preflight(input))
+    expect(runMock.mock.calls.length).toBeGreaterThanOrEqual(2)
+    for (const call of runMock.mock.calls) {
+      expect(call[0].model).toBe('x/y')
+    }
+  })
+
+  it('gate 2 (auth-ping) passes no explicit model when runInput.model is unset, even with preflightModel set', async () => {
+    const homes = await buildHomes()
+    const input = buildInput(homes, { preflightModel: 'a/b' }, undefined)
+    await runP(preflight(input))
+    expect(runMock.mock.calls.length).toBeGreaterThanOrEqual(2)
+    for (const call of runMock.mock.calls) {
+      expect(call[0].model).toBeUndefined()
+    }
+  })
+
+  it('gate 5 (baseline-identical) re-run also targets runInput.model, not preflightModel', async () => {
+    const homes = await buildHomes()
+    const packDir = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    await runP(symlink(packDir, path.join(homes.new, '.config', 'opencode', 'skills', 'myskill')))
+    const input = buildInput(homes, { model: 'x/y', preflightModel: 'a/b' }, skillOutcome(packDir))
+    const result = await runP(preflight(input))
+    expect(result.allPassed).toBe(true)
+    // gate 2 pings old+new, gate 5 re-pings old — at least 3 auth-ping calls total.
+    expect(runMock.mock.calls.length).toBeGreaterThanOrEqual(3)
+    for (const call of runMock.mock.calls) {
+      expect(call[0].model).toBe('x/y')
+    }
+  })
+
   it('build-agent absent → E_PREFLIGHT_FAILED, exitCode=2', async () => {
     const homes = await buildHomes()
     await runP(removeDir(path.join(homes.new, '.config', 'opencode', 'agents', 'build.md')))
@@ -324,6 +360,20 @@ describe('phase 05 — preflight', () => {
     const packDir = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(packDir))
     // no SKILL.md created
+    const input = buildInput(homes, {}, skillOutcome(packDir))
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['check']).toBe('pack-visibility')
+  })
+
+  it('pack-visibility skill fail when the NEW-home symlink was never created (pack source has SKILL.md)', async () => {
+    const homes = await buildHomes()
+    const packDir = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    // deliberately skip creating .config/opencode/skills/myskill in homes.new:
+    // the pack source is fine, but registration into the new HOME never happened
     const input = buildInput(homes, {}, skillOutcome(packDir))
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
@@ -415,6 +465,21 @@ describe('phase 05 — preflight', () => {
       }),
     )
     const input = buildInput(homes, {}, skillOutcome(packDir))
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
+    expect(err.context?.['check']).toBe('baseline-identical')
+    expect(err.context?.['exitCode']).toBe(2)
+  })
+
+  it('baseline-identical leak (plugin .js file on old side) → E_PREFLIGHT_FAILED, exitCode=2', async () => {
+    const homes = await buildHomes()
+    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
+    // leak: same plugin file (with its .js extension) accidentally on old side
+    await runP(writeFile(path.join(homes.old, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
+    runMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: 'OK', stderr: '', durationMs: 5, timedOut: false }),
+    )
+    const input = buildInput(homes, {}, pluginOutcome('myplugin'))
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_FAILED')
     expect(err.context?.['check']).toBe('baseline-identical')

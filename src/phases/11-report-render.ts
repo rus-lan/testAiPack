@@ -4,7 +4,8 @@
  * Assembles the Report object from upstream artifacts and renders it into the
  * requested formats. `report.md` (stdout + file) and `report.json` (file) are
  * always produced; `report.yaml` / `report.html` only when requested via
- * `runInput.formats`. The only failure mode is `E_DISK_FULL` (ENOSPC).
+ * `runInput.formats`. Failure modes: `E_DISK_FULL` (ENOSPC) or `E_EXPORT_INVALID`
+ * (the assembled Report fails its own schema — an internal contract mismatch).
  *
  * @see docs/phases/11-report-render.ru.md
  * @see contract/phases/11-report-render.tsp
@@ -43,12 +44,13 @@ const toDiskFull =
 const writeOptional = (
   wanted: boolean,
   filePath: string,
-  render: () => string,
+  render: () => Effect.Effect<string, PhaseError>,
   what: string,
 ): Effect.Effect<void, PhaseError> =>
   Effect.gen(function* () {
     if (!wanted) return
-    yield* writeFile(filePath, render()).pipe(Effect.mapError(toDiskFull(what, filePath)))
+    const content = yield* render()
+    yield* writeFile(filePath, content).pipe(Effect.mapError(toDiskFull(what, filePath)))
   })
 
 export const buildReport = (input: ReportRenderInput): Report => {
@@ -65,13 +67,15 @@ export const buildReport = (input: ReportRenderInput): Report => {
 
 /**
  * Local result extension: the contract `ReportRenderResult` carries the file
- * paths and stdout format, but not the rendered Markdown body. The pipeline
- * needs the rendered MD to print it to stdout (spec invariant: "report.md
- * напечатан в stdout"), so this extension exposes it when Markdown output was
- * requested by the user.
+ * paths and stdout format, but not the rendered body. The pipeline needs the
+ * rendered content to print to stdout (spec invariant: the report is always
+ * printed, in the format the user actually requested), so this extension
+ * carries exactly one of the two, matching `stdoutFormat`: `stdoutMd` when
+ * Markdown was requested (the default), `stdoutJson` otherwise.
  */
 export interface ReportRenderResultExt extends ReportRenderResult {
   readonly stdoutMd?: string
+  readonly stdoutJson?: string
 }
 
 export const reportRender = (
@@ -95,7 +99,8 @@ export const reportRender = (
     )
 
     const jsonPath = path.join(resultsDir, 'report.json')
-    yield* writeFile(jsonPath, renderJson(report)).pipe(
+    const jsonContent = yield* renderJson(report)
+    yield* writeFile(jsonPath, jsonContent).pipe(
       Effect.mapError(toDiskFull('write report.json', jsonPath)),
     )
 
@@ -105,9 +110,14 @@ export const reportRender = (
     const htmlPath = path.join(resultsDir, 'report.html')
 
     yield* writeOptional(yamlWanted, yamlPath, () => renderYaml(report), 'write report.yaml')
-    yield* writeOptional(htmlWanted, htmlPath, () => renderHtml(report), 'write report.html')
+    yield* writeOptional(
+      htmlWanted,
+      htmlPath,
+      () => Effect.succeed(renderHtml(report)),
+      'write report.html',
+    )
 
-    const stdoutFormat: 'md' | 'json' = formats.includes('md') ? 'md' : 'json'
+    const stdoutFormat: 'md' | 'json' = mdRequested ? 'md' : 'json'
 
     const paths: ReportRenderResult['paths'] = {
       md: mdPath,
@@ -120,6 +130,6 @@ export const reportRender = (
       formats,
       paths,
       stdoutFormat,
-      ...(mdRequested ? { stdoutMd: mdContent } : {}),
+      ...(mdRequested ? { stdoutMd: mdContent } : { stdoutJson: jsonContent }),
     }
   })

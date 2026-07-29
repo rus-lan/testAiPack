@@ -126,11 +126,14 @@ export const selectSide = (
 }
 
 const percentPhrase = (
-  percent: number,
+  percent: number | undefined,
   more: string,
   fewer: string,
   equal: string,
 ): string => {
+  // percent is omitted only for a 0 → non-zero change (see MetricDelta.percent);
+  // absolute moved away from zero, so it reads as the "more"/increase case.
+  if (percent === undefined) return more
   const abs = Math.abs(percent).toFixed(1)
   if (percent > 0) return `${abs}% ${more}`
   if (percent < 0) return `${abs}% ${fewer}`

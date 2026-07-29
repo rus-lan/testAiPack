@@ -1,5 +1,6 @@
 import { Data, Effect } from 'effect'
 import type { PackType } from '@generated/types'
+import { redactUrlCredentials } from '../util/redact.js'
 
 export type PackSource = 'git' | 'npm' | 'local' | 'inline'
 
@@ -23,10 +24,27 @@ export class PackDetectError extends Data.TaggedError('PackDetectError')<{
   readonly reason: string
 }> {}
 
+/**
+ * A version of a pack ref safe to put into an error message or log context.
+ * An inline `mcp:<name>:<config>` ref's payload can carry provider secrets in
+ * its `env` block, so it is truncated to the `mcp:<name>` prefix. Every other
+ * ref shape (URL, local path, plugin name) has no comparable payload, but a
+ * git URL can still carry `user:token@host` credentials, so those go through
+ * `redactUrlCredentials` instead of passing through unchanged.
+ */
+export const safeRefDisplay = (ref: string): string => {
+  const trimmed = ref.trim()
+  if (!trimmed.startsWith('mcp:')) return redactUrlCredentials(ref)
+  const rest = trimmed.slice('mcp:'.length)
+  const colonIdx = rest.indexOf(':')
+  return colonIdx === -1 ? trimmed : `mcp:${rest.slice(0, colonIdx)}`
+}
+
 const GIT_URL_RE = /^(https?|git\+https?|git\+ssh|ssh|git):\/\/[^\s]+(?:\.git)?$/
 const GIT_SCP_RE = /^git@[^@\s]+:[^@\s/]+\/[^@\s]+(?:\.git)?$/
 const GITHUB_SHORT_RE = /^github:([^/\s]+)\/([^/\s]+?)(?:\.git)?$/
-const NPM_NAME_RE = /^@?[A-Za-z0-9][A-Za-z0-9._-]*$/
+const NPM_NAME_RE = /^(?:@[A-Za-z0-9][A-Za-z0-9._-]*\/)?[A-Za-z0-9][A-Za-z0-9._-]*$/
+const SAFE_NAME_RE = /^[A-Za-z0-9._-]+$/
 
 const isGitUrl = (s: string): boolean =>
   GIT_URL_RE.test(s) || GIT_SCP_RE.test(s) || GITHUB_SHORT_RE.test(s)
@@ -142,6 +160,18 @@ export const detectPack = (ref: string): Effect.Effect<PackRef, PackDetectError>
           : new PackDetectError({ ref, reason: 'unexpected detection failure', ...(e === undefined ? {} : { cause: e }) }),
     })
     const { type, source, name, url, path: localPath, config } = detected
+    // npm names never become a directory segment (installPlugin passes them
+    // straight to `opencode plugin <name>`), so scoped names (`@scope/name`)
+    // stay valid there; every other source must resolve to one safe segment.
+    const nameIsSafe = source === 'npm' ? NPM_NAME_RE.test(name) : SAFE_NAME_RE.test(name) && name !== '.' && name !== '..'
+    if (!nameIsSafe) {
+      yield* Effect.fail(
+        new PackDetectError({
+          ref,
+          reason: `pack name must be a single safe path segment, got: ${name}`,
+        }),
+      )
+    }
     return {
       raw: ref,
       type,

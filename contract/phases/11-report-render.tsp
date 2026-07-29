@@ -6,7 +6,7 @@ namespace TestAiPack.ReportRender;
 
 @error
 model ReportRenderError {
-  code: "E_DISK_FULL";
+  code: "E_DISK_FULL" | "E_EXPORT_INVALID";
   message: string;
   context?: Record<unknown>;
 }

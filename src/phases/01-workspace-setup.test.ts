@@ -168,6 +168,30 @@ describe('workspaceSetup — manifest', () => {
     expect(result.manifest.opencodeVersion).toBe('9.9.9')
   })
 
+  it('redacts a credentialed repoUrl and a secret-bearing inline mcp packRef, in the returned manifest and on disk', async () => {
+    const { workspacePath } = await freshProject()
+    const result = await runP(
+      workspaceSetup({
+        runInput: makeRunInput({
+          workspacePath,
+          repoUrl: 'https://user:ghp_secrettoken@github.com/org/repo.git',
+          packRef: 'mcp:srv:{"env":{"API_KEY":"sk-fake-secret"}}',
+        }),
+        runId: 'rid',
+      }),
+    )
+    expect(result.manifest.repoUrl).not.toContain('ghp_secrettoken')
+    expect(result.manifest.repoUrl).not.toContain('user:')
+    expect(result.manifest.packRef).not.toContain('sk-fake-secret')
+    expect(result.manifest.packRef).not.toContain('API_KEY')
+    expect(result.manifest.packRef).toBe('mcp:srv')
+
+    const raw = await runP(readFile(path.join(result.rootPath, 'manifest.json')))
+    expect(raw).not.toContain('ghp_secrettoken')
+    expect(raw).not.toContain('sk-fake-secret')
+    expect(raw).not.toContain('API_KEY')
+  })
+
   it('falls back to "unknown" when the opencode version probe fails', async () => {
     versionMock.mockReturnValue(
       Effect.fail(new OpencodeError({ command: 'version', exitCode: 1, stderr: 'not found', stdout: '', timedOut: false })),
@@ -214,6 +238,16 @@ describe('workspaceSetup — .gitignore', () => {
     await runP(workspaceSetup({ runInput: makeRunInput({ workspacePath }), runId: 'rid' }))
     const gi = await runP(readFile(path.join(project, '.gitignore')))
     expect(gi).toBe('dist/\n.testaipack/\n')
+  })
+
+  it('uses the actual workspace dir name for a custom --workspace, not a hardcoded .testaipack/', async () => {
+    const project = makeTempDir()
+    await ensureDirP(project)
+    const workspacePath = path.join(project, 'myworkspace')
+    await runP(workspaceSetup({ runInput: makeRunInput({ workspacePath }), runId: 'rid' }))
+    const gi = await runP(readFile(path.join(project, '.gitignore')))
+    expect(gi).toContain('myworkspace/')
+    expect(gi).not.toContain('.testaipack/')
   })
 })
 

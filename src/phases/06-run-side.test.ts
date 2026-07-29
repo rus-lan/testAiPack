@@ -12,6 +12,7 @@ import {
   computeMaxConsecutiveSameTool,
   hasRateLimitSignal,
   DOOM_LOOP_THRESHOLD,
+  EXPORT_VALIDATION_MAX_RETRIES,
 } from './06-run-side.js'
 import type { AnalyzeInput } from './06-run-side.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
@@ -289,6 +290,28 @@ describe('phase 06 — run-side', () => {
     expect(exported).toBe(validExport())
   })
 
+  it('failing --init exit code is not masked by a successful --prompt', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    let call = 0
+    runMock.mockImplementation((opts: { onEvent?: (e: unknown) => void }) => {
+      call += 1
+      if (call === 1) {
+        return Effect.fail(
+          new OpencodeError({ command: 'run', exitCode: 1, stderr: 'init failed', stdout: '', timedOut: false }),
+        )
+      }
+      opts.onEvent?.(stepFinish('stop'))
+      return Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 5, timedOut: false })
+    })
+    const input = buildInput(root, { runInput: { init: 'setup first' } })
+    const result = await runP(runSide(input))
+    expect(result.exitCode).toBe(1)
+    expect(result.successRank).toBe(0)
+    expect(result.finishCause).toBe('error')
+    expect(result.errorCode).toBe('E_RUN_CRASH')
+  })
+
   it('hang (watchdog) → watchdogTriggered true, rank 0, finish error, E_RUN_HANG_WATCHDOG', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
@@ -435,12 +458,27 @@ describe('phase 06 — run-side', () => {
     expect(err.phase).toBe('run-side')
   })
 
-  it('export.json invalid (schema mismatch) → E_EXPORT_INVALID', async () => {
+  it('export.json invalid (schema mismatch) → E_EXPORT_INVALID after exhausting retries', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     exportMock.mockImplementation(() => Effect.succeed('{"not":"valid export"}'))
     const err = await runFlip(runSide(buildInput(root)))
     expect(err.code).toBe('E_EXPORT_INVALID')
+    expect(exportMock.mock.calls.length).toBe(EXPORT_VALIDATION_MAX_RETRIES + 1)
+  })
+
+  it('export retries past truncated/invalid JSON and succeeds once a fresh export is valid', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    exportMock
+      .mockImplementationOnce(() => Effect.succeed('{"info":{"id":"trunc'))
+      .mockImplementationOnce(() => Effect.succeed('{"not":"valid export"}'))
+      .mockImplementation(() => Effect.succeed(validExport()))
+    const result = await runP(runSide(buildInput(root)))
+    expect(result.successRank).toBe(4)
+    expect(exportMock.mock.calls.length).toBe(3)
+    const exported = await runP(readFile(result.exportPath))
+    expect(exported).toBe(validExport())
   })
 
   it('missing app cwd → E_RUN_CRASH', async () => {
@@ -757,6 +795,118 @@ describe('phase 06 — run-side', () => {
     const circular: Record<string, unknown> = { type: 'text' }
     circular['self'] = circular
     expect(hasRateLimitSignal([circular])).toBe(false)
+  })
+
+  it('hasRateLimitSignal ignores a callID that happens to contain 429', () => {
+    const toolEvent = {
+      type: 'tool_use',
+      part: {
+        type: 'tool',
+        tool: 'read',
+        callID: 'call_d64e471b16ba429d870a415c',
+        state: { status: 'completed', input: {} },
+      },
+    }
+    expect(hasRateLimitSignal([toolEvent])).toBe(false)
+  })
+
+  it('hasRateLimitSignal ignores 429 inside a successfully read file\'s content', () => {
+    const toolEvent = {
+      type: 'tool_use',
+      part: {
+        type: 'tool',
+        tool: 'read',
+        callID: 'c',
+        state: { status: 'completed', input: {}, output: '<content>\nport 429 is reserved\n</content>' },
+      },
+    }
+    expect(hasRateLimitSignal([toolEvent])).toBe(false)
+  })
+
+  it('hasRateLimitSignal ignores a token count equal to 429', () => {
+    const stepFinishEvent = {
+      type: 'step-finish',
+      reason: 'stop',
+      tokens: { input: 10, output: 429, reasoning: 0, cache: { read: 0, write: 0 } },
+    }
+    expect(hasRateLimitSignal([stepFinishEvent])).toBe(false)
+  })
+
+  it('hasRateLimitSignal still detects 429 in a failed tool call (state.error, not state.output)', () => {
+    // real shape (opencode 1.18.3, message.part.updated -> ToolStateError.make):
+    // { status: "error", error, input, structured, content, result } — no `output` field at all.
+    const toolEvent = {
+      type: 'tool_use',
+      part: {
+        type: 'tool',
+        tool: 'bash',
+        callID: 'c',
+        state: {
+          status: 'error',
+          error: 'Error: 429 Too Many Requests',
+          input: {},
+          structured: {},
+          content: [],
+          result: undefined,
+        },
+      },
+    }
+    expect(hasRateLimitSignal([toolEvent])).toBe(true)
+  })
+
+  it('hasRateLimitSignal ignores a token/callID-shaped 429 on a failed tool call (only state.error/state.output text counts)', () => {
+    const toolEvent = {
+      type: 'tool_use',
+      part: {
+        type: 'tool',
+        tool: 'bash',
+        callID: 'call_d64e471b16ba429d870a415c',
+        state: {
+          status: 'error',
+          error: 'Cancelled',
+          input: {},
+          structured: {},
+          content: [],
+          result: undefined,
+        },
+      },
+    }
+    expect(hasRateLimitSignal([toolEvent])).toBe(false)
+  })
+
+  it('hasRateLimitSignal detects 429 in the top-level provider-error event', () => {
+    // real shape (opencode 1.18.3 CLI printer, Z("error", {error: J.error}) on a
+    // session.error): { type: "error", timestamp, sessionID, error: { name, data: { message } } }
+    const errorEvent = {
+      type: 'error',
+      timestamp: 1784932035873,
+      sessionID: 'ses_069c2fdafffepsciAOGZjzBvif',
+      error: {
+        name: 'ProviderRateLimitError',
+        data: { message: 'HTTP 429: Too Many Requests' },
+      },
+    }
+    expect(hasRateLimitSignal([errorEvent])).toBe(true)
+  })
+
+  it('hasRateLimitSignal falls back to error.name when the provider-error event has no data.message', () => {
+    const errorEvent = {
+      type: 'error',
+      timestamp: 1784932035873,
+      sessionID: 'ses_069c2fdafffepsciAOGZjzBvif',
+      error: { name: 'rate_limit_error' },
+    }
+    expect(hasRateLimitSignal([errorEvent])).toBe(true)
+  })
+
+  it('hasRateLimitSignal ignores a provider-error event unrelated to rate limits', () => {
+    const errorEvent = {
+      type: 'error',
+      timestamp: 1784932035873,
+      sessionID: 'ses_069c2fdafffepsciAOGZjzBvif',
+      error: { name: 'ContextOverflowError', data: { message: 'context window exceeded' } },
+    }
+    expect(hasRateLimitSignal([errorEvent])).toBe(false)
   })
 
   it('makeSessionId format: <runId>-<side>-<runIndex>-<hex>', () => {

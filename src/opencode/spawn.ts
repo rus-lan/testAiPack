@@ -1,6 +1,12 @@
 import { Effect } from 'effect'
 import { spawn as nodeSpawn, execFile as nodeExecFile } from 'node:child_process'
 
+/** How long to wait after SIGTERM before forcing SIGKILL on a child that ignores it. */
+const KILL_GRACE_MS = 5000
+
+const MAX_BUFFER_BYTES = 16 * 1024 * 1024
+const MAX_BUFFER_ERROR_CODE = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
+
 export interface SpawnInput {
   readonly command: string
   readonly args: readonly string[]
@@ -29,6 +35,8 @@ export interface ExecOutput {
   readonly stdout: string
   readonly stderr: string
   readonly exitCode: number
+  /** The raw non-numeric error code (e.g. `ENOENT`) when `exitCode` falls back to -1. */
+  readonly spawnErrorCode?: string
 }
 
 export const spawnProcess = (input: SpawnInput): Effect.Effect<SpawnOutput> =>
@@ -46,9 +54,12 @@ export const spawnProcess = (input: SpawnInput): Effect.Effect<SpawnOutput> =>
     let stderrClosed = false
     let procExited = false
 
+    let killTimer: ReturnType<typeof setTimeout> | undefined
+
     const finish = (out: SpawnOutput): void => {
       if (settled) return
       settled = true
+      if (timer) clearTimeout(timer)
       resume(Effect.succeed(out))
     }
 
@@ -64,20 +75,27 @@ export const spawnProcess = (input: SpawnInput): Effect.Effect<SpawnOutput> =>
       }
     }
 
-    const timer =
-      input.timeoutMs === undefined
-        ? undefined
-        : setTimeout(() => {
-            timedOut = true
-            controller.abort()
-          }, input.timeoutMs)
-
     const child = nodeSpawn(input.command, [...input.args], {
       cwd: input.cwd,
       env: input.env,
       signal: controller.signal,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
+
+    const abortThenEscalate = (): void => {
+      controller.abort()
+      killTimer = setTimeout(() => {
+        if (!procExited) child.kill('SIGKILL')
+      }, KILL_GRACE_MS)
+    }
+
+    const timer =
+      input.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true
+            abortThenEscalate()
+          }, input.timeoutMs)
 
     const onStdoutLine = input.onStdoutLine
     child.stdout.setEncoding('utf8')
@@ -123,11 +141,11 @@ export const spawnProcess = (input: SpawnInput): Effect.Effect<SpawnOutput> =>
     child.on('exit', (code) => {
       procExited = true
       exitCode = code
+      if (killTimer) clearTimeout(killTimer)
       maybeFinish()
     })
 
     child.on('error', (err) => {
-      if (timer) clearTimeout(timer)
       finish({
         stdout: stdoutChunks.join(''),
         stderr: `${stderrStr}${stderrStr ? '\n' : ''}spawn error: ${err.message}`,
@@ -139,7 +157,7 @@ export const spawnProcess = (input: SpawnInput): Effect.Effect<SpawnOutput> =>
 
     return Effect.sync(() => {
       if (timer) clearTimeout(timer)
-      controller.abort()
+      abortThenEscalate()
     })
   })
 
@@ -153,19 +171,32 @@ export const execCmd = (input: ExecInput): Effect.Effect<ExecOutput> =>
       {
         cwd: input.cwd,
         env: input.env,
-        encoding: 'utf8' as BufferEncoding,
-        maxBuffer: 16 * 1024 * 1024,
+        encoding: 'utf8',
+        maxBuffer: MAX_BUFFER_BYTES,
         signal: controller.signal,
       },
       (err, stdout, stderr) => {
         if (settled) return
         settled = true
+        if (err !== null && err.code === MAX_BUFFER_ERROR_CODE) {
+          resume(
+            Effect.succeed({
+              stdout,
+              stderr: `${stderr}${stderr ? '\n' : ''}output exceeded max buffer size (${String(MAX_BUFFER_BYTES)} bytes)`,
+              exitCode: -1,
+              spawnErrorCode: MAX_BUFFER_ERROR_CODE,
+            }),
+          )
+          return
+        }
         const exitCode = err === null ? 0 : typeof err.code === 'number' ? err.code : -1
+        const spawnErrorCode = err !== null && typeof err.code === 'string' ? err.code : undefined
         resume(
           Effect.succeed({
             stdout,
             stderr,
             exitCode,
+            ...(spawnErrorCode === undefined ? {} : { spawnErrorCode }),
           }),
         )
       },

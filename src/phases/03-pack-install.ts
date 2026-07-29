@@ -14,7 +14,7 @@ import { Effect } from 'effect'
 import { Duration } from 'effect'
 import path from 'node:path'
 import type { PackInstallInput, PackInstallResult, PackType } from '@generated/types'
-import { detectPack } from '../pack/detector.js'
+import { detectPack, safeRefDisplay } from '../pack/detector.js'
 import type { PackDetectError, PackRef } from '../pack/detector.js'
 import { clone } from '../util/git.js'
 import type { GitError } from '../util/git.js'
@@ -24,6 +24,7 @@ import {
   copyFile,
   ensureDir,
   exists,
+  isPathWithin,
   pathKind,
   readDir,
   readFile,
@@ -31,6 +32,7 @@ import {
   writeFile,
 } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
+import { redactUrlCredentials } from '../util/redact.js'
 import { packInstallError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
 
@@ -77,7 +79,7 @@ const failPack = (
   packRef: string,
   context?: Record<string, unknown>,
 ): Effect.Effect<never, PhaseError> =>
-  Effect.fail(packInstallError(message, code, { packRef, ...(context ?? {}) }))
+  Effect.fail(packInstallError(message, code, { packRef: safeRefDisplay(packRef), ...(context ?? {}) }))
 
 const appendLog = (logPath: string, line: string): Effect.Effect<void, PhaseError> =>
   appendFile(logPath, line).pipe(
@@ -89,9 +91,9 @@ const appendLog = (logPath: string, line: string): Effect.Effect<void, PhaseErro
   )
 
 const mapCloneError = (url: string) => (e: GitError): PhaseError =>
-  packInstallError(`git clone failed: ${e.stderr}`, 'E_INSTALL_FAILED', {
-    ref: url,
-    ...(e.stderr.length > 0 ? { stderr: e.stderr } : {}),
+  packInstallError(`git clone failed: ${redactUrlCredentials(e.stderr)}`, 'E_INSTALL_FAILED', {
+    ref: redactUrlCredentials(url),
+    ...(e.stderr.length > 0 ? { stderr: redactUrlCredentials(e.stderr) } : {}),
   })
 
 const mapCopyError = (src: string) => (e: FsError): PhaseError =>
@@ -119,14 +121,28 @@ const withTimeout = (
     ),
   )
 
-const cleanDest = (dest: string): Effect.Effect<void, PhaseError> =>
-  removeDir(dest).pipe(
-    Effect.mapError((e: FsError) =>
-      packInstallError(`cannot clean pack dest: ${e.path}`, 'E_INSTALL_FAILED', {
-        path: e.path,
-      }),
-    ),
-  )
+const cleanDest = (
+  packDir: string,
+  dest: string,
+  packRef: string,
+): Effect.Effect<void, PhaseError> =>
+  Effect.gen(function* () {
+    if (!isPathWithin(packDir, dest)) {
+      yield* Effect.fail(
+        packInstallError(`pack destination escapes pack dir: ${dest}`, 'E_PACK_INVALID_REF', {
+          packRef: safeRefDisplay(packRef),
+          path: dest,
+        }),
+      )
+    }
+    yield* removeDir(dest).pipe(
+      Effect.mapError((e: FsError) =>
+        packInstallError(`cannot clean pack dest: ${e.path}`, 'E_INSTALL_FAILED', {
+          path: e.path,
+        }),
+      ),
+    )
+  })
 
 const scanDir = (dir: string): Effect.Effect<readonly string[], PhaseError> =>
   readDir(dir).pipe(
@@ -139,17 +155,18 @@ const scanDir = (dir: string): Effect.Effect<readonly string[], PhaseError> =>
 
 const deliverDir = (
   ref: PackRef,
+  packDir: string,
   dest: string,
   seconds: number,
 ): Effect.Effect<void, PhaseError> =>
   Effect.gen(function* () {
-    yield* cleanDest(dest)
+    yield* cleanDest(packDir, dest, ref.raw)
     if (ref.source === 'git') {
       const url = ref.url ?? ''
       yield* withTimeout(
         clone(url, dest, { shallow: true }).pipe(Effect.mapError(mapCloneError(url))),
         seconds,
-        url,
+        redactUrlCredentials(url),
         'git clone',
       )
       return
@@ -221,7 +238,7 @@ const deliverSkill = (
 ): Effect.Effect<Delivery, PhaseError> =>
   Effect.gen(function* () {
     const dest = path.join(packDir, ref.name)
-    yield* deliverDir(ref, dest, seconds)
+    yield* deliverDir(ref, packDir, dest, seconds)
     const resolved = yield* resolveSkillRoot(dest, ref.name)
     if (resolved === null) {
       yield* failPack('E_PACK_INVALID_REF', `SKILL.md missing in pack ${ref.name}`, ref.raw, {
@@ -272,7 +289,7 @@ const deliverMd = (
     const name = ref.name.replace(/\.md$/, '')
     if (ref.source === 'git') {
       const dest = path.join(packDir, name)
-      yield* deliverDir(ref, dest, seconds)
+      yield* deliverDir(ref, packDir, dest, seconds)
       const mdPath = path.join(dest, `${name}.md`)
       if (!(yield* exists(mdPath))) {
         yield* failPack(
@@ -303,7 +320,7 @@ const deliverMd = (
       }
     }
     const dest = path.join(packDir, name)
-    yield* cleanDest(dest)
+    yield* cleanDest(packDir, dest, ref.raw)
     yield* withTimeout(copyDir(src, dest).pipe(Effect.mapError(mapCopyError(src))), seconds, src, 'copy')
     const mdPath = path.join(dest, `${name}.md`)
     if (!(yield* exists(mdPath))) {
@@ -370,12 +387,25 @@ const scanMd = (
     }
   })
 
+/** opencode loads a plugin from a single `<name>.js`-style module file (see phase 04/05). */
+const PLUGIN_FILE_RE = /\.(?:m?[jt]s|cjs)$/
+
 const scanPlugins = (pluginsDir: string): Effect.Effect<ScanResult, PhaseError> =>
   Effect.gen(function* () {
     const entries = yield* scanDir(pluginsDir)
-    const instructions = entries.map(
-      (name): RegistrationInstruction => ({ kind: 'plugin', name }),
+    const nested = yield* Effect.forEach(
+      entries,
+      (entry) =>
+        Effect.gen(function* () {
+          if (!PLUGIN_FILE_RE.test(entry)) return [] as readonly RegistrationInstruction[]
+          const kind = yield* pathKind(path.join(pluginsDir, entry))
+          if (kind !== 'file') return [] as readonly RegistrationInstruction[]
+          const name = entry.replace(PLUGIN_FILE_RE, '')
+          return [{ kind: 'plugin', name }] as readonly RegistrationInstruction[]
+        }),
+      { concurrency: 1 },
     )
+    const instructions = nested.flat()
     return {
       sections: instructions.length > 0 ? ['plugins'] : [],
       instructions,
@@ -398,7 +428,7 @@ const deliverAll = (
 ): Effect.Effect<Delivery, PhaseError> =>
   Effect.gen(function* () {
     const dest = path.join(packDir, ref.name)
-    yield* deliverDir(ref, dest, seconds)
+    yield* deliverDir(ref, packDir, dest, seconds)
     const parts = yield* Effect.all([
       maybeScan(path.join(dest, 'skills'), scanSkills),
       maybeScan(path.join(dest, 'agents'), (d) => scanMd(d, 'agents')),
@@ -412,18 +442,34 @@ const deliverAll = (
     }
   })
 
+const jsonParseErrorPosition = (e: unknown): number | undefined => {
+  if (!(e instanceof Error)) return undefined
+  const match = /position (\d+)/.exec(e.message)
+  return match?.[1] === undefined ? undefined : Number(match[1])
+}
+
+/**
+ * mcp configs routinely carry provider API keys/tokens in their `env` block,
+ * so a parse failure must never echo the raw text. It also can't reuse
+ * `JSON.parse`'s own error message verbatim: V8 quotes a snippet of the input
+ * when the bad token is at the very start of the string (no valid JSON
+ * recognized yet), which would leak the same secret through a different
+ * door. Only the pack name, length, and a numeric position are safe to keep.
+ */
 const parseJsonConfig = (
   text: string,
-  packRef: string,
+  packName: string,
 ): Effect.Effect<unknown, PhaseError> =>
   Effect.try({
     try: () => JSON.parse(text) as unknown,
-    catch: (e): PhaseError =>
-      packInstallError(
-        `invalid mcp config json: ${text}`,
+    catch: (e): PhaseError => {
+      const position = jsonParseErrorPosition(e)
+      return packInstallError(
+        `mcp config for ${packName} is not valid JSON${position === undefined ? '' : ` (near position ${String(position)})`}`,
         'E_PACK_INVALID_REF',
-        { packRef, reason: e instanceof Error ? e.message : String(e) },
-      ),
+        { pack: packName, length: text.length, ...(position === undefined ? {} : { position }) },
+      )
+    },
   })
 
 const resolveMcpConfigText = (
@@ -443,7 +489,7 @@ const resolveMcpConfigText = (
         return yield* readFile(filePath).pipe(
           Effect.mapError((e: FsError) =>
             packInstallError(`cannot read mcp config file: ${e.path}`, 'E_PACK_INVALID_REF', {
-              packRef: ref.raw,
+              packRef: safeRefDisplay(ref.raw),
               file: e.path,
             }),
           ),
@@ -494,7 +540,7 @@ const deliverMcp = (
     }
 
     const resolved = configText ?? ''
-    const parsed = yield* parseJsonConfig(resolved, ref.raw)
+    const parsed = yield* parseJsonConfig(resolved, ref.name)
     yield* writeFile(path.join(packDir, 'mcp.json'), resolved).pipe(
       Effect.mapError((e: FsError) =>
         packInstallError(`cannot persist mcp.json: ${e.path}`, 'E_INSTALL_FAILED', { path: e.path }),
@@ -570,7 +616,7 @@ export const packInstall = (
         packInstallError(
           `invalid pack reference: ${e.reason}`,
           'E_PACK_INVALID_REF',
-          { packRef, reason: e.reason },
+          { packRef: safeRefDisplay(packRef), reason: e.reason },
         ),
       ),
     )

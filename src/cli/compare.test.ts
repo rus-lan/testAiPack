@@ -352,6 +352,20 @@ describe('cli/compare — pure helpers', () => {
     expect(headline).toContain('fewer tokens')
     expect(headline).toContain('lower success rank')
   })
+
+  it('buildCompareHeadline handles an omitted percent (0 -> non-zero change) without "NaN%"', () => {
+    const headline = buildCompareHeadline({
+      totalTokens: { absolute: 500, significant: true, better: 'worse' },
+      wallClockMs: { absolute: -1000, percent: -5, significant: false, better: 'better' },
+      costUsd: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      stepCount: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      toolCallCount: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      successRank: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      maxParallelism: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+    })
+    expect(headline).not.toContain('NaN')
+    expect(headline).toContain('more tokens')
+  })
 })
 
 describe('cli/compare — renderers', () => {

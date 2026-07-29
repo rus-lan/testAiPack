@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { Effect } from 'effect'
+import { Effect, Fiber } from 'effect'
 import { existsSync } from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
 import { judge, parseJudgeResponse, buildJudgePrompt } from './09-judge.js'
 import { makeTempDir } from '../../tests/setup.js'
-import { readFile } from '../util/fs.js'
+import { readFile, writeFile, ensureDir, removeDir } from '../util/fs.js'
 import type {
   DiffResult,
   DiffRunResult,
@@ -194,7 +196,8 @@ const PARSE_CASES: readonly ParseCase[] = [
   { name: 'quality out of range high', raw: '{"verdict":"ok","oldQuality":15,"newQuality":5,"explanation":"x"}', expect: { verdict: 'ok', oldQuality: 10, newQuality: 5, explanation: 'x' } },
   { name: 'quality out of range low', raw: '{"verdict":"ok","oldQuality":-1,"newQuality":5,"explanation":"x"}', expect: { verdict: 'ok', oldQuality: 0, newQuality: 5, explanation: 'x' } },
   { name: 'quality clamps both extremes', raw: '{"verdict":"ok","oldQuality":-5,"newQuality":42,"explanation":"x"}', expect: { verdict: 'ok', oldQuality: 0, newQuality: 10, explanation: 'x' } },
-  { name: 'quality not integer', raw: '{"verdict":"ok","oldQuality":5.5,"newQuality":5,"explanation":"x"}', expect: null },
+  { name: 'quality fractional is accepted and rounded', raw: '{"verdict":"ok","oldQuality":5.5,"newQuality":8.4,"explanation":"x"}', expect: { verdict: 'ok', oldQuality: 6, newQuality: 8, explanation: 'x' } },
+  { name: 'quality not a number', raw: '{"verdict":"ok","oldQuality":"5","newQuality":5,"explanation":"x"}', expect: null },
   { name: 'explanation not string', raw: '{"verdict":"ok","oldQuality":5,"newQuality":5,"explanation":42}', expect: null },
   { name: 'not an object', raw: '[1,2,3]', expect: null },
 ]
@@ -229,6 +232,16 @@ describe('buildJudgePrompt', () => {
     const runInput = without(makeRunInput({}), 'packRef')
     const prompt = buildJudgePrompt(runInput, 'a', 'b')
     expect(prompt).toContain('with pack: n/a')
+  })
+
+  it('redacts an inline mcp: packRef instead of sending its secret config to the judge model', () => {
+    const dangerousPackRef = 'mcp:myserver:{"env":{"API_KEY":"sk-secret-12345"}}'
+    const runInput = makeRunInput({ packRef: dangerousPackRef })
+    const prompt = buildJudgePrompt(runInput, 'a', 'b')
+    expect(prompt).not.toContain('sk-secret-12345')
+    expect(prompt).not.toContain('API_KEY')
+    expect(prompt).not.toContain('{"env"')
+    expect(prompt).toContain('with pack: mcp:myserver')
   })
 
   it('truncates patches larger than 100KB to 50KB with a notice', () => {
@@ -308,8 +321,55 @@ describe('judge — happy path', () => {
     expect(prompt).toContain('+new')
     expect(prompt).toContain('Judge which side is better.')
     expect(opts!.model).toBe('cheap/judge-model')
-    expect(opts!.agent).toBe('build')
+    expect(opts!.agent).toBe('plan')
+    expect(opts!.auto).toBe(false)
+    expect(opts!.cwd).not.toBe(opts!.homeDir)
+    expect(opts!.cwd).toContain('testaipack-judge')
     expect(opts!.timeoutMs).toBe(30 * 1000)
+  })
+
+  it('scratch cwd is removed again after the judge call finishes', async () => {
+    await runP(judge(buildInput({})))
+    const opts = runMock.mock.calls[0]?.[0]
+    expect(existsSync(opts!.cwd)).toBe(false)
+  })
+
+  it('degrades to unclear (no shared-tmp fallback, no opencode call) when the scratch dir cannot be created', async () => {
+    const runId = 'rid-judge-scratch-blocked'
+    const scratchDir = path.join(os.tmpdir(), 'testaipack-judge', runId)
+    await runP(ensureDir(path.dirname(scratchDir)))
+    await runP(writeFile(scratchDir, 'a plain file blocking the scratch dir path'))
+    try {
+      const input = { ...buildInput({}), manifest: { ...fakeManifest, runId } }
+      const result = await runP(judge(input))
+      const j = result.judge as JudgeResult
+      expect(j.verdict).toBe('unclear')
+      expect(j.explanation).toContain('scratch directory')
+      expect(runMock).not.toHaveBeenCalled()
+    } finally {
+      await runP(removeDir(scratchDir))
+    }
+  })
+
+  it('cleans up the scratch dir even when the judge call is interrupted mid-run', async () => {
+    const runId = 'rid-judge-interrupted'
+    const scratchDir = path.join(os.tmpdir(), 'testaipack-judge', runId)
+    runMock.mockImplementation(() => Effect.never)
+    const input = { ...buildInput({}), manifest: { ...fakeManifest, runId } }
+
+    const fiber = Effect.runFork(judge(input))
+    let created = false
+    for (let i = 0; i < 50; i++) {
+      if (existsSync(scratchDir)) {
+        created = true
+        break
+      }
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    expect(created).toBe(true)
+
+    await Effect.runPromise(Fiber.interrupt(fiber))
+    expect(existsSync(scratchDir)).toBe(false)
   })
 
   it('no preflightModel → model option omitted', async () => {

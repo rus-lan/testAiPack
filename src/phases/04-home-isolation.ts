@@ -24,8 +24,8 @@ import type {
 } from '@generated/types'
 import type { PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
 import { installPlugin } from '../opencode/cli.js'
-import type { OpencodeError } from '../opencode/cli.js'
-import { copyDir, copyFile, ensureDir, exists, pathKind, readFile, removeDir, symlink, writeFile, writeJson } from '../util/fs.js'
+import type { DockerExec, OpencodeError } from '../opencode/cli.js'
+import { copyDir, copyFile, ensureDir, exists, isPathWithin, pathKind, readFile, removeDir, symlink, writeFile, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
@@ -185,26 +185,55 @@ const readOpendcodeConfig = (
     }
   })
 
+const isStringArray = (v: unknown): v is readonly string[] =>
+  Array.isArray(v) && v.every((x) => typeof x === 'string')
+
+export interface SourceConnectivity {
+  readonly model: string | undefined
+  readonly provider: Record<string, unknown> | undefined
+  readonly smallModel: string | undefined
+  readonly enabledProviders: readonly string[] | undefined
+  readonly disabledProviders: readonly string[] | undefined
+}
+
+const EMPTY_CONNECTIVITY: SourceConnectivity = {
+  model: undefined,
+  provider: undefined,
+  smallModel: undefined,
+  enabledProviders: undefined,
+  disabledProviders: undefined,
+}
+
 /**
- * Read the `model` field from the user's source opencode.json so the isolated
- * runs use the same authenticated provider/model the user configured. Without
- * this, OPENCODE_CONFIG_CONTENT replaces the config with a model-less one and
- * opencode falls back to its default provider, which is typically not
- * authenticated for the isolated HOME (e.g. GitHub Copilot → 400). Returns
- * undefined when the source config is absent or has no `model`.
+ * Read the connectivity/model-selection fields from the user's source
+ * opencode.json in one pass: `model`, `small_model`, `provider`,
+ * `enabled_providers`, `disabled_providers`. The isolated config is built
+ * from scratch, so without these an isolated run has no way to know a custom
+ * provider exists (e.g. a local model server), which model to use, or that
+ * the user's real config gates providers at all — even though all of it
+ * lives in the same real config file. Every field is independently optional;
+ * an unexpected shape for any one field is treated the same as absent rather
+ * than thrown. Returns all-undefined when the source config itself is
+ * absent or unreadable.
  */
-const readSourceModel = (sourceHome: string): Effect.Effect<string | undefined, PhaseError> =>
+const readSourceConnectivity = (sourceHome: string): Effect.Effect<SourceConnectivity, PhaseError> =>
   Effect.gen(function* () {
     const cfgPath = path.join(sourceHome, '.config/opencode/opencode.json')
-    if (!(yield* exists(cfgPath))) return undefined
+    if (!(yield* exists(cfgPath))) return EMPTY_CONNECTIVITY
     const raw = yield* readFile(cfgPath).pipe(Effect.catchAll(() => Effect.succeed('')))
-    if (raw === '') return undefined
+    if (raw === '') return EMPTY_CONNECTIVITY
     try {
       const obj = JSON.parse(raw) as unknown
-      const m = isRecord(obj) ? obj['model'] : undefined
-      return typeof m === 'string' ? m : undefined
+      if (!isRecord(obj)) return EMPTY_CONNECTIVITY
+      return {
+        model: typeof obj['model'] === 'string' ? obj['model'] : undefined,
+        provider: isRecord(obj['provider']) ? obj['provider'] : undefined,
+        smallModel: typeof obj['small_model'] === 'string' ? obj['small_model'] : undefined,
+        enabledProviders: isStringArray(obj['enabled_providers']) ? obj['enabled_providers'] : undefined,
+        disabledProviders: isStringArray(obj['disabled_providers']) ? obj['disabled_providers'] : undefined,
+      }
     } catch {
-      return undefined
+      return EMPTY_CONNECTIVITY
     }
   })
 
@@ -221,11 +250,21 @@ const applyInstruction = (
   inst: RegistrationInstruction,
   homeDir: string,
   installSeconds: number,
+  docker: DockerExec | undefined,
 ): Effect.Effect<void, PhaseError> => {
   switch (inst.kind) {
     case 'symlink':
       return Effect.gen(function* () {
-        const linkPath = path.join(homeDir, '.config/opencode/skills', inst.name)
+        const skillsDir = path.join(homeDir, '.config/opencode/skills')
+        const linkPath = path.join(skillsDir, inst.name)
+        if (!isPathWithin(skillsDir, linkPath)) {
+          yield* Effect.fail(
+            setupFail(`skill link escapes skills dir: ${linkPath}`, {
+              name: inst.name,
+              path: linkPath,
+            }),
+          )
+        }
         yield* removeDir(linkPath).pipe(Effect.catchAll(() => Effect.void))
         yield* symlink(inst.target, linkPath).pipe(
           Effect.mapError((e: FsError) =>
@@ -255,7 +294,7 @@ const applyInstruction = (
         )
       })
     case 'plugin':
-      return installPlugin(homeDir, inst.name).pipe(
+      return installPlugin(homeDir, inst.name, ...(docker === undefined ? [] : [docker])).pipe(
         Effect.mapError((e: OpencodeError) =>
           homeIsolationError(`opencode plugin failed: ${e.stderr}`, 'E_PACK_INSTALL_FAILED', {
             module: inst.name,
@@ -321,15 +360,28 @@ const collectMcpServers = (
   )
 }
 
+/** Connectivity/model-selection fields copied as-is (no CLI override) into both sides' configs. */
+export interface ConnectivityExtras {
+  readonly provider: Record<string, unknown> | undefined
+  readonly smallModel: string | undefined
+  readonly enabledProviders: readonly string[] | undefined
+  readonly disabledProviders: readonly string[] | undefined
+}
+
 const buildConfigObject = (
   side: Side,
   pack: PackInfo | undefined,
   mcpServers: Record<string, unknown>,
   model: string | undefined,
+  extras: ConnectivityExtras,
 ): Record<string, unknown> => {
   const base: Record<string, unknown> = {
     $schema: 'https://opencode.ai/config.json',
     ...(model === undefined ? {} : { model }),
+    ...(extras.provider === undefined ? {} : { provider: extras.provider }),
+    ...(extras.smallModel === undefined ? {} : { small_model: extras.smallModel }),
+    ...(extras.enabledProviders === undefined ? {} : { enabled_providers: [...extras.enabledProviders] }),
+    ...(extras.disabledProviders === undefined ? {} : { disabled_providers: [...extras.disabledProviders] }),
     agent: {
       build: {
         mode: 'primary',
@@ -371,6 +423,7 @@ export const homeIsolation = (
     const isolation = input.runInput.isolation
     const dockerImage =
       isolation === 'docker' ? (input.dockerImage ?? DEFAULT_OPENCODE_IMAGE) : undefined
+    const docker: DockerExec | undefined = dockerImage === undefined ? undefined : { image: dockerImage }
     const runs = input.runInput.runs
     const sourceHome = os.homedir()
     const authFlags = input.runInput.auth
@@ -378,9 +431,16 @@ export const homeIsolation = (
     const packOutcome = input.packInstall
     const packInfo = packOutcome === undefined ? undefined : packInfoFrom(packOutcome)
     const mcpServers = collectMcpServers(packOutcome?.instructions)
-    const sourceModel = yield* readSourceModel(sourceHome)
-    const baselineObj = buildConfigObject('old', packInfo, mcpServers, sourceModel)
-    const newObj = buildConfigObject('new', packInfo, mcpServers, sourceModel)
+    const sourceConnectivity = yield* readSourceConnectivity(sourceHome)
+    const runModel = input.runInput.model ?? sourceConnectivity.model
+    const connectivityExtras: ConnectivityExtras = {
+      provider: sourceConnectivity.provider,
+      smallModel: sourceConnectivity.smallModel,
+      enabledProviders: sourceConnectivity.enabledProviders,
+      disabledProviders: sourceConnectivity.disabledProviders,
+    }
+    const baselineObj = buildConfigObject('old', packInfo, mcpServers, runModel, connectivityExtras)
+    const newObj = buildConfigObject('new', packInfo, mcpServers, runModel, connectivityExtras)
     const baselineCfg = JSON.stringify(baselineObj, null, 2)
     const newCfg = JSON.stringify(newObj, null, 2)
 
@@ -426,7 +486,7 @@ export const homeIsolation = (
               if (side === 'new' && packOutcome !== undefined) {
                 yield* Effect.forEach(
                   packOutcome.instructions,
-                  (inst) => applyInstruction(inst, homeDir, installSeconds),
+                  (inst) => applyInstruction(inst, homeDir, installSeconds, docker),
                   { concurrency: 1 },
                 )
               }

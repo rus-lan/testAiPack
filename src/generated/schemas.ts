@@ -66,6 +66,7 @@ export const runInputSchema = z.object({
   judgeFiles: z.array(z.string()).optional(),
   preflightEnabled: z.boolean(),
   preflightModel: z.string().optional(),
+  model: z.string().optional(),
   formats: z.array(outputFormatSchema),
   outputPath: z.string(),
   diffHtml: z.boolean(),
@@ -153,19 +154,6 @@ export const recordToolStatSchema = z.record(z.string(), toolStatSchema)
 
 export const recordInt32Schema = z.record(z.string(), z.number().int())
 
-export const fileChangeSchema = z.object({
-  path: z.string(),
-  additions: z.number().int(),
-  deletions: z.number().int(),
-})
-
-export const fileDiffStatsSchema = z.object({
-  additions: z.number().int(),
-  deletions: z.number().int(),
-  filesChanged: z.number().int(),
-  perFile: z.array(fileChangeSchema).optional(),
-})
-
 export const secondaryMetricsSchema = z.object({
   inputTokens: z.string(),
   outputTokens: z.string(),
@@ -177,7 +165,6 @@ export const secondaryMetricsSchema = z.object({
   stepLatencyP95Ms: z.string(),
   toolLatencyAvgMs: z.string(),
   finishCauseDistribution: recordInt32Schema,
-  fileDiffStats: fileDiffStatsSchema,
   maxConsecutiveSameTool: z.number().int(),
 })
 
@@ -246,7 +233,7 @@ export const sideAggregatesSchema = z.object({
 
 export const metricDeltaSchema = z.object({
   absolute: z.number(),
-  percent: z.number(),
+  percent: z.number().optional(),
   significant: z.boolean(),
   better: z.union([
     z.literal('better'),
@@ -323,6 +310,12 @@ export const diffInputSchema = z.object({
   runInput: runInputSchema,
   manifest: manifestSchema,
   workspace: workspaceTreeSchema,
+})
+
+export const fileChangeSchema = z.object({
+  path: z.string(),
+  additions: z.number().int(),
+  deletions: z.number().int(),
 })
 
 export const diffSummarySchema = z.object({
@@ -755,7 +748,7 @@ export const reportSchema = z.object({
 })
 
 export const reportRenderErrorSchema = z.object({
-  code: z.literal('E_DISK_FULL'),
+  code: z.union([z.literal('E_DISK_FULL'), z.literal('E_EXPORT_INVALID')]),
   message: z.string(),
   context: recordUnknownSchema.optional(),
 })

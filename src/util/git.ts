@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import type { DiffSummary, FileChange } from '@generated/types'
+import { redactUrlCredentials } from './redact.js'
 
 export interface DiffStat {
   readonly filesChanged: number
@@ -24,17 +25,25 @@ interface GitRunResult {
   readonly exitCode: number
 }
 
-const execGit = (args: readonly string[], cwd: string): Promise<GitRunResult> =>
-  new Promise((resolve) => {
+const execGit = (args: readonly string[], cwd: string): Effect.Effect<GitRunResult> =>
+  Effect.async<GitRunResult>((resume) => {
+    const controller = new AbortController()
+    let settled = false
     execFile(
       'git',
       [...args],
-      { cwd, maxBuffer: GIT_MAX_BUFFER },
+      { cwd, maxBuffer: GIT_MAX_BUFFER, signal: controller.signal },
       (err, stdout, stderr) => {
+        if (settled) return
+        settled = true
         const exitCode = err === null ? 0 : typeof err.code === 'number' ? err.code : -1
-        resolve({ stdout, stderr, exitCode })
+        resume(Effect.succeed({ stdout, stderr, exitCode }))
       },
     )
+    return Effect.sync(() => {
+      settled = true
+      controller.abort()
+    })
   })
 
 const runGit = (
@@ -43,18 +52,14 @@ const runGit = (
   cwd: string,
 ): Effect.Effect<{ readonly stdout: string; readonly stderr: string }, GitError> =>
   Effect.gen(function* () {
-    const result = yield* Effect.tryPromise({
-      try: () => execGit(args, cwd),
-      catch: (e) =>
-        new GitError({
-          command,
-          exitCode: -1,
-          stderr: `failed to spawn git: ${String(e)}`,
-        }),
-    })
+    const result = yield* execGit(args, cwd)
     if (result.exitCode !== 0) {
       yield* Effect.fail(
-        new GitError({ command, exitCode: result.exitCode, stderr: result.stderr }),
+        new GitError({
+          command,
+          exitCode: result.exitCode,
+          stderr: redactUrlCredentials(result.stderr),
+        }),
       )
     }
     return { stdout: result.stdout, stderr: result.stderr }
@@ -150,18 +155,18 @@ export const diffStatFull = (cwd: string): Effect.Effect<DiffSummary, GitError> 
   })
 
 export const revParseHead = (cwd: string): Effect.Effect<string, GitError> => {
-  if (!existsSync(path.join(cwd, '.git')) && !existsSync(cwd)) {
+  if (!existsSync(cwd) || !existsSync(path.join(cwd, '.git'))) {
     return Effect.fail(
-      new GitError({ command: 'rev-parse', exitCode: -1, stderr: 'cwd does not exist' }),
+      new GitError({ command: 'rev-parse', exitCode: -1, stderr: 'cwd does not exist or is not a git repo' }),
     )
   }
   return Effect.map(runGit('rev-parse', ['rev-parse', 'HEAD'], cwd), (r) => r.stdout.trim())
 }
 
 export const lsFilesStage = (cwd: string): Effect.Effect<string, GitError> => {
-  if (!existsSync(path.join(cwd, '.git')) && !existsSync(cwd)) {
+  if (!existsSync(cwd) || !existsSync(path.join(cwd, '.git'))) {
     return Effect.fail(
-      new GitError({ command: 'ls-files', exitCode: -1, stderr: 'cwd does not exist' }),
+      new GitError({ command: 'ls-files', exitCode: -1, stderr: 'cwd does not exist or is not a git repo' }),
     )
   }
   return Effect.map(runGit('ls-files', ['ls-files', '-s'], cwd), (r) => r.stdout)

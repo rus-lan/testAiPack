@@ -78,7 +78,6 @@ const emptySecondary = (): SecondaryMetrics => ({
   stepLatencyP95Ms: '0',
   toolLatencyAvgMs: '0',
   finishCauseDistribution: {},
-  fileDiffStats: { additions: 0, deletions: 0, filesChanged: 0 },
   maxConsecutiveSameTool: 0,
 })
 
@@ -88,28 +87,54 @@ interface PerToolMerge {
   readonly durSum: number
 }
 
+interface PerToolFold {
+  readonly key: string | null
+  readonly acc: PerToolMerge
+  readonly out: readonly (readonly [string, PerToolMerge])[]
+}
+
+const EMPTY_PER_TOOL_MERGE: PerToolMerge = { count: 0, errors: 0, durSum: 0 }
+
+const flushPerToolRun = (fold: PerToolFold): readonly (readonly [string, PerToolMerge])[] =>
+  fold.key === null ? fold.out : [...fold.out, [fold.key, fold.acc] as const]
+
+/**
+ * Merges per-run tool tables by name in one pass over all runs' entries
+ * sorted by name: the output list only grows on a name change (bounded by
+ * distinct tool count), not once per entry, so this stays O(n log n) instead
+ * of the "spread the whole map every entry" O(n^2) shape.
+ */
 const mergePerTool = (records: readonly Record<string, ToolStat>[]): Record<string, ToolStat> => {
-  const acc = records.reduce<Record<string, PerToolMerge>>((out, rec) => {
-    return Object.entries(rec).reduce<Record<string, PerToolMerge>>((inner, [name, stat]) => {
-      const prev = inner[name] ?? { count: 0, errors: 0, durSum: 0 }
+  const entries = records.flatMap((rec) => Object.entries(rec))
+  const sorted = [...entries].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+  const folded = sorted.reduce<PerToolFold>((fold, [name, stat]) => {
+    const inc: PerToolMerge = {
+      count: stat.count,
+      errors: Math.round(stat.errorRate * stat.count),
+      durSum: toNum(stat.avgDurationMs) * stat.count,
+    }
+    if (fold.key === name) {
       return {
-        ...inner,
-        [name]: {
-          count: prev.count + stat.count,
-          errors: prev.errors + Math.round(stat.errorRate * stat.count),
-          durSum: prev.durSum + toNum(stat.avgDurationMs) * stat.count,
+        ...fold,
+        acc: {
+          count: fold.acc.count + inc.count,
+          errors: fold.acc.errors + inc.errors,
+          durSum: fold.acc.durSum + inc.durSum,
         },
       }
-    }, out)
-  }, {})
-  return Object.entries(acc).reduce<Record<string, ToolStat>>((out, [name, v]) => ({
-    ...out,
-    [name]: {
-      count: v.count,
-      errorRate: v.count === 0 ? 0 : v.errors / v.count,
-      avgDurationMs: String(v.count === 0 ? 0 : Math.round(v.durSum / v.count)),
-    },
-  }), {})
+    }
+    return { key: name, acc: inc, out: flushPerToolRun(fold) }
+  }, { key: null, acc: EMPTY_PER_TOOL_MERGE, out: [] })
+  return Object.fromEntries(
+    flushPerToolRun(folded).map(([name, v]): readonly [string, ToolStat] => [
+      name,
+      {
+        count: v.count,
+        errorRate: v.count === 0 ? 0 : v.errors / v.count,
+        avgDurationMs: String(v.count === 0 ? 0 : Math.round(v.durSum / v.count)),
+      },
+    ]),
+  )
 }
 
 const mergeFinishCause = (records: readonly Record<string, number>[]): Record<string, number> =>
@@ -135,11 +160,6 @@ export const aggregateSecondary = (list: readonly SecondaryMetrics[]): Secondary
     stepLatencyP95Ms: numMedian(list.map((m) => m.stepLatencyP95Ms)),
     toolLatencyAvgMs: numMedian(list.map((m) => m.toolLatencyAvgMs)),
     finishCauseDistribution: mergeFinishCause(list.map((m) => m.finishCauseDistribution)),
-    fileDiffStats: {
-      additions: round(median(list.map((m) => m.fileDiffStats.additions))),
-      deletions: round(median(list.map((m) => m.fileDiffStats.deletions))),
-      filesChanged: round(median(list.map((m) => m.fileDiffStats.filesChanged))),
-    },
     maxConsecutiveSameTool: round(median(list.map((m) => m.maxConsecutiveSameTool))),
   }
 }
@@ -203,6 +223,16 @@ const betterOf = (absolute: number, direction: DeltaDirection): MetricDelta['bet
 }
 
 /**
+ * `percent` has no meaningful value for a 0 → non-zero change (mathematically
+ * an infinite percentage) — omitted rather than reported as the misleading
+ * `0`. `0 → 0` stays `0` (no change); every other baseline divides normally.
+ */
+const percentDelta = (oldValue: number, absolute: number): number | undefined => {
+  if (oldValue === 0) return absolute === 0 ? 0 : undefined
+  return (absolute / oldValue) * 100
+}
+
+/**
  * Single-metric delta. Exposed for table testing; `computeDelta` wires the
  * side-aggregate values + old-side IQR into it.
  */
@@ -213,10 +243,10 @@ export const computeMetricDelta = (
   direction: DeltaDirection,
 ): MetricDelta => {
   const absolute = newValue - oldValue
-  const percent = oldValue === 0 ? 0 : (absolute / oldValue) * 100
+  const percent = percentDelta(oldValue, absolute)
   return {
     absolute,
-    percent,
+    ...(percent === undefined ? {} : { percent }),
     significant: isSignificant(absolute, iqrVal),
     better: betterOf(absolute, direction),
   }
@@ -237,9 +267,10 @@ export const computeDelta = (oldAgg: SideAggregates, newAgg: SideAggregates): Me
   ): MetricDelta => {
     if (anyFailed) {
       const absolute = newValue - oldValue
+      const percent = percentDelta(oldValue, absolute)
       return {
         absolute,
-        percent: oldValue === 0 ? 0 : (absolute / oldValue) * 100,
+        ...(percent === undefined ? {} : { percent }),
         significant: false,
         better: 'neutral',
       }

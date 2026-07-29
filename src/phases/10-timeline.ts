@@ -188,6 +188,8 @@ const sameToolRun = (a: TimelineEvent, b: TimelineEvent): boolean => {
   const ta = toolNameOf(a)
   const tb = toolNameOf(b)
   return (
+    a.type === 'tool-call' &&
+    b.type === 'tool-call' &&
     ta !== undefined &&
     tb !== undefined &&
     ta === tb &&
@@ -197,21 +199,29 @@ const sameToolRun = (a: TimelineEvent, b: TimelineEvent): boolean => {
   )
 }
 
-export const collapseRepeats = (events: readonly TimelineEvent[]): readonly TimelineEvent[] =>
-  events.reduce<readonly TimelineEvent[]>((acc, e) => {
-    const last = acc[acc.length - 1]
-    if (last !== undefined && sameToolRun(last, e)) {
-      const mergedEnd = String(Math.max(Number(last.tEnd), Number(e.tEnd)))
-      const tokens = e.type === 'tool-call' ? sumTokens(last.tokens, e.tokens) : last.tokens
-      const merged: TimelineEvent = {
-        ...last,
-        tEnd: mergedEnd,
-        ...(tokens === undefined ? {} : { tokens }),
-      }
-      return [...acc.slice(0, -1), merged]
-    }
-    return [...acc, e]
-  }, [])
+const mergeRun = (run: readonly TimelineEvent[]): TimelineEvent =>
+  run.reduce((last, e) => {
+    const mergedEnd = String(Math.max(Number(last.tEnd), Number(e.tEnd)))
+    const tokens = e.type === 'tool-call' ? sumTokens(last.tokens, e.tokens) : last.tokens
+    return { ...last, tEnd: mergedEnd, ...(tokens === undefined ? {} : { tokens }) }
+  })
+
+/**
+ * Collapses each contiguous same-tool run via a single index-based scan
+ * (a run's start indices, then one `slice` + `reduce` per run) instead of
+ * rebuilding the whole output array on every event, which kept this O(n^2)
+ * over a timeline with thousands of events.
+ */
+export const collapseRepeats = (events: readonly TimelineEvent[]): readonly TimelineEvent[] => {
+  const runStarts = events.flatMap((e, i) => {
+    const prev = events[i - 1]
+    return prev !== undefined && sameToolRun(prev, e) ? [] : [i]
+  })
+  return runStarts.map((start, idx) => {
+    const end = runStarts[idx + 1] ?? events.length
+    return mergeRun(events.slice(start, end))
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Session tree (v0.2): walk `session.parent_id` to discover sub-agents spawned
@@ -241,11 +251,15 @@ const parseChildIds = (rows: unknown): readonly string[] => {
   })
 }
 
+/** opencode session ids are alphanumeric with `-`/`_`; anything else cannot be a real id. */
+const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]+$/
+
 const fetchChildIds = (
   homeDir: string,
   parentId: string,
 ): Effect.Effect<readonly string[], PhaseError> =>
   Effect.gen(function* () {
+    if (!SESSION_ID_PATTERN.test(parentId)) return []
     const rows = yield* dbQuery(
       homeDir,
       `SELECT id FROM session WHERE parent_id = '${parentId}'`,
@@ -410,14 +424,16 @@ const escapeHtml = (s: string): string =>
 
 type DiffFlag = 'only-old' | 'only-new' | null
 
-const toolClass = (tool: string | undefined): string => (tool === undefined ? '' : tool.toLowerCase())
+const toolClass = (tool: string | undefined): string =>
+  tool === undefined ? '' : escapeHtml(tool.toLowerCase().replace(/[^a-z0-9-]/g, ''))
 
 const PX_PER_MS = 0.5
 const MIN_PX = 4
+const MAX_PX = 2000
 
 const eventWidth = (e: TimelineEvent): number => {
   const duration = Math.max(0, Number(e.tEnd) - Number(e.tStart))
-  return Math.max(MIN_PX, Math.round(duration * PX_PER_MS))
+  return Math.min(MAX_PX, Math.max(MIN_PX, Math.round(duration * PX_PER_MS)))
 }
 
 const eventTooltip = (e: TimelineEvent): string => {
@@ -532,16 +548,16 @@ interface Swimlane {
  * first-appearance order (the events arrive already sorted by runIndex/tStart,
  * so the root lane surfaces before its children). Each lane carries the depth
  * and parent of its first event — these describe the session-tree position.
+ *
+ * `Set` dedupes sessionIds while keeping first-appearance order without
+ * rebuilding a growing per-session array on every event (the O(n^2) shape a
+ * timeline with thousands of events used to hit); one `filter` per distinct
+ * session (typically a handful) reassembles each lane's own events in order.
  */
 const groupSwimlanes = (events: readonly TimelineEvent[]): readonly Swimlane[] => {
-  const grouped = events.reduce<Readonly<Record<string, readonly TimelineEvent[]>>>(
-    (acc, e) => {
-      const prev = acc[e.sessionId] ?? []
-      return { ...acc, [e.sessionId]: [...prev, e] }
-    },
-    {},
-  )
-  return Object.entries(grouped).flatMap(([sessionId, evs]): readonly Swimlane[] => {
+  const orderedSessionIds = [...new Set(events.map((e) => e.sessionId))]
+  return orderedSessionIds.flatMap((sessionId): readonly Swimlane[] => {
+    const evs = events.filter((e) => e.sessionId === sessionId)
     const first = evs[0]
     if (first === undefined) return []
     return [
@@ -612,6 +628,19 @@ const renderMerged = (tl: Timeline): string => {
   return `<div class="timeline"><div class="side merged"><h2>MERGED (old + new)</h2><div class="events">${renderEventRow(all)}</div></div></div>`
 }
 
+/**
+ * Embed JSON inside a `<script>` element without corrupting it: `<script>` content
+ * is not HTML-entity-decoded, so entity-escaping (as for normal HTML text) would
+ * leave literal `&amp;`/`&lt;` in the string a reader later `JSON.parse`s. Instead
+ * escape the few characters that could confuse the HTML parser (chiefly a literal
+ * `</script`) as JSON-valid `\u` sequences, which `JSON.parse` decodes back exactly.
+ */
+const toScriptJson = (value: unknown): string =>
+  JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+
 export const renderTimelineHtml = (tl: Timeline): string => {
   const body =
     tl.mode === 'merged'
@@ -619,7 +648,7 @@ export const renderTimelineHtml = (tl: Timeline): string => {
       : tl.mode === 'tree-diff'
         ? renderTreeDiff(tl)
         : renderSideBySide(tl)
-  const dataJson = escapeHtml(JSON.stringify(tl))
+  const dataJson = toScriptJson(tl)
   return `<!DOCTYPE html>
 <html lang="en">
 <head>

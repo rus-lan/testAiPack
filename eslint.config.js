@@ -76,6 +76,14 @@ export default [
     },
   },
   {
+    // Effect.async resume-guard flag (`let settled`) — no object/array
+    // mutation here, so only `no-let` needs relaxing.
+    files: ['src/util/git.ts'],
+    rules: {
+      'functional/no-let': 'off',
+    },
+  },
+  {
     // Phase 06 run coordinator: a soft hang-watchdog races the opencode spawn
     // while an `onEvent` bridge accumulates streamed events into shared state.
     // This concurrent stateful coordination is the same shape as spawn.ts.

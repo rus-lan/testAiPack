@@ -74,6 +74,10 @@ describe('format — signed deltas and percent', () => {
     expect(fmtPct(value)).toBe(expected)
   })
 
+  it('fmtPct(undefined) === "n/a" (the omitted 0 -> non-zero percent)', () => {
+    expect(fmtPct(undefined)).toBe('n/a')
+  })
+
   it.each<[string | number, MetricKind, string]>([
     ['12345', 'int', '12345'],
     [0.045, 'cost', '0.045'],

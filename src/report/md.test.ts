@@ -9,6 +9,8 @@ import {
   makeJudge,
 } from '../../tests/report-fixture.js'
 import type { FailedRun, JudgeResult, Manifest, MetricDelta, PrimaryDeltas } from '@generated/types'
+import { redactUrlCredentials } from '../util/redact.js'
+import { safeRefDisplay } from '../pack/detector.js'
 
 describe('renderMd — header', () => {
   const md = renderMd(makeReport())
@@ -33,6 +35,19 @@ describe('renderMd — header', () => {
     const { packRef: _drop, ...withoutPack } = manifest
     const m = renderMd(makeReport({ manifest: withoutPack }))
     expect(m).toContain('_smoke-test (no pack)_')
+  })
+
+  it('never echoes a credential when given an already-redacted manifest (the shape buildManifest produces)', () => {
+    const manifest: Manifest = {
+      ...makeManifest(),
+      repoUrl: redactUrlCredentials('https://user:ghp_secrettoken@github.com/org/repo.git'),
+      packRef: safeRefDisplay(redactUrlCredentials('mcp:srv:{"env":{"API_KEY":"sk-fake-secret"}}')),
+    }
+    const md = renderMd(makeReport({ manifest }))
+    expect(md).not.toContain('ghp_secrettoken')
+    expect(md).not.toContain('user:')
+    expect(md).not.toContain('sk-fake-secret')
+    expect(md).not.toContain('API_KEY')
   })
 })
 
@@ -226,6 +241,52 @@ describe('renderMd — secondary metrics', () => {
     expect(md).toContain('### NEW secondary')
     expect(md).toContain('`read`')
     expect(md).toContain('stop=10')
+  })
+
+  it('the File diff line reflects the real git diff totals (phase 08)', () => {
+    // fixture default: diff.old.runs[0].summary = {additions:8, deletions:3, filesChanged:2}
+    const md = renderMd(makeReport())
+    expect(md).toContain('- File diff: +8 -3 (2 files)')
+  })
+
+  it('matches the Diff summary section exactly, since both read the same phase-08 data (the reported bug)', () => {
+    const diff = {
+      old: makeDiffResult('old', {
+        runs: [
+          { runIndex: 1, fullPatch: 'p', summary: { filesChanged: 2, additions: 957, deletions: 0, perFile: [] }, noChanges: false },
+        ],
+      }),
+      new: makeDiffResult('new', {
+        runs: [
+          { runIndex: 1, fullPatch: 'p', summary: { filesChanged: 2, additions: 772, deletions: 0, perFile: [] }, noChanges: false },
+        ],
+      }),
+    }
+    const md = renderMd(makeReport({ diff }))
+    expect(md).toContain('- File diff: +957 -0 (2 files)')
+    expect(md).toContain('- File diff: +772 -0 (2 files)')
+    expect(md).not.toContain('- File diff: +0 -0 (0 files)')
+    // the Diff summary section (further down) reports the exact same per-side totals
+    expect(md).toContain('**old**: +957 -0 (2 files across 1 run(s))')
+    expect(md).toContain('**new**: +772 -0 (2 files across 1 run(s))')
+  })
+
+  it('lists tools by count descending, not insertion order', () => {
+    const base = makeSideAggregates('old')
+    const secondary = {
+      ...base.secondary,
+      perTool: {
+        rare: { count: 1, errorRate: 0, avgDurationMs: '10' },
+        common: { count: 99, errorRate: 0, avgDurationMs: '10' },
+      },
+    }
+    const metricsDiff = makeMetricsDiff({ old: makeSideAggregates('old', { secondary }) })
+    const md = renderMd(makeReport({ metricsDiff }))
+    const commonIdx = md.indexOf('`common`')
+    const rareIdx = md.indexOf('`rare`')
+    expect(commonIdx).toBeGreaterThan(-1)
+    expect(rareIdx).toBeGreaterThan(-1)
+    expect(commonIdx).toBeLessThan(rareIdx)
   })
 })
 

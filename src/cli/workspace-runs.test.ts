@@ -93,6 +93,38 @@ describe('cli/workspace-runs', () => {
     expect(rep).toBeNull()
   })
 
+  it('readReport still loads an OLD report.json that carries the now-removed secondary.fileDiffStats field', async () => {
+    const ws = makeTempDir()
+    await seedRun(ws, 'old-shape', '2025-01-01T00:00:00.000Z', false)
+    const runs = await runP(listRuns(ws))
+    const resultsDir = runs[0]!.resultsDir
+    await runP(ensureDir(resultsDir))
+    const current = makeReport()
+    // Simulates a report.json written by a version that still had the field —
+    // zod schemas here are plain z.object (never .strict()), so an unknown key
+    // is silently dropped, not rejected.
+    const oldShapeJson = {
+      ...current,
+      metricsDiff: {
+        ...current.metricsDiff,
+        old: {
+          ...current.metricsDiff.old,
+          secondary: { ...current.metricsDiff.old.secondary, fileDiffStats: { additions: 20, deletions: 5, filesChanged: 3 } },
+        },
+        new: {
+          ...current.metricsDiff.new,
+          secondary: { ...current.metricsDiff.new.secondary, fileDiffStats: { additions: 8, deletions: 3, filesChanged: 2 } },
+        },
+      },
+    }
+    await runP(writeJson(path.join(resultsDir, 'report.json'), oldShapeJson))
+    const rep = await runP(readReport(resultsDir))
+    expect(rep).not.toBeNull()
+    expect(rep?.manifest.runId).toBe(current.manifest.runId)
+    const parsedOldSecondary = rep?.metricsDiff.old.secondary as unknown as Record<string, unknown>
+    expect(parsedOldSecondary['fileDiffStats']).toBeUndefined()
+  })
+
   it('planGc --keep-last keeps newest N', async () => {
     const ws = makeTempDir()
     await seedRun(ws, 'r1', '2025-01-01T00:00:00.000Z')

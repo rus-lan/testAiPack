@@ -203,7 +203,7 @@ const gateAuthPing = (
   checks: readonly PreflightCheck[],
 ): Effect.Effect<readonly PreflightCheck[], PhaseError> =>
   Effect.gen(function* () {
-    const model = input.runInput.preflightModel
+    const model = input.runInput.model
     const timeoutMs = input.runInput.timeouts.preflightSeconds * 1000
     const docker = dockerFromInput(input)
     const configs = input.configs
@@ -285,7 +285,9 @@ const instructionVisible = (
       // symlink resolves to a readable SKILL.md. We deliberately do NOT probe
       // the LLM with "list available skills": opencode only surfaces built-in
       // skills that way, so the probe would always fail for user packs.
-      return yield* exists(path.join(inst.target, 'SKILL.md'))
+      return yield* exists(
+        path.join(homePaths.new, '.config/opencode/skills', inst.name, 'SKILL.md'),
+      )
     }
     if (inst.kind === 'file') {
       return yield* exists(
@@ -350,7 +352,8 @@ const leakedOntoOld = (
       )
     }
     if (inst.kind === 'plugin') {
-      return yield* exists(path.join(homePaths.old, '.config/opencode/plugins', inst.name))
+      const dir = path.join(homePaths.old, '.config/opencode/plugins')
+      return (yield* exists(path.join(dir, `${inst.name}.js`))) || (yield* exists(path.join(dir, inst.name)))
     }
     return yield* mcpPresentIn(homePaths.old, inst.name)
   })
@@ -364,7 +367,7 @@ const gateBaselineIdentical = (
     // Re-verify gates 1–3 for side=old (idempotent: they already ran and passed
     // in gates 1–3; the spec requires gate 5 to repeat them as a baseline
     // sanity check before the pack-leak assertion).
-    const model = input.runInput.preflightModel
+    const model = input.runInput.model
     const timeoutMs = input.runInput.timeouts.preflightSeconds * 1000
     const docker = dockerFromInput(input)
     yield* runOpencodeLaunch(input.homePaths.old, 'old', docker, checks)

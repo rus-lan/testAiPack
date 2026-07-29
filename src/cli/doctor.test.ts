@@ -44,19 +44,38 @@ describe('cli/doctor — runDoctor', () => {
     expect(hasCriticalFailure(checks)).toBe(false)
   })
 
-  it('opencode missing (exit < 0) → fail + critical', async () => {
+  it('opencode missing (ENOENT, exit < 0) → fail "not found" + critical', async () => {
     execMock.mockImplementation((input) =>
       Effect.succeed({
         stdout: '',
         stderr: 'not found',
         exitCode: input.command === 'opencode' ? -1 : 0,
+        ...(input.command === 'opencode' ? { spawnErrorCode: 'ENOENT' } : {}),
       }),
     )
     existsMock.mockImplementation(() => Effect.succeed(true))
     const checks = await runP(runDoctor('/cwd'))
     const oc = checks.find((c) => c.name === 'opencode')
     expect(oc?.status).toBe('fail')
+    expect(oc?.detail).toContain('not found')
     expect(hasCriticalFailure(checks)).toBe(true)
+  })
+
+  it('opencode exits < 0 for a reason other than ENOENT → fail, but not reported as "not found"', async () => {
+    execMock.mockImplementation((input) =>
+      Effect.succeed({
+        stdout: '',
+        stderr: '',
+        exitCode: input.command === 'opencode' ? -1 : 0,
+        ...(input.command === 'opencode' ? { spawnErrorCode: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' } : {}),
+      }),
+    )
+    existsMock.mockImplementation(() => Effect.succeed(true))
+    const checks = await runP(runDoctor('/cwd'))
+    const oc = checks.find((c) => c.name === 'opencode')
+    expect(oc?.status).toBe('fail')
+    expect(oc?.detail).not.toContain('not found')
+    expect(oc?.detail).toContain('ERR_CHILD_PROCESS_STDIO_MAXBUFFER')
   })
 
   it('opencode non-zero exit → fail with exit code detail', async () => {

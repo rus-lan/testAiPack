@@ -13,6 +13,7 @@
  */
 import { Effect } from 'effect'
 import path from 'node:path'
+import os from 'node:os'
 import type {
   DiffResult,
   JudgeInput,
@@ -23,10 +24,12 @@ import type {
 } from '@generated/types'
 import { run as opencodeRun } from '../opencode/cli.js'
 import type { OpencodeRunOptions } from '../opencode/cli.js'
-import { ensureDir, writeJson } from '../util/fs.js'
+import { ensureDir, removeDir, writeJson } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
 import { judgeError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
+import { safeRefDisplay } from '../pack/detector.js'
+import { redactUrlCredentials } from '../util/redact.js'
 
 const VERDICTS: readonly JudgeVerdict[] = ['ok', 'fail', 'unclear']
 
@@ -87,7 +90,11 @@ export const buildJudgePrompt = (
   oldPatch: string,
   newPatch: string,
 ): string => {
-  const packRef = runInput.packRef ?? 'n/a'
+  // packRef reaches the judge model verbatim below — an inline mcp: ref can
+  // carry a provider secret in its config payload, so it goes through the
+  // same redaction as the on-disk manifest before it is embedded.
+  const packRef =
+    runInput.packRef === undefined ? 'n/a' : safeRefDisplay(redactUrlCredentials(runInput.packRef))
   const oldTrunc = truncatePatch(oldPatch)
   const newTrunc = truncatePatch(newPatch)
   return [
@@ -130,9 +137,9 @@ export interface ParsedJudge {
 const isVerdict = (v: unknown): v is JudgeVerdict =>
   typeof v === 'string' && VERDICTS.includes(v as JudgeVerdict)
 
-const isIntegerValue = (u: unknown): u is number => Number.isInteger(u)
+const isFiniteNumber = (u: unknown): u is number => typeof u === 'number' && Number.isFinite(u)
 
-const clampQuality = (n: number): number => Math.max(0, Math.min(10, n))
+const clampQuality = (n: number): number => Math.round(Math.max(0, Math.min(10, n)))
 
 const safeJsonParse = (s: string): unknown => {
   try {
@@ -167,7 +174,7 @@ export const parseJudgeResponse = (raw: string): ParsedJudge | null => {
   if (!isVerdict(verdict)) return null
   const oldQuality = obj['oldQuality']
   const newQuality = obj['newQuality']
-  if (!isIntegerValue(oldQuality) || !isIntegerValue(newQuality)) return null
+  if (!isFiniteNumber(oldQuality) || !isFiniteNumber(newQuality)) return null
   // Quality out of [0, 10] is clamped rather than rejected (spec step 7).
   const explanation = obj['explanation']
   if (typeof explanation !== 'string') return null
@@ -276,18 +283,34 @@ const computeJudge = (
     )
 
     const model = runInput.preflightModel
+    // homeDir must stay the real HOME: opencode keeps the provider
+    // credentials there that the judge needs to call the model. cwd is a
+    // disposable scratch dir instead, since the prompt embeds diff content
+    // from the run under judgment — acquire/release so it is always cleaned
+    // up (including on interruption), and never falls back to a shared tmp
+    // dir if it can't be created.
     const homeDir = process.env['HOME'] ?? '/tmp'
-    const opts: OpencodeRunOptions = {
-      homeDir,
-      cwd: homeDir,
-      agent: 'build',
-      prompt,
-      auto: true,
-      ...(model === undefined ? {} : { model }),
-      timeoutMs: runInput.timeouts.runSeconds * 1000,
-    }
+    const scratchDir = path.join(os.tmpdir(), 'testaipack-judge', input.manifest.runId)
 
-    const outcome = yield* opencodeRun(opts).pipe(Effect.either)
+    const acquireOutcome = yield* Effect.acquireUseRelease(
+      ensureDir(scratchDir),
+      () =>
+        opencodeRun({
+          homeDir,
+          cwd: scratchDir,
+          agent: 'plan',
+          prompt,
+          auto: false,
+          ...(model === undefined ? {} : { model }),
+          timeoutMs: runInput.timeouts.runSeconds * 1000,
+        } satisfies OpencodeRunOptions).pipe(Effect.either),
+      () => removeDir(scratchDir).pipe(Effect.orElse(() => Effect.void)),
+    ).pipe(Effect.either)
+
+    if (acquireOutcome._tag === 'Left') {
+      return unclearFromFailure('could not create scratch directory for judge', '', model ?? '')
+    }
+    const outcome = acquireOutcome.right
 
     if (outcome._tag === 'Left') {
       const err = outcome.left

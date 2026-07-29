@@ -346,11 +346,15 @@ export const runPipeline = (
       reporter,
       (r) => Object.keys(r.paths).join(', '),
     )
-    // Spec invariant: report.md is printed to stdout. The rendered Markdown is
-    // carried on the result only when the user requested Markdown output.
+    // Spec invariant: the report is always printed to stdout, in whichever
+    // format the user actually requested (md by default, or when both were
+    // requested; json only when the user asked for json without md).
     if (report.stdoutMd !== undefined) {
       const stdoutMd = report.stdoutMd
       yield* Effect.sync(() => process.stdout.write(`${stdoutMd}\n`))
+    } else if (report.stdoutJson !== undefined) {
+      const stdoutJson = report.stdoutJson
+      yield* Effect.sync(() => process.stdout.write(stdoutJson))
     }
 
     // 12 review-workspace

@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { Effect } from 'effect'
 import { renderJson } from './json.js'
 import { renderYaml } from './yaml.js'
 import { renderHtml } from './html.js'
@@ -6,36 +7,45 @@ import { reportSchema } from '@generated/schemas'
 import { makeReport, makeDiffResult } from '../../tests/report-fixture.js'
 import { makeMetricsDiff, makeSideAggregates } from '../../tests/report-fixture.js'
 import type { Report } from '@generated/types'
+import { redactUrlCredentials } from '../util/redact.js'
+import { safeRefDisplay } from '../pack/detector.js'
+
+const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
+const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
 
 describe('renderJson', () => {
-  it('produces valid JSON that round-trips through reportSchema', () => {
+  it('produces valid JSON that round-trips through reportSchema', async () => {
     const report = makeReport()
-    const parsed = JSON.parse(renderJson(report)) as unknown
+    const parsed = JSON.parse(await runP(renderJson(report))) as unknown
     expect(reportSchema.safeParse(parsed).success).toBe(true)
   })
 
-  it('throws when the report fails schema validation', () => {
+  it('fails with a typed PhaseError when the report fails schema validation', async () => {
     const invalid = {
       ...makeReport(),
       manifest: { ...makeReport().manifest, runId: 123 },
     } as unknown as Report
-    expect(() => renderJson(invalid)).toThrow(/schema validation/)
+    const err = await runFlip(renderJson(invalid))
+    expect(err.code).toBe('E_EXPORT_INVALID')
+    expect(err.message).toContain('schema validation')
   })
 })
 
 describe('renderYaml', () => {
-  it('produces non-empty YAML', () => {
-    const text = renderYaml(makeReport())
+  it('produces non-empty YAML', async () => {
+    const text = await runP(renderYaml(makeReport()))
     expect(text.length).toBeGreaterThan(0)
     expect(text).toContain('manifest:')
   })
 
-  it('throws when the report fails schema validation', () => {
+  it('fails with a typed PhaseError when the report fails schema validation', async () => {
     const invalid = {
       ...makeReport(),
       manifest: { ...makeReport().manifest, runId: 123 },
     } as unknown as Report
-    expect(() => renderYaml(invalid)).toThrow(/schema validation/)
+    const err = await runFlip(renderYaml(invalid))
+    expect(err.code).toBe('E_EXPORT_INVALID')
+    expect(err.message).toContain('schema validation')
   })
 })
 
@@ -60,6 +70,19 @@ describe('renderHtml', () => {
     const html = renderHtml(makeReport())
     expect(html).toContain('run-abc-001')
     expect(html).toContain('https://example.com/repo.git')
+  })
+
+  it('never echoes a credential when given an already-redacted manifest (the shape buildManifest produces)', () => {
+    const manifest = {
+      ...makeReport().manifest,
+      repoUrl: redactUrlCredentials('https://user:ghp_secrettoken@github.com/org/repo.git'),
+      packRef: safeRefDisplay(redactUrlCredentials('mcp:srv:{"env":{"API_KEY":"sk-fake-secret"}}')),
+    }
+    const html = renderHtml(makeReport({ manifest }))
+    expect(html).not.toContain('ghp_secrettoken')
+    expect(html).not.toContain('user:')
+    expect(html).not.toContain('sk-fake-secret')
+    expect(html).not.toContain('API_KEY')
   })
 
   it('color-codes the verdict cells (better/worse/neutral)', () => {

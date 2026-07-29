@@ -219,6 +219,19 @@ describe('phase 04 — homeIsolation', () => {
     expect(result.homeTrees.new[0]!.copiedAuth).toContain('.local/share/opencode/auth.json')
   })
 
+  it('symlink instruction whose name escapes the skills dir → E_HOME_SETUP_FAILED, nothing written outside it', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const packDir = await writePackSkill('evil')
+    const input = buildInput({}, skillOutcome(packDir, '../../evil'))
+    const err = await runFlip(homeIsolation(input))
+    expect(err.code).toBe('E_HOME_SETUP_FAILED')
+    const newHome = input.workspace.homeNew[0]!
+    expect(await runP(exists(path.join(newHome, '.config', 'opencode', 'skills')))).toBe(true)
+    expect(await runP(exists(path.join(newHome, '.config', 'evil')))).toBe(false)
+  })
+
   it('smoke-test (no packInstall): no symlink, no plugin install, identical configs', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
@@ -240,6 +253,31 @@ describe('phase 04 — homeIsolation', () => {
     expect(installMock).toHaveBeenCalledTimes(1)
     expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin')
     expect(result.homeTrees.new[0]).toBeDefined()
+  })
+
+  it('docker isolation threads the docker image into plugin install (M7)', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const input = buildInput({ isolation: 'docker' }, pluginOutcome('myplugin'))
+    await runP(homeIsolation(input))
+    expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin', {
+      image: DEFAULT_OPENCODE_IMAGE,
+    })
+  })
+
+  it('docker isolation with a custom --docker-image threads it into plugin install', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const input: HomeIsolationInputExt = {
+      ...buildInput({ isolation: 'docker' }, pluginOutcome('myplugin')),
+      dockerImage: 'registry.example/oc:dev',
+    }
+    await runP(homeIsolation(input))
+    expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin', {
+      image: 'registry.example/oc:dev',
+    })
   })
 
   it('plugin install timeout → E_PACK_INSTALL_TIMEOUT', async () => {
@@ -382,6 +420,160 @@ describe('phase 04 — homeIsolation', () => {
     const result = await runP(homeIsolation(input))
     const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
     expect(baselineJson['model']).toBeUndefined()
+  })
+
+  it('runInput.model overrides the source opencode.json model in both configs', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+      await runP(ensureDir(path.join(h, '.config', 'opencode')))
+      await runP(
+        writeFile(
+          path.join(h, '.config', 'opencode', 'opencode.json'),
+          '{"model":"zai-coding-plan/glm-5.2"}',
+        ),
+      )
+    })
+    const input = buildInput({ model: 'anthropic/claude-x' }, undefined)
+    const result = await runP(homeIsolation(input))
+    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
+    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
+    expect(baselineJson['model']).toBe('anthropic/claude-x')
+    expect(newJson['model']).toBe('anthropic/claude-x')
+  })
+
+  it('runInput.model + mcp pack: baseline and new configs still differ only in mcp', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const outcome: PackInstallOutcome = {
+      packPath: '',
+      detectedType: 'mcp',
+      installLogPath: '/tmp/install.log',
+      registeredIn: ['mcp'],
+      instructions: [
+        { kind: 'config', section: 'mcp', name: 'myserver', json: { command: 'npx' } },
+      ],
+    }
+    const input = buildInput({ model: 'anthropic/claude-x' }, outcome)
+    const result = await runP(homeIsolation(input))
+    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
+    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
+    expect(baselineJson['model']).toBe('anthropic/claude-x')
+    expect(newJson['model']).toBe('anthropic/claude-x')
+    expect(baselineJson['mcp']).toBeUndefined()
+    expect(newJson['mcp']).toBeDefined()
+    const { mcp: _newMcp, ...newRest } = newJson
+    expect(newRest).toEqual(baselineJson)
+  })
+
+  const OLLAMA_PROVIDER = {
+    ollama: {
+      npm: '@ai-sdk/openai-compatible',
+      name: 'Ollama (local)',
+      options: { baseURL: 'http://localhost:11434/v1' },
+      models: { 'qwen3.5:9b': { name: 'Qwen3.5 9B' } },
+    },
+  }
+
+  const SOURCE_CONNECTIVITY_CONFIG = {
+    model: 'ollama/qwen3.5:9b',
+    small_model: 'anthropic/claude-haiku',
+    provider: OLLAMA_PROVIDER,
+    enabled_providers: ['ollama', 'anthropic'],
+    disabled_providers: ['openai'],
+  }
+
+  const expectConnectivityPropagated = (json: Record<string, unknown>): void => {
+    expect(json['provider']).toEqual(OLLAMA_PROVIDER)
+    expect(json['small_model']).toBe('anthropic/claude-haiku')
+    expect(json['enabled_providers']).toEqual(['ollama', 'anthropic'])
+    expect(json['disabled_providers']).toEqual(['openai'])
+  }
+
+  it('propagates provider/small_model/enabled_providers/disabled_providers from the source opencode.json into both configs', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+      await runP(ensureDir(path.join(h, '.config', 'opencode')))
+      await runP(
+        writeFile(
+          path.join(h, '.config', 'opencode', 'opencode.json'),
+          JSON.stringify(SOURCE_CONNECTIVITY_CONFIG),
+        ),
+      )
+    })
+    const input = buildInput({}, undefined)
+    const result = await runP(homeIsolation(input))
+    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
+    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
+    expectConnectivityPropagated(baselineJson)
+    expectConnectivityPropagated(newJson)
+  })
+
+  it('omits provider/small_model/enabled_providers/disabled_providers from both configs when the source opencode.json has none (byte-identical to today)', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const input = buildInput({}, undefined)
+    const result = await runP(homeIsolation(input))
+    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
+    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
+    for (const json of [baselineJson, newJson]) {
+      expect(json['provider']).toBeUndefined()
+      expect(json['small_model']).toBeUndefined()
+      expect(json['enabled_providers']).toBeUndefined()
+      expect(json['disabled_providers']).toBeUndefined()
+    }
+  })
+
+  it('ignores enabled_providers/disabled_providers with an unexpected (non-string-array) shape, same tolerance as an absent field', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+      await runP(ensureDir(path.join(h, '.config', 'opencode')))
+      await runP(
+        writeFile(
+          path.join(h, '.config', 'opencode', 'opencode.json'),
+          JSON.stringify({ enabled_providers: 'anthropic', disabled_providers: [1, 2], small_model: 42 }),
+        ),
+      )
+    })
+    const input = buildInput({}, undefined)
+    const result = await runP(homeIsolation(input))
+    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
+    expect(baselineJson['enabled_providers']).toBeUndefined()
+    expect(baselineJson['disabled_providers']).toBeUndefined()
+    expect(baselineJson['small_model']).toBeUndefined()
+  })
+
+  it('custom provider/small_model/enabled_providers/disabled_providers + mcp pack: baseline and new configs still differ only in mcp', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+      await runP(ensureDir(path.join(h, '.config', 'opencode')))
+      await runP(
+        writeFile(
+          path.join(h, '.config', 'opencode', 'opencode.json'),
+          JSON.stringify(SOURCE_CONNECTIVITY_CONFIG),
+        ),
+      )
+    })
+    const outcome: PackInstallOutcome = {
+      packPath: '',
+      detectedType: 'mcp',
+      installLogPath: '/tmp/install.log',
+      registeredIn: ['mcp'],
+      instructions: [
+        { kind: 'config', section: 'mcp', name: 'myserver', json: { command: 'npx' } },
+      ],
+    }
+    const input = buildInput({}, outcome)
+    const result = await runP(homeIsolation(input))
+    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
+    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
+    expectConnectivityPropagated(baselineJson)
+    expectConnectivityPropagated(newJson)
+    expect(baselineJson['mcp']).toBeUndefined()
+    expect(newJson['mcp']).toBeDefined()
+    const { mcp: _newMcp, ...newRest } = newJson
+    expect(newRest).toEqual(baselineJson)
   })
 
   it('writes config/baseline.json and config/new.json to disk', async () => {

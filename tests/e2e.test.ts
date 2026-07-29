@@ -22,53 +22,48 @@ import {
 // Mock opencode (never spawn the real binary in tests).
 // ---------------------------------------------------------------------------
 
-vi.mock('../src/opencode/cli.js', () => ({
-  OpencodeError: class extends Error {
-    readonly _tag = 'OpencodeError'
-    readonly command: string
-    readonly exitCode: number | null
-    readonly stderr: string
-    readonly stdout: string
-    readonly timedOut: boolean
-    constructor(args: {
-      command: string
-      exitCode: number | null
-      stderr: string
-      stdout?: string
-      timedOut: boolean
-    }) {
-      super(`opencode ${args.command} failed`)
-      this.command = args.command
-      this.exitCode = args.exitCode
-      this.stderr = args.stderr
-      this.stdout = args.stdout ?? ''
-      this.timedOut = args.timedOut
-    }
-  },
-  version: vi.fn(() => Effect.succeed('1.0.0')),
-  run: vi.fn(
-    (opts: { onEvent?: (e: unknown) => void }) =>
-      Effect.sync(() => {
-        opts.onEvent?.({ type: 'step-finish', reason: 'stop', id: 'sf-1' })
-        return { exitCode: 0, stdout: '', stderr: '', durationMs: 12, timedOut: false }
-      }),
-  ),
-  exportSession: vi.fn((_home: string, _sid: string) => Effect.succeed(buildExport('same'))),
-  installPlugin: vi.fn(() => Effect.void),
-  listMcp: vi.fn(() => Effect.succeed('')),
-}))
+vi.mock('../src/opencode/cli.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/opencode/cli.js')>()
+  return {
+    ...actual,
+    version: vi.fn(() => Effect.succeed('1.0.0')),
+    run: vi.fn(
+      (opts: { onEvent?: (e: unknown) => void }) =>
+        Effect.sync(() => {
+          opts.onEvent?.({ type: 'step-finish', reason: 'stop', id: 'sf-1' })
+          return { exitCode: 0, stdout: '', stderr: '', durationMs: 12, timedOut: false }
+        }),
+    ),
+    exportSession: vi.fn((_home: string, _sid: string) => Effect.succeed(buildExport('same'))),
+    installPlugin: vi.fn(() => Effect.void),
+    listMcp: vi.fn(() => Effect.succeed('')),
+  }
+})
+
+// `cli.js`'s real dbQuery (kept via {...actual} above) shells out through
+// execCmd, not spawnProcess — it must be mocked too, or every session-tree
+// query throws and phase 10 silently degrades to a root-only tree.
+function defaultExecCmdResult(
+  input: { readonly args: readonly string[] },
+): Effect.Effect<{ readonly stdout: string; readonly stderr: string; readonly exitCode: number }> {
+  if (input.args[0] !== 'db') return Effect.succeed({ stdout: '', stderr: '', exitCode: 0 })
+  return Effect.succeed({ stdout: '[]', stderr: '', exitCode: 0 })
+}
 
 vi.mock('../src/opencode/spawn.js', () => ({
   spawnProcess: vi.fn(() =>
     Effect.succeed({ stdout: '', stderr: '', exitCode: 0, durationMs: 1, timedOut: false }),
   ),
+  execCmd: vi.fn(defaultExecCmdResult),
 }))
 
 const { run: runMock, exportSession: exportMock, version: versionMock, OpencodeError } =
   await import('../src/opencode/cli.js')
+const { execCmd: execCmdMock } = await import('../src/opencode/spawn.js')
 const mockedRun = vi.mocked(runMock)
 const mockedExport = vi.mocked(exportMock)
 const mockedVersion = vi.mocked(versionMock)
+const mockedExecCmd = vi.mocked(execCmdMock)
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -208,6 +203,8 @@ describe('e2e: full A/B pipeline via runCli', () => {
   beforeEach(() => {
     mockedRun.mockClear()
     mockedExport.mockClear()
+    mockedExecCmd.mockReset()
+    mockedExecCmd.mockImplementation(defaultExecCmdResult)
   })
 
   afterEach(() => {
@@ -292,6 +289,121 @@ describe('e2e: full A/B pipeline via runCli', () => {
     })
   }, 60_000)
 
+  it('sub-agent session tree: a queried child session reaches timeline.json at depth > 0', async () => {
+    await withFakeHome(async () => {
+      const repo = await createTinyRepo()
+      const workspace = path.join(makeTempDir(), '.testaipack')
+
+      mockedExecCmd.mockImplementation((input) => {
+        if (input.args[0] !== 'db') return Effect.succeed({ stdout: '', stderr: '', exitCode: 0 })
+        const sql = input.args[1] ?? ''
+        const stdout = sql.includes("parent_id = 'sess-e2e'")
+          ? JSON.stringify([{ id: 'sess-e2e-child' }])
+          : '[]'
+        return Effect.succeed({ stdout, stderr: '', exitCode: 0 })
+      })
+
+      const code = await runCli([
+        'run',
+        repo,
+        '--prompt',
+        'do the thing',
+        '--runs',
+        '1',
+        '--no-preflight',
+        '--auth',
+        'opencode',
+        '--workspace',
+        workspace,
+      ])
+      expect(code).toBe(0)
+
+      // dbQuery was actually reached and asked for sess-e2e's children (not
+      // silently skipped or defect-swallowed).
+      const dbCalls = mockedExecCmd.mock.calls.filter((c) => c[0].args[0] === 'db')
+      expect(dbCalls.length).toBeGreaterThan(0)
+      expect(dbCalls.some((c) => (c[0].args[1] ?? '').includes("parent_id = 'sess-e2e'"))).toBe(true)
+
+      const runDir = await findRunDir(workspace)
+      const tlRaw = await runP(readFile(path.join(runDir, 'results', 'timeline.json')))
+      const tl = JSON.parse(tlRaw) as {
+        readonly old: readonly { readonly swimlaneDepth: number }[]
+        readonly new: readonly { readonly swimlaneDepth: number }[]
+      }
+      // The queried child only shows up as depth > 0 events if the tree walk
+      // actually recursed into it (root events are always depth 0).
+      const allEvents = [...tl.old, ...tl.new]
+      expect(allEvents.some((e) => e.swimlaneDepth > 0)).toBe(true)
+    })
+  }, 60_000)
+
+  it('--format json (without md) prints the JSON report to stdout, not markdown', async () => {
+    await withFakeHome(async () => {
+      const repo = await createTinyRepo()
+      const workspace = path.join(makeTempDir(), '.testaipack')
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+      try {
+        const code = await runCli([
+          'run',
+          repo,
+          '--prompt',
+          'do the thing',
+          '--runs',
+          '1',
+          '--no-preflight',
+          '--auth',
+          'opencode',
+          '--workspace',
+          workspace,
+          '--format',
+          'json',
+        ])
+        expect(code).toBe(0)
+        const writes = writeSpy.mock.calls.map((c) => String(c[0]))
+        const jsonWrite = writes.find((w) => {
+          try {
+            const parsed = JSON.parse(w) as { manifest?: { runId?: string } }
+            return typeof parsed.manifest?.runId === 'string'
+          } catch {
+            return false
+          }
+        })
+        expect(jsonWrite).toBeDefined()
+        expect(writes.some((w) => w.includes('# testaipack report'))).toBe(false)
+      } finally {
+        writeSpy.mockRestore()
+      }
+    })
+  }, 60_000)
+
+  it('default format (md) prints the Markdown report to stdout, not raw JSON', async () => {
+    await withFakeHome(async () => {
+      const repo = await createTinyRepo()
+      const workspace = path.join(makeTempDir(), '.testaipack')
+      const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+      try {
+        const code = await runCli([
+          'run',
+          repo,
+          '--prompt',
+          'do the thing',
+          '--runs',
+          '1',
+          '--no-preflight',
+          '--auth',
+          'opencode',
+          '--workspace',
+          workspace,
+        ])
+        expect(code).toBe(0)
+        const writes = writeSpy.mock.calls.map((c) => String(c[0]))
+        expect(writes.some((w) => w.includes('# testaipack report'))).toBe(true)
+      } finally {
+        writeSpy.mockRestore()
+      }
+    })
+  }, 60_000)
+
   it('smoke-test mode (no --pack): baseline vs baseline', async () => {
     await withFakeHome(async () => {
       const repo = await createTinyRepo()
@@ -315,6 +427,96 @@ describe('e2e: full A/B pipeline via runCli', () => {
       const runDir = await findRunDir(workspace)
       expect(existsSync(path.join(runDir, 'manifest.json'))).toBe(true)
       expect(existsSync(path.join(runDir, 'results', 'report.md'))).toBe(true)
+    })
+  }, 60_000)
+
+  it('--model bakes the override into both sides\' config content and persisted config files', async () => {
+    await withFakeHome(async () => {
+      const repo = await createTinyRepo()
+      const workspace = path.join(makeTempDir(), '.testaipack')
+
+      const code = await runCli([
+        'run',
+        repo,
+        '--prompt',
+        'do something',
+        '--runs',
+        '1',
+        '--no-preflight',
+        '--auth',
+        'opencode',
+        '--workspace',
+        workspace,
+        '--model',
+        'anthropic/claude-x',
+      ])
+      expect(code).toBe(0)
+
+      expect(mockedRun.mock.calls.length).toBeGreaterThan(0)
+      for (const call of mockedRun.mock.calls) {
+        const opts = call[0] as { readonly configContent?: string }
+        expect(opts.configContent).toBeDefined()
+        const cfg = JSON.parse(opts.configContent ?? '{}') as Record<string, unknown>
+        expect(cfg['model']).toBe('anthropic/claude-x')
+      }
+
+      const runDir = await findRunDir(workspace)
+      const baseline = JSON.parse(
+        await runP(readFile(path.join(runDir, 'config', 'baseline.json'))),
+      ) as Record<string, unknown>
+      const newCfg = JSON.parse(
+        await runP(readFile(path.join(runDir, 'config', 'new.json'))),
+      ) as Record<string, unknown>
+      expect(baseline['model']).toBe('anthropic/claude-x')
+      expect(newCfg['model']).toBe('anthropic/claude-x')
+    })
+  }, 60_000)
+
+  it('without --model, the ambient source model still flows through both sides unchanged', async () => {
+    await withFakeHome(async () => {
+      const home = process.env['HOME']
+      if (home === undefined) throw new Error('fake HOME not set')
+      await runP(ensureDir(path.join(home, '.config', 'opencode')))
+      await runP(
+        writeFile(
+          path.join(home, '.config', 'opencode', 'opencode.json'),
+          '{"model":"zai-coding-plan/glm-5.2"}',
+        ),
+      )
+      const repo = await createTinyRepo()
+      const workspace = path.join(makeTempDir(), '.testaipack')
+
+      const code = await runCli([
+        'run',
+        repo,
+        '--prompt',
+        'do something',
+        '--runs',
+        '1',
+        '--no-preflight',
+        '--auth',
+        'opencode',
+        '--workspace',
+        workspace,
+      ])
+      expect(code).toBe(0)
+
+      expect(mockedRun.mock.calls.length).toBeGreaterThan(0)
+      for (const call of mockedRun.mock.calls) {
+        const opts = call[0] as { readonly configContent?: string }
+        const cfg = JSON.parse(opts.configContent ?? '{}') as Record<string, unknown>
+        expect(cfg['model']).toBe('zai-coding-plan/glm-5.2')
+      }
+
+      const runDir = await findRunDir(workspace)
+      const baseline = JSON.parse(
+        await runP(readFile(path.join(runDir, 'config', 'baseline.json'))),
+      ) as Record<string, unknown>
+      const newCfg = JSON.parse(
+        await runP(readFile(path.join(runDir, 'config', 'new.json'))),
+      ) as Record<string, unknown>
+      expect(baseline['model']).toBe('zai-coding-plan/glm-5.2')
+      expect(newCfg['model']).toBe('zai-coding-plan/glm-5.2')
     })
   }, 60_000)
 

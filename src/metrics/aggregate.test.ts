@@ -35,7 +35,6 @@ const emptySecondary = (): SecondaryMetrics => ({
   stepLatencyP95Ms: '0',
   toolLatencyAvgMs: '0',
   finishCauseDistribution: {},
-  fileDiffStats: { additions: 0, deletions: 0, filesChanged: 0 },
   maxConsecutiveSameTool: 0,
 })
 
@@ -71,8 +70,19 @@ describe('computeMetricDelta (table)', () => {
     expect(computeMetricDelta(1, 5, undefined, 'context-dependent').better).toBe('context-dependent')
   })
 
-  it('percent is 0 when old value is 0', () => {
-    expect(computeMetricDelta(0, 50, undefined, 'lower-is-better').percent).toBe(0)
+  it('percent is omitted for a 0 -> non-zero change (an infinite percent, not "no change")', () => {
+    const d = computeMetricDelta(0, 50, undefined, 'lower-is-better')
+    expect(d.absolute).toBe(50)
+    expect(d.percent).toBeUndefined()
+    expect('percent' in d).toBe(false)
+  })
+
+  it('percent stays 0 for a 0 -> 0 change (genuinely no change)', () => {
+    expect(computeMetricDelta(0, 0, undefined, 'lower-is-better').percent).toBe(0)
+  })
+
+  it('percent is still computed normally for a non-zero -> 0 change', () => {
+    expect(computeMetricDelta(50, 0, undefined, 'lower-is-better').percent).toBe(-100)
   })
 })
 
@@ -141,7 +151,27 @@ describe('aggregateSecondary', () => {
   it('empty input -> zero secondary', () => {
     const out = aggregateSecondary([])
     expect(out.perTool).toEqual({})
-    expect(out.fileDiffStats).toEqual({ additions: 0, deletions: 0, filesChanged: 0 })
+    expect(out.maxConsecutiveSameTool).toBe(0)
+  })
+
+  it('merges the same tool name across non-adjacent runs (not pre-grouped)', () => {
+    const a: SecondaryMetrics = {
+      ...emptySecondary(),
+      perTool: { zeta: { count: 1, errorRate: 0, avgDurationMs: '100' } },
+    }
+    const b: SecondaryMetrics = {
+      ...emptySecondary(),
+      perTool: { bash: { count: 2, errorRate: 0, avgDurationMs: '50' } },
+    }
+    const c: SecondaryMetrics = {
+      ...emptySecondary(),
+      perTool: { zeta: { count: 3, errorRate: 1 / 3, avgDurationMs: '300' } },
+    }
+    const out = aggregateSecondary([a, b, c])
+    // zeta: count 1+3=4, durSum 100*1 + 300*3 = 1000 -> avg 250
+    expect(out.perTool['zeta']?.count).toBe(4)
+    expect(out.perTool['zeta']?.avgDurationMs).toBe('250')
+    expect(out.perTool['bash']?.count).toBe(2)
   })
 })
 
@@ -206,5 +236,13 @@ describe('computeDelta', () => {
     const diff = computeDelta(oldAgg, newAgg)
     expect(diff.bothFailed).toBe(true)
     expect(diff.deltas.maxParallelism.better).toBe('neutral')
+  })
+
+  it('old side empty (0 tokens) vs a new side with tokens -> percent omitted, not 0', () => {
+    const oldAgg = buildSideAggregates({ side: 'old', extracted: [], failedRuns: [], rawRunIds: [] })
+    const newAgg = sideFromPrimary('new', [primary({ totalTokens: '100' })])
+    const diff = computeDelta(oldAgg, newAgg)
+    expect(diff.deltas.totalTokens.absolute).toBe(100)
+    expect(diff.deltas.totalTokens.percent).toBeUndefined()
   })
 })

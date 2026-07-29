@@ -1,8 +1,21 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { Effect } from 'effect'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { makeTempDir } from '../../tests/setup.js'
+import type * as ChildProcessModule from 'node:child_process'
+
+// Real `execFile` by default (every existing test below runs against real
+// git); only the credential-redaction test overrides it for one call, since
+// this git version already sanitizes URLs in its own clone/network errors
+// and cannot be used to reproduce the leaky-stderr shape the fix targets.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof ChildProcessModule>()
+  return { ...actual, execFile: vi.fn(actual.execFile) }
+})
+
+import type { ChildProcess, ExecException, ExecFileOptions } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import {
   GitError,
   clone,
@@ -12,6 +25,8 @@ import {
   init,
   revParseHead,
 } from './git.js'
+
+const execFileMock = vi.mocked(execFile)
 
 const run = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> =>
@@ -78,5 +93,29 @@ describe('git utils', () => {
     expect(err.command).toBe('clone')
     expect(err.exitCode).not.toBe(0)
     expect(err.stderr.length).toBeGreaterThan(0)
+  })
+
+  it('redacts a credentialed URL echoed in git stderr from the resulting GitError', async () => {
+    const leakyStderr =
+      "fatal: unable to access 'https://user:sk-fake-token@example.invalid/repo.git/': The requested URL returned error: 403"
+    execFileMock.mockImplementationOnce(
+      (
+        (
+          _file: string,
+          _args: readonly string[] | null | undefined,
+          _options: ExecFileOptions,
+          callback: (error: ExecException | null, stdout: string, stderr: string) => void,
+        ): ChildProcess => {
+          callback(Object.assign(new Error('git failed'), { code: 128 }), '', leakyStderr)
+          return {} as unknown as ChildProcess
+        }
+      ) as typeof execFile,
+    )
+
+    const err = await runFlip(clone('https://user:sk-fake-token@example.invalid/repo.git', makeTempDir()))
+    expect(err).toBeInstanceOf(GitError)
+    expect(err.stderr).not.toContain('sk-fake-token')
+    expect(err.stderr).not.toContain('user:')
+    expect(err.stderr).toContain('https://example.invalid/repo.git')
   })
 })

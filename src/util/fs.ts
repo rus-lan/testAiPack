@@ -13,6 +13,7 @@ import {
   symlink as fsSymlink,
   writeFile as fsWriteFile,
 } from 'node:fs/promises'
+import path from 'node:path'
 import type { ZodType } from 'zod'
 
 export class FsError extends Data.TaggedError('FsError')<{
@@ -132,6 +133,13 @@ export const copyFile = (
     try: () => fsCopyFile(src, dst),
     catch: wrap('copyFile', src),
   })
+
+/** True when `target` resolves to strictly inside `parent` (not equal to it). */
+export const isPathWithin = (parent: string, target: string): boolean => {
+  const resolvedParent = path.resolve(parent)
+  const resolvedTarget = path.resolve(target)
+  return resolvedTarget !== resolvedParent && resolvedTarget.startsWith(`${resolvedParent}${path.sep}`)
+}
 
 export type PathKind = 'file' | 'dir' | 'missing'
 

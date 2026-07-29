@@ -130,6 +130,7 @@ model RunInput {
   judgeFiles?: string[];
   preflightEnabled: boolean;
   preflightModel?: string;
+  "model"?: string;
   formats: OutputFormat[];
   outputPath: string;
   diffHtml: boolean;
@@ -352,7 +353,6 @@ model SecondaryMetrics {
   stepLatencyP95Ms: int64;
   toolLatencyAvgMs: int64;
   finishCauseDistribution: Record<int32>;
-  fileDiffStats: FileDiffStats;
   maxConsecutiveSameTool: int32;
 }
 
@@ -360,13 +360,6 @@ model ToolStat {
   count: int32;
   errorRate: float64;
   avgDurationMs: int64;
-}
-
-model FileDiffStats {
-  additions: int32;
-  deletions: int32;
-  filesChanged: int32;
-  perFile?: FileChange[];
 }
 
 model FileChange {
@@ -429,7 +422,7 @@ model PrimaryDeltas {
 
 model MetricDelta {
   absolute: float64;
-  percent: float64;
+  percent?: float64;
   significant: boolean;
   better: "better" | "worse" | "neutral" | "context-dependent";
 }

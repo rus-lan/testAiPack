@@ -319,6 +319,22 @@ const callAt = (tStart: number, tool = 'bash'): TimelineEvent => ({
   tool,
 })
 
+const resultAt = (
+  tStart: number,
+  tool = 'bash',
+  status: 'completed' | 'error' = 'completed',
+): TimelineEvent => ({
+  tStart: String(tStart),
+  tEnd: String(tStart),
+  side: 'old',
+  runIndex: 1,
+  sessionId: 's',
+  swimlaneDepth: 0,
+  type: 'tool-result',
+  tool,
+  status,
+})
+
 describe('collapseRepeats', () => {
   it('5 identical tool-call events → 1 (merged tEnd = max)', () => {
     const events = [100, 200, 300, 400, 500].map((t) => callAt(t))
@@ -351,6 +367,21 @@ describe('collapseRepeats', () => {
     ]
     const out = collapseRepeats(events)
     expect(out).toHaveLength(3)
+  })
+
+  it('does not merge a tool-call with its own adjacent tool-result (same tool)', () => {
+    const events: TimelineEvent[] = [callAt(100, 'bash'), resultAt(200, 'bash')]
+    const out = collapseRepeats(events)
+    expect(out).toHaveLength(2)
+    expect(out[0]!.type).toBe('tool-call')
+    expect(out[1]!.type).toBe('tool-result')
+  })
+
+  it('preserves an error status on tool-result instead of merging it away', () => {
+    const events: TimelineEvent[] = [callAt(100, 'bash'), resultAt(200, 'bash', 'error')]
+    const out = collapseRepeats(events)
+    expect(out).toHaveLength(2)
+    expect(out[1]!.status).toBe('error')
   })
 
   it('sums tokens when present', () => {
@@ -411,6 +442,61 @@ describe('renderTimelineHtml', () => {
   it('tool events get tool-specific class (bash)', () => {
     const html = renderTimelineHtml(sampleTimeline('side-by-side'))
     expect(html).toContain('tool-call bash')
+  })
+
+  it('sanitizes a tool name with unsafe characters before using it as a CSS class', () => {
+    const tl: Timeline = {
+      old: [
+        {
+          tStart: '0',
+          tEnd: '10',
+          side: 'old',
+          runIndex: 1,
+          sessionId: 's',
+          swimlaneDepth: 0,
+          type: 'tool-call',
+          tool: '"><img src=x onerror=alert(1)>',
+          status: 'completed',
+        },
+      ],
+      new: [],
+      mode: 'side-by-side',
+    }
+    const html = renderTimelineHtml(tl)
+    expect(html).not.toContain('<img')
+    const classAttr = /class="(event tool-call [^"]*)"/.exec(html)
+    expect(classAttr).not.toBeNull()
+    expect(classAttr![1]!).toMatch(/^[a-z0-9 -]+$/)
+  })
+
+  it('caps event width instead of rendering an unbounded pixel value', () => {
+    const tl: Timeline = {
+      old: [
+        { tStart: '0', tEnd: '600000', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' },
+      ],
+      new: [],
+      mode: 'side-by-side',
+    }
+    const html = renderTimelineHtml(tl)
+    expect(html).not.toContain('width:300000px')
+    expect(html).toContain('width:2000px')
+  })
+
+  it('embeds the timeline JSON so it survives a literal </script> in tool data', () => {
+    const tl: Timeline = {
+      old: [
+        { tStart: '0', tEnd: '10', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash & "quoted" <b>', status: 'completed' },
+      ],
+      new: [],
+      mode: 'side-by-side',
+    }
+    const html = renderTimelineHtml(tl)
+    const match = /<script type="application\/json" id="timeline-data">([\s\S]*?)<\/script>/.exec(html)
+    expect(match).not.toBeNull()
+    const scriptContent = match![1]!
+    expect(scriptContent).not.toMatch(/&amp;|&lt;|&quot;/)
+    const parsed = JSON.parse(scriptContent) as Timeline
+    expect(parsed.old[0]?.tool).toBe('bash & "quoted" <b>')
   })
 
   it('is self-contained: no external resources', () => {
@@ -539,13 +625,13 @@ describe('timeline — happy path', () => {
     expect(existsSync(result.jsonPath)).toBe(true)
   })
 
-  it('collapseRepeats=true → consecutive same-tool collapsed in output', async () => {
+  it('collapseRepeats=true → consecutive same-tool calls collapsed in output', async () => {
     const tree = await makeWorkspace(1)
     const runInput = makeRunInput({ runs: 1, collapseRepeats: true })
     const parts: readonly PartBuilder[] = [
-      toolPart('bash', 'completed', 0, 10),
-      toolPart('bash', 'completed', 10, 20),
-      toolPart('bash', 'completed', 20, 30),
+      toolPart('bash', 'running', 0, 10),
+      toolPart('bash', 'running', 10, 20),
+      toolPart('bash', 'running', 20, 30),
     ]
     await writeRaw(tree, 'old', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts }] }))
     await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
@@ -703,6 +789,13 @@ describe('loadSessionTree', () => {
     expect([...tree.map((n) => n.sessionId)].sort()).toEqual(['A', 'B'])
   })
 
+  it('a session id with SQL-unsafe characters never reaches the DB query', async () => {
+    setupTreeMocks({}, {})
+    const tree = await runP(loadSessionTree('/h', "root' OR '1'='1"))
+    expect(tree).toHaveLength(1)
+    expect(dbMock).not.toHaveBeenCalled()
+  })
+
   it('depth limit: a chain of 12 -> stops at depth 10 (≤11 nodes)', async () => {
     const ids = Array.from({ length: 12 }, (_, i) => `n${String(i)}`)
     const exports: Record<string, Record<string, unknown>> = {}
@@ -788,6 +881,41 @@ describe('renderTimelineHtml — swimlanes', () => {
     }
     const html = renderTimelineHtml(tl)
     expect(html).toContain('data-depth="1"')
+  })
+
+  it('preserves first-appearance session order even when interleaved and not alphabetical', () => {
+    const evt = (
+      sessionId: string,
+      depth: number,
+      tool: string,
+      tStart: string,
+      tEnd: string,
+    ): TimelineEvent => ({
+      tStart, tEnd, side: 'old', runIndex: 1, sessionId, swimlaneDepth: depth,
+      type: 'tool-call', tool, status: 'completed',
+    })
+    const tl: Timeline = {
+      old: [
+        evt('zzz', 0, 'first', '0', '10'),
+        evt('aaa', 1, 'second', '5', '15'),
+        evt('zzz', 0, 'third', '10', '20'),
+        evt('mmm', 1, 'fourth', '15', '25'),
+      ],
+      new: [],
+      mode: 'side-by-side',
+    }
+    const html = renderTimelineHtml(tl)
+    const zzzFirst = html.indexOf('data-tooltip="tool-call first')
+    const zzzThird = html.indexOf('data-tooltip="tool-call third')
+    const aaaIdx = html.indexOf('data-tooltip="tool-call second')
+    const mmmIdx = html.indexOf('data-tooltip="tool-call fourth')
+    expect(zzzFirst).toBeGreaterThan(-1)
+    // zzz's own two (non-adjacent in the input) events land in one lane, together
+    expect(zzzThird).toBeGreaterThan(zzzFirst)
+    expect(zzzThird).toBeLessThan(aaaIdx)
+    // session order follows first appearance (zzz, aaa, mmm), not alphabetical
+    expect(aaaIdx).toBeGreaterThan(zzzThird)
+    expect(mmmIdx).toBeGreaterThan(aaaIdx)
   })
 })
 

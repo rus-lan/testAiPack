@@ -3,7 +3,7 @@ import { Effect } from 'effect'
 import path from 'node:path'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir } from '../util/fs.js'
-import { detectPack, PackDetectError, type PackRef } from './detector.js'
+import { detectPack, safeRefDisplay, PackDetectError, type PackRef } from './detector.js'
 
 const run = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> =>
@@ -19,6 +19,16 @@ describe('detectPack', () => {
   it('bare single word → Plugin/npm', async () => {
     const r = await run(detectPack('lodash'))
     expect(r).toMatchObject({ type: 'plugin', source: 'npm', name: 'lodash' })
+  })
+
+  it('npm:@scope/name → Plugin/npm, scoped name preserved', async () => {
+    const r = await run(detectPack('npm:@myorg/opencode-plugin'))
+    expect(r).toMatchObject({ type: 'plugin', source: 'npm', name: '@myorg/opencode-plugin' })
+  })
+
+  it('bare @scope/name (no npm: prefix) → Plugin/npm', async () => {
+    const r = await run(detectPack('@myorg/opencode-plugin'))
+    expect(r).toMatchObject({ type: 'plugin', source: 'npm', name: '@myorg/opencode-plugin' })
   })
 
   it('https://….git → Skill/git with url + name', async () => {
@@ -147,6 +157,14 @@ describe('detectPack', () => {
     expect(err).toBeInstanceOf(PackDetectError)
   })
 
+  it.each(['../..', './..', '/some/dir/..', 'github:owner/..'])(
+    '%s (name resolves to "..") → PackDetectError',
+    async (ref) => {
+      const err = await runFlip(detectPack(ref))
+      expect(err).toBeInstanceOf(PackDetectError)
+    },
+  )
+
   describe('graphify pack URL formats (3 git-source formats)', () => {
     it('https://github.com/Graphify-Labs/graphify (HTTPS, no .git) → Skill/git', async () => {
       const r = await run(detectPack('https://github.com/Graphify-Labs/graphify'))
@@ -177,5 +195,35 @@ describe('detectPack', () => {
         url: 'https://github.com/Graphify-Labs/graphify.git',
       })
     })
+  })
+})
+
+describe('safeRefDisplay', () => {
+  it('truncates an inline mcp ref to mcp:<name>, dropping the config payload', () => {
+    expect(safeRefDisplay('mcp:myserver:{"env":{"KEY":"sk-fake-secret"}}')).toBe('mcp:myserver')
+  })
+
+  it('truncates an mcp ref even when the name itself is unsafe', () => {
+    expect(safeRefDisplay('mcp:../evil:{"env":{"KEY":"sk-fake-secret"}}')).toBe('mcp:../evil')
+  })
+
+  it('truncates an mcp @file ref to mcp:<name> too (file path is not the sensitive part, but stays consistent)', () => {
+    expect(safeRefDisplay('mcp:myserver:@/some/path/mcp.json')).toBe('mcp:myserver')
+  })
+
+  it('leaves a bare mcp:<name> ref (no config part) unchanged', () => {
+    expect(safeRefDisplay('mcp:myserver')).toBe('mcp:myserver')
+  })
+
+  it('redacts credentials from a non-mcp git URL ref', () => {
+    expect(safeRefDisplay('https://user:sk-fake-token@example.invalid/repo.git')).toBe(
+      'https://example.invalid/repo.git',
+    )
+  })
+
+  it('leaves non-mcp refs with no credentials unchanged (git URL, local path, npm name)', () => {
+    expect(safeRefDisplay('https://github.com/owner/repo.git')).toBe('https://github.com/owner/repo.git')
+    expect(safeRefDisplay('./local/skill')).toBe('./local/skill')
+    expect(safeRefDisplay('npm:myplugin')).toBe('npm:myplugin')
   })
 })

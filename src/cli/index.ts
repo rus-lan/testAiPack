@@ -4,9 +4,12 @@
  * `gc`, `init`, `doctor`.
  *
  * The `run` command forwards its raw trailing tokens (`Option.Proxy`) to phase
- * 00 (cli-parse), which owns flag parsing for the A/B run. Clipanion only
- * consumes the handful of flags that are orchestrator-level (not phase-00):
- * `--review-run`, `--ide`, `--ephemeral`, `--config`.
+ * 00 (cli-parse), which owns flag parsing for the A/B run. Clipanion's
+ * Option.Proxy captures every remaining token, option-shaped or not, so the
+ * four orchestrator-level flags (`--review-run`, `--ide`, `--ephemeral`,
+ * `--config`) cannot be declared as regular Option.* fields alongside it —
+ * `splitRunFlags` pulls them out of the raw proxy tokens by hand before the
+ * remainder reaches phase 00.
  *
  * @see docs/phases/00-cli-parse.ru.md
  */
@@ -26,6 +29,7 @@ import {
   readReport,
   ensureWorkspace,
   resolveWorkspace,
+  parseOlderThan,
 } from './workspace-runs.js'
 import { runDoctor, hasCriticalFailure } from './doctor.js'
 import {
@@ -38,14 +42,49 @@ import { updateGitignore } from '../util/gitignore.js'
 import { mapIdeToBinary } from '../phases/12-review-workspace.js'
 import { renderMd } from '../report/md.js'
 import { PhaseError } from '../errors.js'
+import {
+  VALUE_FLAGS,
+  BOOLEAN_FLAGS,
+  AUTH_KEYS,
+  NO_AUTH_PREFIX,
+  TIMEOUT_KEYS,
+  DEFAULT_RUNS,
+  DEFAULT_TIMEOUTS,
+  DEFAULT_AUTH,
+  DEFAULT_ISOLATION,
+  DEFAULT_PURE_BASELINE,
+  DEFAULT_PREFLIGHT_ENABLED,
+  DEFAULT_DIFF_HTML,
+  DEFAULT_COLLAPSE_REPEATS,
+  DEFAULT_TIMELINE_MODE,
+  DEFAULT_LOG_LEVEL,
+  DEFAULT_OUTPUT_PATH,
+  DEFAULT_WORKSPACE_PATH,
+  DEFAULT_FORMATS,
+} from '../phases/00-cli-parse.js'
+import type { RunBooleanKey } from '../phases/00-cli-parse.js'
+import {
+  packTypeSchema,
+  isolationModeSchema,
+  timelineModeSchema,
+  logLevelSchema,
+  outputFormatSchema,
+} from '@generated/schemas'
+import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import pkg from '../../package.json' with { type: 'json' }
 
 const BINARY_NAME = 'testaipack'
 const BINARY_VERSION: string = pkg.version
 
-const parseRunIndex = (s: string): number => {
-  const n = Number.parseInt(s, 10)
-  return Number.isFinite(n) && n >= 1 ? n : 1
+const parseNonNegativeInt = (s: string): number | undefined => {
+  if (!/^\d+$/.test(s.trim())) return undefined
+  const n = Number(s)
+  return Number.isSafeInteger(n) ? n : undefined
+}
+
+const parseRunIndex = (s: string): number | undefined => {
+  const n = parseNonNegativeInt(s)
+  return n !== undefined && n >= 1 ? n : undefined
 }
 
 const formatPhaseError = (e: PhaseError): string =>
@@ -64,7 +103,7 @@ const exitCodeFromError = (e: unknown): number => {
 // run
 // ---------------------------------------------------------------------------
 
-interface RunFlags {
+export interface RunFlags {
   readonly reviewRun: number
   readonly ide: string
   readonly ephemeral: boolean
@@ -124,6 +163,18 @@ export const executeReview = async (flags: ReviewFlags): Promise<number> => {
   }
   const bin = mapIdeToBinary(flags.ide)
   const child = spawn(bin, [wsFile], { detached: true, stdio: 'ignore' })
+  const spawned = await new Promise<boolean>((resolve) => {
+    child.once('error', () => {
+      resolve(false)
+    })
+    child.once('spawn', () => {
+      resolve(true)
+    })
+  })
+  if (!spawned) {
+    console.error(`failed to open ${wsFile}: could not launch "${bin}" (is it installed and on PATH?)`)
+    return 1
+  }
   child.unref()
   process.stdout.write(`opened ${wsFile} in ${bin}\n`)
   return 0
@@ -142,7 +193,12 @@ export const executeReport = async (
     console.error(`no run found in ${resolveWorkspace(workspace)}`)
     return 1
   }
-  const report = await Effect.runPromise(readReport(found.resultsDir))
+  const outcome = await Effect.runPromise(Effect.either(readReport(found.resultsDir)))
+  if (outcome._tag === 'Left') {
+    console.error(`cannot read report.json in ${found.resultsDir}: ${outcome.left._tag}`)
+    return 1
+  }
+  const report = outcome.right
   if (report === null) {
     console.error(`no report.json in ${found.resultsDir}`)
     return 1
@@ -241,7 +297,7 @@ export const executeInit = async (workspace: string): Promise<number> => {
     await Effect.runPromise(writeJson(cfgPath, DEFAULT_CONFIG))
   }
   const giPath = path.join(path.dirname(path.resolve(root)), '.gitignore')
-  await Effect.runPromise(updateGitignore(giPath))
+  await Effect.runPromise(updateGitignore(giPath, `${path.basename(path.resolve(root))}/`))
   process.stdout.write(`Initialized testaipack workspace at ${root}\n`)
   return 0
 }
@@ -267,42 +323,299 @@ const runUsage: Usage = {
   category: 'A/B testing',
   description: 'Run an A/B comparison of an opencode pack against a baseline.',
   details:
-    'Clones the repo, installs the pack on the new side only, runs the prompt N times per side, collects metrics, and renders a comparison report. All phase-00 flags (--pack, --prompt, --runs, --workspace, ...) are forwarded to the parser. See `testaipack --help` for the full flag table.',
+    'Clones the repo, installs the pack on the new side only, runs the prompt N times per side, collects metrics, and renders a comparison report.\n\n' +
+    'Orchestrator-level flags, parsed ahead of phase 00: `--review-run <n>` (which run index to surface in `review`, default 1), `--ide vscode|cursor|code-insiders` (default vscode), `--ephemeral` (delete apps/, home/ and pack/ after the run, keeps results/), `--config <path>` (path to a testaipack config.json).\n\n' +
+    'See the full flag table below.',
   examples: [
     ['Minimal run', '$0 <repo> --pack <pack-ref> --prompt "implement feature X"'],
     ['Smoke test (no pack)', '$0 <repo> --prompt "do the thing"'],
   ],
 }
 
+// ---------------------------------------------------------------------------
+// run --help flag table
+//
+// Flag names, value types and defaults are all read from phase 00's own
+// VALUE_FLAGS/BOOLEAN_FLAGS tables and default constants (plus the generated
+// enum schemas), so a flag added there without a matching row here still
+// shows up — it just falls back to a generic description. Only the
+// human-readable description text is a literal (natural-language strings
+// cannot be derived from the flag tables), keyed by the same `dest` string
+// VALUE_FLAGS/BOOLEAN_FLAGS already use.
+// ---------------------------------------------------------------------------
+
+interface FlagRow {
+  readonly names: string
+  readonly type: string
+  readonly def: string
+  readonly description: string
+}
+
+const FLAG_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  repoUrl: 'Git repository URL to run the A/B comparison against.',
+  prompts: 'Prompt for the agent on the build side. Repeatable; @file reads the file content.',
+  inits: 'Optional prompt run BEFORE --prompt in the same session (environment setup).',
+  verifies: 'Optional shell command run after the agent finishes (e.g. "npm test").',
+  judges: 'Prompt for an LLM judge that scores the semantic diff between the two sides.',
+  formats: 'Report formats to write. Repeatable, e.g. --format md --format html.',
+  auth: `Add <kind> to the isolation whitelist (copies credentials into the isolated HOME). Repeatable. Use ${NO_AUTH_PREFIX}<kind> to remove a kind that is on by default.`,
+  runs: 'Number of runs per side (the median is used for the comparison).',
+  isolation: '`docker` runs opencode in a container; falls back to `home` when the daemon is unavailable.',
+  dockerImage: 'Image for --isolation=docker. Ignored in `home` mode.',
+  packRef: 'The pack under test: git URL, npm package, local path, or mcp:<name>:<config>.',
+  packType: 'Override the auto-detected pack type.',
+  timelineMode: 'How the timeline visualizes old vs new.',
+  logLevel: 'Log verbosity.',
+  outputPath: 'Where report artifacts (report.*, metrics.json, timeline.*, diff/, ...) are written.',
+  workspacePath: 'Root of the testaipack working tree.',
+  opencodeVersion: 'Pin the opencode version for both sides (auto-detected otherwise).',
+  preflightModel: 'Model for the pre-flight auth-ping and the LLM judge (see --model for the run model).',
+  model: 'Model for the run itself, applied identically to both sides.',
+  pricingPath: 'Custom pricing table (USD per 1M tokens). The built-in table is used otherwise.',
+  preflightSeconds: 'Timeout for the pre-flight stage (seconds).',
+  runSeconds: 'Timeout for a single agent run (seconds).',
+  verifySeconds: 'Timeout for the --verify command (seconds).',
+  installSeconds: 'Timeout for pack installation (seconds).',
+  watchdogSeconds: 'A run is considered hung if there is no output for this many seconds.',
+  totalSeconds: 'Overall run timeout (seconds), on top of the other timeouts.',
+  pureBaseline: 'Run both sides with --pure (no third-party plugins/skills besides the pack under test).',
+  preflightEnabled: 'Pre-flight stage (model ping, pack check).',
+  diffHtml: 'Generate an HTML side-by-side diff.',
+  collapseRepeats: 'Collapse consecutive identical tool-call sequences in the timeline.',
+}
+
+const enumChoices = (schema: { readonly options: readonly string[] }): string => schema.options.join('|')
+
+const namesForValueDest = (dest: string): string =>
+  Object.entries(VALUE_FLAGS)
+    .filter(([, d]) => d === dest)
+    .map(([name]) => name)
+    .join(', ')
+
+const onOffAuthKeys = (): { readonly on: readonly string[]; readonly off: readonly string[] } => {
+  const entries = Object.entries(DEFAULT_AUTH)
+  return {
+    on: entries.filter(([, v]) => v).map(([k]) => k),
+    off: entries.filter(([, v]) => !v).map(([k]) => k),
+  }
+}
+
+const timeoutDefault = (dest: string): number | undefined => {
+  if (dest === 'preflightSeconds') return DEFAULT_TIMEOUTS.preflightSeconds
+  if (dest === 'runSeconds') return DEFAULT_TIMEOUTS.runSeconds
+  if (dest === 'verifySeconds') return DEFAULT_TIMEOUTS.verifySeconds
+  if (dest === 'installSeconds') return DEFAULT_TIMEOUTS.installSeconds
+  if (dest === 'watchdogSeconds') return DEFAULT_TIMEOUTS.watchdogSeconds
+  if (dest === 'totalSeconds') return DEFAULT_TIMEOUTS.totalSeconds
+  return undefined
+}
+
+const valueFlagType = (dest: string): string => {
+  if (dest === 'isolation') return enumChoices(isolationModeSchema)
+  if (dest === 'packType') return enumChoices(packTypeSchema)
+  if (dest === 'timelineMode') return enumChoices(timelineModeSchema)
+  if (dest === 'logLevel') return enumChoices(logLevelSchema)
+  if (dest === 'formats') return `${enumChoices(outputFormatSchema)} (repeatable)`
+  if (dest === 'auth') return `${[...AUTH_KEYS].join('|')} (repeatable)`
+  if (dest === 'runs' || TIMEOUT_KEYS.has(dest)) return 'int'
+  return 'string'
+}
+
+const valueFlagDefault = (dest: string): string => {
+  if (dest === 'runs') return String(DEFAULT_RUNS)
+  if (dest === 'isolation') return DEFAULT_ISOLATION
+  if (dest === 'packType') return 'auto (from --pack)'
+  if (dest === 'timelineMode') return DEFAULT_TIMELINE_MODE
+  if (dest === 'logLevel') return DEFAULT_LOG_LEVEL
+  if (dest === 'outputPath') return DEFAULT_OUTPUT_PATH
+  if (dest === 'workspacePath') return DEFAULT_WORKSPACE_PATH
+  if (dest === 'dockerImage') return DEFAULT_OPENCODE_IMAGE
+  if (dest === 'formats') return DEFAULT_FORMATS.join(', ')
+  if (dest === 'auth') {
+    const { on } = onOffAuthKeys()
+    return `${on.join(',')} = on; rest off`
+  }
+  if (TIMEOUT_KEYS.has(dest)) {
+    const val = timeoutDefault(dest)
+    return val === undefined ? '— (unlimited)' : String(val)
+  }
+  return '—'
+}
+
+const BOOLEAN_KEY_ORDER: readonly RunBooleanKey[] = [
+  'pureBaseline', 'preflightEnabled', 'diffHtml', 'collapseRepeats',
+]
+
+const BOOLEAN_DEFAULTS: Readonly<Record<RunBooleanKey, boolean>> = {
+  pureBaseline: DEFAULT_PURE_BASELINE,
+  preflightEnabled: DEFAULT_PREFLIGHT_ENABLED,
+  diffHtml: DEFAULT_DIFF_HTML,
+  collapseRepeats: DEFAULT_COLLAPSE_REPEATS,
+}
+
+const namesForBooleanKey = (key: RunBooleanKey, value: boolean): string =>
+  Object.entries(BOOLEAN_FLAGS)
+    .filter(([, b]) => b.key === key && b.value === value)
+    .map(([name]) => name)
+    .join(', ')
+
+const ORCHESTRATOR_FLAG_ROWS: readonly FlagRow[] = [
+  {
+    names: '--review-run',
+    type: 'int',
+    def: '1',
+    description: 'Which run index (1-based) to surface in `review`.',
+  },
+  {
+    names: '--ide',
+    type: 'vscode|cursor|code-insiders',
+    def: 'vscode',
+    description: 'Editor used by `review`.',
+  },
+  {
+    names: '--ephemeral',
+    type: 'flag',
+    def: 'off',
+    description: 'Delete apps/, home/ and pack/ after the run (keeps results/).',
+  },
+  {
+    names: '--config',
+    type: 'string',
+    def: '—',
+    description: 'Path to a testaipack config.json (CLI flags still win over it).',
+  },
+]
+
+const REPO_POSITIONAL_ROW: FlagRow = {
+  names: '<repo>',
+  type: 'string',
+  def: '— (required; positional, or repoUrl in config.json)',
+  description: 'Git repository URL for the A/B run.',
+}
+
+const buildValueFlagRows = (): readonly FlagRow[] =>
+  [...new Set(Object.values(VALUE_FLAGS))].map((dest) => ({
+    names: namesForValueDest(dest),
+    type: valueFlagType(dest),
+    def: valueFlagDefault(dest),
+    description: FLAG_DESCRIPTIONS[dest] ?? '(no description yet)',
+  }))
+
+const buildBooleanFlagRows = (): readonly FlagRow[] =>
+  BOOLEAN_KEY_ORDER.map((key) => ({
+    names: `${namesForBooleanKey(key, true)}, ${namesForBooleanKey(key, false)}`,
+    type: 'flag',
+    def: BOOLEAN_DEFAULTS[key] ? 'on' : 'off',
+    description: FLAG_DESCRIPTIONS[key] ?? '(no description yet)',
+  }))
+
+const renderFlagRow = (r: FlagRow): string =>
+  `  ${r.names}\n      ${r.type}, default: ${r.def}\n      ${r.description}`
+
+const renderRunFlagTable = (): string =>
+  [
+    'Orchestrator flags (parsed before phase 00, by splitRunFlags):',
+    '',
+    ...ORCHESTRATOR_FLAG_ROWS.map(renderFlagRow),
+    '',
+    'Run configuration flags (phase 00):',
+    '',
+    renderFlagRow(REPO_POSITIONAL_ROW),
+    ...buildValueFlagRows().map(renderFlagRow),
+    ...buildBooleanFlagRows().map(renderFlagRow),
+  ].join('\n')
+
+interface RunFlagState {
+  readonly reviewRun: string
+  readonly ide: string
+  readonly ephemeral: boolean
+  readonly configFile: string | undefined
+  readonly rest: readonly string[]
+  readonly error: string | undefined
+}
+
+const RUN_FLAG_STATE_DEFAULTS: RunFlagState = {
+  reviewRun: '1',
+  ide: 'vscode',
+  ephemeral: false,
+  configFile: undefined,
+  rest: [],
+  error: undefined,
+}
+
+export interface RunFlagSplit {
+  readonly flags: RunFlags
+  readonly rest: readonly string[]
+  readonly error: string | undefined
+}
+
+const splitRunFlagsLoop = (tokens: readonly string[], i: number, acc: RunFlagState): RunFlagState => {
+  if (i >= tokens.length || acc.error !== undefined) return acc
+  const tok = tokens[i] ?? ''
+  const eq = tok.indexOf('=')
+  const name = eq >= 0 ? tok.slice(0, eq) : tok
+  const inline = eq >= 0 ? tok.slice(eq + 1) : undefined
+
+  if (name === '--ephemeral') return splitRunFlagsLoop(tokens, i + 1, { ...acc, ephemeral: true })
+  if (name === '--no-ephemeral') return splitRunFlagsLoop(tokens, i + 1, { ...acc, ephemeral: false })
+
+  if (name === '--review-run' || name === '--ide' || name === '--config') {
+    const value = inline ?? tokens[i + 1]
+    if (value === undefined || value.startsWith('-')) {
+      return { ...acc, error: `${name} requires a value` }
+    }
+    const next: RunFlagState =
+      name === '--review-run'
+        ? { ...acc, reviewRun: value }
+        : name === '--ide'
+          ? { ...acc, ide: value }
+          : { ...acc, configFile: value }
+    return splitRunFlagsLoop(tokens, inline !== undefined ? i + 1 : i + 2, next)
+  }
+
+  return splitRunFlagsLoop(tokens, i + 1, { ...acc, rest: [...acc.rest, tok] })
+}
+
+/**
+ * Pulls `--review-run`, `--ide`, `--ephemeral`/`--no-ephemeral` and `--config`
+ * out of the raw `run` proxy tokens (order-independent), leaving the rest
+ * (repoUrl positional + phase-00 flags) untouched for `cliParse`.
+ */
+export const splitRunFlags = (tokens: readonly string[]): RunFlagSplit => {
+  const state = splitRunFlagsLoop(tokens, 0, RUN_FLAG_STATE_DEFAULTS)
+  const baseFlags: RunFlags = {
+    reviewRun: 1,
+    ide: state.ide,
+    ephemeral: state.ephemeral,
+    configFile: state.configFile,
+  }
+  if (state.error !== undefined) {
+    return { flags: baseFlags, rest: state.rest, error: state.error }
+  }
+  const reviewRun = parseRunIndex(state.reviewRun)
+  if (reviewRun === undefined) {
+    return {
+      flags: baseFlags,
+      rest: state.rest,
+      error: `--review-run must be a positive integer, got: ${state.reviewRun}`,
+    }
+  }
+  return { flags: { ...baseFlags, reviewRun }, rest: state.rest, error: undefined }
+}
+
 class RunCommand extends Command {
   static override paths = [['run'], Command.Default]
   static override usage = Command.Usage(runUsage)
 
-  reviewRun = Option.String('--review-run', '1', {
-    description: 'Which run index (1-based) to surface in `review`.',
-  })
-  ide = Option.String('--ide', 'vscode', {
-    description: 'Editor for `review`: vscode | cursor | code-insiders.',
-  })
-  ephemeral = Option.Boolean('--ephemeral', false, {
-    description: 'Delete apps/, home/ and pack/ after the run (keeps results/).',
-  })
-  configFile = Option.String('--config', {
-    description: 'Path to a testaipack config.json.',
-  })
   proxy = Option.Proxy({ required: 0 })
 
   async execute(): Promise<number> {
-    return executeRun(
-      this.proxy,
-      {
-        reviewRun: parseRunIndex(this.reviewRun),
-        ide: this.ide,
-        ephemeral: this.ephemeral,
-        configFile: this.configFile,
-      },
-      process.cwd(),
-    )
+    const { flags, rest, error } = splitRunFlags(this.proxy)
+    if (error !== undefined) {
+      console.error(error)
+      return 2
+    }
+    return executeRun(rest, flags, process.cwd())
   }
 }
 
@@ -313,14 +626,25 @@ class ReviewCommand extends Command {
     description: 'Open a run in a multi-root VSCode workspace (old / new / pack).',
   })
   runId = Option.String({ required: false, name: 'run-id' })
-  reviewRun = Option.String('--review-run', '1')
-  ide = Option.String('--ide', 'vscode')
-  workspace = Option.String('--workspace', '.testaipack')
+  reviewRun = Option.String('--review-run', '1', {
+    description: 'Which run index (1-based) to open.',
+  })
+  ide = Option.String('--ide', 'vscode', {
+    description: 'Editor: vscode | cursor | code-insiders.',
+  })
+  workspace = Option.String('--workspace', '.testaipack', {
+    description: 'Root of the testaipack workspace.',
+  })
 
   async execute(): Promise<number> {
+    const reviewRun = parseRunIndex(this.reviewRun)
+    if (reviewRun === undefined) {
+      console.error(`invalid --review-run: ${this.reviewRun} (expected a positive integer)`)
+      return 2
+    }
     return executeReview({
       runId: this.runId,
-      reviewRun: parseRunIndex(this.reviewRun),
+      reviewRun,
       ide: this.ide,
       workspace: this.workspace,
     })
@@ -334,7 +658,9 @@ class ReportCommand extends Command {
     description: 'Re-print a run report as Markdown to stdout.',
   })
   runId = Option.String({ required: false, name: 'run-id' })
-  workspace = Option.String('--workspace', '.testaipack')
+  workspace = Option.String('--workspace', '.testaipack', {
+    description: 'Root of the testaipack workspace.',
+  })
 
   async execute(): Promise<number> {
     return executeReport(this.runId, this.workspace)
@@ -347,7 +673,9 @@ class ListCommand extends Command {
     category: 'Results',
     description: 'List all runs in the workspace.',
   })
-  workspace = Option.String('--workspace', '.testaipack')
+  workspace = Option.String('--workspace', '.testaipack', {
+    description: 'Root of the testaipack workspace.',
+  })
 
   async execute(): Promise<number> {
     return executeList(this.workspace)
@@ -364,12 +692,26 @@ class GcCommand extends Command {
   })
   keepLast = Option.String('--keep-last', { description: 'Keep only the N most recent runs.' })
   olderThan = Option.String('--older-than', { description: 'Duration, e.g. 7d / 12h.' })
-  aggressive = Option.Boolean('--aggressive', false)
-  workspace = Option.String('--workspace', '.testaipack')
+  aggressive = Option.Boolean('--aggressive', false, {
+    description: 'Also prune home/ and apps/ from the surviving runs.',
+  })
+  workspace = Option.String('--workspace', '.testaipack', {
+    description: 'Root of the testaipack workspace.',
+  })
 
   async execute(): Promise<number> {
+    const keepLast =
+      this.keepLast === undefined ? undefined : parseNonNegativeInt(this.keepLast)
+    if (this.keepLast !== undefined && keepLast === undefined) {
+      console.error(`invalid --keep-last: ${this.keepLast} (expected a non-negative integer)`)
+      return 2
+    }
+    if (this.olderThan !== undefined && parseOlderThan(this.olderThan) === null) {
+      console.error(`invalid --older-than: ${this.olderThan} (expected e.g. 7d, 12h, 30m)`)
+      return 2
+    }
     return executeGc({
-      keepLast: this.keepLast === undefined ? undefined : Number.parseInt(this.keepLast, 10),
+      keepLast,
       olderThan: this.olderThan,
       aggressive: this.aggressive,
       workspace: this.workspace,
@@ -392,9 +734,15 @@ class CompareCommand extends Command {
 
   runId1 = Option.String({ required: true, name: 'run-id-1' })
   runId2 = Option.String({ required: true, name: 'run-id-2' })
-  perspective = Option.String('--perspective', 'auto')
-  format = Option.String('--format', 'md')
-  workspace = Option.String('--workspace', '.testaipack')
+  perspective = Option.String('--perspective', 'auto', {
+    description: 'new-vs-new | old-vs-old | best | auto.',
+  })
+  format = Option.String('--format', 'md', {
+    description: 'md | json.',
+  })
+  workspace = Option.String('--workspace', '.testaipack', {
+    description: 'Root of the testaipack workspace.',
+  })
 
   async execute(): Promise<number> {
     const perspective = this.perspective
@@ -425,7 +773,9 @@ class InitCommand extends Command {
     category: 'Setup',
     description: 'Initialize the testaipack workspace (.testaipack/).',
   })
-  workspace = Option.String('--workspace', '.testaipack')
+  workspace = Option.String('--workspace', '.testaipack', {
+    description: 'Root of the testaipack workspace.',
+  })
 
   async execute(): Promise<number> {
     return executeInit(this.workspace)
@@ -476,7 +826,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
     return 0
   }
   if (head === 'run' && (argv.includes('-h') || argv.includes('--help'))) {
-    process.stdout.write(`${cli.usage(RunCommand, { detailed: true })}\n`)
+    const clipanionUsage = cli.usage(RunCommand, { detailed: true })
+    process.stdout.write(`${clipanionUsage}\n\n${renderRunFlagTable()}\n`)
     return 0
   }
   return cli.run([...argv])

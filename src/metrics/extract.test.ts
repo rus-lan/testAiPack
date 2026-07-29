@@ -161,6 +161,28 @@ describe('extractMetrics — secondary', () => {
     expect(bash?.avgDurationMs).toBe('200')
   })
 
+  it('perTool: interleaved tool names (not pre-grouped) still aggregate per name', () => {
+    const exp = makeExport({
+      messages: [
+        message([
+          toolPart('bash', { id: 'a', start: 0, end: 100 }),
+          toolPart('read', { id: 'b', start: 0, end: 40, status: 'error' }),
+          toolPart('bash', { id: 'c', start: 0, end: 300 }),
+          toolPart('read', { id: 'd', start: 0, end: 60 }),
+          toolPart('bash', { id: 'e', start: 0, end: 200 }),
+        ]),
+      ],
+    })
+    const { secondary } = extractMetrics(exp, null, 4)
+    const bash = secondary.perTool['bash']
+    const read = secondary.perTool['read']
+    expect(bash?.count).toBe(3)
+    expect(bash?.avgDurationMs).toBe('200')
+    expect(read?.count).toBe(2)
+    expect(read?.errorRate).toBeCloseTo(0.5, 3)
+    expect(read?.avgDurationMs).toBe('50')
+  })
+
   it('maxConsecutiveSameTool: 5 identical bash in a row -> 5', () => {
     const exp = makeExport({
       messages: [
@@ -183,6 +205,23 @@ describe('extractMetrics — secondary', () => {
     })
     const { secondary } = extractMetrics(exp, null, 4)
     expect(secondary.maxConsecutiveSameTool).toBe(1)
+  })
+
+  it('non-tool parts between same-tool calls do not break the run', () => {
+    const exp = makeExport({
+      messages: [
+        message([
+          toolPart('bash', { id: '1' }),
+          stepFinish('sf1'),
+          stepStart('ss2'),
+          toolPart('bash', { id: '2' }),
+          reasoningPart(0, 10, 'r1'),
+          toolPart('bash', { id: '3' }),
+        ]),
+      ],
+    })
+    const { secondary } = extractMetrics(exp, null, 4)
+    expect(secondary.maxConsecutiveSameTool).toBe(3)
   })
 
   it('finishCauseDistribution counts per finish cause', () => {
@@ -216,11 +255,6 @@ describe('extractMetrics — secondary', () => {
     expect(secondary.toolLatencyAvgMs).toBe('300')
   })
 
-  it('fileDiffStats mirrors info.summary', () => {
-    const exp = makeExport({ summary: { additions: 42, deletions: 7, files: 3 } })
-    const { secondary } = extractMetrics(exp, null, 4)
-    expect(secondary.fileDiffStats).toEqual({ additions: 42, deletions: 7, filesChanged: 3 })
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -258,6 +292,11 @@ const PARALLEL_CASES: readonly ParallelCase[] = [
   {
     name: 'edge: end of one = start of next -> 1',
     sessions: [{ timeCreated: 0, timeUpdated: 100 }, { timeCreated: 100, timeUpdated: 200 }],
+    expected: 1,
+  },
+  {
+    name: 'edge: zero-duration single session (created === updated) -> 1, not 0',
+    sessions: [{ timeCreated: 500, timeUpdated: 500 }],
     expected: 1,
   },
 ]
@@ -317,6 +356,12 @@ describe('extractMetricsFromTree', () => {
     const root = makeExport({ id: 'root', tStart: 0, tEnd: 100 })
     const child = makeExport({ id: 'child', tStart: 200, tEnd: 300 })
     const { primary } = extractMetricsFromTree([node(root, 0, null), node(child, 1, 'root')], null, 4)
+    expect(primary.maxParallelism).toBe(1)
+  })
+
+  it('single-node tree with a zero-duration session (created === updated) -> maxParallelism 1, not 0', () => {
+    const exp = makeExport({ id: 'root', tStart: 500, tEnd: 500 })
+    const { primary } = extractMetricsFromTree([node(exp, 0, null)], null, 4)
     expect(primary.maxParallelism).toBe(1)
   })
 
