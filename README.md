@@ -91,6 +91,15 @@ TESTAIPACK_VERSION=0.5.0 sh install.sh
 INSTALL_DIR=/opt/bin sh install.sh
 ```
 
+Проверка checksum обязательна: если в окружении нет `sha256sum`/`shasum`,
+скачать `checksums-sha256.txt` не вышло или в нём нет строки для нужного
+бинарника — установка прерывается. Обойти это (например, в минимальном
+окружении без sha256-утилит) можно через:
+
+```bash
+TESTAIPACK_SKIP_CHECKSUM=1 sh install.sh
+```
+
 ### Готовый бинарник из releases
 
 Скачайте бинарник для своей платформы со

@@ -9,6 +9,7 @@
 #
 # Override the install dir with:   INSTALL_DIR=/opt/bin sh install.sh
 # Pin a specific version with:     TESTAIPACK_VERSION=0.5.0 sh install.sh
+# Skip checksum verification with: TESTAIPACK_SKIP_CHECKSUM=1 sh install.sh
 set -eu
 
 OWNER="rus-lan"
@@ -39,15 +40,35 @@ else
 fi
 
 # --- resolve the release path: latest, or a pinned TESTAIPACK_VERSION ---
-# `releases/latest/download/<asset>` itself resolves "latest" to the real tag
-# as part of the download redirect — there is nothing to look up in advance.
+# "latest" is resolved to one concrete tag with a single redirect probe, then
+# every asset (binary + checksums) is downloaded from that same
+# releases/download/<tag>/ path — two independent "latest" lookups can never
+# race and disagree between the binary and its checksum file.
 if [ -n "${TESTAIPACK_VERSION:-}" ]; then
-  echo "testaipack: installing pinned version v${TESTAIPACK_VERSION}..."
-  RELEASE_PATH="releases/download/v${TESTAIPACK_VERSION}"
+  RESOLVED_TAG="v${TESTAIPACK_VERSION#v}"
+  echo "testaipack: installing pinned version ${RESOLVED_TAG}..."
 else
-  echo "testaipack: installing latest release..."
-  RELEASE_PATH="releases/latest/download"
+  echo "testaipack: resolving latest release..."
+  PROBE_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/checksums-sha256.txt"
+  if ! REDIRECT_URL=$(curl -fsS --no-location -o /dev/null -w '%{redirect_url}' "$PROBE_URL"); then
+    echo "testaipack: could not resolve the latest release from GitHub (network error, rate limit, or HTTP failure — see curl's message above)." >&2
+    echo "  probed: $PROBE_URL" >&2
+    exit 1
+  fi
+  if [ -z "$REDIRECT_URL" ]; then
+    echo "testaipack: GitHub did not redirect while resolving the latest release — no release may exist yet." >&2
+    echo "  probed: $PROBE_URL" >&2
+    exit 1
+  fi
+  RESOLVED_TAG=$(printf '%s' "$REDIRECT_URL" | sed -n 's#.*/releases/download/\(v[^/]*\)/.*#\1#p')
+  if [ -z "$RESOLVED_TAG" ]; then
+    echo "testaipack: could not parse a release tag from GitHub's redirect." >&2
+    echo "  redirect target: $REDIRECT_URL" >&2
+    exit 1
+  fi
+  echo "testaipack: resolved latest release to ${RESOLVED_TAG}."
 fi
+RELEASE_PATH="releases/download/${RESOLVED_TAG}"
 BASE_URL="https://github.com/${OWNER}/${REPO}/${RELEASE_PATH}"
 DOWNLOAD_URL="${BASE_URL}/${asset}"
 
@@ -67,8 +88,8 @@ echo "testaipack: downloading $asset..."
 if ! curl -fsSL -o "$TMP_FILE" "$DOWNLOAD_URL"; then
   echo "testaipack: could not download $asset from $DOWNLOAD_URL" >&2
   if [ -n "${TESTAIPACK_VERSION:-}" ]; then
-    echo "testaipack: check that release v${TESTAIPACK_VERSION} exists and includes this asset:" >&2
-    echo "  https://github.com/${OWNER}/${REPO}/releases/tag/v${TESTAIPACK_VERSION}" >&2
+    echo "testaipack: check that release ${RESOLVED_TAG} exists and includes this asset:" >&2
+    echo "  https://github.com/${OWNER}/${REPO}/releases/tag/${RESOLVED_TAG}" >&2
   else
     echo "testaipack: check your network connection, or browse releases at:" >&2
     echo "  https://github.com/${OWNER}/${REPO}/releases/latest" >&2
@@ -77,29 +98,50 @@ if ! curl -fsSL -o "$TMP_FILE" "$DOWNLOAD_URL"; then
 fi
 
 # --- verify checksum against checksums-sha256.txt from the same release ---
-# Best-effort: a missing checksums asset or a missing sha256sum/shasum
-# degrades to a warning and the install proceeds anyway. An actual mismatch
-# is always fatal — a corrupted or tampered binary must never be installed.
+# Verification is mandatory: a missing sha256 tool, a failed checksums
+# download, or a missing entry for this asset all hard-fail the install.
+# Set TESTAIPACK_SKIP_CHECKSUM=1 to downgrade those three to a warning and
+# install unverified anyway. An actual checksum mismatch is always fatal,
+# regardless of that variable — a corrupted or tampered binary must never
+# be installed.
 SHA_CMD=""
 if command -v sha256sum >/dev/null 2>&1; then
   SHA_CMD="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then
   SHA_CMD="shasum -a 256"
-else
-  echo "testaipack: WARNING: neither sha256sum nor shasum is available — skipping integrity check." >&2
 fi
 
-if [ -n "$SHA_CMD" ]; then
+if [ -z "$SHA_CMD" ]; then
+  if [ "${TESTAIPACK_SKIP_CHECKSUM:-}" = "1" ]; then
+    echo "testaipack: WARNING: neither sha256sum nor shasum is available — skipping integrity check." >&2
+  else
+    echo "testaipack: neither sha256sum nor shasum is available — cannot verify the download." >&2
+    echo "  set TESTAIPACK_SKIP_CHECKSUM=1 to install anyway without verification." >&2
+    exit 1
+  fi
+else
   CHECKSUMS_URL="${BASE_URL}/checksums-sha256.txt"
   TMP_CHECKSUMS=$(mktemp "${TMPDIR:-/tmp}/testaipack-sha.XXXXXX")
-  if ! curl -fsSL -o "$TMP_CHECKSUMS" "$CHECKSUMS_URL" 2>/dev/null; then
-    echo "testaipack: WARNING: could not download checksums-sha256.txt — skipping integrity check." >&2
+  if ! curl -fsSL -o "$TMP_CHECKSUMS" "$CHECKSUMS_URL"; then
     rm -f "$TMP_CHECKSUMS"
+    if [ "${TESTAIPACK_SKIP_CHECKSUM:-}" = "1" ]; then
+      echo "testaipack: WARNING: could not download checksums-sha256.txt — skipping integrity check." >&2
+    else
+      echo "testaipack: could not download checksums-sha256.txt — cannot verify the download." >&2
+      echo "  set TESTAIPACK_SKIP_CHECKSUM=1 to install anyway without verification." >&2
+      exit 1
+    fi
   else
     EXPECTED=$(grep -E "  ${asset}\$" "$TMP_CHECKSUMS" | awk '{print $1}' | head -1)
     rm -f "$TMP_CHECKSUMS"
     if [ -z "$EXPECTED" ]; then
-      echo "testaipack: WARNING: no checksum entry for '$asset' — skipping integrity check." >&2
+      if [ "${TESTAIPACK_SKIP_CHECKSUM:-}" = "1" ]; then
+        echo "testaipack: WARNING: no checksum entry for '$asset' — skipping integrity check." >&2
+      else
+        echo "testaipack: no checksum entry for '$asset' in checksums-sha256.txt — cannot verify the download." >&2
+        echo "  set TESTAIPACK_SKIP_CHECKSUM=1 to install anyway without verification." >&2
+        exit 1
+      fi
     else
       ACTUAL=$($SHA_CMD "$TMP_FILE" | awk '{print $1}')
       if [ "$EXPECTED" != "$ACTUAL" ]; then
