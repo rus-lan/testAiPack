@@ -1,9 +1,9 @@
 #!/usr/bin/env sh
-# testaipack installer — downloads the release binary for your platform
-# straight from GitHub's release-download redirect
-# (github.com/OWNER/REPO/releases/latest/download/<asset>), never the REST
-# API — so the installer is never subject to the API's 60 requests/hour
-# per-IP rate limit.
+# testaipack installer — downloads the release binary for your platform.
+# The latest release's tag is resolved with a single redirect probe against
+# GitHub's release-download URL (avoids the REST API's per-IP rate limit);
+# the binary and its checksums are then downloaded from that release's
+# pinned releases/download/<tag>/ path.
 # Usage: curl -fsSL https://github.com/rus-lan/testAiPack/releases/latest/download/install.sh | sh
 #   or:  wget -qO- https://github.com/rus-lan/testAiPack/releases/latest/download/install.sh | sh
 #
@@ -76,13 +76,32 @@ DOWNLOAD_URL="${BASE_URL}/${asset}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$INSTALL_DIR"
 
+if [ ! -w "$INSTALL_DIR" ]; then
+  echo "testaipack: cannot write to $INSTALL_DIR — check permissions or ownership." >&2
+  echo "  re-run with sudo, or set INSTALL_DIR to a writable location, e.g.:" >&2
+  echo "  INSTALL_DIR=\$HOME/.local/bin sh install.sh" >&2
+  exit 1
+fi
+
 TARGET="$INSTALL_DIR/$BINARY_NAME"
 if [ "$os" = "windows" ]; then
   TARGET="${TARGET}.exe"
 fi
 
-TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/testaipack-dl.XXXXXX")
-trap 'rm -f "$TMP_FILE"' EXIT
+# TMP_FILE lives inside INSTALL_DIR (not $TMPDIR) so the final "mv" below is
+# an atomic same-filesystem rename instead of a cross-filesystem copy, which
+# could otherwise leave a truncated file at $TARGET if it runs out of space
+# or is interrupted partway through.
+TMP_FILE=$(mktemp "$INSTALL_DIR/.testaipack-dl.XXXXXX")
+TMP_CHECKSUMS=""
+cleanup() {
+  rm -f "$TMP_FILE" "$TMP_CHECKSUMS" 2>/dev/null
+}
+trap cleanup EXIT
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 131' QUIT
+trap 'cleanup; exit 143' TERM
 
 echo "testaipack: downloading $asset..."
 if ! curl -fsSL -o "$TMP_FILE" "$DOWNLOAD_URL"; then
@@ -156,7 +175,7 @@ else
 fi
 
 mv "$TMP_FILE" "$TARGET"
-chmod +x "$TARGET" 2>/dev/null || true
+chmod 755 "$TARGET" 2>/dev/null || true
 
 # --- PATH hint ---
 case ":$PATH:" in
