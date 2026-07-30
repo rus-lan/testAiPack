@@ -9,6 +9,7 @@ import path from 'node:path'
 import type {
   Manifest,
   RunInput,
+  VariantTree,
   WorkspaceSetupInput,
   WorkspaceSetupResult,
   WorkspaceTree,
@@ -73,7 +74,7 @@ const probeOpencodeVersion = (probeHome: string, docker?: DockerExec): Effect.Ef
 /**
  * The manifest is a report/audit artifact (list, compare, report.md/json/html
  * all read it), never the source of truth for re-running the pipeline (that
- * stays on `runInput`) — so `repoUrl`/`packRef` are redacted here, at the one
+ * stays on `runInput`) — so `repoUrl`/pack refs are redacted here, at the one
  * place all four shared artifacts trace back to, rather than in each renderer.
  */
 const buildManifest = (
@@ -82,57 +83,64 @@ const buildManifest = (
   opencodeVersion: string,
   flagDefaults: Record<string, unknown>,
 ): Manifest => ({
+  schemaVersion: 2,
   runId,
   timestamp: new Date().toISOString(),
   repoUrl: redactUrlCredentials(runInput.repoUrl),
-  prompt: runInput.prompt,
   runs: runInput.runs,
+  parallel: runInput.parallel,
+  baseline: runInput.baseline,
+  packs: runInput.packs.map((p) => ({ ...p, ref: safeRefDisplay(redactUrlCredentials(p.ref)) })),
+  variants: runInput.variants,
   isolation: runInput.isolation,
   opencodeVersion,
   flagDefaults,
-  ...(runInput.packRef !== undefined
-    ? { packRef: safeRefDisplay(redactUrlCredentials(runInput.packRef)) }
-    : {}),
-  ...(runInput.packType !== undefined ? { packType: runInput.packType } : {}),
+  ...(runInput.prompt !== undefined ? { prompt: runInput.prompt } : {}),
   ...(runInput.init !== undefined ? { init: runInput.init } : {}),
+  ...(runInput.hint !== undefined ? { hint: runInput.hint } : {}),
   ...(runInput.verify !== undefined ? { verify: runInput.verify } : {}),
-  ...(runInput.packSetup !== undefined ? { packSetup: runInput.packSetup } : {}),
-  ...(runInput.packCheck !== undefined ? { packCheck: runInput.packCheck } : {}),
-  ...(runInput.packExercise !== undefined ? { packExercise: runInput.packExercise } : {}),
-  ...(runInput.packHint !== undefined ? { packHint: runInput.packHint } : {}),
 })
 
 /**
- * Pure function of `(rootPath, runs)` — the same `WorkspaceTree` this phase
- * derives while setting up a run, rederivable at any later point (e.g. `report
- * --rebuild`) without touching disk. Kept in lockstep with the directory
- * layout `workspaceSetup` creates below.
+ * Pure function of `(rootPath, runs, variants, schemaVersion)` — the same
+ * `WorkspaceTree` this phase derives while setting up a run, rederivable at
+ * any later point (e.g. `report --rebuild`) without touching disk. Kept in
+ * lockstep with the directory layout `workspaceSetup` creates below.
+ *
+ * `schemaVersion` picks the apps-dir naming only: v1 workspaces (pre-dating
+ * n-way variants) spelled the two arms `apps/oldVersion` / `apps/newVersion`;
+ * v2 uses the variant's own name (`apps/<name>`). `home/<name>` and
+ * `gitdirs/<name>` never carried the `Version` suffix, so both versions agree
+ * there — rebuild depends on this exact split to reconstruct pre-upgrade
+ * workspaces (`01-contract.md §7`).
  */
-export const buildTreePaths = (rootPath: string, runs: number): WorkspaceTree => {
+export const buildTreePaths = (
+  rootPath: string,
+  runs: number,
+  variants: readonly string[],
+  schemaVersion: 1 | 2,
+): WorkspaceTree => {
   const appsSource = path.join(rootPath, 'apps', 'source')
-  const appsOldBase = path.join(rootPath, 'apps', 'oldVersion')
-  const appsNewBase = path.join(rootPath, 'apps', 'newVersion')
   const pack = path.join(rootPath, 'pack')
-  const homeOldBase = path.join(rootPath, 'home', 'old')
-  const homeNewBase = path.join(rootPath, 'home', 'new')
-  const gitDirsOldBase = path.join(rootPath, 'gitdirs', 'old')
-  const gitDirsNewBase = path.join(rootPath, 'gitdirs', 'new')
   const config = path.join(rootPath, 'config')
   const results = path.join(rootPath, 'results')
   const raw = path.join(rootPath, 'results', 'raw')
   const diff = path.join(rootPath, 'results', 'diff')
   const runPaths = (base: string) => range(runs).map((n) => path.join(base, `run-${n.toString()}`))
+  const appsDirName = (name: string) => (schemaVersion === 1 ? `${name}Version` : name)
+
+  const variantTrees: VariantTree[] = variants.map((name) => ({
+    name,
+    apps: runPaths(path.join(rootPath, 'apps', appsDirName(name))),
+    homes: runPaths(path.join(rootPath, 'home', name)),
+    gitDirs: runPaths(path.join(rootPath, 'gitdirs', name)),
+  }))
 
   return {
     root: rootPath,
     appsSource,
-    appsOld: runPaths(appsOldBase),
-    appsNew: runPaths(appsNewBase),
     pack,
-    homeOld: runPaths(homeOldBase),
-    homeNew: runPaths(homeNewBase),
-    gitDirsOld: runPaths(gitDirsOldBase),
-    gitDirsNew: runPaths(gitDirsNewBase),
+    variantTrees,
     config,
     results,
     raw,
@@ -170,28 +178,32 @@ export const workspaceSetup = (
       })
     }
 
-    const appsSource = path.join(rootPath, 'apps', 'source')
-    const appsOldBase = path.join(rootPath, 'apps', 'oldVersion')
-    const appsNewBase = path.join(rootPath, 'apps', 'newVersion')
-    const pack = path.join(rootPath, 'pack')
-    const homeOldBase = path.join(rootPath, 'home', 'old')
-    const homeNewBase = path.join(rootPath, 'home', 'new')
-    const gitDirsOldBase = path.join(rootPath, 'gitdirs', 'old')
-    const gitDirsNewBase = path.join(rootPath, 'gitdirs', 'new')
-    const config = path.join(rootPath, 'config')
-    const raw = path.join(rootPath, 'results', 'raw')
-    const rawOld = path.join(raw, 'old')
-    const rawNew = path.join(raw, 'new')
-    const diff = path.join(rootPath, 'results', 'diff')
-    const diffOld = path.join(diff, 'old')
-    const diffNew = path.join(diff, 'new')
+    const variantNames = runInput.variants.map((v) => v.name)
+    const treePaths = buildTreePaths(rootPath, runInput.runs, variantNames, 2)
+    const config = treePaths.config
 
-    // gitdirs/{old,new} are created unconditionally (like home/{old,new}) so the
-    // skeleton stays flag-free — they stay empty unless --protect-git moves a
-    // run's .git into them (phase 02); per-run subdirs are created by that move.
+    // Base dirs derived from treePaths.variantTrees (dirname of each run-1
+    // entry) rather than re-joined from the variant name here — buildTreePaths
+    // is the one place that knows the apps-dir naming rule (appsDirName), so
+    // the skeleton can't drift from it.
+    // home/<name> and gitdirs/<name> are created unconditionally (one pair per
+    // variant) so the skeleton stays flag-free — gitdirs stay empty unless
+    // --protect-git moves a run's .git into them (phase 02); per-run subdirs
+    // are created by that move (or by phase 04 for home).
+    const baseDirOf = (runPaths: readonly string[], fallback: string): string =>
+      runPaths[0] === undefined ? fallback : path.dirname(runPaths[0])
     const skeleton: readonly string[] = [
-      appsSource, appsOldBase, appsNewBase, pack, homeOldBase, homeNewBase,
-      gitDirsOldBase, gitDirsNewBase, config, rawOld, rawNew, diffOld, diffNew,
+      treePaths.appsSource,
+      treePaths.pack,
+      config,
+      treePaths.results,
+      ...treePaths.variantTrees.flatMap((vt) => [
+        baseDirOf(vt.apps, path.join(rootPath, 'apps', vt.name)),
+        baseDirOf(vt.homes, path.join(rootPath, 'home', vt.name)),
+        baseDirOf(vt.gitDirs, path.join(rootPath, 'gitdirs', vt.name)),
+        path.join(treePaths.raw, vt.name),
+        path.join(treePaths.diff, vt.name),
+      ]),
     ]
     for (const p of skeleton) {
       yield* ensureDir(p).pipe(Effect.mapError(mapFsTo('mkdir-failed', p)))
@@ -222,8 +234,6 @@ export const workspaceSetup = (
     )
 
     yield* updateGitignore(path.join(projectRoot, '.gitignore'), `${path.basename(workspaceDir)}/`)
-
-    const treePaths = buildTreePaths(rootPath, runInput.runs)
 
     return { manifest, rootPath, treePaths }
   })

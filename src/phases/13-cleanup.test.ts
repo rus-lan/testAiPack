@@ -2,10 +2,12 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Effect } from 'effect'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
-import { makeWorkspace, makeRunInput, makeManifest } from '../../tests/report-fixture.js'
+import { makeTempDir } from '../../tests/setup.js'
+import { shimPair, makeWorkspaceTree } from '../../tests/helpers/variants.js'
 import { ensureDir, readFile, removeDir, writeFile } from '../util/fs.js'
 import { FsError } from '../util/fs.js'
 import { cleanup } from './13-cleanup.js'
+import type { Manifest, RunInput, WorkspaceTree } from '@generated/types'
 
 vi.mock('../util/fs.js', async () => {
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -17,8 +19,29 @@ const removeDirMock = vi.mocked(removeDir)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 
-const buildWorkspaceTree = async (runs = 1): Promise<ReturnType<typeof makeWorkspace>> => {
-  const workspace = makeWorkspace(runs)
+const makeRunInput = (): RunInput => shimPair().runInput
+
+const makeManifest = (): Manifest => {
+  const { runInput } = shimPair()
+  return {
+    schemaVersion: 2,
+    runId: 'rid',
+    timestamp: new Date().toISOString(),
+    repoUrl: runInput.repoUrl,
+    runs: runInput.runs,
+    parallel: runInput.parallel,
+    baseline: runInput.baseline,
+    packs: runInput.packs,
+    variants: runInput.variants,
+    isolation: runInput.isolation,
+    opencodeVersion: 'test',
+    flagDefaults: {},
+  }
+}
+
+const buildWorkspaceTree = async (runs = 1): Promise<WorkspaceTree> => {
+  const root = makeTempDir()
+  const workspace = makeWorkspaceTree(root, runs, ['old', 'new'])
   for (const p of [
     path.join(workspace.root, 'apps'),
     path.join(workspace.root, 'home'),
@@ -56,7 +79,7 @@ describe('cleanup — ephemeral off (default)', () => {
     expect(existsSync(workspace.pack)).toBe(true)
   })
 
-  it('kept contains results and the workspace paths', async () => {
+  it('kept contains results and every variant path (apps/homes/gitDirs), covering all variants (02-phases.md §13 AC)', async () => {
     const workspace = await buildWorkspaceTree()
     const result = await runP(
       cleanup({ runInput: makeRunInput(), manifest: makeManifest(), workspace, ephemeral: false }),
@@ -64,8 +87,11 @@ describe('cleanup — ephemeral off (default)', () => {
     expect(result.kept).toContain(workspace.results)
     expect(result.kept).toContain(workspace.config)
     expect(result.kept).toContain(workspace.pack)
-    for (const p of [...workspace.gitDirsOld, ...workspace.gitDirsNew]) {
-      expect(result.kept).toContain(p)
+    expect(workspace.variantTrees).toHaveLength(2)
+    for (const vt of workspace.variantTrees) {
+      for (const a of vt.apps) expect(result.kept).toContain(a)
+      for (const h of vt.homes) expect(result.kept).toContain(h)
+      for (const g of vt.gitDirs) expect(result.kept).toContain(g)
     }
   })
 })

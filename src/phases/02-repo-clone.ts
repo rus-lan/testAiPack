@@ -6,7 +6,7 @@
  */
 import { Effect } from 'effect'
 import path from 'node:path'
-import type { RepoCloneInput, RepoCloneResult } from '@generated/types'
+import type { RepoCloneInput, RepoCloneResult, VariantCopyPaths } from '@generated/types'
 import { repoCloneError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
 import { clone, revParseHead, lsFilesStage } from '../util/git.js'
@@ -151,10 +151,7 @@ export const repoClone = (
 
     const pairUp = (dests: readonly string[], gitDirs: readonly string[]): readonly DestGitDir[] =>
       dests.map((dest, i) => ({ dest, gitDir: gitDirs[i] ?? '' }))
-    const allPairs = [
-      ...pairUp(workspace.appsOld, workspace.gitDirsOld),
-      ...pairUp(workspace.appsNew, workspace.gitDirsNew),
-    ]
+    const allPairs = workspace.variantTrees.flatMap((vt) => pairUp(vt.apps, vt.gitDirs))
 
     for (const { dest } of allPairs) {
       yield* copyDir(sourcePath, dest).pipe(
@@ -172,9 +169,14 @@ export const repoClone = (
 
     yield* checkDeterminism(sourcePath, allPairs, runInput.protectGit, safeRepoUrl)
 
+    const copyPaths: VariantCopyPaths[] = workspace.variantTrees.map((vt) => ({
+      name: vt.name,
+      paths: [...vt.apps],
+    }))
+
     return {
       sourcePath,
-      copyPaths: { old: [...workspace.appsOld], new: [...workspace.appsNew] },
+      copyPaths,
       cloneDurationMs,
     }
   })

@@ -4,6 +4,7 @@ import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { rm as fsRm } from 'node:fs/promises'
 import { makeTempDir } from '../../tests/setup.js'
+import { shimPair, threeVariants, makeWorkspaceTree } from '../../tests/helpers/variants.js'
 import { ensureDir, writeFile } from '../util/fs.js'
 import { repoClone } from './02-repo-clone.js'
 import { PhaseError } from '../errors.js'
@@ -36,31 +37,11 @@ const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise
 const ensureDirP = (p: string): Promise<void> => runP(ensureDir(p))
 const writeFileP = (p: string, c: string): Promise<void> => runP(writeFile(p, c))
 
-const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
+/** Legacy old/new shim pair as the default base — overrides layer on top. */
+const makeRunInput = (overrides: Partial<RunInput> = {}): RunInput => ({
+  ...shimPair().runInput,
   repoUrl: '',
-  prompt: 'fix the bug',
   runs: 2,
-  isolation: 'home',
-  auth: {
-    opencode: false, npmrc: false, anthropic: false, openai: false,
-    gemini: false, aws: false, ssh: false, git: false,
-  },
-  pureBaseline: true,
-  protectGit: false,
-  allowBaselineTool: false,
-  initSide: 'both',
-  preflightEnabled: true,
-  formats: ['md'],
-  outputPath: './results',
-  diffHtml: false,
-  collapseRepeats: true,
-  timelineMode: 'side-by-side',
-  timeouts: {
-    preflightSeconds: 60, runSeconds: 600, verifySeconds: 300,
-    installSeconds: 300, watchdogSeconds: 1200,
-  },
-  workspacePath: './.testaipack',
-  logLevel: 'info',
   ...overrides,
 })
 
@@ -73,37 +54,31 @@ const buildSourceRepo = async (): Promise<string> => {
   return repo
 }
 
-const makeWorkspace = async (runs: number): Promise<{ readonly root: string; readonly tree: WorkspaceTree }> => {
+const makeWorkspace = async (
+  runs: number,
+  names: readonly string[] = ['old', 'new'],
+): Promise<{ readonly root: string; readonly tree: WorkspaceTree }> => {
   const root = makeTempDir()
-  await ensureDirP(path.join(root, 'apps', 'oldVersion'))
-  await ensureDirP(path.join(root, 'apps', 'newVersion'))
-  await ensureDirP(path.join(root, 'gitdirs', 'old'))
-  await ensureDirP(path.join(root, 'gitdirs', 'new'))
-  const range = Array.from({ length: runs }, (_, i) => i + 1)
-  const tree: WorkspaceTree = {
-    root,
-    appsSource: path.join(root, 'apps', 'source'),
-    appsOld: range.map((n) => path.join(root, 'apps', 'oldVersion', `run-${n.toString()}`)),
-    appsNew: range.map((n) => path.join(root, 'apps', 'newVersion', `run-${n.toString()}`)),
-    pack: path.join(root, 'pack'),
-    homeOld: [],
-    homeNew: [],
-    gitDirsOld: range.map((n) => path.join(root, 'gitdirs', 'old', `run-${n.toString()}`)),
-    gitDirsNew: range.map((n) => path.join(root, 'gitdirs', 'new', `run-${n.toString()}`)),
-    config: path.join(root, 'config'),
-    results: path.join(root, 'results'),
-    raw: path.join(root, 'results', 'raw'),
-    diff: path.join(root, 'results', 'diff'),
+  for (const name of names) {
+    await ensureDirP(path.join(root, 'apps', name))
+    await ensureDirP(path.join(root, 'gitdirs', name))
   }
+  const tree = makeWorkspaceTree(root, runs, [...names])
   return { root, tree }
 }
 
+const treeOf = (tree: WorkspaceTree, name: string) => tree.variantTrees.find((vt) => vt.name === name)
+
 const makeManifest = (runInput: RunInput): Manifest => ({
+  schemaVersion: 2,
   runId: 'rid',
   timestamp: new Date().toISOString(),
   repoUrl: runInput.repoUrl,
-  prompt: runInput.prompt,
   runs: runInput.runs,
+  parallel: runInput.parallel,
+  baseline: runInput.baseline,
+  packs: runInput.packs,
+  variants: runInput.variants,
   isolation: runInput.isolation,
   opencodeVersion: 'test',
   flagDefaults: {},
@@ -129,26 +104,31 @@ describe('repoClone — happy path', () => {
     const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 2 })
     const result = await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
 
+    const oldApps = treeOf(tree, 'old')?.apps ?? []
+    const newApps = treeOf(tree, 'new')?.apps ?? []
+
     expect(result.sourcePath).toBe(tree.appsSource)
     expect(existsSync(path.join(tree.appsSource, '.git'))).toBe(true)
     expect(existsSync(path.join(tree.appsSource, 'README.md'))).toBe(true)
-    expect(result.copyPaths.old).toEqual(tree.appsOld)
-    expect(result.copyPaths.new).toEqual(tree.appsNew)
-    for (const p of [...tree.appsOld, ...tree.appsNew]) {
+    expect(result.copyPaths.find((c) => c.name === 'old')?.paths).toEqual(oldApps)
+    expect(result.copyPaths.find((c) => c.name === 'new')?.paths).toEqual(newApps)
+    for (const p of [...oldApps, ...newApps]) {
       expect(existsSync(path.join(p, 'README.md'))).toBe(true)
       expect(existsSync(path.join(p, '.git'))).toBe(true)
     }
     expect(Number(result.cloneDurationMs)).toBeGreaterThanOrEqual(0)
   })
 
-  it('N=1 produces exactly one copy per side', async () => {
+  it('N=1 produces exactly one copy per variant', async () => {
     const src = await buildSourceRepo()
     const { tree } = await makeWorkspace(1)
     const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 1 })
     const result = await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
-    expect(result.copyPaths.old).toHaveLength(1)
-    expect(result.copyPaths.new).toHaveLength(1)
-    expect(existsSync(path.join(result.copyPaths.old[0] ?? '', 'README.md'))).toBe(true)
+    const oldPaths = result.copyPaths.find((c) => c.name === 'old')?.paths ?? []
+    const newPaths = result.copyPaths.find((c) => c.name === 'new')?.paths ?? []
+    expect(oldPaths).toHaveLength(1)
+    expect(newPaths).toHaveLength(1)
+    expect(existsSync(path.join(oldPaths[0] ?? '', 'README.md'))).toBe(true)
   })
 })
 
@@ -207,15 +187,38 @@ describe('repoClone — clone failed', () => {
 })
 
 describe('repoClone — copyPaths shape', () => {
-  it('copyPaths.old/new match workspace.appsOld/appsNew', async () => {
+  it('copyPaths carries one entry per variant, paths matching the variant tree', async () => {
     const src = await buildSourceRepo()
     const { tree } = await makeWorkspace(3)
     const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 3 })
     const result = await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
-    expect(result.copyPaths.old).toEqual(tree.appsOld)
-    expect(result.copyPaths.new).toEqual(tree.appsNew)
-    expect(result.copyPaths.old).toHaveLength(3)
-    expect(result.copyPaths.new).toHaveLength(3)
+    expect(result.copyPaths).toHaveLength(2)
+    for (const vt of tree.variantTrees) {
+      const entry = result.copyPaths.find((c) => c.name === vt.name)
+      expect(entry?.paths).toEqual(vt.apps)
+      expect(entry?.paths).toHaveLength(3)
+    }
+  })
+
+  it('3 variants × 2 runs produce 6 copies (02-phases.md §02 AC)', async () => {
+    const src = await buildSourceRepo()
+    const { runInput: threeVariantInput } = threeVariants()
+    const names = threeVariantInput.variants.map((v) => v.name)
+    const { tree } = await makeWorkspace(2, names)
+    const runInput = makeRunInput({
+      repoUrl: `file://${src}`,
+      runs: 2,
+      baseline: threeVariantInput.baseline,
+      variants: threeVariantInput.variants,
+      packs: threeVariantInput.packs,
+    })
+    const result = await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    expect(result.copyPaths).toHaveLength(3)
+    const totalCopies = result.copyPaths.reduce((n, c) => n + c.paths.length, 0)
+    expect(totalCopies).toBe(6)
+    for (const p of result.copyPaths.flatMap((c) => c.paths)) {
+      expect(existsSync(path.join(p, 'README.md'))).toBe(true)
+    }
   })
 })
 
@@ -236,9 +239,10 @@ describe('repoClone — copy failure', () => {
     const src = await buildSourceRepo()
     const { tree } = await makeWorkspace(1)
     const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 1 })
+    const oldApp0 = treeOf(tree, 'old')?.apps[0] ?? ''
     copyDirMock.mockImplementation(() =>
       Effect.fail(
-        new FsError({ path: tree.appsOld[0] ?? '', operation: 'copyDir', cause: new Error('ENOSPC: no space left on device') }),
+        new FsError({ path: oldApp0, operation: 'copyDir', cause: new Error('ENOSPC: no space left on device') }),
       ),
     )
     const err = await runFlip(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
@@ -269,7 +273,7 @@ describe('repoClone — copy failure', () => {
     copyDirMock.mockImplementation((srcP, dst) =>
       Effect.gen(function* () {
         yield* fsActual.copyDir(srcP, dst)
-        if (dst.endsWith(path.join('oldVersion', 'run-1'))) {
+        if (dst.endsWith(path.join('old', 'run-1'))) {
           yield* Effect.promise(() => fsRm(path.join(dst, 'README.md')))
           yield* addAll(dst).pipe(Effect.catchAll(() => Effect.void))
         }
@@ -290,7 +294,7 @@ describe('repoClone — copy failure', () => {
     copyDirMock.mockImplementation((srcP, dst) =>
       Effect.gen(function* () {
         yield* fsActual.copyDir(srcP, dst)
-        if (dst.endsWith(path.join('oldVersion', 'run-1'))) {
+        if (dst.endsWith(path.join('old', 'run-1'))) {
           yield* fsActual.writeFile(path.join(dst, 'extra.txt'), 'tampered\n')
           yield* addAll(dst).pipe(Effect.catchAll(() => Effect.void))
           yield* commit(dst, 'tamper').pipe(Effect.catchAll(() => Effect.void))
@@ -305,22 +309,38 @@ describe('repoClone — copy failure', () => {
 })
 
 describe('repoClone — protectGit', () => {
-  it('protect ON: no .git left in any run dir, every gitdirs/<side>/run-N holds HEAD, determinism check passes', async () => {
+  it('protect ON, 3 variants × 2 runs: no .git left in any run dir, all 6 gitdirs/<variant>/run-N hold HEAD, determinism check passes (02-phases.md §02 AC)', async () => {
     const src = await buildSourceRepo()
-    const { tree } = await makeWorkspace(2)
-    const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 2, protectGit: true })
+    const { runInput: threeVariantInput } = threeVariants()
+    const names = threeVariantInput.variants.map((v) => v.name)
+    const { tree } = await makeWorkspace(2, names)
+    const runInput = makeRunInput({
+      repoUrl: `file://${src}`,
+      runs: 2,
+      protectGit: true,
+      baseline: threeVariantInput.baseline,
+      variants: threeVariantInput.variants,
+      packs: threeVariantInput.packs,
+    })
     const result = await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
 
     expect(existsSync(path.join(tree.appsSource, '.git'))).toBe(true)
-    for (const dest of [...tree.appsOld, ...tree.appsNew]) {
+
+    const allDests = tree.variantTrees.flatMap((vt) => vt.apps)
+    const allGitDirs = tree.variantTrees.flatMap((vt) => vt.gitDirs)
+    expect(allDests).toHaveLength(6)
+    expect(allGitDirs).toHaveLength(6)
+
+    for (const dest of allDests) {
       expect(existsSync(path.join(dest, '.git'))).toBe(false)
       expect(existsSync(path.join(dest, 'README.md'))).toBe(true)
     }
-    for (const gitDir of [...tree.gitDirsOld, ...tree.gitDirsNew]) {
+    for (const gitDir of allGitDirs) {
       expect(existsSync(path.join(gitDir, 'HEAD'))).toBe(true)
     }
-    expect(result.copyPaths.old).toEqual(tree.appsOld)
-    expect(result.copyPaths.new).toEqual(tree.appsNew)
+    for (const vt of tree.variantTrees) {
+      expect(result.copyPaths.find((c) => c.name === vt.name)?.paths).toEqual(vt.apps)
+    }
   })
 
   it('protect ON: two-path revParseHead against the relocated gitDir returns the same HEAD as source', async () => {
@@ -329,7 +349,8 @@ describe('repoClone — protectGit', () => {
     const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 1, protectGit: true })
     await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
     const sourceHead = await runP(revParseHead(tree.appsSource))
-    const copyHead = await runP(revParseHead(tree.appsOld[0] ?? '', tree.gitDirsOld[0]))
+    const oldTree = treeOf(tree, 'old')
+    const copyHead = await runP(revParseHead(oldTree?.apps[0] ?? '', oldTree?.gitDirs[0]))
     expect(copyHead).toBe(sourceHead)
   })
 
@@ -352,9 +373,11 @@ describe('repoClone — protectGit', () => {
     const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 1, protectGit: false })
     await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
     expect(moveDirMock).not.toHaveBeenCalled()
-    for (const dest of [...tree.appsOld, ...tree.appsNew]) {
+    const oldTree = treeOf(tree, 'old')
+    const newTree = treeOf(tree, 'new')
+    for (const dest of [...(oldTree?.apps ?? []), ...(newTree?.apps ?? [])]) {
       expect(existsSync(path.join(dest, '.git'))).toBe(true)
     }
-    expect(await runP(exists(tree.gitDirsOld[0] ?? ''))).toBe(false)
+    expect(await runP(exists(oldTree?.gitDirs[0] ?? ''))).toBe(false)
   })
 })
