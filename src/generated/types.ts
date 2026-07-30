@@ -558,21 +558,21 @@ export type ExportReasoningPart = {
   text: string
   time: {
     start: number
-    end: number
+    end?: number
   }
   id: string
 }
 
 export type ExportToolState = {
   status: 'pending' | 'running' | 'completed' | 'error'
-  input: unknown
+  input?: unknown
   output?: string
   error?: string
   metadata?: RecordUnknown
   title?: string
   time?: {
     start: number
-    end: number
+    end?: number
   }
 }
 

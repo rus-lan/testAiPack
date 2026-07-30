@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { OpencodeExport } from '@generated/types'
+import { exportPartSchema, opencodeExportSchema } from '@generated/schemas'
 import { extractMetrics, computeMaxParallelism, extractMetricsFromTree, findPhaseBoundary } from './extract.js'
 import type { SessionTreeNode } from './extract.js'
 import type { PricingTable } from '../pricing/lookup.js'
@@ -300,6 +301,191 @@ describe('extractMetrics — secondary', () => {
     expect(secondary.toolLatencyAvgMs).toBe('300')
   })
 
+})
+
+// ---------------------------------------------------------------------------
+// exportPartSchema / extractMetrics — interrupted/malformed parts (regression:
+// an interrupted reasoning/tool part carries time.start with no end; a part
+// failing its typed schema falls through to the tolerant catch-all, which
+// strips every field except type/id)
+// ---------------------------------------------------------------------------
+
+describe('exportPartSchema — end-optional contract', () => {
+  it('reasoning part with time.start but no time.end validates as ExportReasoningPart, not the catch-all', () => {
+    const input = { type: 'reasoning', text: 'hello', time: { start: 100 }, id: 'r1' }
+    const result = exportPartSchema.safeParse(input)
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data).toEqual(input)
+  })
+
+  it('tool part with state.time.start but no state.time.end validates as ExportToolPart, not the catch-all', () => {
+    const input = {
+      type: 'tool',
+      tool: 'bash',
+      callID: 'c1',
+      state: { status: 'running', input: {}, time: { start: 100 } },
+      id: 't1',
+    }
+    const result = exportPartSchema.safeParse(input)
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data).toEqual(input)
+  })
+
+  it('reasoning part missing time entirely still falls through to the catch-all (stripped to {type, id})', () => {
+    const result = exportPartSchema.safeParse({ type: 'reasoning', id: 'r2' })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data).toEqual({ type: 'reasoning', id: 'r2' })
+  })
+
+  it('tool part missing state entirely still falls through to the catch-all (stripped to {type, id})', () => {
+    const result = exportPartSchema.safeParse({ type: 'tool', id: 't2' })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data).toEqual({ type: 'tool', id: 't2' })
+  })
+
+  it('text part missing text entirely still falls through to the catch-all (stripped to {type, id})', () => {
+    const result = exportPartSchema.safeParse({ type: 'text', id: 'x2' })
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data).toEqual({ type: 'text', id: 'x2' })
+  })
+
+  it('tool part with a pending state and no input validates as ExportToolPart, not the catch-all', () => {
+    const input = { type: 'tool', tool: 'bash', callID: 'c1', state: { status: 'pending' }, id: 't1' }
+    const result = exportPartSchema.safeParse(input)
+    expect(result.success).toBe(true)
+    if (!result.success) return
+    expect(result.data).toEqual(input)
+  })
+})
+
+describe('extractMetrics — interrupted/malformed parts', () => {
+  it('reasoning part with time.start but no time.end -> validates as reasoning (text kept), duration counted as 0', () => {
+    const raw = makeExport({
+      messages: [message([{ type: 'reasoning', text: 'hello', time: { start: 100 }, id: 'r-interrupted' }])],
+    })
+    const parsed = opencodeExportSchema.safeParse(raw)
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+    const exp = parsed.data as OpencodeExport
+    expect(() => extractMetrics(exp, null, 4)).not.toThrow()
+    const { secondary, extras } = extractMetrics(exp, null, 4)
+    expect(extras.reasoningChars).toBe(5)
+    expect(secondary.reasoningTimeMs).toBe('0')
+  })
+
+  it('reasoning part already stripped to {type, id} (no text/time) -> excluded, no throw', () => {
+    const exp = makeExport({ messages: [message([{ type: 'reasoning', id: 'r-stripped' }])] })
+    expect(() => extractMetrics(exp, null, 4)).not.toThrow()
+    const { secondary, extras } = extractMetrics(exp, null, 4)
+    expect(extras.reasoningChars).toBe(0)
+    expect(secondary.reasoningTimeMs).toBe('0')
+  })
+
+  it('tool part with state.time.start but no state.time.end -> validates as tool (counted), duration excluded from the average', () => {
+    const raw = makeExport({
+      messages: [
+        message([
+          {
+            type: 'tool',
+            tool: 'bash',
+            callID: 'call-interrupted',
+            state: { status: 'error', input: {}, time: { start: 100 } },
+            id: 'tool-interrupted',
+          },
+        ]),
+      ],
+    })
+    const parsed = opencodeExportSchema.safeParse(raw)
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+    const exp = parsed.data as OpencodeExport
+    expect(() => extractMetrics(exp, null, 4)).not.toThrow()
+    const { primary, secondary } = extractMetrics(exp, null, 4)
+    expect(primary.toolCallCount).toBe(1)
+    expect(secondary.toolLatencyAvgMs).toBe('0')
+  })
+
+  it('tool part already stripped to {type, id} (no state) -> excluded from toolCallCount, no throw', () => {
+    const exp = makeExport({ messages: [message([{ type: 'tool', id: 't-stripped' }])] })
+    expect(() => extractMetrics(exp, null, 4)).not.toThrow()
+    const { primary } = extractMetrics(exp, null, 4)
+    expect(primary.toolCallCount).toBe(0)
+  })
+
+  it('text part already stripped to {type, id} (no text) -> excluded from textChars, no throw', () => {
+    const exp = makeExport({ messages: [message([{ type: 'text', id: 'tx' }])] })
+    expect(() => extractMetrics(exp, null, 4)).not.toThrow()
+    const { extras } = extractMetrics(exp, null, 4)
+    expect(extras.textChars).toBe(0)
+  })
+
+  it('an end-less tool call is excluded from the latency average, not counted as a 0ms sample', () => {
+    const raw = makeExport({
+      messages: [
+        message([
+          toolPart('bash', { id: 'done', start: 0, end: 200 }),
+          {
+            type: 'tool',
+            tool: 'bash',
+            callID: 'call-running',
+            state: { status: 'running', input: {}, time: { start: 300 } },
+            id: 'running',
+          },
+        ]),
+      ],
+    })
+    const parsed = opencodeExportSchema.safeParse(raw)
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+    const exp = parsed.data as OpencodeExport
+    const { secondary } = extractMetrics(exp, null, 4)
+    // Only the measured 200ms call feeds the average; the unmeasured call is
+    // excluded, not counted as a 0ms sample.
+    expect(secondary.toolLatencyAvgMs).toBe('200')
+    expect(secondary.perTool['bash']?.count).toBe(2)
+    expect(secondary.perTool['bash']?.avgDurationMs).toBe('200')
+  })
+
+  it('pending tool call with no input validates as a real tool part, is counted, and creates no phantom duplicate', () => {
+    const raw = makeExport({
+      messages: [
+        message([
+          { type: 'tool', tool: 'bash', callID: 'call-pending-1', state: { status: 'pending' }, id: 'pending-1' },
+          { type: 'tool', tool: 'bash', callID: 'call-pending-2', state: { status: 'pending' }, id: 'pending-2' },
+        ]),
+      ],
+    })
+    const parsed = opencodeExportSchema.safeParse(raw)
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+    const exp = parsed.data as OpencodeExport
+    expect(() => extractMetrics(exp, null, 4)).not.toThrow()
+    const { primary, extras } = extractMetrics(exp, null, 4)
+    expect(primary.toolCallCount).toBe(2)
+    expect(extras.duplicateToolCalls).toBe(0)
+  })
+
+  it('well-formed text/reasoning/tool parts are unaffected (no shift from the stronger guards)', () => {
+    const exp = makeExport({
+      messages: [
+        message([
+          { type: 'text', text: 'hi', id: 'txt1' },
+          reasoningPart(0, 100),
+          toolPart('bash', { id: 'ok', start: 0, end: 200 }),
+        ]),
+      ],
+    })
+    const { primary, secondary, extras } = extractMetrics(exp, null, 4)
+    expect(primary.toolCallCount).toBe(1)
+    expect(secondary.reasoningTimeMs).toBe('100')
+    expect(secondary.toolLatencyAvgMs).toBe('200')
+    expect(extras.textChars).toBe(2)
+  })
 })
 
 // ---------------------------------------------------------------------------

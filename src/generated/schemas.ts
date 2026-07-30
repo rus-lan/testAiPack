@@ -579,7 +579,7 @@ export const exportReasoningPartSchema = z.object({
   text: z.string(),
   time: z.object({
     start: z.number().int(),
-    end: z.number().int(),
+    end: z.number().int().optional(),
   }),
   id: z.string(),
 })
@@ -591,7 +591,7 @@ export const exportToolStateSchema = z.object({
     z.literal('completed'),
     z.literal('error'),
   ]),
-  input: z.unknown(),
+  input: z.unknown().optional(),
   output: z.string().optional(),
   error: z.string().optional(),
   metadata: recordUnknownSchema.optional(),
@@ -599,7 +599,7 @@ export const exportToolStateSchema = z.object({
   time: z
     .object({
       start: z.number().int(),
-      end: z.number().int(),
+      end: z.number().int().optional(),
     })
     .optional(),
 })

@@ -12,9 +12,6 @@
 import type {
   ExportMessage,
   ExportPart,
-  ExportReasoningPart,
-  ExportStepFinishPart,
-  ExportTextPart,
   ExportToolPart,
   OpencodeExport,
   PrimaryMetrics,
@@ -26,6 +23,7 @@ import type {
 import type { PricingTable } from '../pricing/lookup.js'
 import { computeCost, lookupPrice } from '../pricing/lookup.js'
 import { isRecord } from '../util/types.js'
+import { isReasoning, isStepFinish, isText, isTool } from './parts.js'
 import { findRiskyCommand } from './risky-commands.js'
 import { findPackActivitySignals } from './baseline-contamination.js'
 import type { UnindexedSignal } from './baseline-contamination.js'
@@ -124,16 +122,24 @@ export const computeMaxParallelism = (
   return Math.max(1, swept)
 }
 
-const isTool = (p: ExportPart): p is ExportToolPart => p.type === 'tool'
-const isReasoning = (p: ExportPart): p is ExportReasoningPart => p.type === 'reasoning'
-const isStepFinish = (p: ExportPart): p is ExportStepFinishPart => p.type === 'step-finish'
-const isText = (p: ExportPart): p is ExportTextPart => p.type === 'text'
 const isInvalid = (p: ExportToolPart): boolean => p.tool === 'invalid'
 
-const durationOf = (start: number | string, end: number | string): number => {
+const durationOf = (start: number | string, end: number | string | undefined): number => {
   const d = toNum(end) - toNum(start)
   return d > 0 ? d : 0
 }
+
+/**
+ * A tool's `state.time.end` can be absent (an interrupted call). Distinguishes
+ * "no measurement" from "0ms measurement" so an average's denominator counts
+ * only calls that actually finished.
+ */
+const measuredToolDuration = (
+  t: ExportToolPart['state']['time'],
+): { readonly dur: number; readonly measured: boolean } =>
+  t !== undefined && t.end !== undefined
+    ? { dur: durationOf(t.start, t.end), measured: true }
+    : { dur: 0, measured: false }
 
 const allParts = (exp: OpencodeExport): readonly ExportPart[] =>
   exp.messages.flatMap((m) => m.parts)
@@ -148,8 +154,8 @@ const reasoningTimeMs = (exp: OpencodeExport): number =>
 
 const toolLatencyAverage = (tools: readonly ExportToolPart[]): number => {
   const durations = tools.flatMap((p) => {
-    const t = p.state.time
-    return t === undefined ? [] : [durationOf(t.start, t.end)]
+    const { dur, measured } = measuredToolDuration(p.state.time)
+    return measured ? [dur] : []
   })
   return durations.length === 0 ? 0 : durations.reduce((a, b) => a + b, 0) / durations.length
 }
@@ -181,10 +187,9 @@ const flushToolRun = (fold: ToolRunFold): readonly (readonly [string, PerToolAcc
 const groupToolRuns = (tools: readonly ExportToolPart[]): readonly (readonly [string, PerToolAcc])[] => {
   const sorted = [...tools].sort((a, b) => (a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : 0))
   const folded = sorted.reduce<ToolRunFold>((fold, p) => {
-    const t = p.state.time
-    const dur = t === undefined ? 0 : durationOf(t.start, t.end)
+    const { dur, measured } = measuredToolDuration(p.state.time)
+    const hasDur = measured ? 1 : 0
     const isError = p.state.status === 'error' ? 1 : 0
-    const hasDur = t === undefined ? 0 : 1
     if (fold.key === p.tool) {
       return {
         ...fold,
@@ -240,8 +245,10 @@ const stepDurations = (exp: OpencodeExport): readonly number[] =>
       readonly current: number
       readonly out: readonly number[]
     }>((st, p) => {
+      // No shared guard for step-start: this is its only reader anywhere in
+      // the codebase, and it never reads a field off the part beyond `type`.
       if (p.type === 'step-start') return { open: true, current: 0, out: st.out }
-      if (p.type === 'step-finish') {
+      if (isStepFinish(p)) {
         return st.open
           ? { open: false, current: 0, out: [...st.out, st.current] }
           : { open: false, current: 0, out: st.out }
@@ -321,9 +328,22 @@ const packUseOf = (
   }
 }
 
+/**
+ * `p.state.input` can be absent (a pending call has no input yet).
+ * `JSON.stringify(undefined)` is the JS value `undefined`, not a string, so
+ * interpolating it would render every input-less call as the literal text
+ * `undefined` — two different input-less calls of the same tool would then
+ * collide into a false duplicate. Keying on `callID` instead (unique per
+ * call) keeps each one distinct.
+ */
+const duplicateKeyOf = (p: ExportToolPart): string =>
+  p.state.input === undefined
+    ? `${p.tool}\x00no-input\x00${p.callID}`
+    : `${p.tool}\x00${JSON.stringify(p.state.input)}`
+
 const duplicateToolCallsOf = (tools: readonly ExportToolPart[]): number => {
   const counts = tools.reduce<Readonly<Record<string, number>>>((m, p) => {
-    const key = `${p.tool} ${JSON.stringify(p.state.input)}`
+    const key = duplicateKeyOf(p)
     return { ...m, [key]: (m[key] ?? 0) + 1 }
   }, {})
   return Object.values(counts).reduce((sum, c) => sum + Math.max(0, c - 1), 0)

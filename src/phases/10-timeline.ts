@@ -13,10 +13,6 @@ import { Effect, Either } from 'effect'
 import path from 'node:path'
 import type {
   ExportPart,
-  ExportReasoningPart,
-  ExportStepFinishPart,
-  ExportTextPart,
-  ExportToolPart,
   OpencodeExport,
   RunSideResult,
   Side,
@@ -34,6 +30,7 @@ import type { FsError } from '../util/fs.js'
 import { dbQuery, exportSession } from '../opencode/cli.js'
 import type { OpencodeError } from '../opencode/cli.js'
 import { isRecord } from '../util/types.js'
+import { isReasoning, isStepFinish, isText, isTool } from '../metrics/parts.js'
 import type { SessionTreeNode } from '../metrics/extract.js'
 
 // ---------------------------------------------------------------------------
@@ -68,14 +65,6 @@ const eventBase = (
   ...(parentSessionId === null ? {} : { parentSessionId }),
 })
 
-// Type guards. The ExportPart union includes a tolerant catch-all whose
-// `type` is a plain string, so a literal `part.type === 'tool'` check no longer
-// narrows the union — these predicates restore the narrowing.
-const isTextPart = (p: ExportPart): p is ExportTextPart => p.type === 'text'
-const isReasoningPart = (p: ExportPart): p is ExportReasoningPart => p.type === 'reasoning'
-const isToolPart = (p: ExportPart): p is ExportToolPart => p.type === 'tool'
-const isStepFinishPart = (p: ExportPart): p is ExportStepFinishPart => p.type === 'step-finish'
-
 /** Map one export part to 0..n timeline events (pre-normalization). */
 const partToEvents = (
   part: ExportPart,
@@ -83,7 +72,7 @@ const partToEvents = (
   msgCompleted: number | undefined,
   base: EventBase,
 ): readonly TimelineEvent[] => {
-  if (isTextPart(part)) {
+  if (isText(part)) {
     return [
       {
         ...base,
@@ -93,17 +82,18 @@ const partToEvents = (
       },
     ]
   }
-  if (isReasoningPart(part)) {
+  if (isReasoning(part)) {
+    const start = toMs(part.time.start, msgCreated)
     return [
       {
         ...base,
-        tStart: String(toMs(part.time.start, msgCreated)),
-        tEnd: String(toMs(part.time.end, msgCreated)),
+        tStart: String(start),
+        tEnd: String(toMs(part.time.end, start)),
         type: 'reasoning',
       },
     ]
   }
-  if (isToolPart(part)) {
+  if (isTool(part)) {
     const start = part.state.time !== undefined ? toMs(part.state.time.start, msgCreated) : msgCreated
     const end = part.state.time !== undefined ? toMs(part.state.time.end, start) : start
     const callEvent: TimelineEvent = {
@@ -127,7 +117,7 @@ const partToEvents = (
     }
     return [callEvent]
   }
-  if (isStepFinishPart(part)) {
+  if (isStepFinish(part)) {
     return [
       {
         ...base,

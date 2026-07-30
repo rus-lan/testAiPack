@@ -21,6 +21,7 @@ import {
 import type { SessionTreeLoader } from './10-timeline.js'
 import type { SessionTreeNode } from '../metrics/extract.js'
 import { PhaseError } from '../errors.js'
+import { opencodeExportSchema } from '@generated/schemas'
 import type {
   Manifest,
   OpencodeExport,
@@ -268,6 +269,76 @@ describe('extractEventsFromExport — event types', () => {
     expect(types).toEqual(['text', 'reasoning', 'tool-call', 'tool-result', 'step-finish'])
     expect(ev.every((e) => e.side === 'new')).toBe(true)
     expect(ev.every((e) => e.runIndex === 2)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// extractEventsFromExport — interrupted/malformed parts (regression:
+// opencode persists an interrupted reasoning part with time.start and no
+// time.end; a part that fails its typed schema falls through to the tolerant
+// catch-all, which strips every field except type/id)
+// ---------------------------------------------------------------------------
+
+describe('extractEventsFromExport — interrupted/malformed parts', () => {
+  const baseExportAt = (created: number, parts: readonly PartBuilder[]): OpencodeExport =>
+    makeExport({ id: 'sess-y', created, messages: [{ role: 'assistant', created, parts }] }) as OpencodeExport
+
+  it('reasoning part with time.start but no time.end → tEnd falls back to tStart, not msgCreated', () => {
+    const parts: readonly PartBuilder[] = [
+      { type: 'reasoning', text: '', time: { start: 1500 }, id: 'r-interrupted' },
+    ]
+    const exp = baseExportAt(1000, parts)
+    const ev = extractEventsFromExport(exp, 'new', 3)
+    expect(ev).toHaveLength(1)
+    expect(ev[0]!.type).toBe('reasoning')
+    expect(ev[0]!.tStart).toBe('500')
+    expect(ev[0]!.tEnd).toBe('500')
+  })
+
+  it('reasoning part already stripped to {type, id} (no time) → no event, no throw', () => {
+    const parts: readonly PartBuilder[] = [{ type: 'reasoning', id: 'r-stripped' }]
+    const exp = baseExportAt(0, parts)
+    expect(() => extractEventsFromExport(exp, 'old', 1)).not.toThrow()
+    expect(extractEventsFromExport(exp, 'old', 1)).toEqual([])
+  })
+
+  it('tool part already stripped to {type, id} (no state) → no event, no throw', () => {
+    const parts: readonly PartBuilder[] = [{ type: 'tool', id: 't-stripped' }]
+    const exp = baseExportAt(0, parts)
+    expect(() => extractEventsFromExport(exp, 'old', 1)).not.toThrow()
+    expect(extractEventsFromExport(exp, 'old', 1)).toEqual([])
+  })
+
+  it('text part already stripped to {type, id} (no text) → no event, no throw', () => {
+    const parts: readonly PartBuilder[] = [{ type: 'text', id: 'x-stripped' }]
+    const exp = baseExportAt(0, parts)
+    expect(() => extractEventsFromExport(exp, 'old', 1)).not.toThrow()
+    expect(extractEventsFromExport(exp, 'old', 1)).toEqual([])
+  })
+
+  it('well-formed reasoning/tool parts are unaffected (no shift from the stronger guards)', () => {
+    const parts: readonly PartBuilder[] = [reasoningPart(1100, 1400), toolPart('bash', 'completed', 100, 200)]
+    const ev = extractEventsFromExport(baseExportAt(1000, parts), 'old', 1)
+    expect(ev.map((e) => e.type)).toEqual(['reasoning', 'tool-call', 'tool-result'])
+    expect(ev[0]!.tStart).toBe('100')
+    expect(ev[0]!.tEnd).toBe('400')
+  })
+
+  it('a schema-validated interrupted reasoning part (real zod parse, no cast) still extracts a reasoning event', () => {
+    const raw = makeExport({
+      id: 'sess-schema',
+      created: 1000,
+      messages: [{ role: 'assistant', created: 1000, parts: [{ type: 'reasoning', text: 'x', time: { start: 1500 }, id: 'r1' }] }],
+    })
+    const parsed = opencodeExportSchema.safeParse(raw)
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+    const exp = parsed.data as OpencodeExport
+    const ev = extractEventsFromExport(exp, 'new', 1)
+    expect(ev).toHaveLength(1)
+    expect(ev[0]!.type).toBe('reasoning')
+    expect(ev[0]!.tStart).toBe('500')
+    expect(ev[0]!.tEnd).toBe('500')
   })
 })
 

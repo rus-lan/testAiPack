@@ -318,7 +318,8 @@ model ExportTextPart {
 model ExportReasoningPart {
   type: "reasoning";
   text: string;
-  time: { start: safeint; end: safeint };
+  // `end` is optional: an interrupted part carries a `start` with no `end`.
+  time: { start: safeint; end?: safeint };
   id: string;
 }
 
@@ -332,13 +333,15 @@ model ExportToolPart {
 
 model ExportToolState {
   status: "pending" | "running" | "completed" | "error";
-  input: unknown;
+  // Optional: opencode's pending tool-call state carries no `input` yet.
+  input?: unknown;
   output?: string;
   /** Error text opencode attaches to a failed tool call. */
   error?: string;
   metadata?: Record<unknown>;
   title?: string;
-  time?: { start: safeint; end: safeint };
+  // `end` is optional for the same reason as ExportReasoningPart.time.end.
+  time?: { start: safeint; end?: safeint };
 }
 
 model ExportStepStartPart {
