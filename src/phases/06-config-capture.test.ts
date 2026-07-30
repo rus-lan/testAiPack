@@ -5,7 +5,7 @@ import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, exists, readFile, symlink, writeFile } from '../util/fs.js'
 import { captureOpencodeConfig } from './06-config-capture.js'
 import type { InstalledJson, UsageJson } from './06-config-capture.js'
-import type { WorkspaceTree } from '@generated/types'
+import type { VariantConfig, WorkspaceTree } from '@generated/types'
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
@@ -36,13 +36,11 @@ const buildWorkspace = async (runs: number): Promise<Built> => {
   const workspace: WorkspaceTree = {
     root,
     appsSource: path.join(root, 'apps', 'source'),
-    appsOld: [],
-    appsNew: [],
     pack: path.join(root, 'pack'),
-    homeOld,
-    homeNew,
-    gitDirsOld: [],
-    gitDirsNew: [],
+    variantTrees: [
+      { name: 'old', apps: [], homes: homeOld, gitDirs: [] },
+      { name: 'new', apps: [], homes: homeNew, gitDirs: [] },
+    ],
     config: configDir,
     results: path.join(root, 'results'),
     raw: rawDir,
@@ -51,27 +49,36 @@ const buildWorkspace = async (runs: number): Promise<Built> => {
   return { workspace, homeOld, homeNew }
 }
 
-const GENERATED = {
-  baseline: JSON.stringify({ $schema: 'https://opencode.ai/config.json', agent: { build: {} } }, null, 2),
-  new: JSON.stringify(
-    { $schema: 'https://opencode.ai/config.json', agent: { build: {} }, mcp: { srv1: { command: 'a' } } },
-    null,
-    2,
-  ),
-}
+const GENERATED: readonly VariantConfig[] = [
+  { name: 'old', config: JSON.stringify({ $schema: 'https://opencode.ai/config.json', agent: { build: {} } }, null, 2) },
+  {
+    name: 'new',
+    config: JSON.stringify(
+      { $schema: 'https://opencode.ai/config.json', agent: { build: {} }, mcp: { srv1: { command: 'a' } } },
+      null,
+      2,
+    ),
+  },
+]
 
-const readInstalled = async (side: string, root: string): Promise<InstalledJson> => {
-  const raw = await runP(readFile(path.join(root, 'config/.config/opencode', side, 'installed.json')))
+/** GENERATED with the 'new' entry's config text swapped out — for secret-redaction fixtures. */
+const generatedWithNewConfig = (newConfig: string): readonly VariantConfig[] => [
+  GENERATED[0]!,
+  { name: 'new', config: newConfig },
+]
+
+const readInstalled = async (variant: string, root: string): Promise<InstalledJson> => {
+  const raw = await runP(readFile(path.join(root, 'config/.config/opencode', variant, 'installed.json')))
   return JSON.parse(raw) as InstalledJson
 }
 
-const readUsage = async (side: string, root: string): Promise<UsageJson> => {
-  const raw = await runP(readFile(path.join(root, 'config/.config/opencode', side, 'usage.json')))
+const readUsage = async (variant: string, root: string): Promise<UsageJson> => {
+  const raw = await runP(readFile(path.join(root, 'config/.config/opencode', variant, 'usage.json')))
   return JSON.parse(raw) as UsageJson
 }
 
 describe('phase 06 (sibling) — captureOpencodeConfig', () => {
-  it('happy path: both side dirs, opencode.json byte-equals generatedConfigs[side], home/ copies, installed.json fields', async () => {
+  it('happy path: both variant dirs, opencode.json byte-equals generatedConfigs[name], home/ copies, installed.json fields', async () => {
     const { workspace, homeOld, homeNew } = await buildWorkspace(1)
     const oldCfg = path.join(homeOld[0]!, '.config/opencode')
     const newCfg = path.join(homeNew[0]!, '.config/opencode')
@@ -96,11 +103,11 @@ describe('phase 06 (sibling) — captureOpencodeConfig', () => {
     const oldOpencodeJson = await runP(
       readFile(path.join(workspace.config, '.config/opencode/old/opencode.json')),
     )
-    expect(oldOpencodeJson).toBe(`${GENERATED.baseline}\n`)
+    expect(oldOpencodeJson).toBe(`${GENERATED[0]!.config}\n`)
     const newOpencodeJson = await runP(
       readFile(path.join(workspace.config, '.config/opencode/new/opencode.json')),
     )
-    expect(newOpencodeJson).toBe(`${GENERATED.new}\n`)
+    expect(newOpencodeJson).toBe(`${GENERATED[1]!.config}\n`)
 
     const copiedJsonc = await runP(
       readFile(path.join(workspace.config, '.config/opencode/new/home/opencode.jsonc')),
@@ -112,6 +119,7 @@ describe('phase 06 (sibling) — captureOpencodeConfig', () => {
     expect(copiedPkg).toBe(await runP(readFile(path.join(newCfg, 'package.json'))))
 
     const installed = await readInstalled('new', workspace.root)
+    expect(installed.variant).toBe('new')
     expect(installed.skills).toEqual([{ name: 'graphify', target: skillTarget }])
     expect(installed.agents).toEqual(['build'])
     expect(installed.npmDependencies).toEqual({ '@opencode-ai/plugin': '1.18.4' })
@@ -121,6 +129,7 @@ describe('phase 06 (sibling) — captureOpencodeConfig', () => {
     expect(installed.configMergeOrder).toEqual(['home/opencode.jsonc', 'opencode.json'])
 
     const oldInstalled = await readInstalled('old', workspace.root)
+    expect(oldInstalled.variant).toBe('old')
     expect(oldInstalled.skills).toEqual([])
     expect(oldInstalled.mcpServers).toEqual([])
   })
@@ -148,6 +157,7 @@ describe('phase 06 (sibling) — captureOpencodeConfig', () => {
 
     await runP(captureOpencodeConfig({ workspace, runs: 1, generatedConfigs: GENERATED }))
     const usage = await readUsage('old', workspace.root)
+    expect(usage.variant).toBe('old')
     expect(usage.toolCalls).toEqual({ bash: 1, read: 1, skill: 1 })
     expect(usage.skillCalls).toEqual([
       { run: 1, name: 'graphify', status: 'error', error: 'Skill "graphify" not found' },
@@ -220,9 +230,8 @@ describe('phase 06 (sibling) — captureOpencodeConfig', () => {
 
   it('top-level opencode.json: redacts a provider apiKey and an mcp env secret, keeps the key names', async () => {
     const { workspace } = await buildWorkspace(1)
-    const secretConfig = {
-      baseline: GENERATED.baseline,
-      new: JSON.stringify(
+    const secretConfigs = generatedWithNewConfig(
+      JSON.stringify(
         {
           $schema: 'https://opencode.ai/config.json',
           provider: { anthropic: { options: { apiKey: 'sk-ant-REAL-SECRET' } } },
@@ -231,8 +240,8 @@ describe('phase 06 (sibling) — captureOpencodeConfig', () => {
         null,
         2,
       ),
-    }
-    await runP(captureOpencodeConfig({ workspace, runs: 1, generatedConfigs: secretConfig }))
+    )
+    await runP(captureOpencodeConfig({ workspace, runs: 1, generatedConfigs: secretConfigs }))
     const captured = await runP(
       readFile(path.join(workspace.config, '.config/opencode/new/opencode.json')),
     )
@@ -312,6 +321,58 @@ describe('phase 06 (sibling) — captureOpencodeConfig', () => {
     const installed = await readInstalled('new', workspace.root)
     expect(installed.identicalAcrossRuns).toBe(false)
     expect(installed.driftFiles).toContain('skills')
+  })
+
+  it('generatedConfigs missing an entry for a variant (phase 04/06 mismatch) → fails loud with E_HOME_SETUP_FAILED instead of fabricating an empty config', async () => {
+    const { workspace } = await buildWorkspace(1)
+    const incompleteConfigs: readonly VariantConfig[] = [GENERATED[0]!] // no entry for 'new'
+    const err = await runFlip(
+      captureOpencodeConfig({ workspace, runs: 1, generatedConfigs: incompleteConfigs }),
+    )
+    expect(err.code).toBe('E_HOME_SETUP_FAILED')
+    // no capture dir was written for the mismatched variant
+    expect(await runP(exists(path.join(workspace.config, '.config/opencode/new/opencode.json')))).toBe(false)
+  })
+
+  it('N-way: three variants each capture into their own config/.config/opencode/<name>/ dir', async () => {
+    const root = makeTempDir('config-capture-nway-')
+    const homes: Record<string, string> = {}
+    for (const name of ['base', 'graphify', 'astgrep']) {
+      const homeDir = path.join(root, 'home', name, 'run-1')
+      homes[name] = homeDir
+      await runP(ensureDir(path.join(homeDir, '.config/opencode')))
+      await runP(ensureDir(path.join(root, 'results', 'raw', name)))
+    }
+    await runP(ensureDir(path.join(root, 'config')))
+    const workspace: WorkspaceTree = {
+      root,
+      appsSource: path.join(root, 'apps', 'source'),
+      pack: path.join(root, 'pack'),
+      variantTrees: [
+        { name: 'base', apps: [], homes: [homes['base']!], gitDirs: [] },
+        { name: 'graphify', apps: [], homes: [homes['graphify']!], gitDirs: [] },
+        { name: 'astgrep', apps: [], homes: [homes['astgrep']!], gitDirs: [] },
+      ],
+      config: path.join(root, 'config'),
+      results: path.join(root, 'results'),
+      raw: path.join(root, 'results', 'raw'),
+      diff: path.join(root, 'results', 'diff'),
+    }
+    const generatedConfigs: readonly VariantConfig[] = [
+      { name: 'base', config: '{}' },
+      { name: 'graphify', config: '{"mcp":{"g":{}}}' },
+      { name: 'astgrep', config: '{"mcp":{"a":{}}}' },
+    ]
+    const result = await runP(captureOpencodeConfig({ workspace, runs: 1, generatedConfigs }))
+    expect(result.capturedDirs).toHaveLength(3)
+    const base = await readInstalled('base', root)
+    const graphify = await readInstalled('graphify', root)
+    const astgrep = await readInstalled('astgrep', root)
+    expect(base.variant).toBe('base')
+    expect(graphify.variant).toBe('graphify')
+    expect(astgrep.variant).toBe('astgrep')
+    expect(graphify.mcpServers).toEqual(['g'])
+    expect(astgrep.mcpServers).toEqual(['a'])
   })
 
   it('unwritable config target (config path is a file) → PhaseError with E_HOME_SETUP_FAILED', async () => {

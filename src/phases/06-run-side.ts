@@ -1,7 +1,7 @@
 /**
  * Phase 06: run-side
  *
- * Executes ONE side for ONE run index: `--init` (optional) → `--prompt` →
+ * Executes ONE variant for ONE run index: `--init` (optional) → `--prompt` →
  * `opencode export`, with a soft hang-watchdog and a hard run timeout, then
  * optionally runs the `--verify` shell command. Crash / hang / timeout /
  * context-overflow / rate-limit / a missing or invalid export are all VALID
@@ -20,10 +20,10 @@ import type {
   ErrorCode,
   FinishCause,
   RunInput,
+  RunResult,
   RunSideInput,
-  RunSideResult,
-  Side,
   SuccessRank,
+  VariantSpec,
 } from '@generated/types'
 import { opencodeExportSchema } from '@generated/schemas'
 import { run as opencodeRun, exportSession, sessionIdFromEvent } from '../opencode/cli.js'
@@ -34,6 +34,9 @@ import { appendFile, ensureDir, readJson, writeFile, writeJson } from '../util/f
 import { isRecord } from '../util/types.js'
 import type { PhaseError } from '../errors.js'
 import { runSideError } from '../errors.js'
+// TODO(WP15): unmock — 00-cli-parse.ts (WP2) owns effectiveOf; tests here
+// vi.mock this import until WP2 lands.
+import { effectiveOf } from './00-cli-parse.js'
 
 /** Consecutive identical tool calls above which a run with no clean finish is a doom-loop. */
 export const DOOM_LOOP_THRESHOLD = 10
@@ -69,47 +72,51 @@ type RunSideErrorCode =
   | 'E_TOTAL_TIMEOUT'
 
 /**
- * Local extension of the contract RunSideResult: carries the precise failure
- * cause for every rank-0 / rank-reduced outcome so phase 07 can preserve it in
- * FailedRun instead of collapsing all failures to E_RUN_CRASH. Lives here rather
- * than in contract/main.tsp because the errorCode is phase-06-derived metadata.
- * `initRan`/`initWallMs`/`promptWallMs`/`setupWallMs` (metric-split spec
- * §4.2/§5.1) are already on the contract `RunSideResult` — this type just
- * inherits them.
+ * Local extension of the contract RunResult, pinned by the WP1 review-gate
+ * arbitration (`04-work-packages.md` §WP6). The contract's `RunResult`
+ * already carries `errorCode?: ErrorCode` (v2), so this is currently an
+ * identity extension — kept as the named export WP12/WP13 are spec'd to
+ * consume rather than importing `RunResult` directly, so the phase-06-local
+ * name survives if the contract's field shape ever drifts from this phase's
+ * needs.
  */
-export interface RunSideResultExt extends RunSideResult {
+export type RunSideResultExt = RunResult & {
   readonly errorCode?: ErrorCode
 }
 
 /**
- * Local extension of the contract RunSideInput: carries the docker image
- * (resolved by phase 04) so that when `runInput.isolation === 'docker'` the
- * opencode run + export execute inside the container. Only adds an optional
- * field, so a plain `RunSideInput` is still assignable.
+ * Local extension of the contract RunSideInput: the wire contract's
+ * `variant: string` is replaced with the full `VariantSpec` — the run needs
+ * `prompt`/`init`/`hint`/`verify`/`pure` per variant, not just its name — plus
+ * `dockerImage` (resolved by phase 04) so that when
+ * `runInput.isolation === 'docker'` the opencode run + export execute inside
+ * the container. Cannot `extends RunSideInput` (the `variant` field's type
+ * changes, not just widens) so it's built as an `Omit` + replace instead.
  */
-export interface RunSideInputExt extends RunSideInput {
+export type RunSideInputExt = Omit<RunSideInput, 'variant'> & {
+  readonly variant: VariantSpec
   readonly dockerImage?: string
 }
 
 const fail = (
   message: string,
   code: RunSideErrorCode,
-  side: Side,
+  variant: string,
   runIndex: number,
   context?: Record<string, unknown>,
 ): PhaseError =>
   runSideError(message, code, {
-    side,
+    variant,
     runIndex,
     ...(context === undefined ? {} : context),
   })
 
 const failFs = (
   e: { readonly operation: string; readonly path: string },
-  side: Side,
+  variant: string,
   runIndex: number,
 ): PhaseError =>
-  fail(`filesystem error during run: ${e.operation} ${e.path}`, 'E_DISK_FULL', side, runIndex, {
+  fail(`filesystem error during run: ${e.operation} ${e.path}`, 'E_DISK_FULL', variant, runIndex, {
     path: e.path,
     operation: e.operation,
   })
@@ -119,20 +126,19 @@ const failFs = (
 // ---------------------------------------------------------------------------
 
 /**
- * The task prompt actually sent to `--prompt`, with `packHint` appended when
- * set. Takes no `side` parameter and reads no `side`-keyed field — the one
- * caller below (`runSide`) invokes this with the same `runInput` for both
- * 'old' and 'new', so there is no way for the two sides to receive different
- * text, unlike `--init` (`initSide` deliberately targets one side, see
- * below). `packHint` must be written so its absence is a no-op ("if X is
- * present, use it; if not, work as usual") — the baseline side gets the same
- * hint and, finding nothing, should spend at most a couple of tool calls
- * confirming that before moving on.
+ * The task prompt actually sent to `--prompt`: the variant's effective prompt
+ * (its own `prompt`, else the global `runInput.prompt`) with the variant's
+ * effective hint appended after a blank line. Both go through `effectiveOf`
+ * (D7): a variant field explicitly set to `''` disables the global instead of
+ * falling back to it. Unlike the old side-blind `packHint`, this text now
+ * legitimately differs across variants — the report discloses each variant's
+ * hint separately (03-hard-problems.md §4).
  */
-export const effectiveTaskPrompt = (runInput: RunInput): string =>
-  runInput.packHint === undefined || runInput.packHint === ''
-    ? runInput.prompt
-    : `${runInput.prompt}\n\n${runInput.packHint}`
+export const effectiveTaskPrompt = (runInput: RunInput, variant: VariantSpec): string => {
+  const prompt = effectiveOf(variant, runInput.prompt, 'prompt') ?? ''
+  const hint = effectiveOf(variant, runInput.hint, 'hint')
+  return hint === undefined || hint === '' ? prompt : `${prompt}\n\n${hint}`
+}
 
 // ---------------------------------------------------------------------------
 // Pure outcome analysis
@@ -405,9 +411,9 @@ export const buildEnvRecord = (homeEnv: EnvVarSet): Record<string, string> => ({
   ...(homeEnv.PATH === undefined ? {} : { PATH: homeEnv.PATH }),
 })
 
-export const makeSessionId = (runId: string, side: Side, runIndex: number): string => {
+export const makeSessionId = (runId: string, variantName: string, runIndex: number): string => {
   const rand = Math.random().toString(16).slice(2, 8).padEnd(6, '0')
-  return `${runId}-${side}-${String(runIndex)}-${rand}`
+  return `${runId}-${variantName}-${String(runIndex)}-${rand}`
 }
 
 const safeStringify = (e: unknown): string => {
@@ -540,9 +546,9 @@ export const runSide = (
 ): Effect.Effect<RunSideResultExt, PhaseError> =>
   Effect.gen(function* () {
     const startedAt = Date.now()
-    const { runInput, manifest, workspace, homeEnv, side, runIndex } = input
+    const { runInput, manifest, workspace, homeEnv, variant, runIndex } = input
     const sessionId =
-      input.sessionId === '' ? makeSessionId(manifest.runId, side, runIndex) : input.sessionId
+      input.sessionId === '' ? makeSessionId(manifest.runId, variant.name, runIndex) : input.sessionId
 
     const docker: DockerExec | undefined =
       runInput.isolation === 'docker'
@@ -552,24 +558,31 @@ export const runSide = (
           }
         : undefined
 
-    const sideRawDir = path.join(workspace.raw, side)
-    yield* ensureDir(sideRawDir).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
+    const variantRawDir = path.join(workspace.raw, variant.name)
+    yield* ensureDir(variantRawDir).pipe(Effect.mapError((e) => failFs(e, variant.name, runIndex)))
 
-    const eventsLogPath = path.join(sideRawDir, `run-${String(runIndex)}.events.ndjson`)
-    const exportPath = path.join(sideRawDir, `run-${String(runIndex)}.json`)
-    const logPath = path.join(sideRawDir, `run-${String(runIndex)}.log`)
+    const eventsLogPath = path.join(variantRawDir, `run-${String(runIndex)}.events.ndjson`)
+    const exportPath = path.join(variantRawDir, `run-${String(runIndex)}.json`)
+    const logPath = path.join(variantRawDir, `run-${String(runIndex)}.log`)
 
     const log = (line: string): Effect.Effect<void> =>
       appendFile(logPath, `${line}\n`).pipe(Effect.catchAll(() => Effect.void))
 
-    yield* log(`[START] side=${side} runIndex=${String(runIndex)} sessionId=${sessionId}`)
+    yield* log(`[START] variant=${variant.name} runIndex=${String(runIndex)} sessionId=${sessionId}`)
 
-    const appList = side === 'old' ? workspace.appsOld : workspace.appsNew
-    const appCwd: string = appList[runIndex - 1] ?? ''
+    const variantTree = workspace.variantTrees.find((vt) => vt.name === variant.name)
+    const appCwd: string = variantTree?.apps[runIndex - 1] ?? ''
     if (appCwd === '') {
-      yield* Effect.fail(
-        fail('missing app working dir for run', 'E_RUN_CRASH', side, runIndex, { runIndex }),
-      )
+      yield* Effect.fail(fail('missing app working dir for run', 'E_RUN_CRASH', variant.name, runIndex))
+    }
+
+    // Phase 00 is supposed to guarantee every variant an effective non-empty
+    // prompt (`effectiveOf(v, prompt, 'prompt')`); if that invariant is ever
+    // violated this must fail loud instead of silently launching opencode
+    // with an empty --prompt, the same way a missing app dir does above.
+    const effectivePromptText = effectiveOf(variant, runInput.prompt, 'prompt')
+    if (effectivePromptText === undefined || effectivePromptText === '') {
+      yield* Effect.fail(fail('missing effective prompt for variant', 'E_RUN_CRASH', variant.name, runIndex))
     }
 
     const envRecord = buildEnvRecord(homeEnv)
@@ -617,16 +630,13 @@ export const runSide = (
     const runResults: OnceResult[] = []
     let realSessionId: string | undefined
 
-    // `initSide` picks which side(s) get `--init` text: `both` (default) is
-    // correct for environment prep both sides need for a fair comparison, but
-    // a pack-trigger init (e.g. a slash command) must stay `new`-only or the
-    // baseline installs and runs the pack itself — see 00-cli-parse.ru.md.
-    const initTargetsThisSide = runInput.initSide === 'both' || runInput.initSide === side
-    const hasInitText = runInput.init !== undefined && runInput.init !== ''
-    const hasInit = hasInitText && initTargetsThisSide
-    if (hasInitText && !initTargetsThisSide) {
-      yield* log(`[INIT] skipped on side=${side} (--init-side ${runInput.initSide})`)
-    }
+    // Every variant carries its own effective init (D7: an explicit '' on the
+    // variant disables the global init instead of falling back to it) — there
+    // is no more side-targeting knob (the old `--init-side` routed one shared
+    // init string to a chosen side; each variant now simply has, or lacks, its
+    // own effective init text).
+    const effectiveInit = effectiveOf(variant, runInput.init, 'init')
+    const hasInit = effectiveInit !== undefined && effectiveInit !== ''
     // Harness wall-clock around each invocation, for the metric-split spec's
     // per-phase timing — NOT `OnceResult.durationMs` (that field is 0 on the
     // watchdog/timeout/error branches, see `runOnce` above; a harness-side
@@ -638,7 +648,7 @@ export const runSide = (
       const b = budget()
       const initStart = Date.now()
       const r = yield* runOnce(
-        baseOpts(runInput.init ?? '', false, undefined),
+        baseOpts(effectiveInit ?? '', false, undefined),
         state,
         watchdogMs,
         b.timeoutMs,
@@ -658,7 +668,7 @@ export const runSide = (
     const bp = budget()
     const promptStart = Date.now()
     const pr = yield* runOnce(
-      baseOpts(effectiveTaskPrompt(runInput), hasInit, realSessionId),
+      baseOpts(effectiveTaskPrompt(runInput, variant), hasInit, realSessionId),
       state,
       watchdogMs,
       bp.timeoutMs,
@@ -698,7 +708,7 @@ export const runSide = (
       state.events.length === 0
         ? ''
         : `${state.events.map((e) => safeStringify(e)).join('\n')}\n`
-    yield* writeFile(eventsLogPath, ndjson).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
+    yield* writeFile(eventsLogPath, ndjson).pipe(Effect.mapError((e) => failFs(e, variant.name, runIndex)))
 
     const exportTimeoutMs = runMs
     const exportSessionId = realSessionId ?? sessionId
@@ -709,7 +719,7 @@ export const runSide = (
       yield* log(`[EXPORT] attempt ${String(exportAttempt)}: requesting opencode export`)
       const exportStr: string = yield* exportSession(homeEnv.HOME, exportSessionId, docker).pipe(
         Effect.mapError((err: OpencodeError) =>
-          fail('opencode export produced no data', 'E_RUN_CRASH', side, runIndex, {
+          fail('opencode export produced no data', 'E_RUN_CRASH', variant.name, runIndex, {
             sessionId: exportSessionId,
             exitCode: err.exitCode,
             stderr: err.stderr,
@@ -719,14 +729,14 @@ export const runSide = (
         Effect.timeout(exportTimeoutMs),
         Effect.catchTag('TimeoutException', () =>
           Effect.fail(
-            fail('opencode export timed out', 'E_RUN_TIMEOUT', side, runIndex, {
+            fail('opencode export timed out', 'E_RUN_TIMEOUT', variant.name, runIndex, {
               sessionId: exportSessionId,
               timeoutMs: exportTimeoutMs,
             }),
           ),
         ),
       )
-      yield* writeFile(exportPath, exportStr).pipe(Effect.mapError((e) => failFs(e, side, runIndex)))
+      yield* writeFile(exportPath, exportStr).pipe(Effect.mapError((e) => failFs(e, variant.name, runIndex)))
       yield* log(`[EXPORT] attempt ${String(exportAttempt)}: written to ${exportPath}`)
 
       yield* readJson(exportPath, opencodeExportSchema).pipe(
@@ -736,7 +746,7 @@ export const runSide = (
             tag === 'ParseError'
               ? (e as { readonly reason: string }).reason
               : `fs:${(e as { readonly operation: string }).operation}`
-          return fail(`export.json invalid: ${detail}`, 'E_EXPORT_INVALID', side, runIndex, {
+          return fail(`export.json invalid: ${detail}`, 'E_EXPORT_INVALID', variant.name, runIndex, {
             path: exportPath,
             attempt: exportAttempt,
           })
@@ -753,7 +763,7 @@ export const runSide = (
       Effect.either,
     )
     // A per-run export failure degrades the run to rank 0 instead of failing the
-    // whole phase — one broken export must not interrupt the other side's
+    // whole phase — one broken export must not interrupt another variant's
     // in-flight runs. E_DISK_FULL is machine-global, so it still aborts.
     const exportFailed =
       exportOutcome._tag === 'Left' && exportOutcome.left.code !== 'E_DISK_FULL'
@@ -778,11 +788,12 @@ export const runSide = (
     let errorCode = outcome.errorCode
     let finish = outcome.finish
     let verifyExitCode: number | undefined
+    const effectiveVerify = effectiveOf(variant, runInput.verify, 'verify')
     const hasVerify =
-      exportFailed === undefined && runInput.verify !== undefined && runInput.verify !== ''
+      exportFailed === undefined && effectiveVerify !== undefined && effectiveVerify !== ''
     if (hasVerify) {
-      yield* log(`[VERIFY] running "${runInput.verify ?? ''}"`)
-      const vres = yield* executeVerify(runInput.verify ?? '', appCwd, timeouts.verifySeconds, {
+      yield* log(`[VERIFY] running "${effectiveVerify ?? ''}"`)
+      const vres = yield* executeVerify(effectiveVerify ?? '', appCwd, timeouts.verifySeconds, {
         ...envRecord,
         HOME: homeEnv.HOME,
       })
@@ -823,7 +834,7 @@ export const runSide = (
     )
 
     const result: RunSideResultExt = {
-      side,
+      variant: variant.name,
       runIndex,
       exportPath,
       eventsLogPath,
@@ -838,7 +849,7 @@ export const runSide = (
       promptWallMs: String(promptWallMs),
     }
 
-    const resultPath = path.join(sideRawDir, `run-${String(runIndex)}.result.json`)
+    const resultPath = path.join(variantRawDir, `run-${String(runIndex)}.result.json`)
     yield* writeJson(resultPath, result).pipe(
       Effect.catchAll((e) => log(`[RESULT_WRITE_FAILED] ${e.operation} on ${e.path}: ${String(e.cause)}`)),
     )

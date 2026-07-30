@@ -1,9 +1,9 @@
 /**
  * Sibling helper of phase 06 (not a numbered pipeline phase): captures the
  * effective opencode config and the installed/used dependency picture for
- * each side into `config/.config/opencode/<side>/`.
+ * each variant into `config/.config/opencode/<name>/`.
  *
- * Runs once after the N×2 `opencode run`s finish (the on-disk
+ * Runs once after every variant's N `opencode run`s finish (the on-disk
  * `opencode.jsonc`/`package.json` only exist once opencode itself has
  * launched) and before phase 13 cleanup, whose ephemeral mode deletes
  * `home/` — captured copies under `config/` survive that.
@@ -26,7 +26,7 @@
  */
 import { Effect } from 'effect'
 import path from 'node:path'
-import type { Side, WorkspaceTree } from '@generated/types'
+import type { VariantConfig, VariantTree, WorkspaceTree } from '@generated/types'
 import {
   copyFile,
   ensureDir,
@@ -46,7 +46,7 @@ import { homeIsolationError } from '../errors.js'
 export interface ConfigCaptureInput {
   readonly workspace: WorkspaceTree
   readonly runs: number
-  readonly generatedConfigs: { readonly baseline: string; readonly new: string }
+  readonly generatedConfigs: readonly VariantConfig[]
 }
 
 export interface ConfigCaptureResult {
@@ -64,7 +64,7 @@ export interface PluginCapture {
 }
 
 export interface InstalledJson {
-  readonly side: Side
+  readonly variant: string
   readonly sourceHome: string
   readonly identicalAcrossRuns: boolean
   readonly driftFiles: readonly string[]
@@ -87,7 +87,7 @@ export interface SkillCallRecord {
 }
 
 export interface UsageJson {
-  readonly side: Side
+  readonly variant: string
   readonly runs: number
   readonly toolCalls: Record<string, number>
   readonly skillCalls: readonly SkillCallRecord[]
@@ -97,7 +97,7 @@ export interface UsageJson {
 /** §1.6: only skill (and, when present, mcp) invocations leave a trace in the event stream. */
 const NOT_KNOWABLE: readonly string[] = ['plugin hook execution', 'npm package usage']
 
-/** Copied byte-for-byte from `home/<side>/run-1/.config/opencode/` when present. */
+/** Copied byte-for-byte from `home/<name>/run-1/.config/opencode/` when present. */
 const HOME_COPY_FILES: readonly string[] = [
   'opencode.jsonc',
   'opencode.json',
@@ -111,16 +111,16 @@ const DRIFT_FILES: readonly string[] = HOME_COPY_FILES
 const fail = (message: string, context: Record<string, unknown>): PhaseError =>
   homeIsolationError(message, 'E_HOME_SETUP_FAILED', context)
 
-const mapFs = (side: Side, e: FsError): PhaseError =>
-  fail(`opencode config capture failed: ${e.operation} ${e.path}`, { side, path: e.path })
+const mapFs = (variant: string, e: FsError): PhaseError =>
+  fail(`opencode config capture failed: ${e.operation} ${e.path}`, { variant, path: e.path })
 
 const range = (n: number): readonly number[] => Array.from({ length: n }, (_, i) => i)
 
 const isStringArray = (v: unknown): v is readonly string[] =>
   Array.isArray(v) && v.every((x) => typeof x === 'string')
 
-interface SideCapture {
-  readonly side: Side
+interface VariantCapture {
+  readonly variant: string
   readonly homeRuns: readonly string[]
   readonly generatedConfig: string
   readonly eventsDir: string
@@ -132,15 +132,15 @@ interface SideCapture {
 // installed.json
 // ---------------------------------------------------------------------------
 
-const readOptionalFile = (side: Side, p: string): Effect.Effect<string | undefined, PhaseError> =>
+const readOptionalFile = (variant: string, p: string): Effect.Effect<string | undefined, PhaseError> =>
   Effect.gen(function* () {
     if (!(yield* exists(p))) return undefined
-    return yield* readFile(p).pipe(Effect.mapError((e) => mapFs(side, e)))
+    return yield* readFile(p).pipe(Effect.mapError((e) => mapFs(variant, e)))
   })
 
-const readJsonRecord = (side: Side, p: string): Effect.Effect<Record<string, unknown>, PhaseError> =>
+const readJsonRecord = (variant: string, p: string): Effect.Effect<Record<string, unknown>, PhaseError> =>
   Effect.gen(function* () {
-    const raw = yield* readOptionalFile(side, p)
+    const raw = yield* readOptionalFile(variant, p)
     if (raw === undefined) return {}
     try {
       const obj = JSON.parse(raw) as unknown
@@ -150,21 +150,24 @@ const readJsonRecord = (side: Side, p: string): Effect.Effect<Record<string, unk
     }
   })
 
-const readDirNames = (side: Side, dir: string): Effect.Effect<readonly string[], PhaseError> =>
+const readDirNames = (variant: string, dir: string): Effect.Effect<readonly string[], PhaseError> =>
   Effect.gen(function* () {
     if (!(yield* exists(dir))) return []
-    return yield* readDir(dir).pipe(Effect.mapError((e) => mapFs(side, e)))
+    return yield* readDir(dir).pipe(Effect.mapError((e) => mapFs(variant, e)))
   })
 
-const readMdBasenames = (side: Side, dir: string): Effect.Effect<readonly string[], PhaseError> =>
+const readMdBasenames = (variant: string, dir: string): Effect.Effect<readonly string[], PhaseError> =>
   Effect.gen(function* () {
-    const names = yield* readDirNames(side, dir)
+    const names = yield* readDirNames(variant, dir)
     return names.filter((n) => n.endsWith('.md')).map((n) => n.slice(0, -'.md'.length))
   })
 
-const readSkills = (side: Side, skillsDir: string): Effect.Effect<readonly SkillCapture[], PhaseError> =>
+const readSkills = (
+  variant: string,
+  skillsDir: string,
+): Effect.Effect<readonly SkillCapture[], PhaseError> =>
   Effect.gen(function* () {
-    const names = yield* readDirNames(side, skillsDir)
+    const names = yield* readDirNames(variant, skillsDir)
     return yield* Effect.forEach(
       names,
       (name) =>
@@ -182,11 +185,11 @@ const readSkills = (side: Side, skillsDir: string): Effect.Effect<readonly Skill
   })
 
 const readNpmDependencies = (
-  side: Side,
+  variant: string,
   packageJsonPath: string,
 ): Effect.Effect<Record<string, string>, PhaseError> =>
   Effect.gen(function* () {
-    const pkg = yield* readJsonRecord(side, packageJsonPath)
+    const pkg = yield* readJsonRecord(variant, packageJsonPath)
     const deps = pkg['dependencies']
     if (!isRecord(deps)) return {}
     return Object.entries(deps).reduce<Record<string, string>>(
@@ -233,7 +236,7 @@ interface DirDriftEntry {
  * actually asserts, not just the 4 files.
  */
 const computeDrift = (
-  side: Side,
+  variant: string,
   homeRuns: readonly string[],
   run1: Run1DirState,
 ): Effect.Effect<
@@ -251,11 +254,11 @@ const computeDrift = (
       DRIFT_FILES,
       (file) =>
         Effect.gen(function* () {
-          const base = yield* readOptionalFile(side, path.join(run1Dir, file))
+          const base = yield* readOptionalFile(variant, path.join(run1Dir, file))
           const differs = yield* Effect.reduce(otherDirs, false, (acc, dir) =>
             Effect.gen(function* () {
               if (acc) return true
-              const other = yield* readOptionalFile(side, path.join(dir, file))
+              const other = yield* readOptionalFile(variant, path.join(dir, file))
               return other !== base
             }),
           )
@@ -268,22 +271,22 @@ const computeDrift = (
       {
         label: 'skills',
         base: skillsFingerprint(run1.skills),
-        read: (dir) => readSkills(side, path.join(dir, 'skills')).pipe(Effect.map(skillsFingerprint)),
+        read: (dir) => readSkills(variant, path.join(dir, 'skills')).pipe(Effect.map(skillsFingerprint)),
       },
       {
         label: 'agents',
         base: namesFingerprint(run1.agents),
-        read: (dir) => readMdBasenames(side, path.join(dir, 'agents')).pipe(Effect.map(namesFingerprint)),
+        read: (dir) => readMdBasenames(variant, path.join(dir, 'agents')).pipe(Effect.map(namesFingerprint)),
       },
       {
         label: 'command',
         base: namesFingerprint(run1.commands),
-        read: (dir) => readMdBasenames(side, path.join(dir, 'command')).pipe(Effect.map(namesFingerprint)),
+        read: (dir) => readMdBasenames(variant, path.join(dir, 'command')).pipe(Effect.map(namesFingerprint)),
       },
       {
         label: 'plugins',
         base: namesFingerprint(run1.plugins),
-        read: (dir) => readDirNames(side, path.join(dir, 'plugins')).pipe(Effect.map(namesFingerprint)),
+        read: (dir) => readDirNames(variant, path.join(dir, 'plugins')).pipe(Effect.map(namesFingerprint)),
       },
     ]
     const dirDrift = yield* Effect.forEach(
@@ -307,23 +310,23 @@ const computeDrift = (
   })
 
 const buildInstalled = (
-  side: Side,
+  variant: string,
   sourceHome: string,
   generatedConfig: string,
   homeRuns: readonly string[],
 ): Effect.Effect<InstalledJson, PhaseError> =>
   Effect.gen(function* () {
     const cfgDir = path.join(sourceHome, '.config/opencode')
-    const skills = yield* readSkills(side, path.join(cfgDir, 'skills'))
-    const agents = yield* readMdBasenames(side, path.join(cfgDir, 'agents'))
+    const skills = yield* readSkills(variant, path.join(cfgDir, 'skills'))
+    const agents = yield* readMdBasenames(variant, path.join(cfgDir, 'agents'))
     // opencode layout: command is singular, unlike the plural skills/agents/plugins.
-    const commands = yield* readMdBasenames(side, path.join(cfgDir, 'command'))
-    const pluginFiles = yield* readDirNames(side, path.join(cfgDir, 'plugins'))
-    const onDiskCfg = yield* readJsonRecord(side, path.join(cfgDir, 'opencode.json'))
+    const commands = yield* readMdBasenames(variant, path.join(cfgDir, 'command'))
+    const pluginFiles = yield* readDirNames(variant, path.join(cfgDir, 'plugins'))
+    const onDiskCfg = yield* readJsonRecord(variant, path.join(cfgDir, 'opencode.json'))
     const configSpecs = isStringArray(onDiskCfg['plugin']) ? onDiskCfg['plugin'] : []
-    const npmDependencies = yield* readNpmDependencies(side, path.join(cfgDir, 'package.json'))
+    const npmDependencies = yield* readNpmDependencies(variant, path.join(cfgDir, 'package.json'))
     const mcpServers = mcpServersOf(generatedConfig)
-    const drift = yield* computeDrift(side, homeRuns, { skills, agents, commands, plugins: pluginFiles })
+    const drift = yield* computeDrift(variant, homeRuns, { skills, agents, commands, plugins: pluginFiles })
 
     const hasHomeJson = yield* exists(path.join(cfgDir, 'opencode.json'))
     const hasHomeJsonc = yield* exists(path.join(cfgDir, 'opencode.jsonc'))
@@ -334,7 +337,7 @@ const buildInstalled = (
     ]
 
     return {
-      side,
+      variant,
       sourceHome,
       identicalAcrossRuns: drift.identicalAcrossRuns,
       driftFiles: drift.driftFiles,
@@ -434,7 +437,7 @@ const mergeCounts = (a: Record<string, number>, b: Record<string, number>): Reco
     ...a,
   })
 
-const buildUsage = (side: Side, eventsDir: string, runs: number): Effect.Effect<UsageJson, PhaseError> =>
+const buildUsage = (variant: string, eventsDir: string, runs: number): Effect.Effect<UsageJson, PhaseError> =>
   Effect.gen(function* () {
     const perRun = yield* Effect.forEach(
       range(runs),
@@ -451,7 +454,7 @@ const buildUsage = (side: Side, eventsDir: string, runs: number): Effect.Effect<
     )
     const toolCalls = perRun.reduce<Record<string, number>>((acc, r) => mergeCounts(acc, r.toolCalls), {})
     const skillCalls = perRun.flatMap((r) => r.skillCalls)
-    return { side, runs, toolCalls, skillCalls, notKnowable: [...NOT_KNOWABLE] }
+    return { variant, runs, toolCalls, skillCalls, notKnowable: [...NOT_KNOWABLE] }
   })
 
 // ---------------------------------------------------------------------------
@@ -462,14 +465,18 @@ const buildUsage = (side: Side, eventsDir: string, runs: number): Effect.Effect<
  * `home/opencode.json` is the one file in `HOME_COPY_FILES` that can carry a
  * live credential (phase 04 merges mcp server `env` blocks into it) — it is
  * read+redacted+written instead of byte-copied. The original file at
- * `home/<side>/run-N/.config/opencode/opencode.json` is untouched; opencode
+ * `home/<name>/run-N/.config/opencode/opencode.json` is untouched; opencode
  * itself reads that one, every run, and needs the real value.
  */
-const copyHomeFiles = (side: Side, sourceHome: string, targetDir: string): Effect.Effect<void, PhaseError> =>
+const copyHomeFiles = (
+  variant: string,
+  sourceHome: string,
+  targetDir: string,
+): Effect.Effect<void, PhaseError> =>
   Effect.gen(function* () {
     const cfgDir = path.join(sourceHome, '.config/opencode')
     const homeDir = path.join(targetDir, 'home')
-    yield* ensureDir(homeDir).pipe(Effect.mapError((e) => mapFs(side, e)))
+    yield* ensureDir(homeDir).pipe(Effect.mapError((e) => mapFs(variant, e)))
     yield* Effect.forEach(
       HOME_COPY_FILES,
       (file) =>
@@ -478,35 +485,67 @@ const copyHomeFiles = (side: Side, sourceHome: string, targetDir: string): Effec
           if (!(yield* exists(src))) return
           const dst = path.join(homeDir, file)
           if (file === 'opencode.json') {
-            const raw = yield* readFile(src).pipe(Effect.mapError((e) => mapFs(side, e)))
-            yield* writeFile(dst, redactConfigJsonText(raw)).pipe(Effect.mapError((e) => mapFs(side, e)))
+            const raw = yield* readFile(src).pipe(Effect.mapError((e) => mapFs(variant, e)))
+            yield* writeFile(dst, redactConfigJsonText(raw)).pipe(Effect.mapError((e) => mapFs(variant, e)))
             return
           }
-          yield* copyFile(src, dst).pipe(Effect.mapError((e) => mapFs(side, e)))
+          yield* copyFile(src, dst).pipe(Effect.mapError((e) => mapFs(variant, e)))
         }),
       { concurrency: 1 },
     )
   })
 
-const captureSide = (s: SideCapture): Effect.Effect<void, PhaseError> =>
+const captureVariant = (c: VariantCapture): Effect.Effect<void, PhaseError> =>
   Effect.gen(function* () {
-    const sourceHome = s.homeRuns[0] ?? ''
-    yield* ensureDir(s.targetDir).pipe(Effect.mapError((e) => mapFs(s.side, e)))
+    const sourceHome = c.homeRuns[0] ?? ''
+    yield* ensureDir(c.targetDir).pipe(Effect.mapError((e) => mapFs(c.variant, e)))
     // Same content opencode received as OPENCODE_CONFIG_CONTENT, minus
     // credential values (redactConfigJsonText keeps the key names) — this
     // copy is for a human to read, never fed back into a run.
-    yield* writeFile(path.join(s.targetDir, 'opencode.json'), redactConfigJsonText(s.generatedConfig)).pipe(
-      Effect.mapError((e) => mapFs(s.side, e)),
+    yield* writeFile(path.join(c.targetDir, 'opencode.json'), redactConfigJsonText(c.generatedConfig)).pipe(
+      Effect.mapError((e) => mapFs(c.variant, e)),
     )
-    yield* copyHomeFiles(s.side, sourceHome, s.targetDir)
-    const installed = yield* buildInstalled(s.side, sourceHome, s.generatedConfig, s.homeRuns)
-    yield* writeJson(path.join(s.targetDir, 'installed.json'), installed).pipe(
-      Effect.mapError((e) => mapFs(s.side, e)),
+    yield* copyHomeFiles(c.variant, sourceHome, c.targetDir)
+    const installed = yield* buildInstalled(c.variant, sourceHome, c.generatedConfig, c.homeRuns)
+    yield* writeJson(path.join(c.targetDir, 'installed.json'), installed).pipe(
+      Effect.mapError((e) => mapFs(c.variant, e)),
     )
-    const usage = yield* buildUsage(s.side, s.eventsDir, s.runs)
-    yield* writeJson(path.join(s.targetDir, 'usage.json'), usage).pipe(
-      Effect.mapError((e) => mapFs(s.side, e)),
+    const usage = yield* buildUsage(c.variant, c.eventsDir, c.runs)
+    yield* writeJson(path.join(c.targetDir, 'usage.json'), usage).pipe(
+      Effect.mapError((e) => mapFs(c.variant, e)),
     )
+  })
+
+/**
+ * A variant with no matching entry in `generatedConfigs` means phase 04 and
+ * phase 06 disagree about which variants exist — a fail-loud phase-04/06
+ * mismatch, not "this variant has no config". Substituting `''` here would
+ * make `installed.json` assert `mcpServers: []` as a verified fact about a
+ * config that was never actually read; this module exists to be trustworthy
+ * evidence, so a missing entry aborts the capture instead.
+ */
+const buildCapture = (
+  vt: VariantTree,
+  generatedConfigs: readonly VariantConfig[],
+  captureRoot: string,
+  rawDir: string,
+  runs: number,
+): Effect.Effect<VariantCapture, PhaseError> =>
+  Effect.gen(function* () {
+    const generated = generatedConfigs.find((g) => g.name === vt.name)
+    if (generated === undefined) {
+      yield* Effect.fail(
+        fail(`no generated config for variant: ${vt.name}`, { variant: vt.name }),
+      )
+    }
+    return {
+      variant: vt.name,
+      homeRuns: vt.homes,
+      generatedConfig: generated?.config ?? '',
+      eventsDir: path.join(rawDir, vt.name),
+      targetDir: path.join(captureRoot, vt.name),
+      runs,
+    }
   })
 
 export const captureOpencodeConfig = (
@@ -514,24 +553,11 @@ export const captureOpencodeConfig = (
 ): Effect.Effect<ConfigCaptureResult, PhaseError> =>
   Effect.gen(function* () {
     const captureRoot = path.join(input.workspace.config, '.config', 'opencode')
-    const sides: readonly SideCapture[] = [
-      {
-        side: 'old',
-        homeRuns: input.workspace.homeOld,
-        generatedConfig: input.generatedConfigs.baseline,
-        eventsDir: path.join(input.workspace.raw, 'old'),
-        targetDir: path.join(captureRoot, 'old'),
-        runs: input.runs,
-      },
-      {
-        side: 'new',
-        homeRuns: input.workspace.homeNew,
-        generatedConfig: input.generatedConfigs.new,
-        eventsDir: path.join(input.workspace.raw, 'new'),
-        targetDir: path.join(captureRoot, 'new'),
-        runs: input.runs,
-      },
-    ]
-    yield* Effect.forEach(sides, captureSide, { concurrency: 1 })
-    return { capturedDirs: sides.map((s) => s.targetDir) }
+    const captures = yield* Effect.forEach(
+      input.workspace.variantTrees,
+      (vt) => buildCapture(vt, input.generatedConfigs, captureRoot, input.workspace.raw, input.runs),
+      { concurrency: 1 },
+    )
+    yield* Effect.forEach(captures, captureVariant, { concurrency: 1 })
+    return { capturedDirs: captures.map((c) => c.targetDir) }
   })

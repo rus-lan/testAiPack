@@ -9,6 +9,20 @@ vi.mock('../util/fs.js', async () => {
   return { ...actual, writeFile: vi.fn(actual.writeFile) }
 })
 
+// TODO(WP15): unmock — 00-cli-parse.ts (WP2) owns effectiveOf/VARIANT_NAME_RE
+// etc. This stub reproduces the spec'd D7 semantics only: a variant field
+// defined (even as '') overrides the global; undefined falls back to it.
+vi.mock('./00-cli-parse.js', () => ({
+  effectiveOf: (
+    v: Record<string, unknown>,
+    g: string | undefined,
+    key: string,
+  ): string | undefined => {
+    const val = v[key]
+    return typeof val === 'string' ? val : g
+  },
+}))
+
 import { existsSync } from 'node:fs'
 import { ensureDir, readFile, writeFile, FsError } from '../util/fs.js'
 import {
@@ -23,10 +37,10 @@ import {
   DOOM_LOOP_THRESHOLD,
   EXPORT_VALIDATION_MAX_RETRIES,
 } from './06-run-side.js'
-import type { AnalyzeInput } from './06-run-side.js'
+import type { AnalyzeInput, RunSideInputExt } from './06-run-side.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
-import type { RunInput, Manifest, WorkspaceTree, EnvVarSet, RunSideInput, ErrorCode } from '@generated/types'
-import { runSideResultSchema } from '@generated/schemas'
+import type { RunInput, Manifest, WorkspaceTree, EnvVarSet, VariantSpec, ErrorCode } from '@generated/types'
+import { runResultSchema } from '@generated/schemas'
 import type { OpencodeRunOptions } from '../opencode/cli.js'
 
 vi.mock('../opencode/cli.js', () => ({
@@ -92,25 +106,32 @@ const baseTimeouts = {
   watchdogSeconds: 90,
 }
 
+const baseAuth = {
+  opencode: true,
+  npmrc: false,
+  anthropic: false,
+  openai: false,
+  gemini: false,
+  aws: false,
+  ssh: false,
+  git: false,
+}
+
 const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
+  schemaVersion: 2,
   repoUrl: 'https://example.com/repo.git',
   prompt: 'build the thing',
   runs: 1,
+  parallel: 2,
+  baseline: 'old',
+  packs: [],
+  variants: [
+    { name: 'old', packs: [], pure: true },
+    { name: 'new', packs: [], pure: false },
+  ],
   isolation: 'home',
-  auth: {
-    opencode: true,
-    npmrc: false,
-    anthropic: false,
-    openai: false,
-    gemini: false,
-    aws: false,
-    ssh: false,
-    git: false,
-  },
-  pureBaseline: true,
+  auth: baseAuth,
   protectGit: false,
-  allowBaselineTool: false,
-  initSide: 'both',
   preflightEnabled: false,
   formats: ['md'],
   outputPath: '/out',
@@ -123,12 +144,26 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
   ...overrides,
 })
 
+const makeVariant = (name: string, overrides: Partial<VariantSpec> = {}): VariantSpec => ({
+  name,
+  packs: [],
+  ...overrides,
+})
+
 const fakeManifest: Manifest = {
+  schemaVersion: 2,
   runId: 'rid-abc',
   timestamp: new Date().toISOString(),
   repoUrl: 'https://example.com/repo.git',
   prompt: 'build the thing',
   runs: 1,
+  parallel: 2,
+  baseline: 'old',
+  packs: [],
+  variants: [
+    { name: 'old', packs: [] },
+    { name: 'new', packs: [] },
+  ],
   isolation: 'home',
   opencodeVersion: '1.0.0',
   flagDefaults: {},
@@ -137,25 +172,33 @@ const fakeManifest: Manifest = {
 const buildWorkspace = (root: string): WorkspaceTree => ({
   root,
   appsSource: path.join(root, 'apps', 'source'),
-  appsOld: [path.join(root, 'apps', 'oldVersion', 'run-1')],
-  appsNew: [path.join(root, 'apps', 'newVersion', 'run-1')],
   pack: path.join(root, 'pack'),
-  homeOld: [path.join(root, 'home', 'old', 'run-1')],
-  homeNew: [path.join(root, 'home', 'new', 'run-1')],
-  gitDirsOld: [path.join(root, 'gitdirs', 'old', 'run-1')],
-  gitDirsNew: [path.join(root, 'gitdirs', 'new', 'run-1')],
+  variantTrees: [
+    {
+      name: 'old',
+      apps: [path.join(root, 'apps', 'old', 'run-1')],
+      homes: [path.join(root, 'home', 'old', 'run-1')],
+      gitDirs: [path.join(root, 'gitdirs', 'old', 'run-1')],
+    },
+    {
+      name: 'new',
+      apps: [path.join(root, 'apps', 'new', 'run-1')],
+      homes: [path.join(root, 'home', 'new', 'run-1')],
+      gitDirs: [path.join(root, 'gitdirs', 'new', 'run-1')],
+    },
+  ],
   config: path.join(root, 'config'),
   results: path.join(root, 'results'),
   raw: path.join(root, 'results', 'raw'),
   diff: path.join(root, 'results', 'diff'),
 })
 
-const buildHomeEnv = (homeDir: string, side: 'old' | 'new'): EnvVarSet => ({
+const buildHomeEnv = (homeDir: string, variantName: string): EnvVarSet => ({
   HOME: homeDir,
   OPENCODE_DISABLE_PROJECT_CONFIG: true,
-  OPENCODE_DISABLE_DEFAULT_PLUGINS: side === 'old',
-  OPENCODE_DISABLE_EXTERNAL_SKILLS: side === 'old',
-  OPENCODE_PURE: side === 'old',
+  OPENCODE_DISABLE_DEFAULT_PLUGINS: variantName === 'old',
+  OPENCODE_DISABLE_EXTERNAL_SKILLS: variantName === 'old',
+  OPENCODE_PURE: variantName === 'old',
   OPENCODE_CONFIG_CONTENT: '{"$schema":"https://opencode.ai/config.json"}',
 })
 
@@ -189,18 +232,26 @@ const tool = (name: string): unknown => ev('tool', { tool: name, callID: 'c', st
 
 const buildInput = (
   root: string,
-  overrides: { runInput?: Partial<RunInput>; sessionId?: string; side?: 'old' | 'new' } = {},
-): RunSideInput => {
+  overrides: {
+    runInput?: Partial<RunInput>
+    sessionId?: string
+    variantName?: string
+    variant?: Partial<VariantSpec>
+    dockerImage?: string
+  } = {},
+): RunSideInputExt => {
   const ws = buildWorkspace(root)
-  const side = overrides.side ?? 'old'
+  const variantName = overrides.variantName ?? 'old'
+  const variant = makeVariant(variantName, overrides.variant ?? {})
   return {
     runInput: makeRunInput(overrides.runInput ?? {}),
     manifest: fakeManifest,
     workspace: ws,
-    homeEnv: buildHomeEnv(path.join(root, 'home', side, 'run-1'), side),
-    side,
+    homeEnv: buildHomeEnv(path.join(root, 'home', variantName, 'run-1'), variantName),
+    variant,
     runIndex: 1,
     sessionId: overrides.sessionId ?? 'rid-abc-old-1-deadbe',
+    ...(overrides.dockerImage === undefined ? {} : { dockerImage: overrides.dockerImage }),
   }
 }
 
@@ -226,23 +277,43 @@ const emitThenSucceed = (events: readonly unknown[]) =>
     })
 
 describe('effectiveTaskPrompt — pure', () => {
-  it('no packHint → prompt unchanged', () => {
-    expect(effectiveTaskPrompt(makeRunInput({ prompt: 'do the thing' }))).toBe('do the thing')
+  const v = (overrides: Partial<VariantSpec> = {}): VariantSpec => makeVariant('new', overrides)
+
+  it('no hint anywhere → prompt unchanged', () => {
+    expect(effectiveTaskPrompt(makeRunInput({ prompt: 'do the thing' }), v())).toBe('do the thing')
   })
 
-  it('empty-string packHint → prompt unchanged (treated as absent)', () => {
-    expect(effectiveTaskPrompt(makeRunInput({ prompt: 'do the thing', packHint: '' }))).toBe('do the thing')
+  it('empty-string variant hint disables the global hint (D7)', () => {
+    expect(
+      effectiveTaskPrompt(makeRunInput({ prompt: 'do the thing', hint: 'global hint' }), v({ hint: '' })),
+    ).toBe('do the thing')
   })
 
-  it('packHint present → appended after a blank line', () => {
-    expect(effectiveTaskPrompt(makeRunInput({ prompt: 'do the thing', packHint: 'check .graphify/' }))).toBe(
-      'do the thing\n\ncheck .graphify/',
-    )
+  it('global hint present, no variant override → appended after a blank line', () => {
+    expect(
+      effectiveTaskPrompt(makeRunInput({ prompt: 'do the thing', hint: 'check .graphify/' }), v()),
+    ).toBe('do the thing\n\ncheck .graphify/')
   })
 
-  it('takes no side parameter — the same runInput always produces the same string, by construction', () => {
-    const runInput = makeRunInput({ prompt: 'p', packHint: 'h' })
-    expect(effectiveTaskPrompt(runInput)).toBe(effectiveTaskPrompt(runInput))
+  it('variant hint overrides the global hint', () => {
+    expect(
+      effectiveTaskPrompt(
+        makeRunInput({ prompt: 'do the thing', hint: 'global hint' }),
+        v({ hint: 'variant-specific hint' }),
+      ),
+    ).toBe('do the thing\n\nvariant-specific hint')
+  })
+
+  it('variant prompt overrides the global prompt', () => {
+    expect(
+      effectiveTaskPrompt(makeRunInput({ prompt: 'global prompt' }), v({ prompt: 'variant prompt' })),
+    ).toBe('variant prompt')
+  })
+
+  it('is a pure function of (runInput, variant) — same inputs, same output', () => {
+    const runInput = makeRunInput({ prompt: 'p', hint: 'h' })
+    const variant = v({ hint: 'vh' })
+    expect(effectiveTaskPrompt(runInput, variant)).toBe(effectiveTaskPrompt(runInput, variant))
   })
 })
 
@@ -278,7 +349,7 @@ describe('phase 06 — run-side', () => {
     expect(result.exitCode).toBe(0)
     expect(result.verifyExitCode).toBe(0)
     expect(result.watchdogTriggered).toBe(false)
-    expect(result.side).toBe('old')
+    expect(result.variant).toBe('old')
     expect(result.runIndex).toBe(1)
   })
 
@@ -291,14 +362,14 @@ describe('phase 06 — run-side', () => {
   })
 
   // -------------------------------------------------------------------------
-  // --pack-hint: appended to --prompt, identically for both sides
+  // hint: appended to --prompt; per-variant override with global fallback (D7)
   // -------------------------------------------------------------------------
 
-  it('packHint is appended to the --prompt call, not the --init call', async () => {
+  it('global hint is appended to the --prompt call, not the --init call', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     const input = buildInput(root, {
-      runInput: { init: 'do setup', prompt: 'do real work', packHint: 'check .graphify/ if present' },
+      runInput: { init: 'do setup', prompt: 'do real work', hint: 'check .graphify/ if present' },
     })
     await runP(runSide(input))
     const calls = runMock.mock.calls.map((c) => c[0])
@@ -306,41 +377,65 @@ describe('phase 06 — run-side', () => {
     expect(calls[1]?.prompt).toBe('do real work\n\ncheck .graphify/ if present')
   })
 
-  it('no packHint → --prompt call is sent unchanged (byte-identical to today)', async () => {
+  it('no hint anywhere → --prompt call is sent unchanged (byte-identical to today)', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     await runP(runSide(buildInput(root, { runInput: { prompt: 'do real work' } })))
     expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('do real work')
   })
 
-  it('empty-string packHint is treated as absent, same as undefined', async () => {
+  it('empty-string global hint is treated as absent, same as undefined', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
-    await runP(runSide(buildInput(root, { runInput: { prompt: 'do real work', packHint: '' } })))
+    await runP(runSide(buildInput(root, { runInput: { prompt: 'do real work', hint: '' } })))
     expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('do real work')
   })
 
-  it('symmetry: old and new sides receive byte-identical --prompt text from the same runInput+packHint', async () => {
+  it('variant-level hint overrides the global hint in the --prompt call', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, {
+      runInput: { prompt: 'do real work', hint: 'global hint (should be overridden)' },
+      variant: { hint: 'variant hint wins' },
+    })
+    await runP(runSide(input))
+    expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('do real work\n\nvariant hint wins')
+  })
+
+  it('empty-string variant hint disables the global hint (D7)', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, {
+      runInput: { prompt: 'do real work', hint: 'global hint' },
+      variant: { hint: '' },
+    })
+    await runP(runSide(input))
+    expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('do real work')
+  })
+
+  it('symmetry: two variants with no prompt/hint override receive byte-identical --prompt text', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     const sharedRunInput: Partial<RunInput> = {
       prompt: 'implement the feature',
-      packHint: 'If .graphify/ contains a prepared index, use it. If not, work as usual.',
+      hint: 'If .graphify/ contains a prepared index, use it. If not, work as usual.',
     }
 
     runMock.mockReset()
     runMock.mockImplementation(emitThenSucceed([stepFinish('stop')]))
-    await runP(runSide(buildInput(root, { side: 'old', runInput: sharedRunInput })))
+    await runP(runSide(buildInput(root, { variantName: 'old', runInput: sharedRunInput })))
     const oldPrompt = runMock.mock.calls[0]?.[0]?.prompt
 
     runMock.mockReset()
     runMock.mockImplementation(emitThenSucceed([stepFinish('stop')]))
-    await runP(runSide(buildInput(root, { side: 'new', runInput: sharedRunInput })))
+    await runP(runSide(buildInput(root, { variantName: 'new', runInput: sharedRunInput })))
     const newPrompt = runMock.mock.calls[0]?.[0]?.prompt
 
     expect(oldPrompt).toBeDefined()
     expect(oldPrompt).toBe(newPrompt)
-    expect(oldPrompt).toBe('implement the feature\n\nIf .graphify/ contains a prepared index, use it. If not, work as usual.')
+    expect(oldPrompt).toBe(
+      'implement the feature\n\nIf .graphify/ contains a prepared index, use it. If not, work as usual.',
+    )
   })
 
   // -------------------------------------------------------------------------
@@ -369,11 +464,11 @@ describe('phase 06 — run-side', () => {
     expect(Number(result.promptWallMs)).toBeGreaterThanOrEqual(0)
   })
 
-  it('--init-side mismatch (init skipped on this side): initRan/initWallMs absent, promptWallMs still recorded', async () => {
+  it('variant init explicitly empty disables the global init (D7): initRan/initWallMs absent, promptWallMs still recorded', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     const result = await runP(
-      runSide(buildInput(root, { side: 'old', runInput: { init: '/graphify .', initSide: 'new' } })),
+      runSide(buildInput(root, { runInput: { init: '/graphify .' }, variant: { init: '' } })),
     )
     expect(result.initRan).toBeUndefined()
     expect(result.initWallMs).toBeUndefined()
@@ -381,83 +476,96 @@ describe('phase 06 — run-side', () => {
   })
 
   // -------------------------------------------------------------------------
-  // init-side routing
+  // per-variant init presence (replaces the old --init-side routing)
   // -------------------------------------------------------------------------
 
-  it('initSide=both (default): init reaches old AND new', async () => {
+  it('global init, no variant override: init reaches every variant (fair baseline prep)', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     const old = await runP(
-      runSide(buildInput(root, { side: 'old', runInput: { init: '/graphify .' } })),
+      runSide(buildInput(root, { variantName: 'old', runInput: { init: '/graphify .' } })),
     )
     expect(runMock).toHaveBeenCalledTimes(2)
     expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('/graphify .')
 
     runMock.mockClear()
     const nw = await runP(
-      runSide(buildInput(root, { side: 'new', runInput: { init: '/graphify .' } })),
+      runSide(buildInput(root, { variantName: 'new', runInput: { init: '/graphify .' } })),
     )
     expect(runMock).toHaveBeenCalledTimes(2)
     void old
     void nw
   })
 
-  it('initSide=new: old side skips init (run called once, no --continue), new side still runs it', async () => {
+  it('variant-level init on ONE variant only: that variant runs init, a sibling with no override and no global init does not', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
 
-    const oldResult = await runP(
-      runSide(
-        buildInput(root, { side: 'old', runInput: { init: '/graphify .', initSide: 'new' } }),
-      ),
-    )
+    const oldResult = await runP(runSide(buildInput(root, { variantName: 'old' })))
     expect(runMock).toHaveBeenCalledTimes(1)
     expect(runMock.mock.calls[0]?.[0]?.continueSession).toBeFalsy()
     expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('build the thing')
     const oldLog = await runP(readFile(path.join(path.dirname(oldResult.eventsLogPath), 'run-1.log')))
-    expect(oldLog).toContain('[INIT] skipped on side=old (--init-side new)')
     expect(oldLog).not.toContain('[INIT] running --init')
 
     runMock.mockClear()
     const newResult = await runP(
-      runSide(
-        buildInput(root, { side: 'new', runInput: { init: '/graphify .', initSide: 'new' } }),
-      ),
+      runSide(buildInput(root, { variantName: 'new', variant: { init: '/graphify .' } })),
     )
     expect(runMock).toHaveBeenCalledTimes(2)
     const newLog = await runP(readFile(path.join(path.dirname(newResult.eventsLogPath), 'run-1.log')))
     expect(newLog).toContain('[INIT] running --init')
-    expect(newLog).not.toContain('[INIT] skipped')
   })
 
-  it('initSide=old: new side skips init, old side still runs it', async () => {
+  it('variant own init overrides the global init text', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
-
-    const newResult = await runP(
+    await runP(
       runSide(
-        buildInput(root, { side: 'new', runInput: { init: 'npm install', initSide: 'old' } }),
+        buildInput(root, {
+          variantName: 'new',
+          runInput: { init: 'npm install' },
+          variant: { init: '/graphify .' },
+        }),
       ),
     )
-    expect(runMock).toHaveBeenCalledTimes(1)
-    const newLog = await runP(readFile(path.join(path.dirname(newResult.eventsLogPath), 'run-1.log')))
-    expect(newLog).toContain('[INIT] skipped on side=new (--init-side old)')
-
-    runMock.mockClear()
-    const oldResult = await runP(
-      runSide(
-        buildInput(root, { side: 'old', runInput: { init: 'npm install', initSide: 'old' } }),
-      ),
-    )
-    expect(runMock).toHaveBeenCalledTimes(2)
-    const oldLog = await runP(readFile(path.join(path.dirname(oldResult.eventsLogPath), 'run-1.log')))
-    expect(oldLog).toContain('[INIT] running --init')
+    expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('/graphify .')
   })
 
   it('without verify → verifyExitCode is undefined', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     const result = await runP(runSide(buildInput(root)))
+    expect(result.verifyExitCode).toBeUndefined()
+  })
+
+  it('variant own verify overrides the global verify', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    spawnMock.mockImplementation((opts) =>
+      Effect.sync(() => {
+        // Both the global and the variant verify text run through spawnProcess
+        // as `sh -c <cmd>`; asserting the exact command proves which one won.
+        return { stdout: opts.args?.[1] ?? '', stderr: '', exitCode: 0, durationMs: 1, timedOut: false }
+      }),
+    )
+    const input = buildInput(root, {
+      runInput: { verify: 'npm test' },
+      variant: { verify: 'npm run variant-check' },
+    })
+    await runP(runSide(input))
+    expect(spawnMock.mock.calls[0]?.[0]?.args).toEqual(['-c', 'npm run variant-check'])
+  })
+
+  it('empty-string variant verify disables the global verify (D7): spawn is never called', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, {
+      runInput: { verify: 'npm test' },
+      variant: { verify: '' },
+    })
+    const result = await runP(runSide(input))
+    expect(spawnMock).not.toHaveBeenCalled()
     expect(result.verifyExitCode).toBeUndefined()
   })
 
@@ -792,10 +900,34 @@ describe('phase 06 — run-side', () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     const input = buildInput(root)
-    // wipe appsOld so the run-1 entry is absent
-    const ws: WorkspaceTree = { ...input.workspace, appsOld: [], appsNew: [] }
+    // wipe every variant's apps[] so the run-1 entry is absent
+    const ws: WorkspaceTree = {
+      ...input.workspace,
+      variantTrees: input.workspace.variantTrees.map((vt) => ({ ...vt, apps: [] })),
+    }
     const err = await runFlip(runSide({ ...input, workspace: ws }))
     expect(err.code).toBe('E_RUN_CRASH')
+  })
+
+  it('empty effective prompt (no global, no variant override) → E_RUN_CRASH, opencode never spawned', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    // Omit `prompt` entirely rather than set it to `undefined` — RunInput.prompt
+    // is optional, and exactOptionalPropertyTypes rejects an explicit `undefined`.
+    const { prompt: _unusedPrompt, ...runInputNoPrompt } = makeRunInput({})
+    const input: RunSideInputExt = { ...buildInput(root), runInput: runInputNoPrompt }
+    const err = await runFlip(runSide(input))
+    expect(err.code).toBe('E_RUN_CRASH')
+    expect(runMock).not.toHaveBeenCalled()
+  })
+
+  it('variant prompt explicitly empty disables a non-empty global prompt (D7) → effective prompt empty → E_RUN_CRASH', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, { runInput: { prompt: 'global prompt' }, variant: { prompt: '' } })
+    const err = await runFlip(runSide(input))
+    expect(err.code).toBe('E_RUN_CRASH')
+    expect(runMock).not.toHaveBeenCalled()
   })
 
   // -------------------------------------------------------------------------
@@ -810,17 +942,17 @@ describe('phase 06 — run-side', () => {
     expect(existsSync(resultPath)).toBe(true)
     const raw = await runP(readFile(resultPath))
     const parsed = JSON.parse(raw) as { successRank: number }
-    expect(runSideResultSchema.safeParse(parsed).success).toBe(true)
+    expect(runResultSchema.safeParse(parsed).success).toBe(true)
     expect(parsed.successRank).toBe(result.successRank)
   })
 
   it('run-N.result.json write failure (fs) does not fail the run', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
-    const sideRawDir = path.join(root, 'results', 'raw', 'old')
+    const variantRawDir = path.join(root, 'results', 'raw', 'old')
     // a directory sitting at the exact result-file path makes the real write
     // fail (EISDIR) without needing to mock writeJson/writeFile.
-    await runP(ensureDir(path.join(sideRawDir, 'run-1.result.json')))
+    await runP(ensureDir(path.join(variantRawDir, 'run-1.result.json')))
     const result = await runP(runSide(buildInput(root)))
     expect(result.successRank).toBe(4)
   })
@@ -851,7 +983,7 @@ describe('phase 06 — run-side', () => {
     expect(exportMock.mock.calls[0]?.[1]).toBe('streamed-sid')
   })
 
-  it('no streamed id → export falls back to the generated <runId>-<side>-<runIndex>-<rand> id', async () => {
+  it('no streamed id → export falls back to the generated <runId>-<variant>-<runIndex>-<rand> id', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     await runP(runSide(buildInput(root, { sessionId: '' })))
@@ -867,7 +999,7 @@ describe('phase 06 — run-side', () => {
   it('env vars propagated to opencode.run (HOME, OPENCODE_*, config, agent, auto)', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
-    const input = buildInput(root, { side: 'old' })
+    const input = buildInput(root, { variantName: 'old' })
     const calls: OpencodeRunOptions[] = []
     runMock.mockImplementation((opts: OpencodeRunOptions) =>
       Effect.sync(() => {
@@ -887,10 +1019,10 @@ describe('phase 06 — run-side', () => {
     expect(calls[0]?.env?.['OPENCODE_DISABLE_DEFAULT_PLUGINS']).toBe('1')
   })
 
-  it('new side → OPENCODE_PURE disabled (0) and pure flag absent', async () => {
+  it('new variant → OPENCODE_PURE disabled (0) and pure flag absent', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
-    const input = buildInput(root, { side: 'new' })
+    const input = buildInput(root, { variantName: 'new' })
     const calls: OpencodeRunOptions[] = []
     runMock.mockImplementation((opts: OpencodeRunOptions) =>
       Effect.sync(() => {
@@ -921,12 +1053,13 @@ describe('phase 06 — run-side', () => {
     }
   })
 
-  it('log file is written with START / PROMPT / STOP markers', async () => {
+  it('log file is written with START / PROMPT / STOP markers, variant= in START', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     const result = await runP(runSide(buildInput(root)))
     const log = await runP(readFile(path.join(path.dirname(result.eventsLogPath), 'run-1.log')))
     expect(log).toContain('[START]')
+    expect(log).toContain('variant=old')
     expect(log).toContain('[PROMPT]')
     expect(log).toContain('[STOP]')
     expect(log).toContain('finish=stop')
@@ -1272,9 +1405,9 @@ describe('phase 06 — run-side', () => {
     expect(hasRateLimitSignal([errorEvent])).toBe(false)
   })
 
-  it('makeSessionId format: <runId>-<side>-<runIndex>-<hex>', () => {
-    const sid = makeSessionId('run42', 'new', 3)
-    expect(sid).toMatch(/^run42-new-3-[0-9a-f]+$/)
+  it('makeSessionId format: <runId>-<variantName>-<runIndex>-<hex>', () => {
+    const sid = makeSessionId('run42', 'graphify', 3)
+    expect(sid).toMatch(/^run42-graphify-3-[0-9a-f]+$/)
   })
 
   it('buildEnvRecord maps booleans to 1/0', () => {
@@ -1319,6 +1452,63 @@ describe('phase 06 — run-side', () => {
   })
 })
 
+describe('phase 06 — run-side, N-way variants', () => {
+  beforeEach(() => {
+    runMock.mockReset()
+    exportMock.mockReset()
+    spawnMock.mockReset()
+    runMock.mockImplementation(emitThenSucceed([stepFinish('stop')]))
+    exportMock.mockImplementation(() => Effect.succeed(validExport()))
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ stdout: '', stderr: '', exitCode: 0, durationMs: 1, timedOut: false }),
+    )
+  })
+
+  const buildThreeWayWorkspace = (root: string): WorkspaceTree => ({
+    root,
+    appsSource: path.join(root, 'apps', 'source'),
+    pack: path.join(root, 'pack'),
+    variantTrees: ['base', 'graphify', 'astgrep'].map((name) => ({
+      name,
+      apps: [path.join(root, 'apps', name, 'run-1')],
+      homes: [path.join(root, 'home', name, 'run-1')],
+      gitDirs: [path.join(root, 'gitdirs', name, 'run-1')],
+    })),
+    config: path.join(root, 'config'),
+    results: path.join(root, 'results'),
+    raw: path.join(root, 'results', 'raw'),
+    diff: path.join(root, 'results', 'diff'),
+  })
+
+  it('a third (non-baseline) variant with its own hint/verify runs independently of the other two', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ stdout: '', stderr: '', exitCode: 0, durationMs: 1, timedOut: false }),
+    )
+    const input: RunSideInputExt = {
+      runInput: makeRunInput({ prompt: 'do the thing', baseline: 'base' }),
+      manifest: fakeManifest,
+      workspace: buildThreeWayWorkspace(root),
+      homeEnv: buildHomeEnv(path.join(root, 'home', 'astgrep', 'run-1'), 'astgrep'),
+      variant: makeVariant('astgrep', { hint: 'use astgrep for structural search', verify: 'astgrep --version' }),
+      runIndex: 1,
+      sessionId: 'rid-abc-astgrep-1-deadbe',
+    }
+    const result = await runP(runSide(input))
+    expect(result.variant).toBe('astgrep')
+    expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('do the thing\n\nuse astgrep for structural search')
+    expect(spawnMock.mock.calls[0]?.[0]?.args).toEqual(['-c', 'astgrep --version'])
+    const resultPath = path.join(root, 'results', 'raw', 'astgrep', 'run-1.result.json')
+    expect(existsSync(resultPath)).toBe(true)
+    // AC: raw/<name>/run-1.result.json carries `variant: <name>` — proven on
+    // the actual on-disk file, not just the in-memory result above.
+    const raw = await runP(readFile(resultPath))
+    const parsed = JSON.parse(raw) as { variant: string }
+    expect(parsed.variant).toBe('astgrep')
+  })
+})
+
 describe('phase 06 — run-side docker threading', () => {
   beforeEach(() => {
     runMock.mockReset()
@@ -1334,10 +1524,10 @@ describe('phase 06 — run-side docker threading', () => {
   it('isolation=docker ⇒ opencode run + export called with the docker image', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
-    const input = buildInput(root, { runInput: { isolation: 'docker' } }) as RunSideInput & {
-      dockerImage?: string
-    }
-    input.dockerImage = 'custom/opencode:test'
+    const input = buildInput(root, {
+      runInput: { isolation: 'docker' },
+      dockerImage: 'custom/opencode:test',
+    })
     await runP(runSide(input))
     const runCalls = runMock.mock.calls.map((c) => c[0])
     expect(runCalls.length).toBeGreaterThan(0)
