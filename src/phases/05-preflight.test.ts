@@ -38,6 +38,11 @@ vi.mock('../opencode/cli.js', () => ({
   listMcp: vi.fn(),
 }))
 
+vi.mock('../opencode/spawn.js', () => ({
+  spawnProcess: vi.fn(),
+  execCmd: vi.fn(),
+}))
+
 vi.mock('../isolation/docker-runner.js', () => ({
   ensureImage: vi.fn(),
   dockerRun: vi.fn(),
@@ -70,6 +75,8 @@ const runMock = vi.mocked(run)
 const { ensureImage, dockerRun, DockerError, DEFAULT_OPENCODE_IMAGE } = await import('../isolation/docker-runner.js')
 const ensureImageMock = vi.mocked(ensureImage)
 const dockerRunMock = vi.mocked(dockerRun)
+const { spawnProcess } = await import('../opencode/spawn.js')
+const spawnMock = vi.mocked(spawnProcess)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
@@ -99,6 +106,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  allowBaselineTool: false,
   initSide: 'both',
   preflightEnabled: true,
   preflightModel: 'cheap/model',
@@ -219,6 +227,10 @@ describe('phase 05 — preflight', () => {
     dockerRunMock.mockImplementation(() =>
       Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }),
     )
+    spawnMock.mockReset()
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }),
+    )
     versionMock.mockImplementation(() => Effect.succeed('1.0.0'))
     runMock.mockImplementation(() =>
       Effect.succeed({
@@ -241,7 +253,7 @@ describe('phase 05 — preflight', () => {
     expect(result.logPath).toBe(expectedLogPath(input))
   })
 
-  it('all-pass (skill pack) → 8 checks (gates 1-3 per side + gate 4 + gate 5), exitCode=0', async () => {
+  it('all-pass (skill pack) → 9 checks (gates 1-3 per side + gate 4 + gate 5 + gate 6 skipped), exitCode=0', async () => {
     const homes = await buildHomes()
     const packDir = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(packDir))
@@ -262,7 +274,7 @@ describe('phase 05 — preflight', () => {
     const result = await runP(preflight(input))
     expect(result.allPassed).toBe(true)
     expect(result.exitCode).toBe(0)
-    expect(result.checks.length).toBe(8)
+    expect(result.checks.length).toBe(9)
     expect(result.checks.every((c) => c.passed)).toBe(true)
     const byName = (name: string, side: string): PreflightCheck | undefined =>
       result.checks.find((c) => c.name === name && c.side === side)
@@ -274,6 +286,7 @@ describe('phase 05 — preflight', () => {
     expect(byName('build-agent', 'new')).toBeDefined()
     expect(byName('pack-visibility', 'new')).toBeDefined()
     expect(byName('baseline-identical', 'old')).toBeDefined()
+    expect(byName('pack-functional', 'new')).toBeDefined()
   })
 
   it('opencode-launch fail → E_PREFLIGHT_FAILED, exitCode=2', async () => {
@@ -815,6 +828,314 @@ describe('phase 05 — preflight', () => {
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
   })
+
+  it('gate 6: no --pack-check → skipped, exitCode=0', async () => {
+    const homes = await buildHomes()
+    const input = buildInput(homes, {}, undefined)
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    const gate6 = result.checks.find((c) => c.name === 'pack-functional')
+    expect(gate6?.details).toContain('skipped')
+    expect(gate6?.passed).toBe(true)
+  })
+
+  it('gate 6: new side exit 0, old side exit 1 (expected) → passes, exitCode=0, packChecks recorded', async () => {
+    const homes = await buildHomes()
+    spawnMock.mockImplementation((opts: { cwd: string }) =>
+      Effect.succeed({
+        exitCode: opts.cwd === homes.new ? 0 : 1,
+        stdout: '', stderr: '', durationMs: 3, timedOut: false,
+      }),
+    )
+    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(result.packChecks).toHaveLength(2)
+    expect(result.packChecks?.find((c) => c.side === 'new')?.exitCode).toBe(0)
+    expect(result.packChecks?.find((c) => c.side === 'old')?.exitCode).toBe(1)
+  })
+
+  it('gate 6: new side check fails (tool not functional) → E_PACK_CHECK_FAILED, exitCode=3', async () => {
+    const homes = await buildHomes()
+    spawnMock.mockImplementation((opts: { cwd: string }) =>
+      Effect.succeed({
+        exitCode: opts.cwd === homes.new ? 1 : 1,
+        stdout: '', stderr: '', durationMs: 3, timedOut: false,
+      }),
+    )
+    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['reason']).toBe('new-side-not-functional')
+  })
+
+  it('gate 6: old side unexpectedly has the tool (exit 0) → E_PACK_CHECK_FAILED, exitCode=3, baseline-already-has-tool', async () => {
+    const homes = await buildHomes()
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false }),
+    )
+    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['reason']).toBe('baseline-already-has-tool')
+  })
+
+  it('gate 6: --allow-baseline-tool overrides the old-side-has-tool hard fail, with a details note', async () => {
+    const homes = await buildHomes()
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false }),
+    )
+    const input = buildInput(homes, { packCheck: 'mytool --version', allowBaselineTool: true }, undefined)
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    const oldCheck = result.checks.find((c) => c.name === 'pack-functional' && c.side === 'old')
+    expect(oldCheck?.passed).toBe(true)
+    expect(oldCheck?.details).toContain('allow-baseline-tool')
+  })
+
+  // Review-gate regression: a missing command exits 127 via the shell
+  // (`sh: 1: graphify: not found`), not 1 — on the OLD side that IS the
+  // expected, required outcome (the baseline correctly lacks the tool), not
+  // an infra fault. This used to abort the whole experiment.
+  it('gate 6: baseline check exits 127 (command not found) → PASS, the invariant holds', async () => {
+    const homes = await buildHomes()
+    spawnMock.mockImplementation((opts: { cwd: string }) =>
+      Effect.succeed({
+        exitCode: opts.cwd === homes.new ? 0 : 127,
+        stdout: '', stderr: 'sh: 1: graphify: not found', durationMs: 3, timedOut: false,
+      }),
+    )
+    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(result.packChecks?.find((c) => c.side === 'old')?.exitCode).toBe(127)
+  })
+
+  it('gate 6: baseline check exits 1 (ordinary absent) → PASS', async () => {
+    const homes = await buildHomes()
+    spawnMock.mockImplementation((opts: { cwd: string }) =>
+      Effect.succeed({
+        exitCode: opts.cwd === homes.new ? 0 : 1,
+        stdout: '', stderr: '', durationMs: 3, timedOut: false,
+      }),
+    )
+    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+  })
+
+  it('gate 6: new side check exits 127 (command not found) → FAIL, new-side-not-functional', async () => {
+    const homes = await buildHomes()
+    spawnMock.mockImplementation((opts: { cwd: string }) =>
+      Effect.succeed({
+        exitCode: opts.cwd === homes.new ? 127 : 1,
+        stdout: '', stderr: 'sh: 1: mytool: not found', durationMs: 3, timedOut: false,
+      }),
+    )
+    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['reason']).toBe('new-side-not-functional')
+  })
+
+  it('gate 6: the check itself times out (runner-level failure) on either side → fails loudly, exitCode=2', async () => {
+    const homes = await buildHomes()
+    spawnMock.mockImplementation((opts: { cwd: string }) =>
+      Effect.succeed({
+        exitCode: opts.cwd === homes.new ? -1 : 0,
+        stdout: '', stderr: '', durationMs: 3, timedOut: opts.cwd === homes.new,
+      }),
+    )
+    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(2)
+    expect(err.context?.['timedOut']).toBe(true)
+  })
+
+  it('gate 6 (docker mode): a docker-level execution error (timeout) on the old side fails loudly, not read as "tool absent"', async () => {
+    const homes = await buildHomes()
+    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
+      opts.homeDir === homes.new
+        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
+        : Effect.fail(new DockerError({ command: 'run', exitCode: null, stderr: 'docker daemon unreachable', timedOut: true })),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker', packCheck: 'mytool --version' }, undefined),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(2)
+  })
+
+  it('gate 6 (docker mode): runs through dockerRun, same pass/fail semantics', async () => {
+    const homes = await buildHomes()
+    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
+      opts.homeDir === homes.new
+        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
+        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false })),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker', packCheck: 'mytool --version' }, undefined),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(result.packChecks).toHaveLength(2)
+  })
+
+  it('gate 6 (home mode): forwards homePathEnv.new/.old as PATH to --pack-check, one value per side', async () => {
+    const homes = await buildHomes()
+    const seenPaths: Record<string, string | undefined> = {}
+    spawnMock.mockImplementation((opts: { cwd: string; env?: Record<string, string> }) => {
+      seenPaths[opts.cwd] = opts.env?.['PATH']
+      return Effect.succeed({
+        exitCode: opts.cwd === homes.new ? 0 : 1,
+        stdout: '', stderr: '', durationMs: 3, timedOut: false,
+      })
+    })
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { packCheck: 'mytool --version' }, undefined),
+      homePathEnv: { new: '/new/.local/bin:/usr/bin', old: '/old/.local/bin:/usr/bin' },
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(seenPaths[homes.new]).toBe('/new/.local/bin:/usr/bin')
+    expect(seenPaths[homes.old]).toBe('/old/.local/bin:/usr/bin')
+  })
+
+  it('gate 6 (docker mode): forwards homePathEnv.new/.old as -e PATH=<value>, one value per side', async () => {
+    const homes = await buildHomes()
+    const seenPaths: Record<string, string | undefined> = {}
+    dockerRunMock.mockImplementation((opts: { homeDir: string; env?: Record<string, string> }) => {
+      seenPaths[opts.homeDir] = opts.env?.['PATH']
+      return opts.homeDir === homes.new
+        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
+        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false }))
+    })
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker', packCheck: 'mytool --version' }, undefined),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+      homePathEnv: { new: '/home/opencode/.local/bin:/usr/bin', old: '/home/opencode/.local/bin:/usr/bin' },
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(seenPaths[homes.new]).toBe('/home/opencode/.local/bin:/usr/bin')
+    expect(seenPaths[homes.old]).toBe('/home/opencode/.local/bin:/usr/bin')
+  })
+
+  it('gate 6: without homePathEnv, PATH is left undefined — inherits the image/host default', async () => {
+    const homes = await buildHomes()
+    let sawPath: string | undefined = 'unset'
+    spawnMock.mockImplementation((opts: { cwd: string; env?: Record<string, string> }) => {
+      if (opts.cwd === homes.new) sawPath = opts.env?.['PATH']
+      return Effect.succeed({
+        exitCode: opts.cwd === homes.new ? 0 : 1,
+        stdout: '', stderr: '', durationMs: 3, timedOut: false,
+      })
+    })
+    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
+    await runP(preflight(input))
+    expect(sawPath).toBe(process.env['PATH'])
+  })
+
+  // Real-incident regression (testaipack run b7d56c): 04b-pack-setup copies
+  // the one HOME it installed into over every other new HOME, and until now
+  // gate 6 only ever checked `homePaths.new`/`.old` (run-1's HOME) — proving
+  // nothing about the rest. `homesForCheck` makes the gate check every HOME.
+  const buildSecondHomes = async (root: string): Promise<{ old2: string; new2: string }> => {
+    const oldHome2 = path.join(root, 'home', 'old', 'run-2')
+    const newHome2 = path.join(root, 'home', 'new', 'run-2')
+    for (const h of [oldHome2, newHome2]) {
+      await runP(ensureDir(path.join(h, '.config', 'opencode', 'skills')))
+      await runP(ensureDir(path.join(h, '.config', 'opencode', 'agents')))
+      await runP(ensureDir(path.join(h, '.config', 'opencode', 'plugins')))
+      await runP(ensureDir(path.join(h, '.config', 'opencode', 'command')))
+      await runP(writeFile(path.join(h, '.config', 'opencode', 'agents', 'build.md'), '# build\n'))
+    }
+    return { old2: oldHome2, new2: newHome2 }
+  }
+
+  it('gate 6 (multi-HOME): run-2 new HOME fails while run-1 passes (incomplete copy) → fails loudly before any run/exercise, exitCode=3, runIndex=2', async () => {
+    const homes = await buildHomes()
+    const { old2, new2 } = await buildSecondHomes(homes.root)
+    spawnMock.mockImplementation((opts: { cwd: string }) => {
+      if (opts.cwd === homes.new) {
+        return Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
+      }
+      if (opts.cwd === new2) {
+        return Effect.succeed({
+          exitCode: 127,
+          stdout: '', stderr: 'sh: 1: graphify: not found', durationMs: 3, timedOut: false,
+        })
+      }
+      return Effect.succeed({ exitCode: 1, stdout: '', stderr: '', durationMs: 3, timedOut: false })
+    })
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { packCheck: 'graphify --version' }, undefined),
+      homesForCheck: {
+        new: [{ homeDir: homes.new, pathOverride: undefined }, { homeDir: new2, pathOverride: undefined }],
+        old: [{ homeDir: homes.old, pathOverride: undefined }, { homeDir: old2, pathOverride: undefined }],
+      },
+    }
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['reason']).toBe('new-side-not-functional')
+    expect(err.context?.['runIndex']).toBe(2)
+  })
+
+  it('gate 6 (multi-HOME): run-2 old HOME unexpectedly has the tool (leaked copy) while run-1 correctly lacks it → fails loudly, runIndex=2', async () => {
+    const homes = await buildHomes()
+    const { old2, new2 } = await buildSecondHomes(homes.root)
+    spawnMock.mockImplementation((opts: { cwd: string }) => {
+      if (opts.cwd === homes.new || opts.cwd === new2) {
+        return Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
+      }
+      if (opts.cwd === old2) {
+        return Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
+      }
+      return Effect.succeed({ exitCode: 1, stdout: '', stderr: '', durationMs: 3, timedOut: false })
+    })
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { packCheck: 'graphify --version' }, undefined),
+      homesForCheck: {
+        new: [{ homeDir: homes.new, pathOverride: undefined }, { homeDir: new2, pathOverride: undefined }],
+        old: [{ homeDir: homes.old, pathOverride: undefined }, { homeDir: old2, pathOverride: undefined }],
+      },
+    }
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['reason']).toBe('baseline-already-has-tool')
+    expect(err.context?.['runIndex']).toBe(2)
+  })
+
+  it('gate 6 (multi-HOME): every HOME on both sides passes its invariant → packChecks carries one entry per HOME with the right runIndex', async () => {
+    const homes = await buildHomes()
+    const { old2, new2 } = await buildSecondHomes(homes.root)
+    spawnMock.mockImplementation((opts: { cwd: string }) =>
+      Effect.succeed({
+        exitCode: opts.cwd === homes.new || opts.cwd === new2 ? 0 : 1,
+        stdout: '', stderr: '', durationMs: 3, timedOut: false,
+      }),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { packCheck: 'graphify --version' }, undefined),
+      homesForCheck: {
+        new: [{ homeDir: homes.new, pathOverride: undefined }, { homeDir: new2, pathOverride: undefined }],
+        old: [{ homeDir: homes.old, pathOverride: undefined }, { homeDir: old2, pathOverride: undefined }],
+      },
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(result.packChecks).toHaveLength(4)
+    expect(result.packChecks?.filter((c) => c.side === 'new').map((c) => c.runIndex).sort()).toEqual([1, 2])
+    expect(result.packChecks?.filter((c) => c.side === 'old').map((c) => c.runIndex).sort()).toEqual([1, 2])
+  })
 })
 
 describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {
@@ -825,6 +1146,10 @@ describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {
     ensureImageMock.mockImplementation(() => Effect.void)
     dockerRunMock.mockReset()
     dockerRunMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }),
+    )
+    spawnMock.mockReset()
+    spawnMock.mockImplementation(() =>
       Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }),
     )
     versionMock.mockImplementation(() => Effect.succeed('1.0.0'))

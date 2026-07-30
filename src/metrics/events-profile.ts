@@ -6,8 +6,13 @@
  *
  * Scope: the profile covers the streamed root run only (`--init` and
  * `--prompt` share one event stream) — sub-agent internals are not in this
- * stream, so on an init-bearing run `timeToFirstToolMs` measures the init
- * session's first tool, not the prompt session's.
+ * stream. `timeToFirstToolMs`/`timeToFirstEditMs` are task-phase signals: pass
+ * `boundaryTs` (the export phase boundary, `extract.ts#findPhaseBoundary`) so
+ * they measure the `--prompt` session's first tool/edit, not the `--init`
+ * session's — on an init-bearing run, measuring from the very first event
+ * would otherwise report the init call's latency under a "first tool" label.
+ * `gapsMs`/`maxEventGapMs` stay whole-stream regardless — a stall is a run-
+ * health signal, not a phase-scoped one (metric-split spec §5.3).
  */
 import { isRecord } from '../util/types.js'
 
@@ -76,8 +81,13 @@ const parseLine = (line: string): TimedEvent | undefined => {
  * an empty or fully-degenerate stream) is `undefined`, never a fabricated
  * `0` — `0` on the wire would read as "measured, instant", which is a
  * different fact from "could not measure".
+ *
+ * `boundaryTs`, when given, scopes `timeToFirstToolMs`/`timeToFirstEditMs` to
+ * events at or after it (the task phase; baseline = the first such event) —
+ * omitted, they measure from the very first event in the stream, as before.
+ * `gapsMs`/`maxEventGapMs` always cover the whole stream regardless.
  */
-export const profileEvents = (ndjson: string): EventsProfile => {
+export const profileEvents = (ndjson: string, boundaryTs?: number): EventsProfile => {
   const events = ndjson.split('\n').flatMap((line) => {
     const parsed = parseLine(line)
     return parsed === undefined ? [] : [parsed]
@@ -86,10 +96,14 @@ export const profileEvents = (ndjson: string): EventsProfile => {
   const first = events[0]
   if (first === undefined) return EMPTY_PROFILE
 
-  const firstTool = events.find((e) => e.isToolUse)
-  const firstEdit = events.find(
-    (e) => e.isToolUse && e.tool !== undefined && EDIT_TOOLS.includes(e.tool),
-  )
+  const taskEvents = boundaryTs === undefined ? events : events.filter((e) => e.timestamp >= boundaryTs)
+  const taskBaseline = boundaryTs === undefined ? first : taskEvents[0]
+
+  const firstTool = taskBaseline === undefined ? undefined : taskEvents.find((e) => e.isToolUse)
+  const firstEdit =
+    taskBaseline === undefined
+      ? undefined
+      : taskEvents.find((e) => e.isToolUse && e.tool !== undefined && EDIT_TOOLS.includes(e.tool))
 
   const gaps = events.slice(1).map((e, i) => {
     const prev = events[i]
@@ -97,8 +111,10 @@ export const profileEvents = (ndjson: string): EventsProfile => {
   })
 
   return {
-    timeToFirstToolMs: firstTool === undefined ? undefined : firstTool.timestamp - first.timestamp,
-    timeToFirstEditMs: firstEdit === undefined ? undefined : firstEdit.timestamp - first.timestamp,
+    timeToFirstToolMs:
+      firstTool === undefined || taskBaseline === undefined ? undefined : firstTool.timestamp - taskBaseline.timestamp,
+    timeToFirstEditMs:
+      firstEdit === undefined || taskBaseline === undefined ? undefined : firstEdit.timestamp - taskBaseline.timestamp,
     maxEventGapMs: Math.max(0, ...gaps),
     gapsMs: gaps,
   }

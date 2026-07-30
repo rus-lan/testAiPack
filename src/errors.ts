@@ -10,6 +10,7 @@ export type PhaseName =
   | 'repo-clone'
   | 'pack-install'
   | 'home-isolation'
+  | 'pack-setup'
   | 'preflight'
   | 'run-side'
   | 'aggregate'
@@ -71,6 +72,7 @@ export const workspaceSetupError = make('workspace-setup')
 export const repoCloneError = make('repo-clone')
 export const packInstallError = make('pack-install')
 export const homeIsolationError = make('home-isolation')
+export const packSetupError = make('pack-setup')
 export const preflightError = make('preflight')
 export const runSideError = make('run-side')
 export const aggregateError = make('aggregate')
@@ -87,6 +89,7 @@ export const PHASE_NAMES: readonly PhaseName[] = [
   'repo-clone',
   'pack-install',
   'home-isolation',
+  'pack-setup',
   'preflight',
   'run-side',
   'aggregate',

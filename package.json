@@ -1,6 +1,6 @@
 {
   "name": "testaipack",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "A/B tester for opencode integrations — compares work before/after installing a pack (skill/plugin/agent/command/mcp)",
   "type": "module",
   "scripts": {

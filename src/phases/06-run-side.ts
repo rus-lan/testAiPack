@@ -19,6 +19,7 @@ import type {
   EnvVarSet,
   ErrorCode,
   FinishCause,
+  RunInput,
   RunSideInput,
   RunSideResult,
   Side,
@@ -72,6 +73,9 @@ type RunSideErrorCode =
  * cause for every rank-0 / rank-reduced outcome so phase 07 can preserve it in
  * FailedRun instead of collapsing all failures to E_RUN_CRASH. Lives here rather
  * than in contract/main.tsp because the errorCode is phase-06-derived metadata.
+ * `initRan`/`initWallMs`/`promptWallMs`/`setupWallMs` (metric-split spec
+ * §4.2/§5.1) are already on the contract `RunSideResult` — this type just
+ * inherits them.
  */
 export interface RunSideResultExt extends RunSideResult {
   readonly errorCode?: ErrorCode
@@ -109,6 +113,26 @@ const failFs = (
     path: e.path,
     operation: e.operation,
   })
+
+// ---------------------------------------------------------------------------
+// Pure: task prompt
+// ---------------------------------------------------------------------------
+
+/**
+ * The task prompt actually sent to `--prompt`, with `packHint` appended when
+ * set. Takes no `side` parameter and reads no `side`-keyed field — the one
+ * caller below (`runSide`) invokes this with the same `runInput` for both
+ * 'old' and 'new', so there is no way for the two sides to receive different
+ * text, unlike `--init` (`initSide` deliberately targets one side, see
+ * below). `packHint` must be written so its absence is a no-op ("if X is
+ * present, use it; if not, work as usual") — the baseline side gets the same
+ * hint and, finding nothing, should spend at most a couple of tool calls
+ * confirming that before moving on.
+ */
+export const effectiveTaskPrompt = (runInput: RunInput): string =>
+  runInput.packHint === undefined || runInput.packHint === ''
+    ? runInput.prompt
+    : `${runInput.prompt}\n\n${runInput.packHint}`
 
 // ---------------------------------------------------------------------------
 // Pure outcome analysis
@@ -376,6 +400,9 @@ export const buildEnvRecord = (homeEnv: EnvVarSet): Record<string, string> => ({
   OPENCODE_DISABLE_DEFAULT_PLUGINS: homeEnv.OPENCODE_DISABLE_DEFAULT_PLUGINS ? '1' : '0',
   OPENCODE_DISABLE_EXTERNAL_SKILLS: homeEnv.OPENCODE_DISABLE_EXTERNAL_SKILLS ? '1' : '0',
   OPENCODE_PURE: homeEnv.OPENCODE_PURE ? '1' : '0',
+  // Set only when --pack-setup is declared (phase 04's buildEnvVars). Absent
+  // otherwise — byte-for-byte today's env for a run with no new flags.
+  ...(homeEnv.PATH === undefined ? {} : { PATH: homeEnv.PATH }),
 })
 
 export const makeSessionId = (runId: string, side: Side, runIndex: number): string => {
@@ -600,10 +627,16 @@ export const runSide = (
     if (hasInitText && !initTargetsThisSide) {
       yield* log(`[INIT] skipped on side=${side} (--init-side ${runInput.initSide})`)
     }
+    // Harness wall-clock around each invocation, for the metric-split spec's
+    // per-phase timing — NOT `OnceResult.durationMs` (that field is 0 on the
+    // watchdog/timeout/error branches, see `runOnce` above; a harness-side
+    // `Date.now()` pair around the call stays meaningful on every branch).
+    let initWallMs: number | undefined
     if (hasInit) {
       yield* log('[INIT] running --init')
       state.lastEvent.time = Date.now()
       const b = budget()
+      const initStart = Date.now()
       const r = yield* runOnce(
         baseOpts(runInput.init ?? '', false, undefined),
         state,
@@ -612,6 +645,7 @@ export const runSide = (
         b.totalBound,
         totalDeadline,
       )
+      initWallMs = Date.now() - initStart
       runResults.push(r)
       realSessionId = r.sessionId
       yield* log(
@@ -622,14 +656,16 @@ export const runSide = (
     yield* log('[PROMPT] running --prompt')
     state.lastEvent.time = Date.now()
     const bp = budget()
+    const promptStart = Date.now()
     const pr = yield* runOnce(
-      baseOpts(runInput.prompt, hasInit, realSessionId),
+      baseOpts(effectiveTaskPrompt(runInput), hasInit, realSessionId),
       state,
       watchdogMs,
       bp.timeoutMs,
       bp.totalBound,
       totalDeadline,
     )
+    const promptWallMs = Date.now() - promptStart
     runResults.push(pr)
     if (pr.sessionId !== undefined) realSessionId = pr.sessionId
     yield* log(
@@ -798,6 +834,8 @@ export const runSide = (
       watchdogTriggered: anyWatchdog,
       ...(verifyExitCode === undefined ? {} : { verifyExitCode }),
       ...(errorCode === undefined ? {} : { errorCode }),
+      ...(hasInit && initWallMs !== undefined ? { initRan: true, initWallMs: String(initWallMs) } : {}),
+      promptWallMs: String(promptWallMs),
     }
 
     const resultPath = path.join(sideRawDir, `run-${String(runIndex)}.result.json`)

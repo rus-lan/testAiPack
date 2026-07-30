@@ -57,6 +57,17 @@ export interface RecoveredRunResult {
   readonly watchdogTriggered: boolean | undefined
   readonly diagnostics: RunArtifactDiagnostics
   readonly notRecoverable: readonly string[]
+  /**
+   * True when the `.log` carries an `[INIT_DONE]` line — the durable proof an
+   * `--init` invocation actually ran, even when the rest of the run's outcome
+   * is lost (metric-split spec §5.8). `false`, never `undefined`: unlike the
+   * other fields here, "no INIT_DONE line" is itself the recovered fact, not
+   * a gap — an export with only 1 user message plus `initRan: false` is an
+   * honest "no init"; `initRan: true` with no matching export boundary is the
+   * spec's "lost session continuation" case (§2.4), surfaced as
+   * `runsWithLostInit` by phase 07/aggregate.
+   */
+  readonly initRan: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +297,7 @@ export const recoverRunResult = (
       watchdogTriggered: combineWatchdog(parsed.initDone?.watchdog, parsed.promptDone?.watchdog),
       diagnostics,
       notRecoverable: NOT_RECOVERABLE_FIELDS,
+      initRan: parsed.initDone !== undefined,
     }
   })
 

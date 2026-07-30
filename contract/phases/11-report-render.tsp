@@ -19,6 +19,7 @@ model ReportRenderInput {
   diff: { old: DiffResult; new: DiffResult };
   judge?: JudgeResult;
   summary: ReportSummary;
+  packSetup?: PackSetupReport;
 }
 
 model ReportRenderResult {

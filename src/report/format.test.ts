@@ -6,6 +6,8 @@ import {
   fmtPct,
   fmtSigned,
   fmtValue,
+  PHASE_METRICS,
+  PRIMARY_METRICS,
   sigLabel,
   toNum,
   trimTrailingZeros,
@@ -110,6 +112,18 @@ const delta = (
   percent: 0,
   significant,
   better,
+})
+
+describe('PHASE_METRICS — the five splittable metrics (metric-split spec §5.7)', () => {
+  it('matches the first five PRIMARY_METRICS entries by key/label/kind (drift guard)', () => {
+    expect(PHASE_METRICS).toEqual(PRIMARY_METRICS.slice(0, 5))
+  })
+
+  it('does not carry successRank or maxParallelism (those stay whole-run-only)', () => {
+    const keys = PHASE_METRICS.map((m) => m.key)
+    expect(keys).not.toContain('successRank')
+    expect(keys).not.toContain('maxParallelism')
+  })
 })
 
 describe('format — verdict and significance labels', () => {

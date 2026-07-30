@@ -25,10 +25,11 @@ import type {
 } from '@generated/types'
 import { diffError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
-import { copyDir, ensureDir, exists, moveDir, removeDir, writeFile } from '../util/fs.js'
+import { copyDir, ensureDir, exists, moveDir, readJson, removeDir, writeFile } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
-import { addAll, diffCached, diffStatFull, headState, headsMatch, readTreeHead } from '../util/git.js'
+import { addAll, appendInfoExclude, diffCached, diffStatFull, headState, headsMatch, readTreeHead } from '../util/git.js'
 import type { GitError, HeadState } from '../util/git.js'
+import { z } from 'zod'
 import { DIFF2HTML_CSS } from './08-diff-css.js'
 
 /**
@@ -151,12 +152,41 @@ const writeSideHtml = (
     return htmlPath
   })
 
+/**
+ * `--pack-exercise` (`cli/pipeline.ts`) appends its artifact paths to the
+ * run's own `.git/info/exclude` right after producing them, and persists the
+ * same list to `run-N.exercise.json`. A fresh `.git` copied in below (agent
+ * deleted or replaced it) has none of that — `info/exclude` is never part of
+ * a git object, so copying `apps/source/.git` cannot carry it over. Without
+ * re-applying it here, an exercise's own output would resurface as an
+ * "agent change" the moment recovery runs. Best-effort: a failure here means
+ * a few extra untracked lines in the diff, not a broken phase — the
+ * dirty-tracked-file guard at exercise time (pipeline.ts's E_PACK_EXERCISE_DIRTY)
+ * is what actually protects measurement integrity.
+ */
+const exerciseRecordSchema = z.object({ excludedPaths: z.array(z.string()) })
+
+const reapplyExerciseExcludes = (
+  rawDir: string,
+  side: Side,
+  runIndex: number,
+  destGitDir: string,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const recordPath = path.join(rawDir, side, `run-${String(runIndex)}.exercise.json`)
+    if (!(yield* exists(recordPath))) return
+    const record = yield* readJson(recordPath, exerciseRecordSchema).pipe(Effect.option)
+    if (record._tag === 'None' || record.value.excludedPaths.length === 0) return
+    yield* appendInfoExclude(destGitDir, record.value.excludedPaths).pipe(Effect.ignore)
+  })
+
 /** Copies `apps/source/.git` into `destDir`, restoring a `.git` the agent deleted. */
 const restoreGit = (
   side: Side,
   runIndex: number,
   appsSource: string,
   destDir: string,
+  rawDir: string,
 ): Effect.Effect<'git-restored', PhaseError> =>
   Effect.gen(function* () {
     const srcGit = path.join(appsSource, '.git')
@@ -166,7 +196,8 @@ const restoreGit = (
         toWorktreeBroken(side, runIndex, `no .git in ${destDir} and no ${srcGit} to restore from`, 'no-git-dir'),
       )
     }
-    yield* copyDir(srcGit, path.join(destDir, '.git')).pipe(
+    const destGit = path.join(destDir, '.git')
+    yield* copyDir(srcGit, destGit).pipe(
       Effect.mapError((e: FsError) => {
         const text = fsCauseText(e)
         const message = `restore .git into ${destDir} failed: ${text}`
@@ -175,6 +206,7 @@ const restoreGit = (
           : toWorktreeBroken(side, runIndex, message, 'no-git-dir', e)
       }),
     )
+    yield* reapplyExerciseExcludes(rawDir, side, runIndex, destGit)
     return 'git-restored' as const
   })
 
@@ -192,6 +224,7 @@ const replaceGit = (
   appsSource: string,
   destDir: string,
   agentGitDir: string,
+  rawDir: string,
 ): Effect.Effect<'git-replaced', PhaseError> =>
   Effect.gen(function* () {
     yield* ensureDir(path.dirname(agentGitDir)).pipe(
@@ -212,7 +245,7 @@ const replaceGit = (
           : toWorktreeBroken(side, runIndex, message, 'foreign-git', e)
       }),
     )
-    yield* restoreGit(side, runIndex, appsSource, destDir)
+    yield* restoreGit(side, runIndex, appsSource, destDir, rawDir)
     return 'git-replaced' as const
   })
 
@@ -238,6 +271,7 @@ const checkGitHead = (
   destDir: string,
   sourceHead: Option.Option<HeadState>,
   agentGitDir: string,
+  rawDir: string,
 ): Effect.Effect<'ok' | 'git-replaced', PhaseError> =>
   Effect.gen(function* () {
     if (Option.isNone(sourceHead)) {
@@ -252,7 +286,7 @@ const checkGitHead = (
     }
     const destHead = yield* headState(destDir).pipe(Effect.option)
     if (Option.isSome(destHead) && headsMatch(destHead.value, sourceHead.value)) return 'ok' as const
-    return yield* replaceGit(side, runIndex, appsSource, destDir, agentGitDir)
+    return yield* replaceGit(side, runIndex, appsSource, destDir, agentGitDir, rawDir)
   })
 
 const failedRun = (runIndex: number, e: PhaseError): DiffRunResult => ({
@@ -280,6 +314,7 @@ const resolveState = (
   sourceHead: Option.Option<HeadState>,
   protectGitDir: string | undefined,
   agentGitDir: string,
+  rawDir: string,
 ): Effect.Effect<DiffRunState, PhaseError> =>
   Effect.gen(function* () {
     if (protectGitDir !== undefined) {
@@ -293,8 +328,8 @@ const resolveState = (
     }
     const hasGit = yield* exists(path.join(destDir, '.git'))
     return hasGit
-      ? yield* checkGitHead(side, runIndex, appsSource, destDir, sourceHead, agentGitDir)
-      : yield* restoreGit(side, runIndex, appsSource, destDir)
+      ? yield* checkGitHead(side, runIndex, appsSource, destDir, sourceHead, agentGitDir, rawDir)
+      : yield* restoreGit(side, runIndex, appsSource, destDir, rawDir)
   })
 
 /**
@@ -327,6 +362,7 @@ const diffOneRun = (
   runId: string,
   sourceHead: Option.Option<HeadState>,
   protectGitDir: string | undefined,
+  rawDir: string,
 ): Effect.Effect<DiffRunResult, PhaseError> =>
   Effect.gen(function* () {
     const outDir = path.join(diffRoot, side, `run-${String(runIndex)}`)
@@ -338,7 +374,7 @@ const diffOneRun = (
 
     const agentGitDir = path.join(appsRoot, 'agent-git', side, `run-${String(runIndex)}`)
     const state = yield* resolveState(
-      side, runIndex, appsSource, destDir, sourceHead, protectGitDir, agentGitDir,
+      side, runIndex, appsSource, destDir, sourceHead, protectGitDir, agentGitDir, rawDir,
     )
 
     // Staging into a temp index rather than destDir/.git's own index keeps
@@ -466,12 +502,13 @@ const diffSide = (
   runId: string,
   sourceHead: Option.Option<HeadState>,
   gitDirs: readonly string[] | undefined,
+  rawDir: string,
 ): Effect.Effect<DiffResult, PhaseError> =>
   Effect.gen(function* () {
     const pairs = yield* pairRunDirs(side, appDirs, gitDirs)
     const runs = yield* Effect.all(
       pairs.map(({ appDir, gitDir }, i) =>
-        diffOneRun(side, i + 1, appDir, appsSource, appsRoot, diffRoot, diffHtml, runId, sourceHead, gitDir).pipe(
+        diffOneRun(side, i + 1, appDir, appsSource, appsRoot, diffRoot, diffHtml, runId, sourceHead, gitDir, rawDir).pipe(
           Effect.catchAll((e: PhaseError) =>
             e.code === 'E_WORKTREE_BROKEN' ? Effect.succeed(failedRun(i + 1, e)) : Effect.fail(e),
           ),
@@ -515,6 +552,7 @@ export const diff = (
       runId,
       sourceHead,
       protectGit ? workspace.gitDirsOld : undefined,
+      workspace.raw,
     )
     const newResult = yield* diffSide(
       'new',
@@ -526,6 +564,7 @@ export const diff = (
       runId,
       sourceHead,
       protectGit ? workspace.gitDirsNew : undefined,
+      workspace.raw,
     )
     return { diff: { old: oldResult, new: newResult } }
   })

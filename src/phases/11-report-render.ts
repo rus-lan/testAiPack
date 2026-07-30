@@ -54,7 +54,7 @@ const writeOptional = (
   })
 
 export const buildReport = (input: ReportRenderInput): Report => {
-  const { manifest, metricsDiff, timeline, diff, judge, summary } = input
+  const { manifest, metricsDiff, timeline, diff, judge, summary, packSetup } = input
   return {
     manifest,
     metricsDiff,
@@ -62,6 +62,7 @@ export const buildReport = (input: ReportRenderInput): Report => {
     diff,
     summary,
     ...(judge === undefined ? {} : { judge }),
+    ...(packSetup === undefined ? {} : { packSetup }),
   }
 }
 

@@ -28,7 +28,7 @@ import { ensureDir, readFile, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import type { PricingTable } from '../pricing/lookup.js'
 import { loadPricing } from '../pricing/lookup.js'
-import { extractMetricsFromTree } from '../metrics/extract.js'
+import { extractMetricsFromTree, findPhaseBoundary } from '../metrics/extract.js'
 import type { ExtractedMetrics } from '../metrics/extract.js'
 import { profileEvents } from '../metrics/events-profile.js'
 import type { EventsProfile } from '../metrics/events-profile.js'
@@ -39,6 +39,7 @@ import { detectPack } from '../pack/detector.js'
 import { loadTreeForRun } from './10-timeline.js'
 import type { SessionTreeLoader } from './10-timeline.js'
 import type { RunSideResultExt } from './06-run-side.js'
+import { toNum } from '../util/numeric.js'
 
 /** Injectable tree loader for v0.2 sub-agent aggregation (tests pass a stub). */
 export interface AggregateDeps {
@@ -67,6 +68,8 @@ type ProcessedRun =
       // profiles to zero gaps; the run then contributes no P5 data point at
       // all instead of a fabricated "0".
       readonly eventsProfile: EventsProfile | undefined
+      /** `RunSideResultExt.initRan === true` — feeds SidePhaseSplit.runsWithLostInit (metric-split spec §5.4). */
+      readonly initRan: boolean
     }
   | { readonly kind: 'failed'; readonly failedRun: FailedRun }
 
@@ -91,10 +94,19 @@ const toExportInvalid = (side: Side, runIndex: number, cause: unknown): PhaseErr
     },
   )
 
-/** A missing/unreadable events.ndjson (older workspace) yields no profile, not a fabricated one. */
-const readEventsProfile = (eventsLogPath: string): Effect.Effect<EventsProfile | undefined> =>
+/**
+ * A missing/unreadable events.ndjson (older workspace) yields no profile, not
+ * a fabricated one. `boundaryTs`, when the run had an init phase (metric-
+ * split spec §5.3/§5.4), scopes `timeToFirstToolMs`/`timeToFirstEditMs` to
+ * the task phase — otherwise they'd measure the init session's first tool on
+ * an init-bearing run.
+ */
+const readEventsProfile = (
+  eventsLogPath: string,
+  boundaryTs?: number,
+): Effect.Effect<EventsProfile | undefined> =>
   readFile(eventsLogPath).pipe(
-    Effect.map(profileEvents),
+    Effect.map((raw) => profileEvents(raw, boundaryTs)),
     Effect.catchAll(() => Effect.succeed(undefined)),
   )
 
@@ -113,6 +125,7 @@ const readAndExtract = (
     readonly id: string
     readonly runIndex: number
     readonly eventsProfile: EventsProfile | undefined
+    readonly initRan: boolean
   },
   PhaseError
 > =>
@@ -135,7 +148,10 @@ const readAndExtract = (
     const data = result.data as OpencodeExport
     const homeDir = homeDirs[r.runIndex - 1] ?? ''
     const tree = yield* loadTreeForRun(homeDir, data, loader)
-    const eventsProfile = yield* readEventsProfile(r.eventsLogPath)
+    // Boundary is taken from the ROOT export (spec §2.2), same source
+    // `extractMetricsFromTree` below uses internally for the phase split.
+    const boundaryTs = findPhaseBoundary(data)?.boundaryTs
+    const eventsProfile = yield* readEventsProfile(r.eventsLogPath, boundaryTs)
     return {
       kind: 'ok' as const,
       metrics: extractMetricsFromTree(tree, pricing, r.successRank, {
@@ -144,6 +160,7 @@ const readAndExtract = (
       id: data.info.id,
       runIndex: r.runIndex,
       eventsProfile,
+      initRan: r.initRan === true,
     }
   })
 
@@ -204,6 +221,12 @@ const aggregateSide = (
     )
     const rawRunIds = processed.flatMap((p) => (p.kind === 'ok' ? [p.id] : []))
     const failedRuns = processed.flatMap((p) => (p.kind === 'failed' ? [p.failedRun] : []))
+    // Parallel to `extracted` — same filter/order as `extras`/`runIndexes` above.
+    const initRanFlags = processed.flatMap((p) => (p.kind === 'ok' ? [p.initRan] : []))
+    // Every ATTEMPTED run, not just successful ones — the pack-exercise
+    // segment runs before the agent session, so a later agent crash doesn't
+    // invalidate its own wall-clock reading (metric-split spec §6.1).
+    const setupWallMsList = results.map((r) => (r.setupWallMs === undefined ? undefined : toNum(r.setupWallMs)))
     const verifyStats = buildVerifyStats(results)
     return buildSideAggregates({
       side,
@@ -215,6 +238,8 @@ const aggregateSide = (
       eventsProfiles,
       canDetect,
       visibilityConfirmed,
+      initRanFlags,
+      setupWallMsList,
       ...(packName === undefined ? {} : { packName }),
       ...(verifyStats === undefined ? {} : { verifyStats }),
       ...(configDriftSignal === undefined ? {} : { configDriftSignal }),

@@ -171,7 +171,7 @@ describe('reportRender — markdown content', () => {
     const md = await runP(readFile(`${out}/report.md`))
     expect(md).toContain('# testaipack report: run-abc-001')
     expect(md).toContain('## Summary')
-    expect(md).toContain('## Primary metrics (delta)')
+    expect(md).toContain('## Primary metrics — total (init + task)')
     expect(md).toContain('## Secondary metrics')
     expect(md).toContain('## LLM Judge')
     expect(md).toContain('## Timeline summary')

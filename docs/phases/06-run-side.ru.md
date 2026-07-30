@@ -25,8 +25,15 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
 - Выход: `RunSideResult` — `{ side: Side, runIndex: int32, exportPath: string,
   eventsLogPath: string, successRank: SuccessRank, finishCause: FinishCause,
   exitCode: int32, durationMs: int64, verifyExitCode?: int32,
-  watchdogTriggered: boolean }`. Все поля обязательные, кроме
-  `verifyExitCode` (появляется только если задан `verify`).
+  watchdogTriggered: boolean, initRan?: boolean, initWallMs?: int64,
+  promptWallMs?: int64 }`. Все поля обязательные, кроме `verifyExitCode`
+  (появляется только если задан `verify`) и `initRan`/`initWallMs`
+  (появляются только если `--init` реально выполнялся на этой стороне —
+  см. п. 3.2.b). `promptWallMs` пишется всегда: обвязочные (harness-side)
+  `Date.now()`-таймеры вокруг каждого вызова opencode, а не
+  `OnceResult.durationMs` (тот 0 на watchdog/timeout/error-ветках) — источник
+  разбиения `init`/`task` для отчёта (см. `docs/phases/07-aggregate.ru.md`,
+  спека `.research/metric-split/spec.md` §5.1).
 - Ошибки: `@error RunSideError` — `{ code, message, side: Side, runIndex: int32,
   context? }`, где `code` принимает только значения:
   - `E_RUN_TIMEOUT` — жёсткий таймаут `runInput.timeouts.runSeconds` (default
@@ -102,7 +109,11 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
    c. Запустить основной промпт:
       `HOME=<env> opencode run --agent build --continue --session <sessionId> --format json --auto "<prompt>"`.
       Если `--init` не было, `--continue` опускается. Все события дописываются
-      в тот же `.events.ndjson`.
+      в тот же `.events.ndjson`. Вокруг каждого из двух вызовов (`--init` в
+      п. b, если он был, и `--prompt` здесь) обвязка меряет собственный
+      wall-clock (`Date.now()` до/после) — это `initWallMs`/`promptWallMs` в
+      `RunSideResult`, harness-сторона того же разбиения init/task, что фаза
+      07 считает по самому экспорту (граница по 2-му user-сообщению).
    d. **Watchdog:** отдельная задача следит за `mtime` файла `.events.ndjson`.
       Если за `timeouts.watchdogSeconds` секунд не было новой строки → kill
       opencode-process, пометить `watchdogTriggered = true`, exit-причину →

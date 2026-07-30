@@ -7,6 +7,7 @@ import "./phases/01-workspace-setup.tsp";
 import "./phases/02-repo-clone.tsp";
 import "./phases/03-pack-install.tsp";
 import "./phases/04-home-isolation.tsp";
+import "./phases/04b-pack-setup.tsp";
 import "./phases/05-preflight.tsp";
 import "./phases/06-run-side.tsp";
 import "./phases/07-aggregate.tsp";

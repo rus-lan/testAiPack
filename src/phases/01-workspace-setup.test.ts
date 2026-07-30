@@ -36,6 +36,7 @@ const makeRunInput = (overrides: Partial<RunInput> & { workspacePath: string }):
   },
   pureBaseline: true,
   protectGit: false,
+  allowBaselineTool: false,
   initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
@@ -184,6 +185,33 @@ describe('workspaceSetup — manifest', () => {
       }),
     )
     expect(result.manifest.opencodeVersion).toBe('9.9.9')
+  })
+
+  it('carries packHint into the manifest as a provenance copy, same as packSetup/packCheck/packExercise', async () => {
+    const { workspacePath } = await freshProject()
+    const result = await runP(
+      workspaceSetup({
+        runInput: makeRunInput({
+          workspacePath,
+          packHint: 'If .graphify/ contains a prepared index, use it. If not, work as usual.',
+        }),
+        runId: 'rid',
+      }),
+    )
+    expect(result.manifest.packHint).toBe(
+      'If .graphify/ contains a prepared index, use it. If not, work as usual.',
+    )
+    const raw = await runP(readFile(path.join(result.rootPath, 'manifest.json')))
+    const onDisk = JSON.parse(raw) as { packHint?: string }
+    expect(onDisk.packHint).toBe(result.manifest.packHint)
+  })
+
+  it('packHint absent from the manifest when not set', async () => {
+    const { workspacePath } = await freshProject()
+    const result = await runP(
+      workspaceSetup({ runInput: makeRunInput({ workspacePath }), runId: 'rid' }),
+    )
+    expect(result.manifest.packHint).toBeUndefined()
   })
 
   it('redacts a credentialed repoUrl and a secret-bearing inline mcp packRef, in the returned manifest and on disk', async () => {

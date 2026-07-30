@@ -55,8 +55,8 @@ describe('PhaseError', () => {
     expect(cleanupError('m', 'E_DISK_FULL').phase).toBe('cleanup')
   })
 
-  it('PHASE_NAMES lists all 14 phases', () => {
-    expect(PHASE_NAMES).toHaveLength(14)
+  it('PHASE_NAMES lists all 15 phases', () => {
+    expect(PHASE_NAMES).toHaveLength(15)
   })
 
   it('serializes to a plain object with ISO timestamp matching the wire PhaseError', () => {

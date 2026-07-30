@@ -4,6 +4,8 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import type { DiffSummary, FileChange } from '@generated/types'
 import { redactUrlCredentials } from './redact.js'
+import { appendFile, ensureDir, readFile } from './fs.js'
+import type { FsError } from './fs.js'
 
 export interface DiffStat {
   readonly filesChanged: number
@@ -279,6 +281,85 @@ export const readTreeHead = (cwd: string, gitDir?: string, indexFile?: string): 
     runGit('read-tree', [...gitDirArgs(cwd, gitDir), 'read-tree', 'HEAD'], cwd, indexEnv(indexFile)),
     undefined,
   )
+
+export interface StatusEntry {
+  /** Two-letter porcelain status code, e.g. `' M'`, `'??'`, `'A '`. */
+  readonly code: string
+  readonly path: string
+}
+
+/**
+ * `git status --porcelain` — used by `--pack-exercise` diff hygiene to tell a
+ * tracked-file modification (the exercise wrote over agent-visible source,
+ * `E_PACK_EXERCISE_DIRTY`, abort) apart from a brand-new untracked path (the
+ * exercise's own output artifacts, excluded from the measured diff instead).
+ * `--porcelain` (v1, not `=v2`) keeps the two-char code + path format stable
+ * across git versions; each line is `XY path` with a single space separator,
+ * a renamed entry's `path` carries the `old -> new` text verbatim.
+ */
+export const statusPorcelain = (cwd: string, gitDir?: string): Effect.Effect<readonly StatusEntry[], GitError> =>
+  Effect.gen(function* () {
+    const { stdout } = yield* runGit(
+      'status',
+      // `-c core.quotePath=false` — otherwise a path with non-ASCII bytes
+      // (verified against real git: a Cyrillic filename) comes back
+      // C-quoted (`"\320\276..."`), and the caller writes that quoted text
+      // itself into `.git/info/exclude` as a pattern, which then matches
+      // nothing real — the artifact it was meant to hide leaks straight
+      // into the measured diff instead.
+      [...gitDirArgs(cwd, gitDir), '-c', 'core.quotePath=false', 'status', '--porcelain'],
+      cwd,
+    )
+    return stdout.split('\n').flatMap((line) => {
+      if (line.trim() === '') return []
+      const code = line.slice(0, 2)
+      const path = line.slice(3)
+      return path === '' ? [] : [{ code, path }]
+    })
+  })
+
+/**
+ * Turns a `git status` path into a literal, root-anchored exclude pattern.
+ * A bare path written as-is is an *unanchored* gitignore pattern — it
+ * matches at any depth, so a root-level `GRAPH_REPORT.md` artifact would
+ * also hide an unrelated `src/GRAPH_REPORT.md` (verified against real git).
+ * The leading `/` fixes that. Backslash-escaping `\ * ? [ ]` stops a literal
+ * filename that happens to contain a gitignore metacharacter from being
+ * read as a glob instead of matched literally.
+ */
+const toExcludePattern = (relPath: string): string => `/${relPath.replace(/[\\*?[\]]/g, '\\$&')}`
+
+/**
+ * Appends paths to `<gitDir>/info/exclude` — the per-repo, never-committed
+ * sibling of `.gitignore` (git honors both for `git add -A`/`git status`).
+ * Used to keep `--pack-exercise` artifacts out of the measured diff without
+ * touching any tracked file (a `.gitignore` edit would itself show up as a
+ * change). Idempotent: a path already present is not duplicated. Creates
+ * `info/exclude` (and its parent dir) if the repo has never used it.
+ */
+export const appendInfoExclude = (
+  gitDir: string,
+  paths: readonly string[],
+): Effect.Effect<void, FsError> =>
+  Effect.gen(function* () {
+    if (paths.length === 0) return
+    const excludePath = path.join(gitDir, 'info', 'exclude')
+    const existing = yield* readFile(excludePath).pipe(Effect.orElseSucceed(() => ''))
+    const already = new Set(existing.split('\n').map((l) => l.trim()).filter((l) => l !== ''))
+    const toAdd = paths.map(toExcludePattern).filter((p) => !already.has(p))
+    if (toAdd.length === 0) return
+    yield* ensureDir(path.dirname(excludePath))
+    const prefix = existing === '' || existing.endsWith('\n') ? '' : '\n'
+    yield* appendFile(excludePath, `${prefix}${toAdd.join('\n')}\n`)
+  })
+
+/** Reads `<gitDir>/info/exclude` back, one path per line — empty array when absent. */
+export const readInfoExclude = (gitDir: string): Effect.Effect<readonly string[]> =>
+  Effect.gen(function* () {
+    const excludePath = path.join(gitDir, 'info', 'exclude')
+    const content = yield* readFile(excludePath).pipe(Effect.orElseSucceed(() => ''))
+    return content.split('\n').map((l) => l.trim()).filter((l) => l !== '')
+  })
 
 export const lsFilesStage = (cwd: string, gitDir?: string): Effect.Effect<string, GitError> => {
   if (!existsSync(cwd) || !existsSync(gitDir ?? path.join(cwd, '.git'))) {

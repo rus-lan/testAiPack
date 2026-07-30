@@ -59,6 +59,7 @@ import {
   DEFAULT_DIFF_HTML,
   DEFAULT_PROTECT_GIT,
   DEFAULT_COLLAPSE_REPEATS,
+  DEFAULT_ALLOW_BASELINE_TOOL,
   DEFAULT_TIMELINE_MODE,
   DEFAULT_INIT_SIDE,
   DEFAULT_LOG_LEVEL,
@@ -394,6 +395,10 @@ const FLAG_DESCRIPTIONS: Readonly<Record<string, string>> = {
   preflightModel: 'Model for the LLM judge only. The pre-flight auth-ping and the run itself both use --model instead.',
   model: 'Model for the run itself, applied identically to both sides.',
   pricingPath: 'Custom pricing table (USD per 1M tokens). The built-in table is used otherwise.',
+  packSetup: 'Shell command that installs the pack\'s runtime into $HOME. Runs once for the whole experiment, then the resulting HOME is copied to every new-side run.',
+  packCheck: 'Shell command that exits 0 iff the pack\'s runtime is functional. Runs in every new HOME (must pass) and every old HOME (must fail, unless --allow-baseline-tool).',
+  packExercise: 'Shell command that runs the pack\'s own pipeline, once per new-side run, before the agent session starts. Absent -> mode `installed-only` (not an error) when the pack has nothing runnable.',
+  packHint: 'Text appended to the task prompt for BOTH sides, identically — e.g. "If the project contains a prepared code index in .graphify/, use it to navigate the code. If it is absent, work as usual." Never sent to only one side: a one-sided hint would make the comparison meaningless. Write it as a conditional ("if X is present, use it; if not, work as usual") so a baseline that finds nothing spends at most a couple of tool calls confirming that. Typically paired with --pack-exercise, whose output the hint is pointing at. Recorded in manifest.json/report.',
   preflightSeconds: 'Timeout for the pre-flight stage (seconds).',
   runSeconds: 'Timeout for a single agent run (seconds).',
   verifySeconds: 'Timeout for the --verify command (seconds).',
@@ -405,6 +410,7 @@ const FLAG_DESCRIPTIONS: Readonly<Record<string, string>> = {
   diffHtml: 'Generate an HTML side-by-side diff.',
   protectGit: 'Keeps each run\'s git dir outside the workspace so the agent cannot delete it; costs you opencode\'s snapshot/patch export parts, which need /workspace/.git (exports get poorer). Weak under --isolation home (agent can still reach it). Default: off.',
   collapseRepeats: 'Collapse consecutive identical tool-call sequences in the timeline.',
+  allowBaselineTool: 'Override gate 6: do not hard-fail when --pack-check already passes on the old (baseline) side. Off by default — a baseline that already has the dependency produces a meaningless comparison.',
 }
 
 const enumChoices = (schema: { readonly options: readonly string[] }): string => schema.options.join('|')
@@ -468,7 +474,7 @@ const valueFlagDefault = (dest: string): string => {
 }
 
 const BOOLEAN_KEY_ORDER: readonly RunBooleanKey[] = [
-  'pureBaseline', 'preflightEnabled', 'diffHtml', 'collapseRepeats', 'protectGit',
+  'pureBaseline', 'preflightEnabled', 'diffHtml', 'collapseRepeats', 'protectGit', 'allowBaselineTool',
 ]
 
 const BOOLEAN_DEFAULTS: Readonly<Record<RunBooleanKey, boolean>> = {
@@ -477,6 +483,7 @@ const BOOLEAN_DEFAULTS: Readonly<Record<RunBooleanKey, boolean>> = {
   diffHtml: DEFAULT_DIFF_HTML,
   collapseRepeats: DEFAULT_COLLAPSE_REPEATS,
   protectGit: DEFAULT_PROTECT_GIT,
+  allowBaselineTool: DEFAULT_ALLOW_BASELINE_TOOL,
 }
 
 const namesForBooleanKey = (key: RunBooleanKey, value: boolean): string =>

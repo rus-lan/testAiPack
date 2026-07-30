@@ -79,6 +79,11 @@ export type RunInput = {
   workspacePath: string
   logLevel: LogLevel
   pricingPath?: string
+  packSetup?: string
+  packCheck?: string
+  packExercise?: string
+  allowBaselineTool?: boolean
+  packHint?: string
 }
 
 export type Manifest = {
@@ -94,6 +99,10 @@ export type Manifest = {
   isolation: IsolationMode
   opencodeVersion: string
   flagDefaults: RecordUnknown
+  packSetup?: string
+  packCheck?: string
+  packExercise?: string
+  packHint?: string
 }
 
 export type WorkspaceTree = {
@@ -145,6 +154,11 @@ export type ErrorCode =
   | 'E_AUTH_MISSING'
   | 'E_MODEL_UNAVAILABLE'
   | 'E_RATE_LIMIT_EXHAUSTED'
+  | 'E_PACK_SETUP_FAILED'
+  | 'E_PACK_SETUP_TIMEOUT'
+  | 'E_PACK_CHECK_FAILED'
+  | 'E_PACK_EXERCISE_FAILED'
+  | 'E_PACK_EXERCISE_DIRTY'
 
 export type RunSideResult = {
   side: Side
@@ -158,6 +172,10 @@ export type RunSideResult = {
   verifyExitCode?: number
   watchdogTriggered: boolean
   errorCode?: ErrorCode
+  setupWallMs?: string
+  initRan?: boolean
+  initWallMs?: string
+  promptWallMs?: string
 }
 
 export type AggregateInput = {
@@ -250,6 +268,7 @@ export type PackUse = {
   firstCallMsMedian?: string
   canDetect: boolean
   visibilityConfirmed?: boolean
+  runsWithoutCall?: Array<number>
 }
 
 export type RiskyCommand = {
@@ -272,6 +291,38 @@ export type ContaminationSignal = {
   runIndex?: number
 }
 
+export type PhaseSlice = {
+  totalTokens: string
+  wallClockMs: string
+  costUsd: number
+  stepCount: number
+  toolCallCount: number
+}
+
+export type PhaseSliceStats = {
+  totalTokens: MetricDistribution
+  wallClockMs: MetricDistribution
+  costUsd: MetricDistribution
+  stepCount: MetricDistribution
+  toolCallCount: MetricDistribution
+}
+
+export type SetupSegment = {
+  wallClockMs: string
+}
+
+export type SidePhaseSplit = {
+  runsWithInit: number
+  runsWithLostInit: number
+  init?: PhaseSlice
+  initStats?: PhaseSliceStats
+  task: PhaseSlice
+  taskStats: PhaseSliceStats
+  costProrated?: boolean
+  setup?: SetupSegment
+  setupStats?: MetricDistribution
+}
+
 export type SideAggregates = {
   side: Side
   primary: PrimaryMetrics
@@ -284,6 +335,7 @@ export type SideAggregates = {
   opencodeVersions?: Array<string>
   verifyStats?: VerifyStats
   contaminationSignals?: Array<ContaminationSignal>
+  phaseSplit?: SidePhaseSplit
 }
 
 export type MetricDelta = {
@@ -303,11 +355,21 @@ export type PrimaryDeltas = {
   maxParallelism: MetricDelta
 }
 
+export type PhaseDeltas = {
+  totalTokens: MetricDelta
+  wallClockMs: MetricDelta
+  costUsd: MetricDelta
+  stepCount: MetricDelta
+  toolCallCount: MetricDelta
+}
+
 export type MetricsDiff = {
   old: SideAggregates
   new: SideAggregates
   deltas: PrimaryDeltas
   bothFailed: boolean
+  taskDeltas?: PhaseDeltas
+  initDeltas?: PhaseDeltas
 }
 
 export type AggregateResult = {
@@ -411,6 +473,7 @@ export type EnvVarSet = {
   OPENCODE_DISABLE_EXTERNAL_SKILLS: boolean
   OPENCODE_PURE: boolean
   OPENCODE_CONFIG_CONTENT?: string
+  PATH?: string
 }
 
 export type ExportCache = {
@@ -648,6 +711,15 @@ export type OpencodeExport = {
   messages: Array<ExportMessage>
 }
 
+export type PackCmdResult = {
+  side: Side
+  runIndex: number
+  exitCode: number
+  durationMs: string
+  outputTail?: string
+  artifactHash?: string
+}
+
 export type PackInstallError = {
   code: 'E_PACK_INVALID_REF' | 'E_PACK_UNKNOWN_TYPE' | 'E_INSTALL_TIMEOUT' | 'E_INSTALL_FAILED'
   message: string
@@ -659,6 +731,37 @@ export type PackInstallInput = {
   runInput: RunInput
   manifest: Manifest
   workspace: WorkspaceTree
+}
+
+export type PackSetupError = {
+  code: 'E_PACK_SETUP_FAILED' | 'E_PACK_SETUP_TIMEOUT'
+  message: string
+  context?: RecordUnknown
+}
+
+export type PackSetupInput = {
+  runInput: RunInput
+  manifest: Manifest
+  workspace: WorkspaceTree
+  packInstall?: PackInstallResult
+}
+
+export type PackSetupMode = 'exercised' | 'installed-only' | 'delivered-only'
+
+export type PackSetupReport = {
+  mode: PackSetupMode
+  setupDeclared: boolean
+  checkDeclared: boolean
+  exerciseDeclared: boolean
+  undeclaredDepWarning?: string
+  setup?: PackCmdResult
+  checks: Array<PackCmdResult>
+  exercises: Array<PackCmdResult>
+}
+
+export type PackSetupResult = {
+  report: PackSetupReport
+  logPath: string
 }
 
 export type PhaseError = {
@@ -680,9 +783,19 @@ export type PreflightCheck = {
 
 export type PreflightError = {
   code:
-    'E_PREFLIGHT_TIMEOUT' | 'E_PREFLIGHT_FAILED' | 'E_PREFLIGHT_PACK_INVISIBLE' | 'E_AUTH_MISSING'
+    | 'E_PREFLIGHT_TIMEOUT'
+    | 'E_PREFLIGHT_FAILED'
+    | 'E_PREFLIGHT_PACK_INVISIBLE'
+    | 'E_AUTH_MISSING'
+    | 'E_PACK_CHECK_FAILED'
   phase: 'preflight'
-  check: 'opencode-launch' | 'auth-ping' | 'build-agent' | 'pack-visibility' | 'baseline-identical'
+  check:
+    | 'opencode-launch'
+    | 'auth-ping'
+    | 'build-agent'
+    | 'pack-visibility'
+    | 'baseline-identical'
+    | 'pack-functional'
   side: Side
   message: string
   context?: RecordUnknown
@@ -754,6 +867,7 @@ export type ReportSummary = {
   regressions: Array<MetricDelta>
   neutral: Array<MetricDelta>
   failures: Array<FailedRun>
+  basis?: 'task' | 'total'
 }
 
 export type Report = {
@@ -766,6 +880,7 @@ export type Report = {
   }
   judge?: JudgeResult
   summary: ReportSummary
+  packSetup?: PackSetupReport
 }
 
 export type ReportRenderError = {
@@ -785,6 +900,7 @@ export type ReportRenderInput = {
   }
   judge?: JudgeResult
   summary: ReportSummary
+  packSetup?: PackSetupReport
 }
 
 export type ReportRenderResult = {

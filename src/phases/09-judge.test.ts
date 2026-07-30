@@ -1,12 +1,14 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Effect, Fiber } from 'effect'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { fileURLToPath } from 'node:url'
 import {
   judge,
   parseJudgeResponse,
   buildJudgePrompt,
+  extractAssistantText,
   judgeInstructionMentionsReportFile,
   summarizeDiffRuns,
 } from './09-judge.js'
@@ -40,6 +42,28 @@ const runMock = vi.mocked(run)
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 
 // ---------------------------------------------------------------------------
+// Real judge.log fixture — captured verbatim from a real run
+// (2026-07-30_14-05-58_b7d56c, model ollama/qwen3.5-9b-32k) where the model
+// returned a substantive, well-formed verdict that the parser nonetheless
+// discarded as "Failed to parse judge response". Loaded from disk rather
+// than retyped inline: the model's response text is Cyrillic with JSON
+// escapes, and the whole point of this fixture is byte fidelity, not a
+// hand-typed approximation of it.
+// ---------------------------------------------------------------------------
+
+const REAL_JUDGE_LOG = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'tests', 'fixtures', 'judge-real-response.txt'),
+  'utf8',
+)
+
+/** The `--- stdout ---` section of the fixture — what opencode's `run()` would have returned as `stdout`. */
+const REAL_JUDGE_STDOUT = (() => {
+  const m = /--- stdout ---\n([\s\S]*?)\n\n--- stderr ---/.exec(REAL_JUDGE_LOG)
+  if (m === null || m[1] === undefined) throw new Error('judge-real-response fixture format changed — could not extract stdout section')
+  return m[1]
+})()
+
+// ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
@@ -54,6 +78,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  allowBaselineTool: false,
   initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
@@ -141,6 +166,16 @@ const assistantMessageEvent = (text: string): string =>
     parts: [{ type: 'text', text, id: 'p1' }],
   })}\n`
 
+/**
+ * The shape opencode actually streams per NDJSON line — `text` sits under a
+ * singular `part` object, not directly on the event and not under a `parts`
+ * array. This is what `judge-real-response.txt` contains; `textEvent` above
+ * (flat `{ type: "text", text }`) is a shape the old parser also accepted,
+ * but it is not what a real run produces.
+ */
+const streamedTextEvent = (text: string): string =>
+  `${JSON.stringify({ type: 'text', timestamp: 1, sessionID: 's1', part: { id: 'p1', type: 'text', text } })}\n`
+
 const okResult = (stdout: string): OpencodeRunResult => ({
   exitCode: 0,
   stdout,
@@ -160,6 +195,46 @@ const failWith = (args: { readonly exitCode: number | null; readonly stderr: str
 beforeEach(() => {
   runMock.mockReset()
   runMock.mockImplementation(succeedWith(textEvent('{"verdict":"ok","oldQuality":5,"newQuality":8,"explanation":"new is better"}')))
+})
+
+// ---------------------------------------------------------------------------
+// extractAssistantText — real opencode event shapes
+// ---------------------------------------------------------------------------
+
+describe('extractAssistantText — event shape regression', () => {
+  it('flat { type: "text", text } event (export-style part) — already worked', () => {
+    expect(extractAssistantText(textEvent('hello'))).toBe('hello')
+  })
+
+  it('{ type: "message", parts: [...] } assistant event — already worked', () => {
+    expect(extractAssistantText(assistantMessageEvent('hello'))).toBe('hello')
+  })
+
+  it('streamed run event { type: "text", part: { type: "text", text } } — the real opencode shape, was silently dropped before the fix', () => {
+    expect(extractAssistantText(streamedTextEvent('hello'))).toBe('hello')
+  })
+
+  it('multiple streamed text events concatenate in order, same as the flat shape', () => {
+    const stdout = streamedTextEvent('foo') + streamedTextEvent('bar')
+    expect(extractAssistantText(stdout)).toBe('foobar')
+  })
+
+  it('non-text streamed events (step_start, step_finish) contribute nothing and do not throw', () => {
+    const stdout =
+      `${JSON.stringify({ type: 'step_start', part: { type: 'step-start' } })}\n` +
+      streamedTextEvent('the verdict') +
+      `${JSON.stringify({ type: 'step_finish', part: { type: 'step-finish', reason: 'stop' } })}\n`
+    expect(extractAssistantText(stdout)).toBe('the verdict')
+  })
+
+  it('extracts the real qwen3.5-9b-32k transcript (judge-real-response.txt fixture) — this is the exact bug report', () => {
+    const text = extractAssistantText(REAL_JUDGE_STDOUT)
+    expect(text).toContain('```json')
+    expect(text).toContain('"verdict": "unclear"')
+    expect(text).toContain('"oldQuality": 5')
+    expect(text).toContain('"newQuality": 8')
+    expect(text).toContain('Файл report.md недоступен')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -209,6 +284,31 @@ const PARSE_CASES: readonly ParseCase[] = [
   { name: 'quality not a number', raw: '{"verdict":"ok","oldQuality":"5","newQuality":5,"explanation":"x"}', expect: null },
   { name: 'explanation not string', raw: '{"verdict":"ok","oldQuality":5,"newQuality":5,"explanation":42}', expect: null },
   { name: 'not an object', raw: '[1,2,3]', expect: null },
+  {
+    name: 'trailing explanation after fenced JSON, with a stray closing brace in the prose',
+    raw: '```json\n{"verdict":"ok","oldQuality":5,"newQuality":5,"explanation":"x"}\n```\nHope that helps! :}',
+    expect: { verdict: 'ok', oldQuality: 5, newQuality: 5, explanation: 'x' },
+  },
+  {
+    name: 'trailing explanation after bare JSON (no fence), with a stray closing brace in the prose',
+    raw: '{"verdict":"ok","oldQuality":6,"newQuality":6,"explanation":"see {a:1} above"}\np.s. thanks for reading :}',
+    expect: { verdict: 'ok', oldQuality: 6, newQuality: 6, explanation: 'see {a:1} above' },
+  },
+  {
+    name: 'different key casing (Verdict/OldQuality/NewQuality/Explanation)',
+    raw: '{"Verdict":"fail","OldQuality":8,"NewQuality":2,"Explanation":"regressed"}',
+    expect: { verdict: 'fail', oldQuality: 8, newQuality: 2, explanation: 'regressed' },
+  },
+  {
+    name: 'SCREAMING key casing',
+    raw: '{"VERDICT":"ok","OLDQUALITY":4,"NEWQUALITY":9,"EXPLANATION":"caps"}',
+    expect: { verdict: 'ok', oldQuality: 4, newQuality: 9, explanation: 'caps' },
+  },
+  {
+    name: 'Russian text in explanation, no fence',
+    raw: '{"verdict":"unclear","oldQuality":5,"newQuality":8,"explanation":"Файл report.md недоступен для анализа"}',
+    expect: { verdict: 'unclear', oldQuality: 5, newQuality: 8, explanation: 'Файл report.md недоступен для анализа' },
+  },
 ]
 
 describe('parseJudgeResponse — tabular', () => {
@@ -217,6 +317,19 @@ describe('parseJudgeResponse — tabular', () => {
       expect(parseJudgeResponse(c.raw)).toEqual(c.expect)
     })
   }
+})
+
+describe('parseJudgeResponse — real qwen3.5-9b-32k response (judge-real-response.txt fixture)', () => {
+  it('parses the fenced JSON out of the real transcript into the verdict the model actually gave', () => {
+    const text = extractAssistantText(REAL_JUDGE_STDOUT)
+    const parsed = parseJudgeResponse(text)
+    expect(parsed).not.toBeNull()
+    expect(parsed?.verdict).toBe('unclear')
+    expect(parsed?.oldQuality).toBe(5)
+    expect(parsed?.newQuality).toBe(8)
+    expect(parsed?.explanation).toContain('Файл report.md недоступен')
+    expect(parsed?.explanation).toContain('CHPU')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -601,6 +714,20 @@ describe('judge — unparseable response', () => {
     expect(j.explanation).toContain('parse')
     expect(j.rawResponse).toBe('I really cannot decide this one.')
     expect(j.ran).toBe(true)
+  })
+})
+
+describe('judge — real qwen3.5-9b-32k response fixture (regression: was reported as "Failed to parse")', () => {
+  it('opencode stdout from the real run parses into the verdict the model actually gave, not "unclear/0/0/Failed to parse"', async () => {
+    runMock.mockImplementation(succeedWith(REAL_JUDGE_STDOUT))
+    const result = await runP(judge(buildInput({})))
+    const j = result.judge as JudgeResult
+    expect(j.ran).toBe(true)
+    expect(j.explanation).not.toContain('Failed to parse')
+    expect(j.verdict).toBe('unclear')
+    expect(j.oldQuality).toBe(5)
+    expect(j.newQuality).toBe(8)
+    expect(j.explanation).toContain('Файл report.md недоступен')
   })
 })
 

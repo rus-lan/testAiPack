@@ -111,6 +111,51 @@ describe('profileEvents — synthetic', () => {
 })
 
 // ---------------------------------------------------------------------------
+// boundaryTs — task-phase scoping (metric-split spec §5.3)
+// ---------------------------------------------------------------------------
+
+describe('profileEvents — boundaryTs (task-phase scoping)', () => {
+  it('with boundaryTs, timeToFirstToolMs is measured from the first post-boundary event, not the stream start', () => {
+    const lines = [
+      toolUse(0, 'bash'), // init tool — before the boundary
+      ev('text', 500, { part: { type: 'text', text: 'prompt starts' } }),
+      toolUse(700, 'ls'), // task tool
+    ]
+    const p = profileEvents(lines.join('\n'), 500)
+    // baseline is the first event at/after boundaryTs (ts=500) -> 700-500=200
+    expect(p.timeToFirstToolMs).toBe(200)
+  })
+
+  it('with boundaryTs, timeToFirstEditMs is scoped the same way', () => {
+    const lines = [toolUse(0, 'edit'), ev('text', 500), toolUse(600, 'edit')]
+    const p = profileEvents(lines.join('\n'), 500)
+    expect(p.timeToFirstEditMs).toBe(100)
+  })
+
+  it('gapsMs / maxEventGapMs stay whole-stream regardless of boundaryTs', () => {
+    const lines = [toolUse(0, 'bash'), toolUse(100, 'bash'), toolUse(70_100, 'bash')]
+    const withoutBoundary = profileEvents(lines.join('\n'))
+    const withBoundary = profileEvents(lines.join('\n'), 70_000)
+    expect(withBoundary.gapsMs).toEqual(withoutBoundary.gapsMs)
+    expect(withBoundary.maxEventGapMs).toBe(withoutBoundary.maxEventGapMs)
+  })
+
+  it('boundary beyond every event -> task signals are undefined, never 0', () => {
+    const lines = [toolUse(0, 'bash'), toolUse(100, 'edit')]
+    const p = profileEvents(lines.join('\n'), 10_000)
+    expect(p.timeToFirstToolMs).toBeUndefined()
+    expect(p.timeToFirstEditMs).toBeUndefined()
+  })
+
+  it('omitted boundaryTs keeps the old whole-stream behavior', () => {
+    const lines = [ev('text', 1000, { part: { type: 'text', text: 'hi' } }), toolUse(1200, 'bash'), toolUse(1500, 'edit')]
+    const p = profileEvents(lines.join('\n'))
+    expect(p.timeToFirstToolMs).toBe(200)
+    expect(p.timeToFirstEditMs).toBe(500)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Real ground truth — .research/metrics-expansion/golden-values.md, per-run
 // table. Reads the actual events.ndjson files from the sample workspace this
 // data was hand-computed from. That workspace lives outside the repo (a real

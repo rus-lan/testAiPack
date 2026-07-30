@@ -10,6 +10,7 @@
  * @see contract/main.tsp (OpencodeExport, PrimaryMetrics, SecondaryMetrics)
  */
 import type {
+  ExportMessage,
   ExportPart,
   ExportReasoningPart,
   ExportStepFinishPart,
@@ -64,6 +65,15 @@ export interface ExtractedMetrics {
   readonly primary: PrimaryMetrics
   readonly secondary: SecondaryMetrics
   readonly extras: ExtractedExtras
+  /**
+   * Split of the five splittable primary metrics between the `--init` and
+   * `--prompt` invocations that share this export (metric-split spec §2/§3).
+   * `task` is always present — a run with no init IS the task, whole. `init`
+   * only exists when the export's message list has a second user turn (a
+   * boundary). Numbers, not wire strings — the caller stringifies at the
+   * wire boundary, same convention as the rest of this module.
+   */
+  readonly phases: ExtractedPhases
 }
 
 export interface ExtractOptions {
@@ -351,6 +361,183 @@ const stepInputTokensOf = (
   return { first, last }
 }
 
+// ---------------------------------------------------------------------------
+// Phase split (metric-split spec §2/§3): the boundary between the `--init`
+// and `--prompt` opencode invocations that share one export.
+// ---------------------------------------------------------------------------
+
+export interface ExportPhaseBoundary {
+  /** Index of the export's 2nd `user`-role message (`U[1]`). */
+  readonly boundaryIndex: number
+  /** That message's `info.time.created`. */
+  readonly boundaryTs: number
+}
+
+/**
+ * The boundary marker: the second `user`-role message of the export (spec
+ * §2.1). `undefined` for 0 or 1 user messages (no init ran, or the export
+ * only ever saw one CLI invocation) — the whole export is then the task
+ * slice. A 3rd+ user message (never observed; the harness only ever issues
+ * two CLI turns) still yields `U[1]` — everything from the 2nd turn onward
+ * belongs to the `--prompt` invocation.
+ */
+export const findPhaseBoundary = (exp: OpencodeExport): ExportPhaseBoundary | undefined => {
+  const userIndexes = exp.messages.flatMap((m, i) => (m.info.role === 'user' ? [i] : []))
+  const boundaryIndex = userIndexes[1]
+  if (boundaryIndex === undefined) return undefined
+  const boundaryTs = toNum(exp.messages[boundaryIndex]?.info.time.created ?? 0)
+  return { boundaryIndex, boundaryTs }
+}
+
+/** One phase's share of the five splittable primary metrics — numbers, stringified at the wire boundary by the caller. */
+export interface PhaseSliceNum {
+  readonly totalTokens: number
+  readonly wallClockMs: number
+  readonly costUsd: number
+  readonly stepCount: number
+  readonly toolCallCount: number
+  /** True when `costUsd` came from prorating the session's reported cost by token share, not from measured per-message costs. */
+  readonly costProrated: boolean
+}
+
+export interface ExtractedPhases {
+  readonly init?: PhaseSliceNum
+  readonly task: PhaseSliceNum
+}
+
+const ZERO_PHASE_SLICE: PhaseSliceNum = {
+  totalTokens: 0,
+  wallClockMs: 0,
+  costUsd: 0,
+  stepCount: 0,
+  toolCallCount: 0,
+  costProrated: false,
+}
+
+interface SliceTokenSums {
+  readonly input: number
+  readonly output: number
+  readonly reasoning: number
+  readonly cacheRead: number
+  readonly cacheWrite: number
+}
+
+const ZERO_SLICE_TOKENS: SliceTokenSums = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }
+
+/** Per-message `info.tokens` is optional (only assistant messages carry usage) — absent sums as zero. */
+const sumMessageTokens = (messages: readonly ExportMessage[]): SliceTokenSums =>
+  messages.reduce<SliceTokenSums>((acc, m) => {
+    const t = m.info.tokens
+    return t === undefined
+      ? acc
+      : {
+          input: acc.input + t.input,
+          output: acc.output + t.output,
+          reasoning: acc.reasoning + t.reasoning,
+          cacheRead: acc.cacheRead + t.cache.read,
+          cacheWrite: acc.cacheWrite + t.cache.write,
+        }
+  }, ZERO_SLICE_TOKENS)
+
+interface SliceRaw {
+  readonly totalTokens: number
+  readonly stepCount: number
+  readonly toolCallCount: number
+  /** Sum of per-message `info.cost` — 0 when every message in the slice carries none (or all zero). */
+  readonly messageCostSum: number
+  readonly tokens: SliceTokenSums
+}
+
+/** Same total-tokens formula as the whole-run one (`extractMetrics`): input + output + reasoning + cache.read, no cache.write. */
+const sliceRawOf = (messages: readonly ExportMessage[]): SliceRaw => {
+  const parts = messages.flatMap((m) => m.parts)
+  const tokens = sumMessageTokens(messages)
+  return {
+    totalTokens: tokens.input + tokens.output + tokens.reasoning + tokens.cacheRead,
+    stepCount: parts.filter(isStepFinish).length,
+    toolCallCount: parts.filter(isTool).length,
+    messageCostSum: messages.reduce((sum, m) => sum + (m.info.cost ?? 0), 0),
+    tokens,
+  }
+}
+
+/**
+ * Slice cost precedence (spec §3): measured per-message costs first; else,
+ * when the session as a whole has a real provider-reported cost but the
+ * per-message breakdown is all zero, prorate that real total by the slice's
+ * share of the whole-run token count (flagged `costProrated` — a derived
+ * figure, never presented as measured); else fall back to the pricing table
+ * over the slice's own token sums (same as the whole-run `resolveCost`);
+ * else 0.
+ */
+const resolveSliceCost = (
+  exp: OpencodeExport,
+  pricing: PricingTable | null,
+  raw: SliceRaw,
+  wholeTotalTokens: number,
+): { readonly costUsd: number; readonly prorated: boolean } => {
+  if (raw.messageCostSum > 0) return { costUsd: raw.messageCostSum, prorated: false }
+  const sessionCost = exp.info.cost
+  if (sessionCost > 0) {
+    const share = wholeTotalTokens > 0 ? raw.totalTokens / wholeTotalTokens : 0
+    return { costUsd: sessionCost * share, prorated: true }
+  }
+  if (pricing) {
+    const price = lookupPrice(pricing, exp.info.model.providerID, exp.info.model.id)
+    const costUsd = computeCost(price, {
+      input: raw.tokens.input,
+      output: raw.tokens.output,
+      cache: { read: raw.tokens.cacheRead, write: raw.tokens.cacheWrite },
+    })
+    return { costUsd, prorated: false }
+  }
+  return { costUsd: 0, prorated: false }
+}
+
+const sliceOf = (
+  exp: OpencodeExport,
+  pricing: PricingTable | null,
+  messages: readonly ExportMessage[],
+  wallClockMs: number,
+  wholeTotalTokens: number,
+): PhaseSliceNum => {
+  const raw = sliceRawOf(messages)
+  const cost = resolveSliceCost(exp, pricing, raw, wholeTotalTokens)
+  return {
+    totalTokens: raw.totalTokens,
+    wallClockMs,
+    costUsd: cost.costUsd,
+    stepCount: raw.stepCount,
+    toolCallCount: raw.toolCallCount,
+    costProrated: cost.prorated,
+  }
+}
+
+/**
+ * Splits one export's messages at the phase boundary (spec §2). No boundary
+ * (0–1 user messages) -> the whole export is the task slice, `init` absent.
+ * Wall-clock partitions exactly by construction: `boundaryTs − created` +
+ * `updated − boundaryTs` = `updated − created` (spec §2.3); the inter-
+ * invocation CLI-startup gap lands in the task slice by the same convention
+ * the whole-run `wallClockMs` already uses.
+ */
+const buildPhaseSlices = (exp: OpencodeExport, pricing: PricingTable | null): ExtractedPhases => {
+  const boundary = findPhaseBoundary(exp)
+  const whole = sliceRawOf(exp.messages)
+  if (boundary === undefined) {
+    const wallClockMs = durationOf(exp.info.time.created, exp.info.time.updated)
+    return { task: sliceOf(exp, pricing, exp.messages, wallClockMs, whole.totalTokens) }
+  }
+  const initMessages = exp.messages.slice(0, boundary.boundaryIndex)
+  const taskMessages = exp.messages.slice(boundary.boundaryIndex)
+  const initWallClockMs = durationOf(exp.info.time.created, boundary.boundaryTs)
+  const taskWallClockMs = durationOf(boundary.boundaryTs, exp.info.time.updated)
+  return {
+    init: sliceOf(exp, pricing, initMessages, initWallClockMs, whole.totalTokens),
+    task: sliceOf(exp, pricing, taskMessages, taskWallClockMs, whole.totalTokens),
+  }
+}
+
 const extractExtras = (exp: OpencodeExport, opts: ExtractOptions): ExtractedExtras => {
   const tools = toolPartsOf(exp)
   const pack = packUseOf(exp, tools, opts.packName)
@@ -423,7 +610,7 @@ export const extractMetrics = (
     maxConsecutiveSameTool: maxConsecutiveSameTool(realParts),
   }
 
-  return { primary, secondary, extras: extractExtras(exp, opts) }
+  return { primary, secondary, extras: extractExtras(exp, opts), phases: buildPhaseSlices(exp, pricing) }
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +763,51 @@ const mergeExtrasAcrossNodes = (
   }
 }
 
+/** A node created before the root's boundary belongs to init, at/after it belongs to task; every node belongs to task when the root has no boundary (spec §2.2). */
+const attributePhase = (node: SessionTreeNode, boundaryTs: number | undefined): 'init' | 'task' =>
+  boundaryTs !== undefined && toNum(node.export.info.time.created) < boundaryTs ? 'init' : 'task'
+
+/**
+ * A sub-agent node is attributed WHOLLY to one phase, so only the count-like
+ * fields accumulate — its own wall-clock interval already sits inside the
+ * root's phase window (spec §5.2), and its cost is a normal whole-node
+ * figure, never a proration, so `wallClockMs`/`costProrated` stay root-owned.
+ */
+const addNodeToPhaseSlice = (slice: PhaseSliceNum, p: PrimaryMetrics): PhaseSliceNum => ({
+  ...slice,
+  totalTokens: slice.totalTokens + toNum(p.totalTokens),
+  costUsd: slice.costUsd + p.costUsd,
+  stepCount: slice.stepCount + p.stepCount,
+  toolCallCount: slice.toolCallCount + p.toolCallCount,
+})
+
+/**
+ * Folds the phase split over a tree: the ROOT's own export supplies the
+ * boundary and its own message-level init/task slice (`buildPhaseSlices`,
+ * already computed per-node by `extractMetrics`); every non-root node is
+ * attributed wholly to init or task by its own `info.time.created` vs the
+ * root's boundary, then folded in (spec §5.2).
+ */
+const mergePhasesAcrossTree = (
+  tree: readonly SessionTreeNode[],
+  perNode: readonly ExtractedMetrics[],
+): ExtractedPhases => {
+  const rootIndex = tree.findIndex((n) => n.parentId === null)
+  const rootIdx = rootIndex === -1 ? 0 : rootIndex
+  const rootNode = tree[rootIdx]
+  const rootPhases = perNode[rootIdx]?.phases
+  if (rootNode === undefined || rootPhases === undefined) return { task: ZERO_PHASE_SLICE }
+  const boundaryTs = findPhaseBoundary(rootNode.export)?.boundaryTs
+  return tree.reduce<ExtractedPhases>((acc, node, i) => {
+    if (i === rootIdx) return acc
+    const p = perNode[i]?.primary
+    if (p === undefined) return acc
+    return attributePhase(node, boundaryTs) === 'init'
+      ? { ...acc, init: addNodeToPhaseSlice(acc.init ?? ZERO_PHASE_SLICE, p) }
+      : { ...acc, task: addNodeToPhaseSlice(acc.task, p) }
+  }, rootPhases)
+}
+
 /**
  * Fold metrics over a whole session tree (root + sub-agents):
  * - totalTokens / costUsd / stepCount / toolCallCount: SUM across nodes.
@@ -606,6 +838,7 @@ export const extractMetricsFromTree = (
       },
       secondary: emptySecondaryMetrics(),
       extras: emptyExtras(),
+      phases: { task: ZERO_PHASE_SLICE },
     }
   }
   const perNode = tree.map((n) => extractMetrics(n.export, pricing, successRank, opts))
@@ -631,5 +864,6 @@ export const extractMetricsFromTree = (
     primary,
     secondary: mergeSecondaryAcrossNodes(perNode.map((p) => p.secondary)),
     extras: mergeExtrasAcrossNodes(tree, perNode.map((p) => p.extras)),
+    phases: mergePhasesAcrossTree(tree, perNode),
   }
 }

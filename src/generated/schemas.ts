@@ -81,6 +81,11 @@ export const runInputSchema = z.object({
   workspacePath: z.string(),
   logLevel: logLevelSchema,
   pricingPath: z.string().optional(),
+  packSetup: z.string().optional(),
+  packCheck: z.string().optional(),
+  packExercise: z.string().optional(),
+  allowBaselineTool: z.boolean().optional(),
+  packHint: z.string().optional(),
 })
 
 export const manifestSchema = z.object({
@@ -96,6 +101,10 @@ export const manifestSchema = z.object({
   isolation: isolationModeSchema,
   opencodeVersion: z.string(),
   flagDefaults: recordUnknownSchema,
+  packSetup: z.string().optional(),
+  packCheck: z.string().optional(),
+  packExercise: z.string().optional(),
+  packHint: z.string().optional(),
 })
 
 export const workspaceTreeSchema = z.object({
@@ -154,6 +163,11 @@ export const errorCodeSchema = z.enum([
   'E_AUTH_MISSING',
   'E_MODEL_UNAVAILABLE',
   'E_RATE_LIMIT_EXHAUSTED',
+  'E_PACK_SETUP_FAILED',
+  'E_PACK_SETUP_TIMEOUT',
+  'E_PACK_CHECK_FAILED',
+  'E_PACK_EXERCISE_FAILED',
+  'E_PACK_EXERCISE_DIRTY',
 ])
 
 export const runSideResultSchema = z.object({
@@ -168,6 +182,10 @@ export const runSideResultSchema = z.object({
   verifyExitCode: z.number().int().optional(),
   watchdogTriggered: z.boolean(),
   errorCode: errorCodeSchema.optional(),
+  setupWallMs: z.string().optional(),
+  initRan: z.boolean().optional(),
+  initWallMs: z.string().optional(),
+  promptWallMs: z.string().optional(),
 })
 
 export const aggregateInputSchema = z.object({
@@ -260,6 +278,7 @@ export const packUseSchema = z.object({
   firstCallMsMedian: z.string().optional(),
   canDetect: z.boolean(),
   visibilityConfirmed: z.boolean().optional(),
+  runsWithoutCall: z.array(z.number().int()).optional(),
 })
 
 export const riskyCommandSchema = z.object({
@@ -282,6 +301,38 @@ export const contaminationSignalSchema = z.object({
   runIndex: z.number().int().optional(),
 })
 
+export const phaseSliceSchema = z.object({
+  totalTokens: z.string(),
+  wallClockMs: z.string(),
+  costUsd: z.number(),
+  stepCount: z.number().int(),
+  toolCallCount: z.number().int(),
+})
+
+export const phaseSliceStatsSchema = z.object({
+  totalTokens: metricDistributionSchema,
+  wallClockMs: metricDistributionSchema,
+  costUsd: metricDistributionSchema,
+  stepCount: metricDistributionSchema,
+  toolCallCount: metricDistributionSchema,
+})
+
+export const setupSegmentSchema = z.object({
+  wallClockMs: z.string(),
+})
+
+export const sidePhaseSplitSchema = z.object({
+  runsWithInit: z.number().int(),
+  runsWithLostInit: z.number().int(),
+  init: phaseSliceSchema.optional(),
+  initStats: phaseSliceStatsSchema.optional(),
+  task: phaseSliceSchema,
+  taskStats: phaseSliceStatsSchema,
+  costProrated: z.boolean().optional(),
+  setup: setupSegmentSchema.optional(),
+  setupStats: metricDistributionSchema.optional(),
+})
+
 export const sideAggregatesSchema = z.object({
   side: sideSchema,
   primary: primaryMetricsSchema,
@@ -294,6 +345,7 @@ export const sideAggregatesSchema = z.object({
   opencodeVersions: z.array(z.string()).optional(),
   verifyStats: verifyStatsSchema.optional(),
   contaminationSignals: z.array(contaminationSignalSchema).optional(),
+  phaseSplit: sidePhaseSplitSchema.optional(),
 })
 
 export const metricDeltaSchema = z.object({
@@ -318,11 +370,21 @@ export const primaryDeltasSchema = z.object({
   maxParallelism: metricDeltaSchema,
 })
 
+export const phaseDeltasSchema = z.object({
+  totalTokens: metricDeltaSchema,
+  wallClockMs: metricDeltaSchema,
+  costUsd: metricDeltaSchema,
+  stepCount: metricDeltaSchema,
+  toolCallCount: metricDeltaSchema,
+})
+
 export const metricsDiffSchema = z.object({
   old: sideAggregatesSchema,
   new: sideAggregatesSchema,
   deltas: primaryDeltasSchema,
   bothFailed: z.boolean(),
+  taskDeltas: phaseDeltasSchema.optional(),
+  initDeltas: phaseDeltasSchema.optional(),
 })
 
 export const aggregateResultSchema = z.object({
@@ -426,6 +488,7 @@ export const envVarSetSchema = z.object({
   OPENCODE_DISABLE_EXTERNAL_SKILLS: z.boolean(),
   OPENCODE_PURE: z.boolean(),
   OPENCODE_CONFIG_CONTENT: z.string().optional(),
+  PATH: z.string().optional(),
 })
 
 export const exportCacheSchema = z.object({
@@ -680,6 +743,15 @@ export const opencodeExportSchema = z.object({
   messages: z.array(exportMessageSchema),
 })
 
+export const packCmdResultSchema = z.object({
+  side: sideSchema,
+  runIndex: z.number().int(),
+  exitCode: z.number().int(),
+  durationMs: z.string(),
+  outputTail: z.string().optional(),
+  artifactHash: z.string().optional(),
+})
+
 export const packInstallErrorSchema = z.object({
   code: z.union([
     z.literal('E_PACK_INVALID_REF'),
@@ -696,6 +768,37 @@ export const packInstallInputSchema = z.object({
   runInput: runInputSchema,
   manifest: manifestSchema,
   workspace: workspaceTreeSchema,
+})
+
+export const packSetupErrorSchema = z.object({
+  code: z.union([z.literal('E_PACK_SETUP_FAILED'), z.literal('E_PACK_SETUP_TIMEOUT')]),
+  message: z.string(),
+  context: recordUnknownSchema.optional(),
+})
+
+export const packSetupInputSchema = z.object({
+  runInput: runInputSchema,
+  manifest: manifestSchema,
+  workspace: workspaceTreeSchema,
+  packInstall: packInstallResultSchema.optional(),
+})
+
+export const packSetupModeSchema = z.enum(['exercised', 'installed-only', 'delivered-only'])
+
+export const packSetupReportSchema = z.object({
+  mode: packSetupModeSchema,
+  setupDeclared: z.boolean(),
+  checkDeclared: z.boolean(),
+  exerciseDeclared: z.boolean(),
+  undeclaredDepWarning: z.string().optional(),
+  setup: packCmdResultSchema.optional(),
+  checks: z.array(packCmdResultSchema),
+  exercises: z.array(packCmdResultSchema),
+})
+
+export const packSetupResultSchema = z.object({
+  report: packSetupReportSchema,
+  logPath: z.string(),
 })
 
 export const phaseErrorSchema = z.object({
@@ -721,6 +824,7 @@ export const preflightErrorSchema = z.object({
     z.literal('E_PREFLIGHT_FAILED'),
     z.literal('E_PREFLIGHT_PACK_INVISIBLE'),
     z.literal('E_AUTH_MISSING'),
+    z.literal('E_PACK_CHECK_FAILED'),
   ]),
   phase: z.literal('preflight'),
   check: z.union([
@@ -729,6 +833,7 @@ export const preflightErrorSchema = z.object({
     z.literal('build-agent'),
     z.literal('pack-visibility'),
     z.literal('baseline-identical'),
+    z.literal('pack-functional'),
   ]),
   side: sideSchema,
   message: z.string(),
@@ -809,6 +914,7 @@ export const reportSummarySchema = z.object({
   regressions: z.array(metricDeltaSchema),
   neutral: z.array(metricDeltaSchema),
   failures: z.array(failedRunSchema),
+  basis: z.union([z.literal('task'), z.literal('total')]).optional(),
 })
 
 export const reportSchema = z.object({
@@ -821,6 +927,7 @@ export const reportSchema = z.object({
   }),
   judge: judgeResultSchema.optional(),
   summary: reportSummarySchema,
+  packSetup: packSetupReportSchema.optional(),
 })
 
 export const reportRenderErrorSchema = z.object({
@@ -840,6 +947,7 @@ export const reportRenderInputSchema = z.object({
   }),
   judge: judgeResultSchema.optional(),
   summary: reportSummarySchema,
+  packSetup: packSetupReportSchema.optional(),
 })
 
 export const reportRenderResultSchema = z.object({

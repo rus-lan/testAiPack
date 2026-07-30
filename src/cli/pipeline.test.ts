@@ -1,17 +1,35 @@
 import { describe, it, expect } from 'vitest'
+import { Effect } from 'effect'
+import path from 'node:path'
 import {
+  checkExerciseIntegrity,
   diffFailureStatus,
   diffFailureWarning,
   dockerDowngradeWarning,
+  excludeFailedExerciseArtifacts,
   initPackContaminationWarning,
+  packExerciseWithoutCheckWarning,
   packShortName,
   protectGitHomeWarning,
   redactRunInput,
   resolvePackVisibilityConfirmed,
   warnFsFailure,
 } from './pipeline.js'
-import { FsError } from '../util/fs.js'
-import type { DiffResultOutput, DiffRunResult, DiffRunState, PreflightCheck, RunInput, Side } from '@generated/types'
+import { FsError, readJson, writeFile } from '../util/fs.js'
+import { addAll, commit, init, lsFilesStage } from '../util/git.js'
+import { makeTempDir } from '../../tests/setup.js'
+import { z } from 'zod'
+import type { DiffResultOutput, DiffRunResult, DiffRunState, PackCmdResult, PreflightCheck, RunInput, Side } from '@generated/types'
+
+const run = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
+
+/** Build a real git repo at dir with one committed file, ready for exercise output on top. */
+const buildRepo = async (dir: string): Promise<void> => {
+  await run(init(dir))
+  await run(writeFile(path.join(dir, 'a.txt'), 'a\n'))
+  await run(addAll(dir))
+  await run(commit(dir, 'init'))
+}
 
 describe('cli/pipeline — dockerDowngradeWarning', () => {
   it('returns a warning when flagDefaults.dockerDowngraded is true', () => {
@@ -27,6 +45,137 @@ describe('cli/pipeline — dockerDowngradeWarning', () => {
 
   it('returns undefined when dockerDowngraded is absent', () => {
     expect(dockerDowngradeWarning({ configSource: 'cli' })).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// packExerciseWithoutCheckWarning
+// ---------------------------------------------------------------------------
+
+describe('cli/pipeline — packExerciseWithoutCheckWarning', () => {
+  it('warns when --pack-exercise is set without --pack-check', () => {
+    const msg = packExerciseWithoutCheckWarning(baseRunInput({ packExercise: 'mytool run' }))
+    expect(msg).toBeDefined()
+    expect(msg).toContain('--pack-exercise')
+    expect(msg).toContain('--pack-check')
+  })
+
+  it('stays quiet when both --pack-exercise and --pack-check are set', () => {
+    expect(
+      packExerciseWithoutCheckWarning(
+        baseRunInput({ packExercise: 'mytool run', packCheck: 'mytool --version' }),
+      ),
+    ).toBeUndefined()
+  })
+
+  it('stays quiet when --pack-exercise is absent', () => {
+    expect(packExerciseWithoutCheckWarning(baseRunInput())).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// checkExerciseIntegrity — review-gate regression: the artifact hash was
+// computed but never asserted or compared across runs, so "exited 0, wrote
+// nothing" was indistinguishable from a real exercise.
+// ---------------------------------------------------------------------------
+
+const exerciseResult = (over: Partial<PackCmdResult> = {}): PackCmdResult => ({
+  side: 'new',
+  runIndex: 1,
+  exitCode: 0,
+  durationMs: '10',
+  ...over,
+})
+
+describe('cli/pipeline — checkExerciseIntegrity', () => {
+  it('no exercises at all (--pack-exercise never declared) → quiet', () => {
+    expect(checkExerciseIntegrity([])).toBeUndefined()
+  })
+
+  it('every exercise exited 0 but left no artifact → flagged as suspicious, not silent success', () => {
+    const msg = checkExerciseIntegrity([
+      exerciseResult({ runIndex: 1 }),
+      exerciseResult({ runIndex: 2 }),
+      exerciseResult({ runIndex: 3 }),
+    ])
+    expect(msg).toBeDefined()
+    expect(msg).toContain('no-op')
+    expect(msg).toContain('3')
+  })
+
+  it('same artifact hash across every run → quiet (deterministic, real output)', () => {
+    const msg = checkExerciseIntegrity([
+      exerciseResult({ runIndex: 1, artifactHash: 'abc' }),
+      exerciseResult({ runIndex: 2, artifactHash: 'abc' }),
+      exerciseResult({ runIndex: 3, artifactHash: 'abc' }),
+    ])
+    expect(msg).toBeUndefined()
+  })
+
+  it('artifact hash diverges across runs → flagged as possibly non-deterministic', () => {
+    const msg = checkExerciseIntegrity([
+      exerciseResult({ runIndex: 1, artifactHash: 'abc' }),
+      exerciseResult({ runIndex: 2, artifactHash: 'def' }),
+      exerciseResult({ runIndex: 3, artifactHash: 'abc' }),
+    ])
+    expect(msg).toBeDefined()
+    expect(msg).toContain('non-deterministic')
+    expect(msg).toContain('2')
+  })
+
+  it('a mix of no-artifact and matching-artifact runs is judged on the runs that did produce output', () => {
+    const msg = checkExerciseIntegrity([
+      exerciseResult({ runIndex: 1, artifactHash: 'abc' }),
+      exerciseResult({ runIndex: 2 }), // no artifact this run
+      exerciseResult({ runIndex: 3, artifactHash: 'abc' }),
+    ])
+    expect(msg).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// excludeFailedExerciseArtifacts
+// ---------------------------------------------------------------------------
+
+describe('cli/pipeline — excludeFailedExerciseArtifacts (failed --pack-exercise diff hygiene)', () => {
+  const exerciseRecordSchema = z.object({ excludedPaths: z.array(z.string()) })
+
+  it('excludes a failed exercise\'s untracked output and persists the run-N.exercise.json record for phase 08 to re-apply', async () => {
+    const repo = makeTempDir()
+    await buildRepo(repo)
+    await run(writeFile(path.join(repo, 'partial-output.log'), 'half-built\n'))
+    const rawDir = makeTempDir()
+
+    await run(excludeFailedExerciseArtifacts(repo, path.join(repo, '.git'), rawDir, 3))
+
+    const record = await run(readJson(path.join(rawDir, 'run-3.exercise.json'), exerciseRecordSchema))
+    expect(record).toEqual({ excludedPaths: ['partial-output.log'] })
+
+    // phase 08's `git add -A` (addAll) must not stage it.
+    await run(addAll(repo))
+    const staged = await run(lsFilesStage(repo))
+    expect(staged).not.toContain('partial-output.log')
+  })
+
+  it('is a no-op (no record written) when the failed exercise left nothing untracked', async () => {
+    const repo = makeTempDir()
+    await buildRepo(repo)
+    const rawDir = makeTempDir()
+
+    await run(excludeFailedExerciseArtifacts(repo, path.join(repo, '.git'), rawDir, 1))
+
+    const err = await run(readJson(path.join(rawDir, 'run-1.exercise.json'), exerciseRecordSchema).pipe(Effect.option))
+    expect(err._tag).toBe('None')
+  })
+
+  it('never fails the effect even against a broken gitDir — best-effort, since the run is already contained as failed', async () => {
+    const repo = makeTempDir()
+    const bogusGitDir = path.join(makeTempDir(), 'nope')
+    const rawDir = makeTempDir()
+
+    // Resolves cleanly instead of throwing/failing — Effect.ignore swallows
+    // the underlying GitError from a non-existent gitDir.
+    await expect(run(excludeFailedExerciseArtifacts(repo, bogusGitDir, rawDir, 1))).resolves.toBeUndefined()
   })
 })
 
@@ -53,6 +202,7 @@ const baseRunInput = (overrides: Partial<RunInput> = {}): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  allowBaselineTool: false,
   initSide: 'both',
   preflightEnabled: false,
   formats: ['md'],

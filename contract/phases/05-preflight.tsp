@@ -12,9 +12,9 @@ model PreflightInput {
 
 @error
 model PreflightError {
-  code: "E_PREFLIGHT_TIMEOUT" | "E_PREFLIGHT_FAILED" | "E_PREFLIGHT_PACK_INVISIBLE" | "E_AUTH_MISSING";
+  code: "E_PREFLIGHT_TIMEOUT" | "E_PREFLIGHT_FAILED" | "E_PREFLIGHT_PACK_INVISIBLE" | "E_AUTH_MISSING" | "E_PACK_CHECK_FAILED";
   phase: "preflight";
-  check: "opencode-launch" | "auth-ping" | "build-agent" | "pack-visibility" | "baseline-identical";
+  check: "opencode-launch" | "auth-ping" | "build-agent" | "pack-visibility" | "baseline-identical" | "pack-functional";
   side: Side;
   message: string;
   context?: Record<unknown>;

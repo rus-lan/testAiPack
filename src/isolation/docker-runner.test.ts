@@ -15,6 +15,7 @@ import {
   imageExists,
   ensureImage,
   buildDockerRunArgs,
+  probeImagePath,
   DockerError,
   DEFAULT_OPENCODE_IMAGE,
 } from './docker-runner.js'
@@ -126,6 +127,22 @@ describe('docker-runner — buildDockerRunArgs', () => {
     ])
   })
 
+  it('adds -i right after --rm when input is set, so the container keeps stdin open for it', () => {
+    const args = buildDockerRunArgs({ ...baseOpts, input: 'fix the bug' }, 'cnt-1')
+    const rmIdx = args.indexOf('--rm')
+    expect(args[rmIdx + 1]).toBe('-i')
+  })
+
+  it('omits -i entirely when input is unset — byte-identical to the pre-stdin arg list', () => {
+    const args = buildDockerRunArgs(baseOpts, 'cnt-1')
+    expect(args).not.toContain('-i')
+  })
+
+  it('never adds -t — no fake tty, which would corrupt captured stdout/stderr', () => {
+    const args = buildDockerRunArgs({ ...baseOpts, input: 'fix the bug' }, 'cnt-1')
+    expect(args).not.toContain('-t')
+  })
+
   it('emits --network <mode> right after --name when set', () => {
     const args = buildDockerRunArgs({ ...baseOpts, network: 'host' }, 'cnt-1')
     const nameIdx = args.indexOf('cnt-1')
@@ -214,6 +231,17 @@ describe('docker-runner — dockerRun', () => {
     const killCall = execCalls().find((c) => c.args[0] === 'kill')
     expect(killCall).toBeDefined()
     expect(killCall?.args).toEqual(['kill', containerName])
+  })
+
+  it('forwards `input` straight through to the spawner, and includes -i in the docker args', async () => {
+    await runP(dockerRun({ ...baseOpts, input: 'fix the bug' }))
+    expect(lastSpawn?.input).toBe('fix the bug')
+    expect(lastSpawn?.args).toContain('-i')
+  })
+
+  it('never sets spawner `input` when opts.input is unset', async () => {
+    await runP(dockerRun(baseOpts))
+    expect(lastSpawn?.input).toBeUndefined()
   })
 
   it('treats a spawn failure (docker binary missing) as DockerError', async () => {
@@ -351,6 +379,31 @@ describe('docker-runner — ensureImage', () => {
     const err = await runFlip(ensureImage('opencode/missing:latest'))
     expect(err).toBeInstanceOf(DockerError)
     expect(err.command).toBe('pull')
+  })
+})
+
+describe('docker-runner — probeImagePath', () => {
+  it('runs `sh -c` (never `sh -lc`) — a login shell resets PATH on the real image', async () => {
+    await runP(probeImagePath(DEFAULT_OPENCODE_IMAGE))
+    const shIdx = lastSpawn?.args.indexOf('sh') ?? -1
+    expect(lastSpawn?.args[shIdx + 1]).toBe('-c')
+    expect(lastSpawn?.args[shIdx + 2]).toBe('printf %s "$PATH"')
+    expect(lastSpawn?.args).not.toContain('-lc')
+  })
+
+  it('returns the trimmed stdout as the baseline PATH', async () => {
+    sp.mockImplementation((input) => {
+      lastSpawn = input
+      return Effect.succeed(okSpawn({ stdout: '/usr/local/bin:/usr/bin:/bin\n' }))
+    })
+    const path = await runP(probeImagePath(DEFAULT_OPENCODE_IMAGE))
+    expect(path).toBe('/usr/local/bin:/usr/bin:/bin')
+  })
+
+  it('passes --network when given', async () => {
+    await runP(probeImagePath(DEFAULT_OPENCODE_IMAGE, 'none'))
+    expect(lastSpawn?.args).toContain('--network')
+    expect(lastSpawn?.args).toContain('none')
   })
 })
 

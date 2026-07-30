@@ -12,18 +12,31 @@
  */
 import { Effect } from 'effect'
 import path from 'node:path'
-import type { PreflightCheck, PreflightInput, PreflightResult, Side } from '@generated/types'
+import type { PackCmdResult, PreflightCheck, PreflightInput, PreflightResult, Side } from '@generated/types'
 import type { PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
 import { run as opencodeRun, version as opencodeVersion } from '../opencode/cli.js'
 import type { DockerExec, OpencodeError } from '../opencode/cli.js'
 import { dockerRun, ensureImage } from '../isolation/docker-runner.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import type { DockerError } from '../isolation/docker-runner.js'
+import { runShellInHome } from '../isolation/shell-runner.js'
 import { appendFile, ensureDir, exists, readFile } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
 import type { PhaseError } from '../errors.js'
 import { preflightError } from '../errors.js'
+
+/**
+ * Local result extension: gate 6 (`pack-functional`) also produces the
+ * `checks` half of `PackSetupReport` (§7.2 of the pack-setup spec) — the
+ * contract `PreflightResult` only carries `PreflightCheck[]` (pass/fail +
+ * duration), which cannot hold a check command's exit code/output tail.
+ * `cli/pipeline.ts` merges this into the accumulating `PackSetupReport`
+ * alongside phase 04b's `setup` and the per-run `exercises`.
+ */
+export interface PreflightResultExt extends PreflightResult {
+  readonly packChecks?: readonly PackCmdResult[]
+}
 
 /**
  * Local input extension: phase 05 needs the phase-03 outcome (instructions) to
@@ -42,6 +55,35 @@ export interface PreflightInputExt extends PreflightInput {
    * it opencode has no model and falls back to an unauthenticated default.
    */
   readonly configs?: { readonly old: string; readonly new: string }
+  /**
+   * The exact `EnvVarSet.PATH` phase 04 already computed for `homePaths.old`
+   * / `homePaths.new` — reused rather than recomputed, so gate 6's
+   * `--pack-check` resolves a HOME-installed binary exactly like the agent's
+   * own bash tool will. Undefined when `--pack-setup` was never declared.
+   */
+  readonly homePathEnv?: { readonly old?: string; readonly new?: string }
+  /**
+   * Every HOME on each side (one entry per run) with its own PATH override —
+   * gate 6 (`gatePackFunctional`) must verify EACH home individually, not
+   * just `homePaths.old`/`.new` (run index 0): 04b copies the one HOME it
+   * installed into over every other new HOME, and that copy step is exactly
+   * where a HOME can silently end up without a working install (see
+   * `copyDir`'s `verbatimSymlinks` fix in `util/fs.ts` for one concrete way
+   * that happened) — `homePaths.old`/`.new` alone would only ever prove the
+   * FIRST home works, the same gap that let a broken run-2 HOME reach the
+   * exercise step instead of failing preflight. Falls back to a single-home
+   * list built from `homePaths`/`homePathEnv` when omitted, so callers that
+   * only care about one HOME (most existing tests) do not need to change.
+   */
+  readonly homesForCheck?: {
+    readonly old: readonly HomeCheckTarget[]
+    readonly new: readonly HomeCheckTarget[]
+  }
+}
+
+export interface HomeCheckTarget {
+  readonly homeDir: string
+  readonly pathOverride: string | undefined
 }
 
 /** opencode layout: skills/agents/plugins are plural, command is singular. */
@@ -525,13 +567,179 @@ const gateBaselineIdentical = (
     ]
   })
 
+/**
+ * Gate 6: `--pack-check` must exit 0 in EVERY new HOME (the pack is
+ * genuinely functional there, not just delivered — gate 4 only proves the
+ * files exist) and must exit NON-ZERO in EVERY old HOME (the baseline must
+ * not already have the dependency, or the comparison is meaningless —
+ * `--allow-baseline-tool` overrides this one assertion, nothing else).
+ * `gatePackFunctional` calls this once per HOME on each side — checking only
+ * `homePaths.new[0]`/`.old[0]` would prove nothing about the rest: 04b
+ * builds every new HOME by copying the ONE home it installed into, and nothing
+ * upstream of this gate proves that copy actually carried a working install
+ * to every run (see the `copyDir`/`verbatimSymlinks` fix in `util/fs.ts` for
+ * one concrete way it silently didn't).
+ *
+ * "Non-zero" on the old side means exactly that — ANY non-zero exit is the
+ * invariant holding, not just exit 1. A shell reports a missing command as
+ * exit 127 (`sh: 1: graphify: not found`), not 1; treating anything other
+ * than {0,1} as an infra fault made the expected, required baseline outcome
+ * on a real run abort the whole experiment (`graphify: not found` on old is
+ * success, not an error). The only reliable "the check itself did not run"
+ * signal available at this layer is `outcome.timedOut` — `runShellInHome`
+ * already folds a docker-level failure into the same `ShellOutcome` shape a
+ * normal command completion uses, so a non-zero `exitCode` cannot be told
+ * apart from "the container ran and its command exited N" by inspecting the
+ * code alone; a timeout is unambiguous regardless of side and fails loudly,
+ * same fail-loud-on-infra-error principle `homeSubExistsOrFail` already
+ * applies to gate 5's leak check.
+ */
+const runPackCheck = (
+  cmd: string,
+  side: Side,
+  homeDir: string,
+  runIndex: number,
+  docker: DockerExec | undefined,
+  timeoutMs: number,
+  allowBaselineTool: boolean,
+  checks: readonly PreflightCheck[],
+  pathOverride: string | undefined,
+): Effect.Effect<{ readonly check: PreflightCheck; readonly cmdResult: PackCmdResult }, PhaseError> =>
+  Effect.gen(function* () {
+    const start = Date.now()
+    const outcome = yield* runShellInHome(cmd, homeDir, homeDir, docker, timeoutMs, pathOverride)
+    const cmdResult: PackCmdResult = {
+      side,
+      runIndex,
+      exitCode: outcome.exitCode,
+      durationMs: String(outcome.durationMs),
+      outputTail: outcome.outputTail,
+    }
+    if (outcome.timedOut) {
+      yield* fail(
+        'E_PACK_CHECK_FAILED',
+        'pack-functional',
+        side,
+        2,
+        `--pack-check could not run on the ${side} side (run ${String(runIndex)}): timed out`,
+        checks,
+        { side, runIndex, timedOut: true, processExitCode: outcome.exitCode },
+      )
+    }
+    const toolPresent = outcome.exitCode === 0
+    if (side === 'new' && !toolPresent) {
+      yield* fail(
+        'E_PACK_CHECK_FAILED',
+        'pack-functional',
+        'new',
+        3,
+        `--pack-check failed on the new side (run ${String(runIndex)}) — the pack was delivered but is not functional in this HOME`,
+        checks,
+        { side, runIndex, reason: 'new-side-not-functional' },
+      )
+    }
+    if (side === 'old' && toolPresent && !allowBaselineTool) {
+      yield* fail(
+        'E_PACK_CHECK_FAILED',
+        'pack-functional',
+        'old',
+        3,
+        `--pack-check unexpectedly passed on the old (baseline) side (run ${String(runIndex)}) — the baseline already has the dependency, so the comparison would be meaningless. Pass --allow-baseline-tool to override.`,
+        checks,
+        { side, runIndex, reason: 'baseline-already-has-tool' },
+      )
+    }
+    const overridden = side === 'old' && toolPresent && allowBaselineTool
+    return {
+      check: {
+        name: 'pack-functional',
+        side,
+        passed: true,
+        durationMs: String(Date.now() - start),
+        ...(overridden
+          ? { details: `baseline already has the tool (run ${String(runIndex)}) — allowed via --allow-baseline-tool; comparison validity is reduced` }
+          : {}),
+      },
+      cmdResult,
+    }
+  })
+
+interface PackFunctionalOutcome {
+  readonly checks: readonly PreflightCheck[]
+  readonly packChecks: readonly PackCmdResult[]
+}
+
+/** Single-home fallback for callers that don't supply `homesForCheck` (existing single-HOME tests). */
+const defaultCheckTargets = (homeDir: string, pathOverride: string | undefined): readonly HomeCheckTarget[] => [
+  { homeDir, pathOverride },
+]
+
+const summarizeSide = (
+  side: Side,
+  results: readonly { readonly check: PreflightCheck; readonly cmdResult: PackCmdResult }[],
+): PreflightCheck => {
+  const totalMs = results.reduce((sum, r) => sum + Number(r.check.durationMs), 0)
+  const overriddenCount = results.filter((r) => r.check.details !== undefined).length
+  const overrideNote = overriddenCount === 0 ? '' : ` (${String(overriddenCount)} allowed via --allow-baseline-tool)`
+  return {
+    name: 'pack-functional',
+    side,
+    passed: true,
+    durationMs: String(totalMs),
+    details: `${String(results.length)}/${String(results.length)} ${side} HOME(s) verified${overrideNote}`,
+  }
+}
+
+const gatePackFunctional = (
+  input: PreflightInputExt,
+  checks: readonly PreflightCheck[],
+): Effect.Effect<PackFunctionalOutcome, PhaseError> =>
+  Effect.gen(function* () {
+    const packCheck = input.runInput.packCheck
+    if (packCheck === undefined) {
+      return {
+        checks: [
+          {
+            name: 'pack-functional',
+            side: 'new',
+            passed: true,
+            durationMs: '0',
+            details: 'skipped (no --pack-check)',
+          },
+        ],
+        packChecks: [],
+      }
+    }
+    const docker = dockerFromInput(input)
+    const timeoutMs = input.runInput.timeouts.installSeconds * 1000
+    const allowBaselineTool = input.runInput.allowBaselineTool ?? false
+
+    const newHomes = input.homesForCheck?.new ?? defaultCheckTargets(input.homePaths.new, input.homePathEnv?.new)
+    const oldHomes = input.homesForCheck?.old ?? defaultCheckTargets(input.homePaths.old, input.homePathEnv?.old)
+
+    const newResults = yield* Effect.forEach(
+      newHomes,
+      (h, idx) => runPackCheck(packCheck, 'new', h.homeDir, idx + 1, docker, timeoutMs, allowBaselineTool, checks, h.pathOverride),
+      { concurrency: 1 },
+    )
+    const oldResults = yield* Effect.forEach(
+      oldHomes,
+      (h, idx) => runPackCheck(packCheck, 'old', h.homeDir, idx + 1, docker, timeoutMs, allowBaselineTool, checks, h.pathOverride),
+      { concurrency: 1 },
+    )
+    return {
+      checks: [summarizeSide('new', newResults), summarizeSide('old', oldResults)],
+      packChecks: [...newResults.map((r) => r.cmdResult), ...oldResults.map((r) => r.cmdResult)],
+    }
+  })
+
 const formatLine = (c: PreflightCheck): string => {
   const status = c.passed ? 'PASSED' : 'FAILED'
   const details = c.details === undefined ? '' : ` ${c.details}`
   return `[CHECK] ${c.name} [${c.side}] ${status} (${c.durationMs}ms)${details}\n`
 }
 
-export const preflight = (input: PreflightInputExt): Effect.Effect<PreflightResult, PhaseError> =>
+export const preflight = (input: PreflightInputExt): Effect.Effect<PreflightResultExt, PhaseError> =>
   Effect.gen(function* () {
     const logPath = path.join(input.runInput.outputPath, 'preflight.log')
     yield* ensureResultsDir(logPath)
@@ -543,29 +751,44 @@ export const preflight = (input: PreflightInputExt): Effect.Effect<PreflightResu
 
     interface Gate {
       readonly name: GateName
-      readonly run: (checks: readonly PreflightCheck[]) => Effect.Effect<readonly PreflightCheck[], PhaseError>
+      readonly run: (checks: readonly PreflightCheck[]) => Effect.Effect<PackFunctionalOutcome, PhaseError>
     }
 
+    const noPackChecks = (
+      eff: Effect.Effect<readonly PreflightCheck[], PhaseError>,
+    ): Effect.Effect<PackFunctionalOutcome, PhaseError> =>
+      eff.pipe(Effect.map((checks) => ({ checks, packChecks: [] as readonly PackCmdResult[] })))
+
     const gates: readonly Gate[] = [
-      { name: 'opencode-launch', run: (c) => gateOpencodeLaunch(input, c) },
-      { name: 'auth-ping', run: (c) => gateAuthPing(input, c) },
-      { name: 'build-agent', run: (c) => gateBuildAgent(input.homePaths, c) },
-      { name: 'pack-visibility', run: (c) => gatePackVisibility(input, c) },
-      { name: 'baseline-identical', run: (c) => gateBaselineIdentical(input, c) },
+      { name: 'opencode-launch', run: (c) => noPackChecks(gateOpencodeLaunch(input, c)) },
+      { name: 'auth-ping', run: (c) => noPackChecks(gateAuthPing(input, c)) },
+      { name: 'build-agent', run: (c) => noPackChecks(gateBuildAgent(input.homePaths, c)) },
+      { name: 'pack-visibility', run: (c) => noPackChecks(gatePackVisibility(input, c)) },
+      { name: 'baseline-identical', run: (c) => noPackChecks(gateBaselineIdentical(input, c)) },
+      { name: 'pack-functional', run: (c) => gatePackFunctional(input, c) },
     ]
 
-    const finalChecks = yield* Effect.reduce(
+    const finalOutcome = yield* Effect.reduce(
       gates,
-      [] as readonly PreflightCheck[],
+      { checks: [] as readonly PreflightCheck[], packChecks: [] as readonly PackCmdResult[] },
       (acc, gate) =>
         Effect.gen(function* () {
-          const produced = yield* gate.run(acc)
-          for (const check of produced) {
+          const produced = yield* gate.run(acc.checks)
+          for (const check of produced.checks) {
             yield* writeLog(logPath, formatLine(check))
           }
-          return [...acc, ...produced]
+          return {
+            checks: [...acc.checks, ...produced.checks],
+            packChecks: [...acc.packChecks, ...produced.packChecks],
+          }
         }),
     )
 
-    return { checks: [...finalChecks], allPassed: true, exitCode: 0, logPath }
+    return {
+      checks: [...finalOutcome.checks],
+      allPassed: true,
+      exitCode: 0,
+      logPath,
+      ...(finalOutcome.packChecks.length === 0 ? {} : { packChecks: [...finalOutcome.packChecks] }),
+    }
   })

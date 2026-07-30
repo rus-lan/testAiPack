@@ -55,6 +55,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: false,
   protectGit: false,
+  allowBaselineTool: false,
   initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],

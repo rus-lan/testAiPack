@@ -181,6 +181,7 @@ describe('recoverRunResult', () => {
     expect(r.diagnostics.eventsLineCount).toBe(2)
     expect(r.diagnostics.eventsParseableLineCount).toBe(2)
     expect(r.notRecoverable).toEqual(['errorCode'])
+    expect(r.initRan).toBe(false) // no [INIT_DONE] line in this fixture
   })
 
   it('missing log file entirely: outcome fields absent, diagnostics say so, no throw', async () => {
@@ -194,6 +195,22 @@ describe('recoverRunResult', () => {
     expect(r.successRank).toBeUndefined()
     expect(r.finishCause).toBeUndefined()
     expect(r.exitCode).toBeUndefined()
+    expect(r.initRan).toBe(false)
+  })
+
+  it('initRan (metric-split spec §5.8): true when the .log has an [INIT_DONE] line, false when it does not', async () => {
+    const rawDir = makeTempDir('run-recovery-')
+    await writeRawFiles(rawDir, 'old', 1, {
+      log: '[PROMPT_DONE] exitCode=0 timedOut=false watchdog=false sessionId=x\n[STOP] finish=stop rank=4 durationMs=100',
+    })
+    const noInit = await runP(recoverRunResult(rawDir, 'old', 1, TEST_EXPORT_SCHEMA))
+    expect(noInit.initRan).toBe(false)
+
+    await writeRawFiles(rawDir, 'old', 2, {
+      log: '[INIT_DONE] exitCode=0 timedOut=false watchdog=false sessionId=x\n[PROMPT_DONE] exitCode=0 timedOut=false watchdog=false sessionId=x\n[STOP] finish=stop rank=4 durationMs=100',
+    })
+    const withInit = await runP(recoverRunResult(rawDir, 'old', 2, TEST_EXPORT_SCHEMA))
+    expect(withInit.initRan).toBe(true)
   })
 
   it('export file present but invalid against the schema -> exportValid false, log fields unaffected', async () => {

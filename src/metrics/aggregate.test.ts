@@ -14,10 +14,30 @@ import {
   STALL_THRESHOLD_MS,
 } from './aggregate.js'
 import type { EventsProfile } from './events-profile.js'
-import type { ExtractedExtras, ExtractedMetrics } from './extract.js'
+import type { ExtractedExtras, ExtractedMetrics, ExtractedPhases } from './extract.js'
 import { profileEvents } from './events-profile.js'
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
+
+const emptyPhases = (): ExtractedPhases => ({
+  task: { totalTokens: 0, wallClockMs: 0, costUsd: 0, stepCount: 0, toolCallCount: 0, costProrated: false },
+})
+
+const taskSlice = (over: Partial<ExtractedPhases['task']> = {}): ExtractedPhases['task'] => ({
+  totalTokens: 0,
+  wallClockMs: 0,
+  costUsd: 0,
+  stepCount: 0,
+  toolCallCount: 0,
+  costProrated: false,
+  ...over,
+})
+
+/** `init` present iff `over.init` is given — mirrors the real "no boundary -> no init slice" invariant. */
+const phases = (over: { readonly init?: Partial<ExtractedPhases['task']>; readonly task?: Partial<ExtractedPhases['task']> } = {}): ExtractedPhases => ({
+  ...(over.init === undefined ? {} : { init: taskSlice(over.init) }),
+  task: taskSlice(over.task),
+})
 
 const primary = (over: Partial<PrimaryMetrics>): PrimaryMetrics => ({
   totalTokens: '0',
@@ -213,12 +233,15 @@ describe('buildSideAggregates', () => {
     primary: primary(over),
     secondary: emptySecondary(),
     extras: extras(),
+    phases: emptyPhases(),
   })
 
   const baseInput = {
     extras: [] as readonly ExtractedExtras[],
     runIndexes: [] as readonly number[],
     eventsProfiles: [] as readonly EventsProfile[],
+    initRanFlags: [] as readonly boolean[],
+    setupWallMsList: [] as readonly (number | undefined)[],
     canDetect: false,
     visibilityConfirmed: false,
   }
@@ -232,6 +255,8 @@ describe('buildSideAggregates', () => {
       extras: [extras(), extras()],
       runIndexes: [1, 3],
       eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
       canDetect: false,
       visibilityConfirmed: false,
     })
@@ -264,6 +289,7 @@ describe('buildSideAggregates — contaminationSignals only ever surface on the 
     primary: primary({}),
     secondary: emptySecondary(),
     extras: extras(),
+    phases: emptyPhases(),
   })
 
   it('attaches runIndex to per-run activity signals and appends the config-drift signal, on old', () => {
@@ -278,6 +304,8 @@ describe('buildSideAggregates — contaminationSignals only ever surface on the 
       ],
       runIndexes: [1, 2],
       eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
       canDetect: false,
       visibilityConfirmed: false,
       configDriftSignal: { kind: 'install-drift', detail: "captured config differs across this side's own runs in: skills" },
@@ -297,6 +325,8 @@ describe('buildSideAggregates — contaminationSignals only ever surface on the 
       extras: [extras()],
       runIndexes: [1],
       eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
       canDetect: false,
       visibilityConfirmed: false,
     })
@@ -312,6 +342,8 @@ describe('buildSideAggregates — contaminationSignals only ever surface on the 
       extras: [extras({ packActivitySignals: [{ kind: 'skill-call', detail: 'skill tool call succeeded for "graphify"' }] })],
       runIndexes: [1],
       eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
       canDetect: true,
       visibilityConfirmed: true,
       configDriftSignal: { kind: 'install-drift', detail: 'irrelevant on new' },
@@ -516,12 +548,14 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
   it('packUse omitted without packName', () => {
     const agg = buildSideAggregates({
       side: 'old',
-      extracted: [{ primary: primary({}), secondary: emptySecondary(), extras: extras({ packCalls: 1 }) }],
+      extracted: [{ primary: primary({}), secondary: emptySecondary(), extras: extras({ packCalls: 1 }), phases: emptyPhases() }],
       failedRuns: [],
       rawRunIds: ['s1'],
       extras: [extras({ packCalls: 1 })],
       runIndexes: [1],
       eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
       canDetect: true,
       visibilityConfirmed: true,
     })
@@ -531,7 +565,7 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
   it('packUse: sums, runsWithCall, runCount, median firstCall over defined values only', () => {
     const agg = buildSideAggregates({
       side: 'old',
-      extracted: [1, 2, 3].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras() })),
+      extracted: [1, 2, 3].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras(), phases: emptyPhases() })),
       failedRuns: [],
       rawRunIds: ['s1', 's2', 's3'],
       extras: [
@@ -541,6 +575,8 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       ],
       runIndexes: [1, 2, 3],
       eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
       packName: 'graphify',
       canDetect: true,
       visibilityConfirmed: true,
@@ -553,13 +589,32 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       firstCallMsMedian: '200',
       canDetect: true,
       visibilityConfirmed: true,
+      runsWithoutCall: [2],
     })
+  })
+
+  it('packUse.runsWithoutCall: present but empty when every run called the pack — measured-clean, not "never checked"', () => {
+    const agg = buildSideAggregates({
+      side: 'old',
+      extracted: [1, 2].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras(), phases: emptyPhases() })),
+      failedRuns: [],
+      rawRunIds: ['s1', 's2'],
+      extras: [extras({ packCalls: 1 }), extras({ packCalls: 2 })],
+      runIndexes: [1, 2],
+      eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
+      packName: 'graphify',
+      canDetect: true,
+      visibilityConfirmed: true,
+    })
+    expect(agg.packUse?.runsWithoutCall).toEqual([])
   })
 
   it('riskyCommands concatenated with runIndex attached', () => {
     const agg = buildSideAggregates({
       side: 'old',
-      extracted: [1, 2].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras() })),
+      extracted: [1, 2].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras(), phases: emptyPhases() })),
       failedRuns: [],
       rawRunIds: ['s1', 's2'],
       extras: [
@@ -568,6 +623,8 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       ],
       runIndexes: [1, 2],
       eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
       canDetect: false,
       visibilityConfirmed: false,
     })
@@ -577,7 +634,7 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
   it('opencodeVersions distinct + sorted', () => {
     const agg = buildSideAggregates({
       side: 'old',
-      extracted: [1, 2, 3].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras() })),
+      extracted: [1, 2, 3].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras(), phases: emptyPhases() })),
       failedRuns: [],
       rawRunIds: ['s1', 's2', 's3'],
       extras: [
@@ -587,10 +644,108 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       ],
       runIndexes: [1, 2, 3],
       eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
       canDetect: false,
       visibilityConfirmed: false,
     })
     expect(agg.opencodeVersions).toEqual(['1.18.3', '1.18.4'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// buildSideAggregates — phaseSplit (metric-split spec §5.5)
+// ---------------------------------------------------------------------------
+
+describe('buildSideAggregates — phaseSplit', () => {
+  const runWith = (p: ExtractedPhases): ExtractedMetrics => ({
+    primary: primary({}),
+    secondary: emptySecondary(),
+    extras: extras(),
+    phases: p,
+  })
+
+  it('phaseSplit absent when no successful runs at all', () => {
+    const agg = buildSideAggregates({
+      side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+    })
+    expect(agg.phaseSplit).toBeUndefined()
+  })
+
+  it('task median/stats over ALL successful runs; init only over runs-with-init (runsWithInit counts those)', () => {
+    const runs = [
+      runWith(phases({ init: { totalTokens: 100 }, task: { totalTokens: 10 } })),
+      runWith(phases({ init: { totalTokens: 200 }, task: { totalTokens: 20 } })),
+      runWith(phases({ task: { totalTokens: 30 } })), // no init on this run
+    ]
+    const agg = buildSideAggregates({
+      side: 'new', extracted: runs, failedRuns: [], rawRunIds: ['s1', 's2', 's3'],
+      extras: [extras(), extras(), extras()], runIndexes: [1, 2, 3], eventsProfiles: [],
+      initRanFlags: [true, true, false], setupWallMsList: [],
+      canDetect: false, visibilityConfirmed: false,
+    })
+    expect(agg.phaseSplit?.runsWithInit).toBe(2)
+    expect(agg.phaseSplit?.runsWithLostInit).toBe(0)
+    expect(agg.phaseSplit?.init?.totalTokens).toBe('150') // median of [100, 200]
+    expect(agg.phaseSplit?.task.totalTokens).toBe('20') // median of [10, 20, 30] — all 3 runs
+    expect(agg.phaseSplit?.taskStats.totalTokens.samples).toEqual([10, 20, 30])
+  })
+
+  it('runsWithLostInit: initRan true but the export has no boundary (session-continuation lost, spec §2.4)', () => {
+    const runs = [
+      runWith(phases({ task: { totalTokens: 10 } })), // initRan true, no boundary -> lost
+      runWith(phases({ task: { totalTokens: 20 } })), // initRan false, no boundary -> normal no-init run
+    ]
+    const agg = buildSideAggregates({
+      side: 'new', extracted: runs, failedRuns: [], rawRunIds: ['s1', 's2'],
+      extras: [extras(), extras()], runIndexes: [1, 2], eventsProfiles: [],
+      initRanFlags: [true, false], setupWallMsList: [],
+      canDetect: false, visibilityConfirmed: false,
+    })
+    expect(agg.phaseSplit?.runsWithInit).toBe(0)
+    expect(agg.phaseSplit?.runsWithLostInit).toBe(1)
+    expect(agg.phaseSplit?.init).toBeUndefined()
+  })
+
+  it('costProrated: true when at least one contributing slice was prorated, absent otherwise', () => {
+    const prorated = buildSideAggregates({
+      side: 'new',
+      extracted: [runWith(phases({ init: { costProrated: true }, task: {} }))],
+      failedRuns: [], rawRunIds: ['s1'], extras: [extras()], runIndexes: [1], eventsProfiles: [],
+      initRanFlags: [true], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+    })
+    expect(prorated.phaseSplit?.costProrated).toBe(true)
+
+    const measured = buildSideAggregates({
+      side: 'new',
+      extracted: [runWith(phases({ init: { costProrated: false }, task: {} }))],
+      failedRuns: [], rawRunIds: ['s1'], extras: [extras()], runIndexes: [1], eventsProfiles: [],
+      initRanFlags: [true], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+    })
+    expect(measured.phaseSplit?.costProrated).toBeUndefined()
+  })
+
+  it('setup: median wall-clock over runs that had one, absent when none did, never a fabricated 0', () => {
+    const withSetup = buildSideAggregates({
+      side: 'new',
+      extracted: [runWith(emptyPhases()), runWith(emptyPhases())],
+      failedRuns: [], rawRunIds: ['s1', 's2'], extras: [extras(), extras()], runIndexes: [1, 2], eventsProfiles: [],
+      initRanFlags: [false, false], setupWallMsList: [1000, 2000],
+      canDetect: false, visibilityConfirmed: false,
+    })
+    expect(withSetup.phaseSplit?.setup).toEqual({ wallClockMs: '1500' })
+    expect(withSetup.phaseSplit?.setupStats?.samples).toEqual([1000, 2000])
+
+    const noSetup = buildSideAggregates({
+      side: 'old',
+      extracted: [runWith(emptyPhases())],
+      failedRuns: [], rawRunIds: ['s1'], extras: [extras()], runIndexes: [1], eventsProfiles: [],
+      initRanFlags: [false], setupWallMsList: [undefined],
+      canDetect: false, visibilityConfirmed: false,
+    })
+    expect(noSetup.phaseSplit?.setup).toBeUndefined()
+    expect(noSetup.phaseSplit?.setupStats).toBeUndefined()
   })
 })
 
@@ -610,7 +765,7 @@ describe('computeDelta', () => {
     const oldAgg = sideFromPrimary('old', [primary({ totalTokens: '100' })])
     const newAgg = buildSideAggregates({
       side: 'new', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false, visibilityConfirmed: false,
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
     })
     const diff = computeDelta(oldAgg, newAgg)
     expect(diff.bothFailed).toBe(false)
@@ -621,11 +776,11 @@ describe('computeDelta', () => {
   it('both sides empty -> bothFailed true, all neutral', () => {
     const oldAgg = buildSideAggregates({
       side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false, visibilityConfirmed: false,
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
     })
     const newAgg = buildSideAggregates({
       side: 'new', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false, visibilityConfirmed: false,
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
     })
     const diff = computeDelta(oldAgg, newAgg)
     expect(diff.bothFailed).toBe(true)
@@ -635,11 +790,111 @@ describe('computeDelta', () => {
   it('old side empty (0 tokens) vs a new side with tokens -> percent omitted, not 0', () => {
     const oldAgg = buildSideAggregates({
       side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false, visibilityConfirmed: false,
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
     })
     const newAgg = sideFromPrimary('new', [primary({ totalTokens: '100' })])
     const diff = computeDelta(oldAgg, newAgg)
     expect(diff.deltas.totalTokens.absolute).toBe(100)
     expect(diff.deltas.totalTokens.percent).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// computeDelta — taskDeltas/initDeltas (metric-split spec §5.5, §6, §9)
+// ---------------------------------------------------------------------------
+
+describe('computeDelta — taskDeltas/initDeltas', () => {
+  const runWith = (p: ExtractedPhases): ExtractedMetrics => ({
+    primary: primary({}),
+    secondary: emptySecondary(),
+    extras: extras(),
+    phases: p,
+  })
+
+  const sideWithPhases = (
+    side: 'old' | 'new',
+    entries: readonly ExtractedPhases[],
+    initRanFlags: readonly boolean[] = entries.map(() => false),
+  ): SideAggregates =>
+    buildSideAggregates({
+      side,
+      extracted: entries.map(runWith),
+      failedRuns: [],
+      rawRunIds: entries.map((_, i) => `s${String(i + 1)}`),
+      extras: entries.map(() => extras()),
+      runIndexes: entries.map((_, i) => i + 1),
+      eventsProfiles: [],
+      initRanFlags,
+      setupWallMsList: [],
+      canDetect: false,
+      visibilityConfirmed: false,
+    })
+
+  it('taskDeltas present whenever both sides carry phaseSplit — even one-sided init (decided: task basis always, spec §6)', () => {
+    const oldAgg = sideWithPhases('old', [
+      phases({ task: { totalTokens: 100 } }),
+      phases({ task: { totalTokens: 100 } }),
+      phases({ task: { totalTokens: 100 } }),
+      phases({ task: { totalTokens: 100 } }),
+    ])
+    const newAgg = sideWithPhases(
+      'new',
+      [
+        phases({ init: { totalTokens: 500 }, task: { totalTokens: 120 } }),
+        phases({ init: { totalTokens: 500 }, task: { totalTokens: 120 } }),
+      ],
+      [true, true],
+    )
+    const diff = computeDelta(oldAgg, newAgg)
+    expect(diff.taskDeltas).toBeDefined()
+    // task-only: the 500 init tokens on the new side never enter this delta.
+    expect(diff.taskDeltas?.totalTokens.absolute).toBe(20) // 120 - 100
+    // old never ran init (runsWithInit === 0) -> one-sided, never a delta.
+    expect(diff.initDeltas).toBeUndefined()
+  })
+
+  it('initDeltas present only when BOTH sides have runsWithInit > 0 (--init-side both)', () => {
+    const oldAgg = sideWithPhases(
+      'old',
+      [
+        phases({ init: { totalTokens: 50 }, task: { totalTokens: 10 } }),
+        phases({ init: { totalTokens: 50 }, task: { totalTokens: 10 } }),
+        phases({ init: { totalTokens: 50 }, task: { totalTokens: 10 } }),
+        phases({ init: { totalTokens: 50 }, task: { totalTokens: 10 } }),
+      ],
+      [true, true, true, true],
+    )
+    const newAgg = sideWithPhases(
+      'new',
+      [
+        phases({ init: { totalTokens: 80 }, task: { totalTokens: 15 } }),
+        phases({ init: { totalTokens: 80 }, task: { totalTokens: 15 } }),
+      ],
+      [true, true],
+    )
+    const diff = computeDelta(oldAgg, newAgg)
+    expect(diff.initDeltas).toBeDefined()
+    expect(diff.initDeltas?.totalTokens.absolute).toBe(30) // 80 - 50
+  })
+
+  it('taskDeltas/initDeltas both absent when a side has no phaseSplit at all (no successful runs)', () => {
+    const oldAgg = sideWithPhases('old', [])
+    const newAgg = sideWithPhases('new', [phases({ task: { totalTokens: 10 } })])
+    const diff = computeDelta(oldAgg, newAgg)
+    expect(diff.taskDeltas).toBeUndefined()
+    expect(diff.initDeltas).toBeUndefined()
+  })
+
+  it('taskDeltas significance is judged against the OLD side task IQR, computed independently of the whole-run IQR', () => {
+    const oldAgg = sideWithPhases('old', [
+      phases({ task: { totalTokens: 100 } }),
+      phases({ task: { totalTokens: 101 } }),
+      phases({ task: { totalTokens: 99 } }),
+      phases({ task: { totalTokens: 100 } }),
+    ])
+    const newAgg = sideWithPhases('new', [phases({ task: { totalTokens: 200 } })])
+    const diff = computeDelta(oldAgg, newAgg)
+    expect(diff.taskDeltas?.totalTokens.significant).toBe(true)
+    expect(diff.taskDeltas?.totalTokens.better).toBe('worse') // lower-is-better direction
   })
 })

@@ -6,7 +6,7 @@
  *
  * @see docs/phases/11-report-render.ru.md
  */
-import type { MetricDelta, PrimaryDeltas, PrimaryMetrics } from '@generated/types'
+import type { MetricDelta, MetricsDiff, PhaseDeltas, PhaseSlice, PrimaryDeltas, PrimaryMetrics } from '@generated/types'
 import { toNum } from '../util/numeric.js'
 
 export { toNum }
@@ -28,6 +28,67 @@ export const PRIMARY_METRICS: readonly PrimaryMeta[] = [
   { key: 'successRank', label: 'Success rank', kind: 'rank' },
   { key: 'maxParallelism', label: 'Max parallelism', kind: 'int' },
 ]
+
+export interface PhaseMeta {
+  readonly key: keyof PhaseDeltas & keyof PhaseSlice
+  readonly label: string
+  readonly kind: MetricKind
+}
+
+/**
+ * The five splittable primary metrics (metric-split spec §5.7) — same
+ * key/label/kind as the first five `PRIMARY_METRICS` entries, kept as its
+ * own literal list (not a `.slice()`) because `PhaseSlice`/`PhaseDeltas`
+ * don't carry `successRank`/`maxParallelism`, so `PrimaryMeta['key']`
+ * (7-key union) isn't assignable to `keyof PhaseSlice` (5-key union).
+ */
+export const PHASE_METRICS: readonly PhaseMeta[] = [
+  { key: 'totalTokens', label: 'Total tokens', kind: 'int' },
+  { key: 'wallClockMs', label: 'Wall-clock (ms)', kind: 'int' },
+  { key: 'costUsd', label: 'Cost ($)', kind: 'cost' },
+  { key: 'stepCount', label: 'Steps', kind: 'int' },
+  { key: 'toolCallCount', label: 'Tool calls', kind: 'int' },
+]
+
+/** `successRank`/`maxParallelism` never split into init/task (spec §3: whole-run verdicts). */
+const WHOLE_RUN_ONLY_METRICS = PRIMARY_METRICS.filter((m) => m.key === 'successRank' || m.key === 'maxParallelism')
+
+export interface DeltaEntry {
+  readonly key: string
+  readonly label: string
+  readonly kind: MetricKind
+  readonly d: MetricDelta
+}
+
+/**
+ * Entries feeding the headline and the improvement/regression/neutral
+ * buckets, on whichever basis the diff supports — task (metric-split spec
+ * §5.6, §6: decided, always, in every configuration a split exists for) is
+ * the five phase deltas plus the two metrics that never split, still read
+ * from the whole-run `diff.deltas`; total (pre-split behavior) is all seven
+ * `PRIMARY_METRICS` read from `diff.deltas`, used only when no split is
+ * available at all. Shared by `cli/summary.ts` (builds `ReportSummary`) and
+ * the md/html renderers (render the Summary section), so both read the
+ * identical basis rule off the same `MetricsDiff`.
+ */
+export const deltaEntriesFor = (
+  diff: MetricsDiff,
+): { readonly entries: readonly DeltaEntry[]; readonly basis: 'task' | 'total' } => {
+  if (diff.taskDeltas === undefined) {
+    return {
+      basis: 'total',
+      entries: PRIMARY_METRICS.map((m) => ({ key: m.key, label: m.label, kind: m.kind, d: diff.deltas[m.key] })),
+    }
+  }
+  const taskDeltas = diff.taskDeltas
+  return {
+    basis: 'task',
+    entries: [
+      ...PHASE_METRICS.map((m) => ({ key: m.key, label: m.label, kind: m.kind, d: taskDeltas[m.key] })),
+      ...WHOLE_RUN_ONLY_METRICS.map((m) => ({ key: m.key, label: m.label, kind: m.kind, d: diff.deltas[m.key] })),
+    ],
+  }
+}
 
 export const trimTrailingZeros = (s: string): string => s.replace(/0+$/, '').replace(/\.$/, '')
 

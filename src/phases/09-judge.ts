@@ -224,20 +224,72 @@ const safeJsonParse = (s: string): unknown => {
   }
 }
 
-/** Extract the first JSON object from a raw string (direct, code-fence, or embedded). */
+/**
+ * Scans forward from the first `{`, tracking JSON string/escape state and
+ * brace depth, to the matching close brace. A small local model routinely
+ * pads its JSON with a leading "Here is my verdict:" or a trailing "Hope
+ * that helps!" (sometimes itself containing a stray `{`/`}`) — stopping at
+ * the depth-0 close, rather than at the raw string's last `}`, is what keeps
+ * that padding from being swept into the parse and breaking it. String
+ * content is tracked so a brace mentioned inside `explanation` (e.g.
+ * describing a code snippet) is not mistaken for structure.
+ */
+interface BraceScanState {
+  readonly depth: number
+  readonly inString: boolean
+  readonly escaped: boolean
+  readonly end: number | null
+}
+
+const scanChar = (state: BraceScanState, ch: string, index: number): BraceScanState => {
+  if (state.end !== null) return state
+  if (state.inString) {
+    if (state.escaped) return { ...state, escaped: false }
+    if (ch === '\\') return { ...state, escaped: true }
+    if (ch === '"') return { ...state, inString: false }
+    return state
+  }
+  if (ch === '"') return { ...state, inString: true }
+  if (ch === '{') return { ...state, depth: state.depth + 1 }
+  if (ch === '}') {
+    const depth = state.depth - 1
+    return depth === 0 ? { ...state, depth, end: index } : { ...state, depth }
+  }
+  return state
+}
+
+const balancedJsonObject = (s: string): string | null => {
+  const start = s.indexOf('{')
+  if (start === -1) return null
+  const initial: BraceScanState = { depth: 0, inString: false, escaped: false, end: null }
+  // Indexed directly against `s` (not `Array.from(s)`), so a surrogate-pair
+  // character (e.g. emoji in a chatty explanation) cannot desync this scan's
+  // index from the `s.slice()` offsets it feeds back into below.
+  const final = Array.from({ length: s.length - start }, (_, i) => start + i).reduce(
+    (state, i) => scanChar(state, s[i] ?? '', i),
+    initial,
+  )
+  return final.end === null ? null : s.slice(start, final.end + 1)
+}
+
+/** Extract the first JSON object from a raw string (direct, code-fence, or embedded — with or without prose around it). */
 const extractJsonObject = (raw: string): string | null => {
   const trimmed = raw.trim()
   if (trimmed === '') return null
-  if (trimmed.startsWith('{')) return trimmed
   const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed)
   if (fence !== null && fence[1] !== undefined) {
-    const inner = fence[1].trim()
-    if (inner.startsWith('{')) return inner
+    const inFence = balancedJsonObject(fence[1])
+    if (inFence !== null) return inFence
   }
-  const start = trimmed.indexOf('{')
-  const end = trimmed.lastIndexOf('}')
-  if (start !== -1 && end > start) return trimmed.slice(start, end + 1)
-  return null
+  return balancedJsonObject(trimmed)
+}
+
+/** Case-insensitive key lookup — a small local model is not consistent about `verdict` vs `Verdict` vs `VERDICT`. */
+const getField = (obj: Record<string, unknown>, key: string): unknown => {
+  if (key in obj) return obj[key]
+  const lower = key.toLowerCase()
+  const found = Object.keys(obj).find((k) => k.toLowerCase() === lower)
+  return found === undefined ? undefined : obj[found]
 }
 
 export const parseJudgeResponse = (raw: string): ParsedJudge | null => {
@@ -245,13 +297,13 @@ export const parseJudgeResponse = (raw: string): ParsedJudge | null => {
   if (extracted === null) return null
   const obj = safeJsonParse(extracted)
   if (!isRecord(obj)) return null
-  const verdict = obj['verdict']
+  const verdict = getField(obj, 'verdict')
   if (!isVerdict(verdict)) return null
-  const oldQuality = obj['oldQuality']
-  const newQuality = obj['newQuality']
+  const oldQuality = getField(obj, 'oldQuality')
+  const newQuality = getField(obj, 'newQuality')
   if (!isFiniteNumber(oldQuality) || !isFiniteNumber(newQuality)) return null
   // Quality out of [0, 10] is clamped rather than rejected (spec step 7).
-  const explanation = obj['explanation']
+  const explanation = getField(obj, 'explanation')
   if (typeof explanation !== 'string') return null
   return {
     verdict,
@@ -267,7 +319,23 @@ export const parseJudgeResponse = (raw: string): ParsedJudge | null => {
 
 const textFromEvent = (ev: unknown): string => {
   if (!isRecord(ev)) return ''
-  if (ev['type'] === 'text' && typeof ev['text'] === 'string') return ev['text']
+  const part = ev['part']
+  const partRecord = isRecord(part) ? part : undefined
+  // Two shapes carry assistant text, same split `06-run-side.ts` already
+  // handles for tool/finish events: an export-style part with the text
+  // directly on the event (`{ type: "text", text }`), and the streamed run
+  // event opencode actually emits per NDJSON line, where `text` sits one
+  // level down (`{ type: "text", part: { type: "text", text } }`). Verified
+  // against a real judge.log (qwen3.5-9b-32k) — the old flat-only check
+  // matched the top-level `type` but then read `ev.text`, which does not
+  // exist on the streamed shape, so it silently returned '' for a
+  // substantive, well-formed verdict.
+  if (ev['type'] === 'text' || partRecord?.['type'] === 'text') {
+    const direct = ev['text']
+    if (typeof direct === 'string') return direct
+    const nested = partRecord?.['text']
+    if (typeof nested === 'string') return nested
+  }
   if (ev['type'] === 'message') {
     const info = ev['info']
     const role = isRecord(info) ? info['role'] : undefined

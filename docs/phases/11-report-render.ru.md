@@ -63,24 +63,43 @@ Namespace: `TestAiPack.ReportRender` (см.
    b. **Summary** — существующие бакеты Improvements/Regressions/Neutral, плюс
       до двух alert-строк наверху: pack-noop (P1) и «⚠ N risky command(s)
       detected — see Safety» (P2).
-   c. **Primary metrics (delta)** — таблица по 7 первичным метрикам
-      (`totalTokens`, `wallClockMs`, `costUsd`, `stepCount`, `toolCallCount`,
-      `successRank`, `maxParallelism`) + новые колонки `[min–max]` (и `IQR=`,
-      если есть) на каждую сторону (P3); плюс блок **Stability** — success
-      rate, гистограмма рангов, флаг `unstable`, и строка `verify: X/Y passed`,
+   c. **Primary metrics — total (init + task)** (заголовок так называется с
+      metric-split, см. ниже — таблица суммирует ВЕСЬ прогон, включая init,
+      если он был) — таблица по 7 первичным метрикам (`totalTokens`,
+      `wallClockMs`, `costUsd`, `stepCount`, `toolCallCount`, `successRank`,
+      `maxParallelism`) + новые колонки `[min–max]` (и `IQR=`, если есть) на
+      каждую сторону (P3); плюс блок **Stability** — success rate,
+      гистограмма рангов, флаг `unstable`, и строка `verify: X/Y passed`,
       если есть `verifyStats` (P10).
       | Метрика | old median | old [min–max] | new median | new [min–max] | Δ | Δ% | Significant | Вердикт |
       Вердикт = ✓ (улучшение), ⚠ (значимо хуже,
       `MetricDelta.significant === true` и `better === "worse"`), — (в шуме).
       Новые метрики waves 1+2 **не входят** в эту таблицу и не имеют вердикта.
+   c′. **Phase split (init vs task)** (metric-split, см. `docs/phases/07-aggregate.ru.md` §9)
+      — присутствует только если хотя бы одна сторона несёт `phaseSplit`.
+      Между Primary metrics и Pack signal: task-таблица (те же 9 колонок, что
+      у Primary metrics, но только по 5 расщепляемым метрикам, всегда
+      task-vs-task); строка(и) pack-setup (только wall-clock, никогда не
+      внутри дельты); блок Init cost — median/[min–max] БЕЗ дельты при
+      одностороннем init, полноценная 9-колоночная дельта-таблица только
+      когда `initDeltas` присутствует (обе стороны гоняли init);
+      предупреждение про `runsWithLostInit`, если есть. `## Summary`
+      получает строку `_Basis: task phase only..._` под заголовком, когда
+      `summary.basis === "task"`; заголовок и бакеты в этом случае считаются
+      от `taskDeltas` (+ `successRank`/`maxParallelism` из whole-run дельт),
+      не от `PrimaryDeltas`.
    d. **Pack signal** (P1) — per-side calls/errors/runs-with-call/first-call
       median; `_pack use is not visible for this pack type_`, если
       `canDetect === false`. Секция отсутствует, если `packUse` нет ни на
       одной стороне (смоук-ран или старый report.json).
    e. **Safety** (P2) — таблица опасных bash-команд (`riskyCommands`) по
       сторонам; отсутствует, если оба списка пусты/не заданы.
-   f. **Secondary metrics** — по сторонам, перегруппировано в 4 именованных
-      блока (в md — вложенные списки, в html — `<details>`, первый открыт):
+   f. **Secondary metrics** — заголовок получает пометку
+      `_Whole-run (init + task) — not split_`, когда у стороны есть
+      `phaseSplit` (эти метрики remain нерасщеплёнными — см.
+      `docs/phases/07-aggregate.ru.md` §9). По сторонам, перегруппировано в
+      4 именованных блока (в md — вложенные списки, в html — `<details>`,
+      первый открыт):
       **Behavior** (finish causes, max same-tool streak, invalid/duplicate/
       bashFail-счётчики, топ error-текстов, per-tool breakdown), **Latency**
       (step p50/p95, reasoning time + доля от wall-clock, P5-строка «first
@@ -152,6 +171,12 @@ Namespace: `TestAiPack.ReportRender` (см.
 | `verifyStats` не задан                                | строка verify в Stability отсутствует              | —                    |
 | Старый `report.json` (waves 1+2 полей нет)           | рендер идентичен дорелизному — без новых секций/строк | —                 |
 | `wallClockMs = 0` (пустой прогон)                     | строка доли reasoning от wall-clock пропускается (деление на 0) | — |
+| Ни у одной стороны нет `phaseSplit` (старый report.json)| секция Phase split отсутствует; Primary metrics всё равно называется «total (init + task)» | — |
+| `phaseSplit` есть, `runsWithInit === 0` на стороне    | Init cost для неё — «no init phase», без дельты          | — |
+| `initDeltas` отсутствует (init односторонний)         | Init cost — median/[min–max] на сторону с init, НИКОГДА не рендерится как дельта | — |
+| `costProrated === true`                                | значение стоимости с префиксом `~` + сноска «derived, not measured» | — |
+| `runsWithLostInit > 0`                                 | предупреждение «⚠ N run(s) ran --init but the export lost the init session» | — |
+| `phaseSplit.setup` отсутствует                          | строка pack-setup для этой стороны не рендерится (не `0ms`) | — |
 
 ## 6. Тест-кейсы (по одному на ветку контракта)
 
@@ -228,6 +253,12 @@ Namespace: `TestAiPack.ReportRender` (см.
 - Отсутствующая метрика рендерится как отсутствующая строка/секция, никогда
   как `0` — `0` на этих полях означает «измерено, значение ноль», а
   `undefined` — «не измерялось».
+- `summary.basis` (metric-split, `docs/phases/07-aggregate.ru.md` §9)
+  согласован с тем, что реально питает заголовок и бакеты: `"task"` ⇔
+  `metricsDiff.taskDeltas` задан, `"total"` иначе. Одностороний init никогда
+  не рендерится как `initDeltas` (нечего вычитать у стороны без init) —
+  только как cost-фигура; `setup`-сегмент несёт исключительно wall-clock и
+  никогда не входит ни в одну дельту.
 
 ## 8. Зависимости от других фаз
 

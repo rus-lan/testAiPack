@@ -1,0 +1,14 @@
+=== testaipack judge log ===
+model: ollama/qwen3.5-9b-32k
+timestamp: 2026-07-30T14:21:52.587Z
+exitCode: 0
+timedOut: false
+
+--- stdout ---
+{"type":"step_start","timestamp":1785421308565,"sessionID":"ses_04c990bfbffeFfKuIUUY6Ssfyo","part":{"id":"prt_fb36722900011w3jCor9NW0tWm","messageID":"msg_fb366f519002Bb09mVCNCij0MV","sessionID":"ses_04c990bfbffeFfKuIUUY6Ssfyo","type":"step-start"}}
+{"type":"text","timestamp":1785421312514,"sessionID":"ses_04c990bfbffeFfKuIUUY6Ssfyo","part":{"id":"prt_fb367251a001cuXSsqNc50FNdc","messageID":"msg_fb366f519002Bb09mVCNCij0MV","sessionID":"ses_04c990bfbffeFfKuIUUY6Ssfyo","type":"text","text":"```json\n{\n  \"verdict\": \"unclear\",\n  \"oldQuality\": 5,\n  \"newQuality\": 8,\n  \"explanation\": \"Файл report.md недоступен для анализа (указано в instruction). Оценка на основе представленных patches:\\n\\nOld (2 run): \\n- run-1: +2/-0 (добавлено только декодирование URL)\\n- run-2: +33/-16 (добавлена обработка CHPU)\\nTotal: +35/-16\\n\\nNew (2 run):\\n- run-1: +63/-10 (аналогично old, но с более полным реализацией)\\n- run-2: no changes (поскольку базовая реализация уже включена)\\n\\nНовый вариант более полный с первого запуска и избегает дублирования кода, но не показан файл для верификации работы функции. Качество реализации CHPU лучше, но без тестов/отчета вердикт 'unclear'.\",\n  \"reason\": \"Нет доступа к report.md для верификации\"\n}\n```","time":{"start":1785421309210,"end":1785421312492}}}
+{"type":"step_finish","timestamp":1785421312514,"sessionID":"ses_04c990bfbffeFfKuIUUY6Ssfyo","part":{"id":"prt_fb36731f0001UCF58wYPgAn1hq","reason":"stop","messageID":"msg_fb366f519002Bb09mVCNCij0MV","sessionID":"ses_04c990bfbffeFfKuIUUY6Ssfyo","type":"step-finish","tokens":{"total":24304,"input":24005,"output":299,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}
+
+
+--- stderr ---
+

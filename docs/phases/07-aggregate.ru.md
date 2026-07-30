@@ -121,7 +121,7 @@ model VerifyStats {
 | `duplicateToolCalls?` | сумма точных повторов (тот же tool + идентичный JSON input), считая повторы сверх первого | **сумма** |
 | `bashFailCount?` | сумма bash-вызовов с `state.metadata.exit !== 0` | **сумма** |
 | `toolErrorTexts?` | топ-5 различных `state.error`-текстов по частоте, каждый обрезан до 200 симв. | ранжирование по частоте |
-| `timeToFirstToolMs?` | первый `tool_use`-таймстамп минус первый таймстамп события | медиана по прогонам |
+| `timeToFirstToolMs?` | первый `tool_use`-таймстамп минус baseline-таймстамп (см. ниже) | медиана по прогонам |
 | `timeToFirstEditMs?` | то же для первого `tool_use` с `part.tool ∈ {edit, write, patch}` | медиана по прогонам-с-правкой, опущено если ни одной |
 | `maxEventGapMs?` | наибольший разрыв между соседними таймстампами событий | **MAX** по прогонам (не медиана — иначе (10с,10с,240с) превратится в незаметные 10с) |
 | `firstStepInputTokens?` | `tokens.input` ПЕРВОЙ `step-finish`-части | медиана по прогонам |
@@ -129,6 +129,13 @@ model VerifyStats {
 | `textChars?` | сумма длин `text`-частей | медиана по прогонам |
 | `reasoningChars?` | сумма длин `reasoning`-частей | медиана по прогонам |
 | `cacheWriteTokens?` | `info.tokens.cache.write` | медиана по прогонам (не участвует в дельте/вердикте — см. `.research/metrics-expansion/spec.md`) |
+
+**Baseline для `timeToFirstToolMs`/`timeToFirstEditMs` (метрик-split, см. §9):**
+на прогоне с `--init` первый событие стрима — это событие сессии `--init`, а
+не `--prompt`; «первый инструмент» без поправки измерял бы, как быстро
+отработал init, а не задачу. Baseline теперь — первое событие НА или ПОСЛЕ
+границы фаз (`boundaryTs`, §9), если она есть; без границы (прогон без init)
+— поведение прежнее, baseline = самое первое событие стрима.
 
 Почему `lastStepInputTokens` не берёт буквально последнюю часть: в реальных
 данных последний `step-finish` может нести `tokens.input: 0` (шаг с обнулённым
@@ -342,3 +349,93 @@ usage), что искажает «финальный размер контекс
   дельт и для новых секций Pack signal / Safety / Stability).
 - Параллелизуется с: **08 diff**, **09 judge** — все три читают независимые
   артефакты фазы 06 и не мешают друг другу.
+
+## 9. Разбиение init/task (metric-split, `.research/metric-split/spec.md`)
+
+Один прогон одной стороны исполняет до двух вызовов opencode CLI в ОДНОЙ
+сессии: `--init` (если задан и `initSide` включает эту сторону,
+`src/phases/06-run-side.ts`), затем `--prompt` продолжением той же сессии
+(`--continue`). Один export покрывает оба вызова, поэтому все метрики,
+извлекаемые из export-а, до сих пор смешивали init и task. Разбиение делит
+пять «расщепляемых» первичных метрик (`totalTokens`, `wallClockMs`,
+`costUsd`, `stepCount`, `toolCallCount`) между двумя фазами.
+
+**Граница (`src/metrics/extract.ts#findPhaseBoundary`).** Второе
+user-role-сообщение экспорта: `U = messages.filter(role === "user")`;
+`|U| ≥ 2` → граница `b = U[1]`, `boundaryTs = messages[b].info.time.created`,
+init = `messages[0..b-1]`, task = `messages[b..]`; `|U| ≤ 1` → границы нет,
+весь export — task (прогон без init IS the task, целиком). Доказано на
+реальных данных: суммы `init.<m> + task.<m>` бит-в-бит равны
+whole-run-значению для всех пяти метрик и для wall-clock (проверено тестами
+против `.testaipack/2026-07-30_09-25-09_b348a2` и `..._b10a40`).
+
+**Стоимость среза (§3 спеки).** Приоритет: (1) сумма `info.cost` по
+сообщениям среза, если > 0 — измерено; (2) иначе, если `info.cost` сессии в
+целом > 0 — пропорция от него по доле токенов среза, флаг
+`costProrated: true` (деривативная величина, никогда не рендерится как
+измеренная); (3) иначе — таблица цен по токенам среза (как для whole-run);
+(4) иначе `0`.
+
+**Новые модели контракта** (`contract/main.tsp`):
+
+```tsp
+model PhaseSlice { totalTokens: int64; wallClockMs: int64; costUsd: float64; stepCount: int32; toolCallCount: int32; }
+model PhaseSliceStats { totalTokens: MetricDistribution; wallClockMs: MetricDistribution; costUsd: MetricDistribution; stepCount: MetricDistribution; toolCallCount: MetricDistribution; }
+model SetupSegment { wallClockMs: int64; }  // harness pack-setup, до агент-сессии — ТОЛЬКО wall-clock
+model SidePhaseSplit {
+  runsWithInit: int32; runsWithLostInit: int32;
+  init?: PhaseSlice; initStats?: PhaseSliceStats;
+  task: PhaseSlice; taskStats: PhaseSliceStats;
+  costProrated?: boolean;
+  setup?: SetupSegment; setupStats?: MetricDistribution;
+}
+model PhaseDeltas { totalTokens: MetricDelta; wallClockMs: MetricDelta; costUsd: MetricDelta; stepCount: MetricDelta; toolCallCount: MetricDelta; }
+```
+
+- `SideAggregates.phaseSplit?: SidePhaseSplit` — медиана/распределение `task`
+  по ВСЕМ успешным прогонам стороны (прогон без init — task = whole run);
+  `init`/`initStats` только по прогонам с границей. `runsWithLostInit` —
+  прогоны, где фаза 06 знает, что `--init` реально выполнялся
+  (`RunSideResultExt.initRan === true`), но export границы не показывает
+  («потерянное продолжение сессии», §2.4 спеки) — init-стоимость не
+  измерена, а не ноль.
+- `MetricsDiff.taskDeltas?: PhaseDeltas` — присутствует, когда ОБЕ стороны
+  несут `phaseSplit` (та же честная замена дельт, что и `PrimaryDeltas`, но
+  над task-срезом; значимость — по IQR task-распределения OLD-стороны).
+- `MetricsDiff.initDeltas?: PhaseDeltas` — присутствует, ТОЛЬКО когда обе
+  стороны имеют `runsWithInit > 0` (`--init-side both`). При одностороннем
+  init init-стоимость рендерится как медиана/разброс, НИКОГДА не как дельта
+  (нечего вычитать у стороны без init).
+- `ReportSummary.basis?: "task" | "total"` — какая база питала заголовок и
+  бакеты improvements/regressions/neutral. Решено (team lead, 2026-07-30):
+  **всегда `"task"`**, когда `taskDeltas` присутствует — и при
+  одностороннем, и при двустороннем init; `"total"` только если разбиения
+  нет вовсе (старый report.json). Причина: init-шум — не поведение пака (в
+  `b348a2` init-срез — модель, воюющая с установкой зависимостей,
+  22K–257K токенов между прогонами ОДНОЙ и той же стороны), и total-дельта
+  при одностороннем init сравнивает разные по составу нагрузки в принципе.
+
+**`RunSideResult`** получает три новых поля от фазы 06
+(`src/phases/06-run-side.ts`, harness-таймеры `Date.now()` вокруг каждого
+вызова, НЕ `OnceResult.durationMs` — тот 0 на watchdog/timeout/error-ветках):
+`initRan?: boolean`, `initWallMs?: int64`, `promptWallMs?: int64`.
+`setupWallMs?: int64` — соседнее поле, harness-обвязка pack-setup-пайплайна
+(до агентской сессии), пишется параллельной фазой; фаза 07 читает его для
+`SidePhaseSplit.setup`/`setupStats`, медиана по ВСЕМ попыткам стороны
+(успешным и failed — setup идёт до агент-сессии, крах агента не портит его
+собственное измерение).
+
+**Ретрофит.** `testaipack report --rebuild` пересчитывает фазу 07 из
+`raw/<side>/run-N.json` на диске — разбиение получается «бесплатно», без
+изменения структуры `rebuild.ts`; для лога-восстановления (нет
+`run-N.result.json`) `initRan` берётся из строки `[INIT_DONE]` в `.log`
+(`src/recovery/run-recovery.ts`). Проверено на реальной workspace
+`b348a2` (см. тест `src/cli/rebuild.test.ts`): числа `phaseSplit` совпадают
+с независимо вычисленными вручную по сырым export-ам.
+
+**`timeToFirstToolMs`/`timeToFirstEditMs` — семантика изменилась.**
+Пересчитаны на месте (не добавлены параллельные поля): на прогоне с init
+теперь измеряют время ДО первого инструмента task-фазы, а не всего стрима.
+Отчёты, пересобранные после этого изменения, покажут другие числа для
+init-содержащих сторон — это не регрессия производительности, а исправление
+метрики, которая раньше молча измеряла init.

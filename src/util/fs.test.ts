@@ -57,6 +57,31 @@ describe('fs utils', () => {
     expect(await run(readFile(path.join(dst, 'sub', 'child.txt')))).toBe('child')
   })
 
+  // Real-incident regression (testaipack run b7d56c): 04b-pack-setup copies
+  // the HOME it ran `npm install -g --prefix $HOME/.local <pkg>` into over
+  // every other new-side HOME. npm's global bin script is a RELATIVE
+  // symlink (`bin/<name> -> ../lib/node_modules/<pkg>/...`). `fs.cp`'s
+  // default (`verbatimSymlinks: false`) resolves that relative link against
+  // its position in `src` and writes the resolved ABSOLUTE path as the
+  // copy's link target — still pointing at `src`, not `dst`. Every HOME
+  // after the first ends up with a symlink into a directory nothing else
+  // mounts, and the exercise step fails with "command not found" instead of
+  // preflight catching the incomplete copy.
+  it('copyDir preserves a relative symlink verbatim — the copy keeps resolving inside itself, not back at the source', async () => {
+    const src = await freshDir()
+    const dst = makeTempDir()
+    await run(ensureDir(path.join(src, 'lib')))
+    await run(ensureDir(path.join(src, 'bin')))
+    await run(writeFile(path.join(src, 'lib', 'tool.cjs'), 'module.exports = 1\n'))
+    await run(symlink('../lib/tool.cjs', path.join(src, 'bin', 'tool')))
+    await run(copyDir(src, dst))
+    const copiedTarget = await readlink(path.join(dst, 'bin', 'tool'))
+    expect(copiedTarget).toBe('../lib/tool.cjs')
+    expect(path.resolve(path.dirname(path.join(dst, 'bin', 'tool')), copiedTarget)).toBe(
+      path.join(dst, 'lib', 'tool.cjs'),
+    )
+  })
+
   it('moveDir relocates a directory: source gone, contents present at the destination', async () => {
     const src = await freshDir()
     await run(ensureDir(path.join(src, 'sub')))

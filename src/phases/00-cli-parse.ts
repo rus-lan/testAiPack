@@ -73,6 +73,7 @@ export const DEFAULT_PREFLIGHT_ENABLED = true
 export const DEFAULT_DIFF_HTML = false
 export const DEFAULT_PROTECT_GIT = false
 export const DEFAULT_COLLAPSE_REPEATS = false
+export const DEFAULT_ALLOW_BASELINE_TOOL = false
 export const DEFAULT_TIMELINE_MODE: TimelineMode = 'side-by-side'
 export const DEFAULT_INIT_SIDE: InitSide = 'both'
 export const DEFAULT_LOG_LEVEL: LogLevel = 'info'
@@ -118,6 +119,11 @@ const configFileSchema = z
     logLevel: logLevelSchema.optional(),
     pricingPath: z.string().optional(),
     auth: authPartialSchema.optional(),
+    packSetup: z.string().optional(),
+    packCheck: z.string().optional(),
+    packExercise: z.string().optional(),
+    allowBaselineTool: z.boolean().optional(),
+    packHint: z.string().optional(),
   })
   .strict()
 
@@ -150,6 +156,11 @@ interface CliRaw {
   readonly preflightModel?: string
   readonly model?: string
   readonly pricingPath?: string
+  readonly packSetup?: string
+  readonly packCheck?: string
+  readonly packExercise?: string
+  readonly allowBaselineTool?: boolean
+  readonly packHint?: string
   readonly timeouts: TimeoutUpdate
   readonly auth: AuthUpdate
 }
@@ -193,6 +204,10 @@ export const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '--preflight-model': 'preflightModel',
   '--model': 'model',
   '--pricing-path': 'pricingPath',
+  '--pack-setup': 'packSetup',
+  '--pack-check': 'packCheck',
+  '--pack-exercise': 'packExercise',
+  '--pack-hint': 'packHint',
   '--timeout-preflight': 'preflightSeconds',
   '--timeout-run': 'runSeconds',
   '--timeout-verify': 'verifySeconds',
@@ -201,7 +216,13 @@ export const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '--timeout-total': 'totalSeconds',
 }
 
-export type RunBooleanKey = 'pureBaseline' | 'preflightEnabled' | 'diffHtml' | 'protectGit' | 'collapseRepeats'
+export type RunBooleanKey =
+  | 'pureBaseline'
+  | 'preflightEnabled'
+  | 'diffHtml'
+  | 'protectGit'
+  | 'collapseRepeats'
+  | 'allowBaselineTool'
 
 export const BOOLEAN_FLAGS: Readonly<
   Record<string, { readonly key: RunBooleanKey; readonly value: boolean }>
@@ -216,6 +237,8 @@ export const BOOLEAN_FLAGS: Readonly<
   '--no-protect-git': { key: 'protectGit', value: false },
   '--collapse-repeats': { key: 'collapseRepeats', value: true },
   '--no-collapse-repeats': { key: 'collapseRepeats', value: false },
+  '--allow-baseline-tool': { key: 'allowBaselineTool', value: true },
+  '--no-allow-baseline-tool': { key: 'allowBaselineTool', value: false },
 }
 
 export const TIMEOUT_KEYS: ReadonlySet<string> = new Set([
@@ -331,6 +354,10 @@ const parseValueFlag = (
     if (dest === 'preflightModel') return setScalar(acc, 'preflightModel', raw)
     if (dest === 'model') return setScalar(acc, 'model', raw)
     if (dest === 'pricingPath') return setScalar(acc, 'pricingPath', raw)
+    if (dest === 'packSetup') return setScalar(acc, 'packSetup', raw)
+    if (dest === 'packCheck') return setScalar(acc, 'packCheck', raw)
+    if (dest === 'packExercise') return setScalar(acc, 'packExercise', raw)
+    if (dest === 'packHint') return setScalar(acc, 'packHint', raw)
     return yield* Effect.fail(
       cliParseError(`unknown flag destination: ${dest}`, 'E_CONFIG_INVALID', { dest }),
     )
@@ -684,6 +711,11 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const preflightModelPick = pick(cli.preflightModel, cfg?.preflightModel)
     const modelPick = pick(cli.model, cfg?.model)
     const pricingPick = pick(cli.pricingPath, cfg?.pricingPath)
+    const packSetupPick = pick(cli.packSetup, cfg?.packSetup)
+    const packCheckPick = pick(cli.packCheck, cfg?.packCheck)
+    const packExercisePick = pick(cli.packExercise, cfg?.packExercise)
+    const allowBaselineToolPick = pick(cli.allowBaselineTool, cfg?.allowBaselineTool)
+    const packHintPick = pick(cli.packHint, cfg?.packHint)
 
     const timeouts = mergeTimeouts(cli.timeouts, cfg?.timeouts)
     const badTimeout = firstNonPositiveTimeout(timeouts)
@@ -720,6 +752,35 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       )
     }
 
+    // --pack-setup/--pack-check/--pack-exercise install/verify/run the PACK's
+    // own runtime — meaningless without a pack under test.
+    if (
+      packRefPick.value === undefined &&
+      (packSetupPick.value !== undefined || packCheckPick.value !== undefined || packExercisePick.value !== undefined)
+    ) {
+      return yield* Effect.fail(
+        cliParseError(
+          '--pack-setup/--pack-check/--pack-exercise require --pack (or packRef in config)',
+          'E_CONFIG_INVALID',
+          { reason: 'pack-setup-without-pack' },
+        ),
+      )
+    }
+
+    // `--pack-check` only ever runs inside preflight's gate 6 (05-preflight.ts)
+    // — with preflight disabled the check is declared but never executed, so
+    // a report claiming the pack was verified functional would be confident
+    // but unverified. Refused outright rather than silently downgrading mode.
+    if (packCheckPick.value !== undefined && !(preflightPick.value ?? DEFAULT_PREFLIGHT_ENABLED)) {
+      return yield* Effect.fail(
+        cliParseError(
+          '--pack-check requires preflight to run it (remove --no-preflight, or drop --pack-check)',
+          'E_CONFIG_INVALID',
+          { reason: 'pack-check-without-preflight' },
+        ),
+      )
+    }
+
     const sources: readonly ('cli' | 'config' | 'default')[] = [
       repoUrlPick.src,
       promptSrc,
@@ -742,6 +803,11 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       modelPick.src,
       pricingPick.src,
       dockerNetworkPick.src,
+      packSetupPick.src,
+      packCheckPick.src,
+      packExercisePick.src,
+      allowBaselineToolPick.src,
+      packHintPick.src,
     ]
     const hasCli = sources.includes('cli')
     const hasConfig = sources.includes('config')
@@ -766,6 +832,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       timeouts,
       workspacePath: workspacePick.value ?? DEFAULT_WORKSPACE_PATH,
       logLevel: logPick.value ?? DEFAULT_LOG_LEVEL,
+      allowBaselineTool: allowBaselineToolPick.value ?? DEFAULT_ALLOW_BASELINE_TOOL,
       ...(packRefPick.value !== undefined ? { packRef: packRefPick.value } : {}),
       ...(packTypeValue !== undefined ? { packType: packTypeValue } : {}),
       ...(promptResolved.files.length > 0 ? { promptFiles: [...promptResolved.files] } : {}),
@@ -781,6 +848,15 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       ...(modelPick.value !== undefined ? { model: modelPick.value } : {}),
       ...(pricingPick.value !== undefined ? { pricingPath: pricingPick.value } : {}),
       ...(dockerNetworkPick.value !== undefined ? { dockerNetwork: dockerNetworkPick.value } : {}),
+      ...(packSetupPick.value !== undefined ? { packSetup: packSetupPick.value } : {}),
+      ...(packCheckPick.value !== undefined ? { packCheck: packCheckPick.value } : {}),
+      ...(packExercisePick.value !== undefined ? { packExercise: packExercisePick.value } : {}),
+      // Unlike `--init` (which has `--init-side` to target one side on
+      // purpose, see below), `--pack-hint` has no side-targeting knob at
+      // all: `RunInput.packHint` is one scalar field, read by the single
+      // prompt-building path in `06-run-side.ts` with no `side` branch, so
+      // there is no configuration that could send it to only one side.
+      ...(packHintPick.value !== undefined ? { packHint: packHintPick.value } : {}),
     }
 
     const zodResult = runInputSchema.safeParse(runInput)

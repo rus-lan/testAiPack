@@ -6,7 +6,8 @@ import { renderHtml } from './html.js'
 import { reportSchema } from '@generated/schemas'
 import { makeReport, makeDiffResult } from '../../tests/report-fixture.js'
 import { makeMetricsDiff, makeSideAggregates, makeManifest } from '../../tests/report-fixture.js'
-import type { JudgeResult, Report } from '@generated/types'
+import { makeSidePhaseSplit, makePhaseDeltas, makePhaseSlice, makePhaseSliceStats } from '../../tests/report-fixture.js'
+import type { JudgeResult, PackSetupReport, Report, SidePhaseSplit } from '@generated/types'
 import { redactUrlCredentials } from '../util/redact.js'
 import { safeRefDisplay } from '../pack/detector.js'
 
@@ -87,6 +88,29 @@ describe('renderHtml', () => {
     expect(html).not.toContain('quality old=')
   })
 
+  it('omits the raw-response block when rawResponse is absent', () => {
+    const html = renderHtml(makeReport())
+    expect(html).not.toContain('Raw model response')
+  })
+
+  it('shows the raw response in a collapsible block when present', () => {
+    const withRaw: JudgeResult = {
+      verdict: 'unclear',
+      oldQuality: 0,
+      newQuality: 0,
+      explanation: 'Failed to parse judge response',
+      modelUsed: 'gpt-test',
+      timestamp: '2025-01-01T00:05:00.000Z',
+      ran: true,
+      rawResponse: 'I <really> cannot decide this one.',
+    }
+    const html = renderHtml(makeReport({ judge: withRaw }))
+    expect(html).toContain('<details><summary>Raw model response</summary>')
+    // HTML-escaped, not injected raw — the model's own text must not be
+    // able to break out of the <pre> block it is shown in.
+    expect(html).toContain('I &lt;really&gt; cannot decide this one.')
+  })
+
   it('has no external dependencies (no http(s) imports or src)', () => {
     const html = renderHtml(makeReport())
     expect(html).not.toMatch(/src="https?:\/\//)
@@ -115,6 +139,17 @@ describe('renderHtml', () => {
 
     const preDates = renderHtml(makeReport({ manifest: makeManifest({ init: '/graphify .', flagDefaults: {} }) }))
     expect(preDates).toContain('<strong>Init side:</strong> unknown (report predates --init-side)')
+  })
+
+  it('header pack-hint: absent without --pack-hint; shown with the "sent identically to both sides" disclosure and HTML-escaped', () => {
+    const without = renderHtml(makeReport())
+    expect(without).not.toContain('Pack hint:')
+
+    const withHint = renderHtml(
+      makeReport({ manifest: makeManifest({ packHint: 'check <.graphify/> if present' }) }),
+    )
+    expect(withHint).toContain('<strong>Pack hint:</strong> sent identically to both sides')
+    expect(withHint).toContain('check &lt;.graphify/&gt; if present')
   })
 
   it('never echoes a credential when given an already-redacted manifest (the shape buildManifest produces)', () => {
@@ -398,6 +433,48 @@ describe('renderHtml', () => {
     expect(html).not.toContain('undefined')
   })
 
+  it('exercised mode + zero calls: no "chose not to call it"/"baseline vs baseline" claim — informational note instead of a warning', () => {
+    const metricsDiff = makeMetricsDiff({
+      new: makeSideAggregates('new', {
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 2, canDetect: true, visibilityConfirmed: true },
+      }),
+    })
+    const packSetup: PackSetupReport = {
+      mode: 'exercised',
+      setupDeclared: true,
+      checkDeclared: true,
+      exerciseDeclared: true,
+      checks: [],
+      exercises: [{ side: 'new', runIndex: 1, exitCode: 0, durationMs: '10', artifactHash: 'abc' }],
+    }
+    const html = renderHtml(makeReport({ metricsDiff, packSetup }))
+    expect(html).not.toContain('chose not to call it')
+    expect(html).not.toContain('Deltas compare baseline vs baseline')
+    expect(html).not.toContain('⚠ Pack was never invoked')
+    expect(html).toContain('Pack was never called directly on the NEW side')
+    expect(html).toContain('nothing left to trigger')
+    expect(html).toContain('Expected under exercised mode, not a defect')
+  })
+
+  it('installed-only mode + zero calls: keeps the original "chose not to call it" warning', () => {
+    const metricsDiff = makeMetricsDiff({
+      new: makeSideAggregates('new', {
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: true },
+      }),
+    })
+    const packSetup: PackSetupReport = {
+      mode: 'installed-only',
+      setupDeclared: true,
+      checkDeclared: false,
+      exerciseDeclared: false,
+      checks: [],
+      exercises: [],
+    }
+    const html = renderHtml(makeReport({ metricsDiff, packSetup }))
+    expect(html).toContain('chose not to call it')
+    expect(html).not.toContain('Pack was never called directly')
+  })
+
   it('safety section lists commands escaped; absent when empty', () => {
     const metricsDiff = makeMetricsDiff({
       old: makeSideAggregates('old', {
@@ -625,10 +702,19 @@ describe('renderHtml', () => {
     expect(html).not.toContain('success rate 3/3')
   })
 
-  it('diff efficiency ratio scales the per-run median by the diffed-run count, not by all metric-successful runs', () => {
+  it('diff efficiency ratio scales the per-run median by the agent-session count (stats.totalTokens.samples), not by the diffed-run count', () => {
+    // Reproduces the real incident: 3 diffed runs, only 2 had an agent
+    // session — the 3rd's --pack-exercise failed (session skipped, worktree
+    // pristine), so it diffs as an ordinary +0/-0 with state "ok", not
+    // "failed". Scaling by the diffed-run count (3) inflated the ratio;
+    // scaling by the session count (2) is the fix.
     const metricsDiff = makeMetricsDiff({
       old: makeSideAggregates('old', {
         primary: { ...makeSideAggregates('old').primary, totalTokens: '1000', costUsd: 2 },
+        stats: {
+          ...makeSideAggregates('old').stats,
+          totalTokens: { median: 1000, min: 1000, max: 1000, samples: [1000, 1000] },
+        },
       }),
     })
     const report = makeReport({
@@ -636,35 +722,18 @@ describe('renderHtml', () => {
       diff: {
         old: makeDiffResult('old', {
           runs: [
-            {
-              runIndex: 1,
-              fullPatch: 'p',
-              summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] },
-              noChanges: false,
-            },
-            {
-              runIndex: 2,
-              fullPatch: 'p',
-              summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] },
-              noChanges: false,
-            },
-            {
-              runIndex: 3,
-              fullPatch: '',
-              summary: { filesChanged: 0, additions: 0, deletions: 0, perFile: [] },
-              noChanges: false,
-              state: 'failed',
-              error: { code: 'E_WORKTREE_BROKEN', message: 'boom' },
-            },
+            { runIndex: 1, fullPatch: '', summary: { filesChanged: 0, additions: 0, deletions: 0, perFile: [] }, noChanges: true },
+            { runIndex: 2, fullPatch: 'p', summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] }, noChanges: false },
+            { runIndex: 3, fullPatch: 'p', summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] }, noChanges: false },
           ],
         }),
         new: makeDiffResult('new'),
       },
     })
     const html = renderHtml(report)
-    // 2 diffed runs (1 of 3 failed) x median 1000 tokens / 200 changed lines = 10
-    // 2 diffed runs x median $2 / 4 files = 1
-    expect(html).toContain('Efficiency: tokens per changed line 10, cost per file 1 (scaled from the per-run median over 2 diffed run(s))')
+    // 2 session runs x median 1000 tokens / 200 changed lines = 10
+    // 2 session runs x median $2 / 4 files = 1 — NOT scaled by 3
+    expect(html).toContain('Efficiency: tokens per changed line 10, cost per file 1 (scaled from the per-run median over 2 run(s) with an agent session)')
   })
 
   it('diff section shows tokens-per-line and cost-per-file; per-file overlap lists both/only-old/only-new', () => {
@@ -711,10 +780,171 @@ describe('renderHtml', () => {
     const html = renderHtml(report)
     expect(html).toContain('Efficiency: tokens per changed line')
     expect(html).toContain('cost per file')
-    expect(html).toContain('diffed run(s)')
+    expect(html).toContain('run(s) with an agent session')
     expect(html).toContain('Per-file overlap')
     expect(html).toContain('shared.ts')
     expect(html).toContain('old-only.ts')
     expect(html).toContain('new-only.ts')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// renderHtml — phase split (metric-split spec §5.7). Mirrors the md.ts
+// coverage in src/report/md.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('renderHtml — phase split', () => {
+  it('absent on pre-split reports; whole-run table retitled regardless (regression guard)', () => {
+    const html = renderHtml(makeReport())
+    expect(html).not.toContain('Phase split (init vs task)')
+    expect(html).not.toContain('Basis: task phase only')
+    expect(html).toContain('Primary metrics — total (init + task)')
+  })
+
+  it('one-sided init: cost figure only, never a delta table for Init cost', () => {
+    const oldNoInitSplit: SidePhaseSplit = {
+      runsWithInit: 0,
+      runsWithLostInit: 0,
+      task: makePhaseSlice({ totalTokens: '500' }),
+      taskStats: makePhaseSliceStats(500),
+    }
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', { phaseSplit: oldNoInitSplit }),
+      new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit({ runsWithInit: 3 }) }),
+      taskDeltas: makePhaseDeltas(),
+    })
+    const html = renderHtml(makeReport({ metricsDiff }))
+    expect(html).toContain('Phase split (init vs task)')
+    expect(html).toContain('Task phase (like-for-like)')
+    expect(html).toContain('Init cost')
+    expect(html).toContain('no init phase')
+    expect(html).toContain('run(s) with init')
+    expect(html).toContain('Basis: task phase only (init excluded)')
+  })
+
+  it('two-sided init renders Init cost as a delta table (no "no init phase" bullet lines)', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', { phaseSplit: makeSidePhaseSplit({ runsWithInit: 2 }) }),
+      new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit({ runsWithInit: 2 }) }),
+      taskDeltas: makePhaseDeltas(),
+      initDeltas: makePhaseDeltas(),
+    })
+    const html = renderHtml(makeReport({ metricsDiff }))
+    expect(html).not.toContain('no init phase')
+    expect(html).not.toContain('run(s) with init')
+  })
+
+  it('setup segment renders wall-clock only, never inside a table/delta', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', { phaseSplit: makeSidePhaseSplit({ setup: { wallClockMs: '4000' } }) }),
+      new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit() }),
+      taskDeltas: makePhaseDeltas(),
+    })
+    const html = renderHtml(makeReport({ metricsDiff }))
+    expect(html).toContain('pack setup (harness, no model call) — median 4000ms')
+  })
+
+  it('costProrated marks the value as derived', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', { phaseSplit: makeSidePhaseSplit({ costProrated: true }) }),
+      new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit() }),
+      taskDeltas: makePhaseDeltas(),
+    })
+    const html = renderHtml(makeReport({ metricsDiff }))
+    expect(html).toContain('~ cost prorated from the session total by token share — derived, not measured.')
+  })
+
+  it('runsWithLostInit warns without silently dropping the run', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', { phaseSplit: makeSidePhaseSplit({ runsWithLostInit: 2 }) }),
+      new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit() }),
+      taskDeltas: makePhaseDeltas(),
+    })
+    const html = renderHtml(makeReport({ metricsDiff }))
+    expect(html).toContain('⚠ OLD: 2 run(s) ran --init but the export lost the init session — init cost unmeasured.')
+  })
+
+  it('secondary metrics section carries the whole-run label when a split exists', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', { phaseSplit: makeSidePhaseSplit() }),
+      new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit() }),
+      taskDeltas: makePhaseDeltas(),
+    })
+    const html = renderHtml(makeReport({ metricsDiff }))
+    expect(html).toContain('Whole-run (init + task) — not split')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// renderHtml — Harness preparation: installed-only banner must not overclaim
+// verification it never performed (mirrors md.test.ts)
+// ---------------------------------------------------------------------------
+
+describe('renderHtml — Harness preparation: installed-only banner splits "installed" from "installed and checked"', () => {
+  const base = {
+    mode: 'installed-only' as const,
+    setupDeclared: true,
+    exerciseDeclared: false,
+    exercises: [],
+  }
+
+  it('--pack-setup only, no --pack-check: banner says "installed" and states plainly that nothing checked it', () => {
+    const packSetup: PackSetupReport = { ...base, checkDeclared: false, checks: [] }
+    const html = renderHtml(makeReport({ packSetup }))
+    expect(html).not.toContain('installed and verified functional')
+    expect(html).not.toContain('installed and checked functional')
+    expect(html).toContain('The pack was installed, but the harness never ran --pack-check to confirm it works')
+    expect(html).toContain('unverified copy')
+  })
+
+  it('--pack-check declared but never actually ran: still the unchecked wording, not "checked"', () => {
+    const packSetup: PackSetupReport = { ...base, checkDeclared: true, checks: [] }
+    const html = renderHtml(makeReport({ packSetup }))
+    expect(html).toContain('the harness never ran --pack-check to confirm it works')
+    expect(html).not.toContain('installed and checked functional')
+  })
+
+  it('--pack-check genuinely ran and passed: banner says "installed and checked functional", not just "installed"', () => {
+    const packSetup: PackSetupReport = {
+      ...base,
+      checkDeclared: true,
+      checks: [{ side: 'new', runIndex: 1, exitCode: 0, durationMs: '400' }],
+    }
+    const html = renderHtml(makeReport({ packSetup }))
+    expect(html).toContain('The pack was installed and checked functional')
+    expect(html).not.toContain('harness never ran --pack-check')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// renderHtml — Harness preparation: no-artifact warning (mirrors md.test.ts)
+// ---------------------------------------------------------------------------
+
+describe('renderHtml — Harness preparation: no-artifact warning', () => {
+  const basePackSetup: PackSetupReport = {
+    mode: 'installed-only',
+    setupDeclared: false,
+    checkDeclared: false,
+    exerciseDeclared: true,
+    checks: [],
+    exercises: [],
+  }
+
+  it('every exercise exits 0 but leaves no artifact → warned', () => {
+    const packSetup: PackSetupReport = {
+      ...basePackSetup,
+      exercises: [{ side: 'new', runIndex: 1, exitCode: 0, durationMs: '10' }],
+    }
+    const html = renderHtml(makeReport({ packSetup }))
+    expect(html).toContain('Exercise produced no artifact on any of 1 run(s)')
+  })
+
+  it('an artifact was recorded → no warning', () => {
+    const packSetup: PackSetupReport = {
+      ...basePackSetup,
+      exercises: [{ side: 'new', runIndex: 1, exitCode: 0, durationMs: '10', artifactHash: 'abc' }],
+    }
+    const html = renderHtml(makeReport({ packSetup }))
+    expect(html).not.toContain('produced no artifact')
   })
 })

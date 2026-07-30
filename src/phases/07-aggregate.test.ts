@@ -4,6 +4,7 @@ import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, readFile, writeFile, writeJson } from '../util/fs.js'
+import { toNum } from '../util/numeric.js'
 import { aggregate } from './07-aggregate.js'
 import type { SessionTreeLoader } from './10-timeline.js'
 import type { SessionTreeNode } from '../metrics/extract.js'
@@ -37,6 +38,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
   outputPath: './results',
   diffHtml: false,
   protectGit: false,
+  allowBaselineTool: false,
   collapseRepeats: true,
   timelineMode: 'side-by-side',
   timeouts: {
@@ -753,8 +755,8 @@ describe.skipIf(!hasGoldenWorkspace)('aggregate — real ground truth (golden-va
     const nw = result.rawAggregates.new
 
     // packUse
-    expect(old.packUse).toEqual({ calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true, visibilityConfirmed: false })
-    expect(nw.packUse).toEqual({ calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: false })
+    expect(old.packUse).toEqual({ calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true, visibilityConfirmed: false, runsWithoutCall: [1, 2, 3, 4] })
+    expect(nw.packUse).toEqual({ calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: false, runsWithoutCall: [1, 2, 3, 4, 5] })
 
     // riskyCommands
     expect(old.riskyCommands).toEqual([
@@ -770,11 +772,18 @@ describe.skipIf(!hasGoldenWorkspace)('aggregate — real ground truth (golden-va
     expect(old.secondary.duplicateToolCalls).toBe(5)
     expect(nw.secondary.duplicateToolCalls).toBe(1)
 
-    // P5 latency
-    expect(old.secondary.timeToFirstToolMs).toBe('2165')
-    expect(nw.secondary.timeToFirstToolMs).toBe('7518')
-    expect(old.secondary.timeToFirstEditMs).toBe('90986') // 90985.5 rounded
-    expect(nw.secondary.timeToFirstEditMs).toBe('117736')
+    // P5 latency — both sides in this golden workspace ran --init (2 user
+    // messages per export), so timeToFirstToolMs/timeToFirstEditMs are now
+    // scoped to the task phase (metric-split spec §5.3): measured from the
+    // first post-boundary event, not from the very start of the stream.
+    // Golden-values.md pins the pre-split (whole-stream) numbers; these are
+    // the corrected task-phase ones. old/run-5's task phase never calls a
+    // tool at all (only step-start/text/step-finish after its boundary), so
+    // it contributes no data point to either median — 4 of 5 runs, not 5.
+    expect(old.secondary.timeToFirstToolMs).toBe('2066') // median of [996, 1754, 2377, 3487]
+    expect(nw.secondary.timeToFirstToolMs).toBe('1936') // median of [1835, 1899, 1936, 2096, 2267]
+    expect(old.secondary.timeToFirstEditMs).toBe('46282') // median of [20136, 44651, 47912, 111362]
+    expect(nw.secondary.timeToFirstEditMs).toBe('63367') // median of [24040, 44224, 82510, 136248] (new/run-2 has no edit)
     expect(old.secondary.maxEventGapMs).toBe('252915')
     expect(nw.secondary.maxEventGapMs).toBe('240663')
     // stall count (>60s threshold): golden per-run maxGap table has exactly
@@ -812,5 +821,104 @@ describe.skipIf(!hasGoldenWorkspace)('aggregate — real ground truth (golden-va
     // existing field, newly rendered
     expect(old.secondary.maxConsecutiveSameTool).toBe(4)
     expect(nw.secondary.maxConsecutiveSameTool).toBe(4)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Real ground truth — .research/metric-split/spec.md evidence workspace
+// (10x2 runs, graphify pack, `--init-side new`). Read-only; skips cleanly
+// when the workspace isn't present on this machine. Expected numbers are
+// independently computed straight from the raw exports (median over the 10
+// per-run init/task slices — same conservation source verified per-run in
+// src/metrics/extract.test.ts), not copied from the spec's own worked
+// example.
+// ---------------------------------------------------------------------------
+
+const B348A2_ROOT = '/home/ruslan/.testaipack/2026-07-30_09-25-09_b348a2'
+const hasB348A2 = existsSync(B348A2_ROOT)
+
+describe.skipIf(!hasB348A2)('aggregate — phase split real ground truth (b348a2, --init-side new)', () => {
+  it('new side: runsWithInit=10, init/task medians match independently computed values; old side: no init at all', async () => {
+    const rawDir = path.join(B348A2_ROOT, 'results', 'raw')
+    const tempResults = makeTempDir()
+    const tree: WorkspaceTree = {
+      root: B348A2_ROOT,
+      appsSource: path.join(B348A2_ROOT, 'apps', 'source'),
+      appsOld: [],
+      appsNew: [],
+      pack: path.join(B348A2_ROOT, 'pack'),
+      homeOld: [],
+      homeNew: [],
+      gitDirsOld: [],
+      gitDirsNew: [],
+      config: path.join(B348A2_ROOT, 'config'),
+      results: tempResults,
+      raw: rawDir,
+      diff: path.join(tempResults, 'diff'),
+    }
+    const runInput = makeRunInput({ runs: 10, packRef: 'https://github.com/Graphify-Labs/graphify' })
+    const manifest = makeManifest(runInput)
+    const runsFor = (side: 'old' | 'new'): RunSideResultExt[] =>
+      Array.from({ length: 10 }, (_, i) => i + 1).map((i) =>
+        sideResult(side, i, 4, { eventsLogPath: path.join(rawDir, side, `run-${String(i)}.events.ndjson`) }),
+      )
+    const result = await runP(
+      aggregate({ runInput, manifest, workspace: tree, sideResults: { old: runsFor('old'), new: runsFor('new') } }),
+    )
+
+    const old = result.rawAggregates.old
+    const nw = result.rawAggregates.new
+
+    // old side never ran --init in this workspace (--init-side new) — no
+    // boundary in any of its 10 exports, so phaseSplit.init is absent and
+    // task equals the whole run (same values the primary table already
+    // shows for old, per §1's motivating report.md excerpt: 147474 total).
+    expect(old.phaseSplit).toBeDefined()
+    expect(old.phaseSplit?.runsWithInit).toBe(0)
+    expect(old.phaseSplit?.runsWithLostInit).toBe(0)
+    expect(old.phaseSplit?.init).toBeUndefined()
+    expect(old.phaseSplit?.task).toEqual({
+      totalTokens: '147474',
+      wallClockMs: '229696',
+      costUsd: 0,
+      stepCount: 13,
+      toolCallCount: 14,
+    })
+
+    // new side ran --init on all 10 runs — every export carries a boundary.
+    expect(nw.phaseSplit).toBeDefined()
+    expect(nw.phaseSplit?.runsWithInit).toBe(10)
+    expect(nw.phaseSplit?.runsWithLostInit).toBe(0)
+    expect(nw.phaseSplit?.init).toEqual({
+      totalTokens: '455398',
+      wallClockMs: '199658',
+      costUsd: 0,
+      stepCount: 24,
+      toolCallCount: 30,
+    })
+    expect(nw.phaseSplit?.task).toEqual({
+      totalTokens: '301566',
+      wallClockMs: '143660',
+      costUsd: 0,
+      stepCount: 11,
+      toolCallCount: 11,
+    })
+    // Neither side's per-message/session costs are populated in this
+    // workspace and no pricing table was supplied — 0, not prorated.
+    expect(old.phaseSplit?.costProrated).toBeUndefined()
+    expect(nw.phaseSplit?.costProrated).toBeUndefined()
+
+    // taskDeltas: present because both sides carry phaseSplit — the
+    // like-for-like basis even though init is one-sided here.
+    expect(result.metricsDiff.taskDeltas).toBeDefined()
+    expect(result.metricsDiff.taskDeltas?.totalTokens.absolute).toBe(301566 - 147474)
+    // initDeltas: absent — init is one-sided (old has runsWithInit === 0).
+    expect(result.metricsDiff.initDeltas).toBeUndefined()
+
+    // Whole-run ("total") deltas are unaffected by the split — still the
+    // +341% swing from §1 of the spec (147474 -> 650322-ish scale); the
+    // point of the split is that the TASK basis tells a different, calmer
+    // story (above), not that the old total-table numbers change.
+    expect(toNum(old.primary.totalTokens)).toBe(147474)
   })
 })

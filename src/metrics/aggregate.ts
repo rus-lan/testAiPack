@@ -13,16 +13,20 @@ import type {
   MetricDistribution,
   MetricsDiff,
   PackUse,
+  PhaseDeltas,
+  PhaseSlice,
+  PhaseSliceStats,
   PrimaryMetrics,
   RiskyCommand,
   SecondaryMetrics,
   Side,
   SideAggregates,
+  SidePhaseSplit,
   ToolStat,
   VerifyStats,
 } from '@generated/types'
 import type { EventsProfile } from './events-profile.js'
-import type { ExtractedExtras, ExtractedMetrics } from './extract.js'
+import type { ExtractedExtras, ExtractedMetrics, ExtractedPhases, PhaseSliceNum } from './extract.js'
 import type { UnindexedSignal } from './baseline-contamination.js'
 import { interquartileRange, maximum, median, minimum, percentile, toNum } from './stats.js'
 import { isSignificant } from './significance.js'
@@ -257,6 +261,7 @@ export const aggregateSecondary = (
 
 const buildPackUse = (
   extras: readonly ExtractedExtras[],
+  runIndexes: readonly number[],
   packName: string | undefined,
   canDetect: boolean,
   visibilityConfirmed: boolean,
@@ -264,6 +269,7 @@ const buildPackUse = (
   if (packName === undefined) return undefined
   const firstTimes = extras.flatMap((e) => (e.firstPackCallMs === undefined ? [] : [e.firstPackCallMs]))
   const firstCallMsMedian = firstTimes.length === 0 ? undefined : String(round(median(firstTimes)))
+  const runsWithoutCall = extras.flatMap((e, i) => (e.packCalls === 0 ? [runIndexes[i] ?? 0] : []))
   return {
     calls: extras.reduce((a, e) => a + e.packCalls, 0),
     errors: extras.reduce((a, e) => a + e.packErrors, 0),
@@ -272,6 +278,10 @@ const buildPackUse = (
     canDetect,
     visibilityConfirmed,
     ...(firstCallMsMedian === undefined ? {} : { firstCallMsMedian }),
+    // Present (possibly empty) whenever runCount > 0 — measured and clean is
+    // different from never checked. Omitted only when there was nothing to
+    // inspect at all (matches riskyCommands/contaminationSignals convention).
+    ...(extras.length === 0 ? {} : { runsWithoutCall: [...runsWithoutCall] }),
   }
 }
 
@@ -319,6 +329,82 @@ const emptyStats = (): AggregateStats => ({
   successRank: dist([]),
 })
 
+// ---------------------------------------------------------------------------
+// Phase split (metric-split spec §5.5): median + distribution of the five
+// splittable metrics for `init`/`task`, plus the harness-only `setup` segment.
+// ---------------------------------------------------------------------------
+
+const phaseSliceDist = (
+  slices: readonly PhaseSliceNum[],
+): { readonly median: PhaseSlice; readonly stats: PhaseSliceStats } => {
+  const totalTokens = slices.map((s) => s.totalTokens)
+  const wallClockMs = slices.map((s) => s.wallClockMs)
+  const costUsd = slices.map((s) => s.costUsd)
+  const stepCount = slices.map((s) => s.stepCount)
+  const toolCallCount = slices.map((s) => s.toolCallCount)
+  return {
+    median: {
+      totalTokens: String(round(median(totalTokens))),
+      wallClockMs: String(round(median(wallClockMs))),
+      costUsd: median(costUsd),
+      stepCount: round(median(stepCount)),
+      toolCallCount: round(median(toolCallCount)),
+    },
+    stats: {
+      totalTokens: dist(totalTokens),
+      wallClockMs: dist(wallClockMs),
+      costUsd: dist(costUsd),
+      stepCount: dist(stepCount),
+      toolCallCount: dist(toolCallCount),
+    },
+  }
+}
+
+/**
+ * Builds `SidePhaseSplit` from per-run phase slices (parallel to `extracted`
+ * in `SideAggregationInput`): `task` medians over every successful run
+ * (a run with no init IS the task, whole); `init` only over runs whose
+ * export carried a boundary. `runsWithLostInit` catches phase 06 recording
+ * that `--init` ran (`initRanFlags`) while the export shows no boundary at
+ * all — the "lost session continuation" case (spec §2.4): init cost went
+ * unmeasured, not zero. `setup` is harness wall-clock only (spec §6.1),
+ * aggregated separately from `setupWallMsList` — never a fabricated zero for
+ * a run that never exercised.
+ */
+const buildPhaseSplit = (
+  phasesList: readonly ExtractedPhases[],
+  initRanFlags: readonly boolean[],
+  setupWallMsList: readonly (number | undefined)[],
+): SidePhaseSplit | undefined => {
+  if (phasesList.length === 0) return undefined
+  const initSlices = phasesList.flatMap((p) => (p.init === undefined ? [] : [p.init]))
+  const taskSlices = phasesList.map((p) => p.task)
+  const runsWithLostInit = phasesList.reduce(
+    (n, p, i) => n + (p.init === undefined && (initRanFlags[i] ?? false) ? 1 : 0),
+    0,
+  )
+  const costProrated = phasesList.some((p) => p.init?.costProrated === true || p.task.costProrated)
+  const { median: task, stats: taskStats } = phaseSliceDist(taskSlices)
+  const setupValues = setupWallMsList.filter((v): v is number => v !== undefined)
+
+  return {
+    runsWithInit: initSlices.length,
+    runsWithLostInit,
+    task,
+    taskStats,
+    ...(costProrated ? { costProrated: true } : {}),
+    ...(initSlices.length === 0
+      ? {}
+      : (() => {
+          const { median: init, stats: initStats } = phaseSliceDist(initSlices)
+          return { init, initStats }
+        })()),
+    ...(setupValues.length === 0
+      ? {}
+      : { setup: { wallClockMs: String(round(median(setupValues))) }, setupStats: dist(setupValues) }),
+  }
+}
+
 export interface SideAggregationInput {
   readonly side: Side
   readonly extracted: readonly ExtractedMetrics[]
@@ -348,10 +434,25 @@ export interface SideAggregationInput {
    * `baseline-contamination.ts`.
    */
   readonly configDriftSignal?: UnindexedSignal
+  /** Parallel to `extracted` — true when `RunSideResultExt.initRan === true` for that run (spec §5.4). */
+  readonly initRanFlags: readonly boolean[]
+  /**
+   * Every attempted run's `RunSideResult.setupWallMs` (successful AND
+   * failed — the pack-exercise segment runs before the agent session, so a
+   * later agent crash doesn't invalidate its own wall-clock reading);
+   * `undefined` entries are runs with no setup segment.
+   */
+  readonly setupWallMsList: readonly (number | undefined)[]
 }
 
 export const buildSideAggregates = (input: SideAggregationInput): SideAggregates => {
-  const packUse = buildPackUse(input.extras, input.packName, input.canDetect, input.visibilityConfirmed)
+  const packUse = buildPackUse(
+    input.extras,
+    input.runIndexes,
+    input.packName,
+    input.canDetect,
+    input.visibilityConfirmed,
+  )
   if (input.extracted.length === 0) {
     return {
       side: input.side,
@@ -362,11 +463,16 @@ export const buildSideAggregates = (input: SideAggregationInput): SideAggregates
       rawRunIds: [...input.rawRunIds],
       ...(packUse === undefined ? {} : { packUse }),
       ...(input.verifyStats === undefined ? {} : { verifyStats: input.verifyStats }),
-      // riskyCommands / opencodeVersions omitted — no successful run was ever inspected.
+      // riskyCommands / opencodeVersions / phaseSplit omitted — no successful run was ever inspected.
     }
   }
   const { median: primary, stats } = aggregatePrimary(input.extracted.map((e) => e.primary))
   const secondary = aggregateSecondary(input.extracted.map((e) => e.secondary), input.extras, input.eventsProfiles)
+  const phaseSplit = buildPhaseSplit(
+    input.extracted.map((e) => e.phases),
+    input.initRanFlags,
+    input.setupWallMsList,
+  )
   return {
     side: input.side,
     primary,
@@ -383,6 +489,7 @@ export const buildSideAggregates = (input: SideAggregationInput): SideAggregates
     ...(input.side === 'old'
       ? { contaminationSignals: [...buildContaminationSignals(input.extras, input.runIndexes, input.configDriftSignal)] }
       : {}),
+    ...(phaseSplit === undefined ? {} : { phaseSplit }),
   }
 }
 
@@ -427,6 +534,35 @@ export const computeMetricDelta = (
 
 const sideHasSamples = (agg: SideAggregates): boolean =>
   agg.stats.totalTokens.samples.length > 0
+
+/**
+ * Five `computeMetricDelta` calls over a phase slice pair — same
+ * lower-is-better direction as the matching `PrimaryDeltas` entries (spec
+ * §5.5); significance is judged against the OLD side's own distribution for
+ * that phase, same convention `computeDelta` uses for the whole-run deltas.
+ */
+const computePhaseDeltas = (oldSlice: PhaseSlice, newSlice: PhaseSlice, oldStats: PhaseSliceStats): PhaseDeltas => ({
+  totalTokens: computeMetricDelta(
+    toNum(oldSlice.totalTokens),
+    toNum(newSlice.totalTokens),
+    oldStats.totalTokens.iqr,
+    'lower-is-better',
+  ),
+  wallClockMs: computeMetricDelta(
+    toNum(oldSlice.wallClockMs),
+    toNum(newSlice.wallClockMs),
+    oldStats.wallClockMs.iqr,
+    'lower-is-better',
+  ),
+  costUsd: computeMetricDelta(oldSlice.costUsd, newSlice.costUsd, oldStats.costUsd.iqr, 'lower-is-better'),
+  stepCount: computeMetricDelta(oldSlice.stepCount, newSlice.stepCount, oldStats.stepCount.iqr, 'lower-is-better'),
+  toolCallCount: computeMetricDelta(
+    oldSlice.toolCallCount,
+    newSlice.toolCallCount,
+    oldStats.toolCallCount.iqr,
+    'lower-is-better',
+  ),
+})
 
 export const computeDelta = (oldAgg: SideAggregates, newAgg: SideAggregates): MetricsDiff => {
   const bothFailed = !sideHasSamples(oldAgg) && !sideHasSamples(newAgg)
@@ -496,7 +632,32 @@ export const computeDelta = (oldAgg: SideAggregates, newAgg: SideAggregates): Me
     ),
   }
 
-  return { old: oldAgg, new: newAgg, deltas, bothFailed }
+  // taskDeltas: present iff both sides carry a phaseSplit (spec §5.5) — the
+  // like-for-like basis whenever init runs on one side or both; initDeltas
+  // additionally requires runsWithInit > 0 on BOTH sides (--init-side both),
+  // never rendered when init is one-sided (that is a cost figure, not a delta).
+  const taskDeltas =
+    oldAgg.phaseSplit !== undefined && newAgg.phaseSplit !== undefined
+      ? computePhaseDeltas(oldAgg.phaseSplit.task, newAgg.phaseSplit.task, oldAgg.phaseSplit.taskStats)
+      : undefined
+
+  const bothHaveInit = (oldAgg.phaseSplit?.runsWithInit ?? 0) > 0 && (newAgg.phaseSplit?.runsWithInit ?? 0) > 0
+  const oldInit = oldAgg.phaseSplit?.init
+  const newInit = newAgg.phaseSplit?.init
+  const oldInitStats = oldAgg.phaseSplit?.initStats
+  const initDeltas =
+    bothHaveInit && oldInit !== undefined && newInit !== undefined && oldInitStats !== undefined
+      ? computePhaseDeltas(oldInit, newInit, oldInitStats)
+      : undefined
+
+  return {
+    old: oldAgg,
+    new: newAgg,
+    deltas,
+    bothFailed,
+    ...(taskDeltas === undefined ? {} : { taskDeltas }),
+    ...(initDeltas === undefined ? {} : { initDeltas }),
+  }
 }
 
 export { percentile }

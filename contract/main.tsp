@@ -108,6 +108,11 @@ enum ErrorCode {
   EAuthMissing: "E_AUTH_MISSING";
   EModelUnavailable: "E_MODEL_UNAVAILABLE";
   ERateLimitExhausted: "E_RATE_LIMIT_EXHAUSTED";
+  EPackSetupFailed: "E_PACK_SETUP_FAILED";
+  EPackSetupTimeout: "E_PACK_SETUP_TIMEOUT";
+  EPackCheckFailed: "E_PACK_CHECK_FAILED";
+  EPackExerciseFailed: "E_PACK_EXERCISE_FAILED";
+  EPackExerciseDirty: "E_PACK_EXERCISE_DIRTY";
 }
 
 @error
@@ -155,6 +160,16 @@ model RunInput {
   workspacePath: string;
   logLevel: LogLevel;
   pricingPath?: string;
+  /** Shell command that installs the pack's runtime into $HOME. Runs once for the whole experiment. */
+  packSetup?: string;
+  /** Shell command that exits 0 iff the pack's runtime is functional. Runs in every new HOME (must pass) and every old HOME (must fail unless allowBaselineTool). */
+  packCheck?: string;
+  /** Shell command that runs the pack's own pipeline, once per new-side run, before the agent session starts. */
+  packExercise?: string;
+  /** Override for gate 6: do not hard-fail when packCheck already passes on the old (baseline) side. Absent = false (reports/run-input.json written before this field existed). */
+  allowBaselineTool?: boolean;
+  /** Text appended to the task prompt for BOTH sides, identically — never one-sided, that would make the comparison meaningless. Meant to tell the agent about tool output that may already sit in the workspace (e.g. from packExercise) without biasing which side looks for it. Must be phrased conditionally ("if X is present, use it; if not, work as usual") so its absence on the baseline side costs at most a couple of tool calls. */
+  packHint?: string;
 }
 
 model AuthWhitelist {
@@ -194,6 +209,14 @@ model Manifest {
   isolation: IsolationMode;
   opencodeVersion: string;
   flagDefaults: Record<unknown>;
+  /** Provenance copy of RunInput.packSetup. */
+  packSetup?: string;
+  /** Provenance copy of RunInput.packCheck. */
+  packCheck?: string;
+  /** Provenance copy of RunInput.packExercise. */
+  packExercise?: string;
+  /** Provenance copy of RunInput.packHint — sent identically to both sides; see RunInput.packHint. */
+  packHint?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +434,71 @@ model SecondaryMetrics {
   cacheWriteTokens?: int64;
 }
 
+/** One phase's share of the splittable primary metrics (init or task). See SidePhaseSplit. */
+model PhaseSlice {
+  totalTokens: int64;
+  wallClockMs: int64;
+  costUsd: float64;
+  stepCount: int32;
+  toolCallCount: int32;
+}
+
+/** Distributions for the five splittable metrics (mirror of AggregateStats). */
+model PhaseSliceStats {
+  totalTokens: MetricDistribution;
+  wallClockMs: MetricDistribution;
+  costUsd: MetricDistribution;
+  stepCount: MetricDistribution;
+  toolCallCount: MetricDistribution;
+}
+
+/**
+ * Deterministic pack tooling the harness runs before the agent phases: no
+ * model call, so no tokens/steps/cost — wall-clock is the ONLY metric that
+ * exists for it. A separate model (not a PhaseSlice) so the absence of agent
+ * metrics is structural, not a fabricated zero. Aggregated from
+ * RunSideResult.setupWallMs (written by the pack-setup pipeline — see its
+ * doc there for exactly what that per-run figure covers).
+ */
+model SetupSegment {
+  wallClockMs: int64;
+}
+
+/**
+ * Per-side split of the primary metrics between the `--init` invocation and
+ * the `--prompt` (task) invocation, derived from the export by cutting the
+ * message list at the second user-role message. Absent on reports written
+ * before the split existed. `task` covers every successful run (for a run
+ * with no init the whole run IS the task); `init` covers only runs whose
+ * export contains an init turn.
+ */
+model SidePhaseSplit {
+  /** Successful runs whose export contains an init turn (2 user messages). */
+  runsWithInit: int32;
+  /** Successful runs where phase 06 ran an init but the export lost it (session continuation failed) — init cost unmeasured, not zero. */
+  runsWithLostInit: int32;
+  /** Median over runs-with-init. Absent when runsWithInit == 0. */
+  "init"?: PhaseSlice;
+  initStats?: PhaseSliceStats;
+  /** Median over ALL successful runs (task == whole run when no init). */
+  task: PhaseSlice;
+  taskStats: PhaseSliceStats;
+  /** True when at least one contributing run's phase cost was prorated from the session cost (per-message costs absent) — render as derived, never as measured. */
+  costProrated?: boolean;
+  /** Harness-run pack setup before the agent phases (see RunSideResult.setupWallMs): wall-clock only — median over runs that had one. Absent when no setup segment ran on this side. */
+  setup?: SetupSegment;
+  setupStats?: MetricDistribution;
+}
+
+/** Deltas over the five splittable metrics only (rank/parallelism are whole-run). */
+model PhaseDeltas {
+  totalTokens: MetricDelta;
+  wallClockMs: MetricDelta;
+  costUsd: MetricDelta;
+  stepCount: MetricDelta;
+  toolCallCount: MetricDelta;
+}
+
 model ToolStat {
   count: int32;
   errorRate: float64;
@@ -442,6 +530,45 @@ model PackUse {
    * `false`.
    */
   visibilityConfirmed?: boolean;
+  /** Run indexes with a successful extraction but zero pack calls — the pack was available and inspected, the agent just never called it. Observational, not a success criterion. */
+  runsWithoutCall?: int32[];
+}
+
+enum PackSetupMode {
+  /** setup + check + exercise all declared and all succeeded — the intended default. */
+  Exercised: "exercised";
+  /** No packExercise declared (the pack has nothing runnable, e.g. a pure instruction skill). Not a failure. */
+  InstalledOnly: "installed-only";
+  /** No setup/check/exercise declared at all — legacy behavior, weakest evidence class. */
+  DeliveredOnly: "delivered-only";
+}
+
+/** Result of one harness-run pack command (setup / check / exercise) — no model, no opencode session. */
+model PackCmdResult {
+  side: Side;
+  /** 0 for the one-shot setup. */
+  runIndex: int32;
+  exitCode: int32;
+  durationMs: int64;
+  /** stdout+stderr tail, truncated (untrusted content). */
+  outputTail?: string;
+  /** exercise only: SHA-256 over the artifact tree it created. */
+  artifactHash?: string;
+}
+
+/** Harness-side pack preparation record for the whole experiment — see RunInput.packSetup/packCheck/packExercise. */
+model PackSetupReport {
+  mode: PackSetupMode;
+  setupDeclared: boolean;
+  checkDeclared: boolean;
+  exerciseDeclared: boolean;
+  /** Dependency markers (pyproject.toml, package.json with bin, pip/uv/npm install text, ...) found in the pack while nothing was declared. */
+  undeclaredDepWarning?: string;
+  setup?: PackCmdResult;
+  /** One per new HOME (must pass) + one per old HOME (must fail unless allowBaselineTool). */
+  checks: PackCmdResult[];
+  /** One per new-side run, only when exerciseDeclared. */
+  exercises: PackCmdResult[];
 }
 
 /** One dangerous shell command found in a run's exports. */
@@ -502,6 +629,8 @@ model SideAggregates {
   verifyStats?: VerifyStats;
   /** Only ever populated for `side: "old"` — see `ContaminationSignal`. */
   contaminationSignals?: ContaminationSignal[];
+  /** Split of the primary metrics between the --init and --prompt invocations — see SidePhaseSplit. */
+  phaseSplit?: SidePhaseSplit;
 }
 
 model AggregateStats {
@@ -533,6 +662,10 @@ model MetricsDiff {
   new: SideAggregates;
   deltas: PrimaryDeltas;
   bothFailed: boolean;
+  /** Task-phase-only deltas (new task vs old task) — the like-for-like basis when init runs on one side. Present iff both sides carry phaseSplit. */
+  taskDeltas?: PhaseDeltas;
+  /** Init-vs-init deltas. Present iff BOTH sides have runsWithInit > 0 (i.e. --init-side both). */
+  initDeltas?: PhaseDeltas;
 }
 
 model PrimaryDeltas {
@@ -650,6 +783,7 @@ model Report {
   diff: { old: DiffResult; new: DiffResult };
   judge?: JudgeResult;
   summary: ReportSummary;
+  packSetup?: PackSetupReport;
 }
 
 model ReportSummary {
@@ -658,6 +792,8 @@ model ReportSummary {
   regressions: MetricDelta[];
   neutral: MetricDelta[];
   failures: FailedRun[];
+  /** Which deltas fed headlineResult and the buckets: "task" (init/setup excluded) or "total". Absent = "total" (older reports). */
+  basis?: "task" | "total";
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +830,8 @@ model EnvVarSet {
   OPENCODE_DISABLE_EXTERNAL_SKILLS: boolean;
   OPENCODE_PURE: boolean;
   OPENCODE_CONFIG_CONTENT?: string;
+  /** Set only when RunInput.packSetup is declared: <homeDir>/.local/bin prepended, identical shape on both sides. */
+  PATH?: string;
 }
 
 model RunSideResult {
@@ -708,4 +846,19 @@ model RunSideResult {
   verifyExitCode?: int32;
   watchdogTriggered: boolean;
   errorCode?: ErrorCode;
+  /**
+   * Wall-clock consumed by harness pack-exercise work for THIS run, before
+   * the agent session started — no model, no tokens, no opencode session.
+   * Absent (not zero) when no exercise ran for this run: the old side never
+   * exercises, and a zero here would read as "measured none" rather than
+   * "not applicable". One-time setup/check wall-clock is experiment-level,
+   * not per-run — see PackSetupReport.setup / PackSetupReport.checks.
+   */
+  setupWallMs?: int64;
+  /** True when this run actually executed an --init invocation. */
+  initRan?: boolean;
+  /** Harness wall-clock around the init invocation (ms). */
+  initWallMs?: int64;
+  /** Harness wall-clock around the prompt invocation (ms). */
+  promptWallMs?: int64;
 }

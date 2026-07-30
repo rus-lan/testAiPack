@@ -138,6 +138,27 @@ describe('cliParse — validation errors', () => {
     expect(err.code).toBe('E_CONFIG_INVALID')
   })
 
+  it('--pack-check with --no-preflight → E_CONFIG_INVALID (the check would be declared but never executed)', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({
+        argv: ['run', REPO, '--prompt', 'x', '--pack', 'npm:mytool', '--pack-check', 'mytool --version', '--no-preflight'],
+        cwd,
+      }),
+    )
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('--pack-check without --no-preflight (preflight defaults on) → not refused by the preflight check', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--pack', 'npm:mytool', '--pack-check', 'mytool --version'], cwd }),
+    )
+    expect(result.runInput.packCheck).toBe('mytool --version')
+    expect(result.runInput.preflightEnabled).toBe(true)
+  })
+
   it('--runs 0 → E_CONFIG_INVALID', async () => {
     const cwd = makeTempDir()
     const err = await runFlip(cliParse({ argv: ['run', REPO, '--prompt', 'x', '--runs', '0'], cwd }))
@@ -315,6 +336,148 @@ describe('cliParse — pack', () => {
     const contextJson = JSON.stringify(err.context)
     expect(contextJson).not.toContain('sk-fake-secret')
     expect(contextJson).not.toContain('"env"')
+  })
+})
+
+describe('cliParse — pack-setup/pack-check/pack-exercise', () => {
+  it('all three flags parsed onto RunInput when --pack is set', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({
+        argv: [
+          'run', REPO, '--prompt', 'x', '--pack', 'npm:x',
+          '--pack-setup', 'npm install -g --prefix $HOME/.local x',
+          '--pack-check', 'x --version',
+          '--pack-exercise', 'x run',
+        ],
+        cwd,
+      }),
+    )
+    expect(result.runInput.packSetup).toBe('npm install -g --prefix $HOME/.local x')
+    expect(result.runInput.packCheck).toBe('x --version')
+    expect(result.runInput.packExercise).toBe('x run')
+  })
+
+  it('defaults: allowBaselineTool is false, the three pack-setup fields are absent', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.runInput.allowBaselineTool).toBe(false)
+    expect(result.runInput.packSetup).toBeUndefined()
+    expect(result.runInput.packCheck).toBeUndefined()
+    expect(result.runInput.packExercise).toBeUndefined()
+  })
+
+  it('--allow-baseline-tool sets the override; --no-allow-baseline-tool clears it', async () => {
+    const cwd = makeTempDir()
+    const on = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--pack', 'npm:x', '--allow-baseline-tool'], cwd }),
+    )
+    expect(on.runInput.allowBaselineTool).toBe(true)
+    const off = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--pack', 'npm:x', '--allow-baseline-tool', '--no-allow-baseline-tool'], cwd }),
+    )
+    expect(off.runInput.allowBaselineTool).toBe(false)
+  })
+
+  it('--pack-setup without --pack (or packRef in config) → E_CONFIG_INVALID', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--pack-setup', 'npm install -g x'], cwd }),
+    )
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('--pack-check without --pack → E_CONFIG_INVALID', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--pack-check', 'x --version'], cwd }),
+    )
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('--pack-exercise without --pack → E_CONFIG_INVALID', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--pack-exercise', 'x run'], cwd }),
+    )
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('--pack-exercise without --pack-check is a WARNING, not an error — cliParse still succeeds', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({
+        argv: ['run', REPO, '--prompt', 'x', '--pack', 'npm:x', '--pack-setup', 's', '--pack-exercise', 'e'],
+        cwd,
+      }),
+    )
+    expect(result.runInput.packExercise).toBe('e')
+    expect(result.runInput.packCheck).toBeUndefined()
+  })
+
+  it('config-file packSetup/packCheck/packExercise/allowBaselineTool are honored', async () => {
+    const cwd = makeTempDir()
+    await ensureDirP(path.join(cwd, '.testaipack'))
+    await writeFileP(
+      path.join(cwd, '.testaipack', 'config.json'),
+      JSON.stringify({
+        repoUrl: REPO,
+        prompt: 'x',
+        packRef: 'npm:x',
+        packSetup: 'setup-cmd',
+        packCheck: 'check-cmd',
+        packExercise: 'exercise-cmd',
+        allowBaselineTool: true,
+      }),
+    )
+    const result = await runP(cliParse({ argv: ['run'], cwd }))
+    expect(result.runInput.packSetup).toBe('setup-cmd')
+    expect(result.runInput.packCheck).toBe('check-cmd')
+    expect(result.runInput.packExercise).toBe('exercise-cmd')
+    expect(result.runInput.allowBaselineTool).toBe(true)
+  })
+})
+
+describe('cliParse — pack-hint', () => {
+  const HINT = 'If the project contains a prepared code index in .graphify/, use it to navigate the code. If it is absent, work as usual.'
+
+  it('--pack-hint sets RunInput.packHint', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--pack-hint', HINT], cwd }),
+    )
+    expect(result.runInput.packHint).toBe(HINT)
+  })
+
+  it('absent by default', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.runInput.packHint).toBeUndefined()
+  })
+
+  it('does not require --pack — the hint text itself is responsible for being a no-op when there is nothing to find', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--pack-hint', HINT], cwd }),
+    )
+    expect(result.runInput.packHint).toBe(HINT)
+    expect(result.runInput.packRef).toBeUndefined()
+  })
+
+  it('config-file packHint is honored, CLI overrides it', async () => {
+    const cwd = makeTempDir()
+    await ensureDirP(path.join(cwd, '.testaipack'))
+    await writeFileP(
+      path.join(cwd, '.testaipack', 'config.json'),
+      JSON.stringify({ repoUrl: REPO, prompt: 'x', packHint: 'config hint' }),
+    )
+    const fromConfig = await runP(cliParse({ argv: ['run'], cwd }))
+    expect(fromConfig.runInput.packHint).toBe('config hint')
+
+    const fromCli = await runP(
+      cliParse({ argv: ['run', '--pack-hint', 'cli hint'], cwd }),
+    )
+    expect(fromCli.runInput.packHint).toBe('cli hint')
   })
 })
 

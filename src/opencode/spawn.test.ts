@@ -115,6 +115,50 @@ describe('spawnProcess (real subprocess)', () => {
     expect(dead).toBe(true)
   }, 20_000)
 
+  it('writes `input` to the child\'s stdin and closes it — the child reads it back byte-exact', async () => {
+    const out = await run(
+      spawnProcess({
+        command: process.execPath,
+        args: ['-e', 'process.stdin.on("data", (d) => process.stdout.write(d))'],
+        cwd: process.cwd(),
+        env: { ...process.env } as Record<string, string>,
+        input: 'fix the "2 failing" tests\nwith a second line',
+      }),
+    )
+    expect(out.stdout).toBe('fix the "2 failing" tests\nwith a second line')
+    expect(out.exitCode).toBe(0)
+  })
+
+  it('without `input`, stdin is ignored — a child that reads stdin sees EOF immediately, not a hang', async () => {
+    const out = await run(
+      spawnProcess({
+        command: process.execPath,
+        args: [
+          '-e',
+          "process.stdin.on('end', () => { process.stdout.write('eof'); process.exit(0) }); process.stdin.resume()",
+        ],
+        cwd: process.cwd(),
+        env: { ...process.env } as Record<string, string>,
+        timeoutMs: 5000,
+      }),
+    )
+    expect(out.stdout).toBe('eof')
+    expect(out.timedOut).toBe(false)
+  })
+
+  it('a child that exits before reading stdin does not crash the caller (EPIPE swallowed)', async () => {
+    const out = await run(
+      spawnProcess({
+        command: process.execPath,
+        args: ['-e', 'process.exit(0)'],
+        cwd: process.cwd(),
+        env: { ...process.env } as Record<string, string>,
+        input: 'x'.repeat(1024 * 1024),
+      }),
+    )
+    expect(out.exitCode).toBe(0)
+  })
+
   it('clears the internal timeout timer (configured for timeoutMs) once the process finishes normally', async () => {
     // Node resets a Timeout's `_idleTimeout` to -1 as part of clearing it, so
     // the delay it was created with must be captured before delegating to the

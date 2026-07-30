@@ -12,32 +12,23 @@ import type {
   MetricsDiff,
   ReportSummary,
 } from '@generated/types'
-import { PRIMARY_METRICS } from '../report/format.js'
-
-type DeltaKey = keyof MetricsDiff['deltas']
-
-const DELTA_KEYS: readonly DeltaKey[] = PRIMARY_METRICS.map((m) => m.key)
+import { deltaEntriesFor } from '../report/format.js'
+import type { DeltaEntry } from '../report/format.js'
 
 const isImprovement = (d: MetricDelta): boolean => d.better === 'better'
 const isRegression = (d: MetricDelta): boolean => d.better === 'worse'
 const isNeutral = (d: MetricDelta): boolean =>
   d.better === 'neutral' || d.better === 'context-dependent'
 
-const labelForDelta = (key: DeltaKey): string => {
-  const meta = PRIMARY_METRICS.find((m) => m.key === key)
-  return meta === undefined ? key : meta.label
-}
-
 /**
  * One-line headline synthesised from the significant deltas. Mentions the
  * strongest significant improvement and regression when present; otherwise
  * reports the absence of significant change.
  */
-const buildHeadline = (diff: MetricsDiff): string => {
+const buildHeadline = (diff: MetricsDiff, entries: readonly DeltaEntry[]): string => {
   if (diff.bothFailed) {
     return 'Both sides failed — comparison unavailable.'
   }
-  const entries = DELTA_KEYS.map((k) => ({ key: k, d: diff.deltas[k] }))
   const sig = entries.filter((e) => e.d.significant)
   if (sig.length === 0) {
     const improvements = entries.filter((e) => isImprovement(e.d)).length
@@ -48,17 +39,18 @@ const buildHeadline = (diff: MetricsDiff): string => {
   const sigRegressions = sig.filter((e) => isRegression(e.d))
   const parts: readonly string[] = [
     ...(sigImprovements.length > 0
-      ? [`${String(sigImprovements.length)} significant improvement(s): ${sigImprovements.map((e) => labelForDelta(e.key)).join(', ')}`]
+      ? [`${String(sigImprovements.length)} significant improvement(s): ${sigImprovements.map((e) => e.label).join(', ')}`]
       : []),
     ...(sigRegressions.length > 0
-      ? [`${String(sigRegressions.length)} significant regression(s): ${sigRegressions.map((e) => labelForDelta(e.key)).join(', ')}`]
+      ? [`${String(sigRegressions.length)} significant regression(s): ${sigRegressions.map((e) => e.label).join(', ')}`]
       : []),
   ]
   return parts.join('; ') + '.'
 }
 
 export const buildReportSummary = (diff: MetricsDiff): ReportSummary => {
-  const deltas = DELTA_KEYS.map((k) => diff.deltas[k])
+  const { entries, basis } = deltaEntriesFor(diff)
+  const deltas = entries.map((e) => e.d)
   const improvements = deltas.filter(isImprovement)
   const regressions = deltas.filter(isRegression)
   const neutral = deltas.filter(isNeutral)
@@ -67,10 +59,11 @@ export const buildReportSummary = (diff: MetricsDiff): ReportSummary => {
     ...diff.new.failedRuns,
   ]
   return {
-    headlineResult: buildHeadline(diff),
+    headlineResult: buildHeadline(diff, entries),
     improvements: [...improvements],
     regressions: [...regressions],
     neutral: [...neutral],
     failures: [...failures],
+    basis,
   }
 }

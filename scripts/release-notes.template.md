@@ -29,6 +29,19 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.6.2 (deterministic pack setup, pack-hint, setup/init/task phase split, judge and rebuild fixes)
+
+- **Deterministic pack setup**: `--pack-setup <cmd>` installs the pack's runtime once and copies the prepared HOME to every new-side run; `--pack-check <cmd>` becomes a verified precondition — gate 6 runs it in every new HOME (must pass) and every old/baseline HOME (must fail, unless `--allow-baseline-tool`); `--pack-exercise <cmd>` runs the pack's own pipeline before each new-side run, so its output exists by construction, not by the model's luck. The report's mode banner (`delivered-only`/`installed-only`/`exercised`) now reflects what actually ran and passed, not just which flags were given.
+- **`--pack-hint <text>`** — appended identically to both sides' task prompt (the prompt-building function takes no "side" parameter, so the two sides cannot diverge). Meant for telling the agent about output `--pack-exercise` already left in the workspace; must be phrased conditionally so the side with nothing to find spends at most a couple of tool calls confirming that. Recorded in `manifest.json`/report.
+- Metrics now split into `init`, `task`, and `setup` (wall-clock only — deterministic pack tooling makes no model calls) phases; the report headline and Improvements/Regressions/Neutral buckets are computed from the task phase alone when available, so init/setup noise no longer drowns the task signal. Free upgrade for existing workspaces via `testaipack report --rebuild`.
+- **Pack-exercise artifacts no longer leak into the measured diff**: the exclude pattern is now anchored (an unanchored root-level artifact used to also hide an agent file of the same name in a subdirectory) and non-ASCII paths (e.g. Cyrillic) are read unquoted from `git status`; a failed/timed-out exercise now excludes its partial output too, instead of leaving it untracked in the diff.
+- **The judge's response text was read from the wrong event nesting level** — a real, well-formed verdict was silently discarded as "Failed to parse judge response". Fixed, extraction made tolerant of prose/trailing text and mismatched key casing, and the raw response is now shown in the report, not only in `judge.log`.
+- **opencode crashed (exit 1) on any prompt containing a bare number** ("fix the 2 failing tests") — its own argv quote-wrap check broke on a standalone numeric-looking element. The prompt is no longer sent via argv at all; it goes to the child process's stdin instead.
+- `testaipack report --rebuild` could write outside the `--workspace` it was pointed at when `run-input.json` recorded an absolute `outputPath` from the original run's machine — a real incident overwrote a real workspace during development. Fixed, with an independent hard guard against ever writing outside the workspace root.
+- A newly required contract field (`allowBaselineTool`) made every pre-existing `run-input.json` fail schema validation, silently downgrading `--rebuild` from exact to best-effort-recovered mode on old workspaces. Optional again, with a documented default.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.6.1...v0.6.2
+
 ## v0.6.1 (docker skill/plugin install fix, baseline contamination, judge fixes)
 
 - **The pack was never actually usable under `--isolation docker`**: skills were installed as a symlink into a cache directory not bind-mounted into the container, so the skill dangled and opencode's skill loader found nothing. Local plugins had the same bug, with a green preflight gate on top — a host-absolute path that the gate resolved on the host but the container never saw. Both now install container-valid; the pack-visibility gate now checks inside the container under docker, and the baseline-leak gate fails loudly on a docker error instead of reading it as "no leak."

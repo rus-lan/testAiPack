@@ -14,6 +14,8 @@ export interface SpawnInput {
   readonly env: Record<string, string>
   readonly timeoutMs?: number
   readonly onStdoutLine?: (line: string) => void
+  /** Written to the child's stdin, then the stream is closed. Omitted ⇒ stdin is `'ignore'`, as before. */
+  readonly input?: string
 }
 
 export interface SpawnOutput {
@@ -75,12 +77,33 @@ export const spawnProcess = (input: SpawnInput): Effect.Effect<SpawnOutput> =>
       }
     }
 
-    const child = nodeSpawn(input.command, [...input.args], {
-      cwd: input.cwd,
-      env: input.env,
-      signal: controller.signal,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
+    // Two literal stdio tuples, not one built from a ternary: Node's spawn
+    // overloads only narrow stdout/stderr to non-null when stdio is a
+    // literal tuple, and a ternary-built array widens to a plain
+    // string[] that falls back to the nullable-everything overload.
+    const child =
+      input.input === undefined
+        ? nodeSpawn(input.command, [...input.args], {
+            cwd: input.cwd,
+            env: input.env,
+            signal: controller.signal,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          })
+        : nodeSpawn(input.command, [...input.args], {
+            cwd: input.cwd,
+            env: input.env,
+            signal: controller.signal,
+            stdio: ['pipe', 'pipe', 'pipe'],
+          })
+
+    if (input.input !== undefined && child.stdin !== null) {
+      // A child that exits before reading (e.g. an early crash) turns the
+      // write into EPIPE — a normal outcome here, not a spawn failure; the
+      // real exit code/stderr already carry that story via the 'exit'/'error'
+      // handlers below.
+      child.stdin.on('error', () => undefined)
+      child.stdin.end(input.input, 'utf8')
+    }
 
     const abortThenEscalate = (): void => {
       controller.abort()

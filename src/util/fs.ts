@@ -46,9 +46,22 @@ export const removeDir = (path: string): Effect.Effect<void, FsError> =>
     catch: wrap('removeDir', path),
   })
 
+/**
+ * `verbatimSymlinks: true` is load-bearing, not cosmetic: `fs.cp`'s default
+ * (`false`) resolves every symlink it copies against its position in `src`
+ * and writes the resolved path as the new link target — a RELATIVE symlink
+ * inside a copied tree (e.g. npm's `bin/<name> -> ../lib/node_modules/...`)
+ * comes out the other end as an ABSOLUTE path still pointing back at `src`,
+ * not at the copy. Confirmed empirically (`fs.cpSync` on a relative symlink
+ * without the flag). That silently breaks any caller copying a self-contained
+ * directory tree to a new location and expecting internal relative symlinks
+ * to keep resolving inside the copy — verbatim preserves the exact link text
+ * instead, which is correct for every current caller (repo clones, pack
+ * files, HOME trees, `.git` duplication).
+ */
 export const copyDir = (src: string, dst: string): Effect.Effect<void, FsError> =>
   Effect.tryPromise({
-    try: () => fsCp(src, dst, { recursive: true }),
+    try: () => fsCp(src, dst, { recursive: true, verbatimSymlinks: true }),
     catch: wrap('copyDir', src),
   })
 

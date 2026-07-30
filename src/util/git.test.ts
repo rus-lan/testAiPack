@@ -18,6 +18,7 @@ import type { ChildProcess, ExecException, ExecFileOptions } from 'node:child_pr
 import { execFile } from 'node:child_process'
 import {
   GitError,
+  appendInfoExclude,
   clone,
   addAll,
   diffCached,
@@ -27,6 +28,7 @@ import {
   init,
   lsFilesStage,
   revParseHead,
+  statusPorcelain,
 } from './git.js'
 
 const execFileMock = vi.mocked(execFile)
@@ -202,5 +204,72 @@ describe('git utils — two-path (--git-dir/--work-tree) form', () => {
     const bogusGitDir = path.join(makeTempDir(), 'nope')
     const err = await runFlip(lsFilesStage(repo, bogusGitDir))
     expect(err).toBeInstanceOf(GitError)
+  })
+})
+
+describe('git utils — statusPorcelain / appendInfoExclude (pack-exercise exclude hygiene)', () => {
+  it('anchors the written pattern, so a root-level artifact does not also hide an agent file of the same name in a subdirectory', async () => {
+    const repo = await buildSourceRepo()
+    const { writeFile, ensureDir } = await import('./fs.js')
+    // Simulate `--pack-exercise` running before the agent: only the
+    // root-level artifact exists untracked at exclude time.
+    await run(writeFile(path.join(repo, 'GRAPH_REPORT.md'), 'pack output\n'))
+    const statuses = await run(statusPorcelain(repo))
+    const untracked = statuses.filter((s) => s.code === '??').map((s) => s.path)
+    expect(untracked).toEqual(['GRAPH_REPORT.md'])
+    await run(appendInfoExclude(path.join(repo, '.git'), untracked))
+
+    // The agent then writes its own, unrelated file of the same basename
+    // in a subdirectory.
+    await run(ensureDir(path.join(repo, 'src')))
+    await run(writeFile(path.join(repo, 'src', 'GRAPH_REPORT.md'), 'agent work\n'))
+    await run(addAll(repo))
+    const diff = await run(diffCached(repo))
+    expect(diff).toContain('src/GRAPH_REPORT.md')
+    expect(diff).not.toContain('+pack output')
+    expect(diff).toContain('+agent work')
+
+    const staged = await run(lsFilesStage(repo))
+    expect(staged).toContain('src/GRAPH_REPORT.md')
+    expect(staged).not.toContain('\tGRAPH_REPORT.md\n')
+  })
+
+  it('escapes gitignore metacharacters so a literal filename is matched exactly, not read as a glob', async () => {
+    const repo = await buildSourceRepo()
+    const { writeFile } = await import('./fs.js')
+    await run(writeFile(path.join(repo, 'report[1].md'), 'artifact\n'))
+    // An unrelated file that a naive (unescaped) `report[1].md` glob would
+    // also match, since `[1]` is a valid one-character character class.
+    await run(writeFile(path.join(repo, 'report1.md'), 'unrelated\n'))
+
+    const statuses = await run(statusPorcelain(repo))
+    const untracked = statuses.filter((s) => s.code === '??').map((s) => s.path)
+    expect(untracked.sort()).toEqual(['report1.md', 'report[1].md'])
+    await run(appendInfoExclude(path.join(repo, '.git'), ['report[1].md']))
+
+    await run(addAll(repo))
+    const staged = await run(lsFilesStage(repo))
+    expect(staged).toContain('report1.md')
+    expect(staged).not.toContain('report[1].md')
+  })
+
+  it('keeps a non-ASCII path byte-exact end to end, so the written exclude pattern actually matches the real file', async () => {
+    const repo = await buildSourceRepo()
+    const { writeFile } = await import('./fs.js')
+    const cyrillicName = 'отчёт.md'
+    await run(writeFile(path.join(repo, cyrillicName), 'artifact\n'))
+
+    const statuses = await run(statusPorcelain(repo))
+    const untracked = statuses.filter((s) => s.code === '??').map((s) => s.path)
+    // Raw, unquoted bytes back from git — not the C-quoted
+    // `"\320\276..."` form core.quotePath produces by default.
+    expect(untracked).toEqual([cyrillicName])
+    await run(appendInfoExclude(path.join(repo, '.git'), untracked))
+
+    await run(addAll(repo))
+    const staged = await run(lsFilesStage(repo))
+    expect(staged).not.toContain(cyrillicName)
+    const afterStatus = await run(statusPorcelain(repo))
+    expect(afterStatus).toEqual([])
   })
 })

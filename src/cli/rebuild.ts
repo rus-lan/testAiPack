@@ -33,6 +33,7 @@ import type {
   JudgeResult,
   Manifest,
   OutputFormat,
+  PackSetupReport,
   ReportRenderInput,
   RunInput,
   Side,
@@ -45,11 +46,13 @@ import {
   errorCodeSchema,
   judgeResultSchema,
   opencodeExportSchema,
+  packSetupReportSchema,
 } from '@generated/schemas'
-import { exists, readFile, writeJson, writeFile } from '../util/fs.js'
+import { exists, isPathWithin, readFile, writeJson, writeFile } from '../util/fs.js'
 import { findRun } from './workspace-runs.js'
 import { buildTreePaths } from '../phases/01-workspace-setup.js'
 import type { RunSideResultExt } from '../phases/06-run-side.js'
+import { derivePackSetupMode } from '../phases/04b-pack-setup.js'
 import { recoverRunResult, recoverManifestCensus } from '../recovery/run-recovery.js'
 import type { ManifestFieldStatus, RecoveredRunResult } from '../recovery/run-recovery.js'
 import { loadPricing } from '../pricing/lookup.js'
@@ -60,6 +63,7 @@ import { timeline } from '../phases/10-timeline.js'
 import { reportRender } from '../phases/11-report-render.js'
 import { buildReportSummary } from './summary.js'
 import {
+  DEFAULT_ALLOW_BASELINE_TOOL,
   DEFAULT_AUTH,
   DEFAULT_COLLAPSE_REPEATS,
   DEFAULT_DIFF_HTML,
@@ -128,11 +132,19 @@ export interface JudgeDisclosure {
   readonly note: string
 }
 
+export type PackSetupDisclosureState = 'reused' | 'confirmed-not-used' | 'unavailable'
+
+export interface PackSetupDisclosure {
+  readonly state: PackSetupDisclosureState
+  readonly note: string
+}
+
 export interface RebuildProvenance {
   readonly runInputMode: 'exact' | 'recovered'
   readonly fields: readonly ProvenanceEntry[]
   readonly runs: readonly RunProvenance[]
   readonly judge: JudgeDisclosure
+  readonly packSetup: PackSetupDisclosure
   readonly pricingWarning: string | undefined
 }
 
@@ -203,6 +215,7 @@ const resolveProtectGit = (
 
 const FOREVER_DEFAULTED_FIELDS: readonly string[] = [
   'auth', 'pureBaseline', 'initSide', 'preflightEnabled', 'dockerNetwork', 'preflightModel', 'timeouts', 'workspacePath', 'logLevel',
+  'allowBaselineTool',
 ]
 
 /**
@@ -242,6 +255,9 @@ const buildSyntheticRunInput = (
     ...(manifest.init === undefined ? {} : { init: manifest.init }),
     initSide: DEFAULT_INIT_SIDE,
     ...(manifest.verify === undefined ? {} : { verify: manifest.verify }),
+    ...(manifest.packSetup === undefined ? {} : { packSetup: manifest.packSetup }),
+    ...(manifest.packCheck === undefined ? {} : { packCheck: manifest.packCheck }),
+    ...(manifest.packExercise === undefined ? {} : { packExercise: manifest.packExercise }),
     runs: manifest.runs,
     isolation: manifest.isolation,
     opencodeVersion: manifest.opencodeVersion,
@@ -249,6 +265,7 @@ const buildSyntheticRunInput = (
     pureBaseline: DEFAULT_PURE_BASELINE,
     protectGit: protectGit.value,
     preflightEnabled: DEFAULT_PREFLIGHT_ENABLED,
+    allowBaselineTool: DEFAULT_ALLOW_BASELINE_TOOL,
     formats: [...formats.value],
     outputPath: resultsDir,
     diffHtml: diffHtml.value,
@@ -352,6 +369,12 @@ const defaultedFieldsOf = (r: RecoveredRunResult): readonly string[] =>
  * required ones. `errorCode` is left absent — phase 07 already falls back to
  * `E_RUN_CRASH` for any rank-0 run without one (`errorCodeFor`,
  * `07-aggregate.ts`), so re-deriving it here would duplicate that policy.
+ * `initRan` mirrors the live path's convention (`06-run-side.ts`): present
+ * (`true`) only when an init invocation actually ran, absent otherwise —
+ * `recovered.initRan` is never guessed, it comes straight from the `.log`'s
+ * `[INIT_DONE]` line (metric-split spec §5.8), so this keeps
+ * `runsWithLostInit` honest under log recovery too. `initWallMs`/
+ * `promptWallMs` have no durable trace in the `.log` and stay unrecoverable.
  */
 const bridgeRecovered = (
   recovered: RecoveredRunResult,
@@ -367,6 +390,7 @@ const bridgeRecovered = (
     durationMs: recovered.durationMs ?? '0',
     watchdogTriggered: recovered.watchdogTriggered ?? false,
     ...(recovered.verifyExitCode === undefined ? {} : { verifyExitCode: recovered.verifyExitCode }),
+    ...(recovered.initRan ? { initRan: true } : {}),
   }
   return { result, defaultedFields: defaultedFieldsOf(recovered) }
 }
@@ -497,6 +521,80 @@ const resolveJudge = (
   })
 
 // ---------------------------------------------------------------------------
+// Pack setup — reuse only, never recomputed (harness shell-command evidence,
+// nothing else on disk can reconstruct it)
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads back `results/pack-setup.json` — the same `PackSetupReport`
+ * `pipeline.ts` writes once at the end of a live run — and threads it into
+ * the rebuilt report verbatim. Unlike aggregate/diff/timeline, this is never
+ * recomputed: `checks`/`exercises` are exit codes and output tails from
+ * harness-run shell commands, and nothing else on disk (raw exports, git
+ * diffs) records them.
+ *
+ * A missing file is genuinely ambiguous: either no `--pack-setup`/
+ * `--pack-check`/`--pack-exercise` was ever declared for this run (correct
+ * absence — the section should stay absent), or one WAS declared but the
+ * evidence file itself did not survive (a workspace predating this artifact,
+ * or the original run crashed before `pipeline.ts`'s write). The manifest's
+ * own `packSetup`/`packCheck`/`packExercise` provenance strings are written
+ * whenever declared regardless of `pack-setup.json`'s fate, so they settle
+ * the ambiguity: absence there means genuinely unused; presence there with
+ * `pack-setup.json` missing means "declared, evidence lost" — and that case
+ * gets a synthesized report instead of silent omission, so "the section is
+ * absent" is never mistaken for "no pack setup was used". `mode` in that
+ * synthesized report is derived conservatively (never `exercised` — that
+ * claims verification this path cannot prove) and `checks`/`exercises` stay
+ * empty, since no per-run exit code survives outside the missing file.
+ */
+const resolvePackSetup = (
+  resultsDir: string,
+  manifest: Manifest,
+): Effect.Effect<{ readonly packSetup: PackSetupReport | undefined; readonly disclosure: PackSetupDisclosure }> =>
+  Effect.gen(function* () {
+    const parsed = yield* readJsonOrUndefined(path.join(resultsDir, 'pack-setup.json'))
+    const check = parsed === undefined ? undefined : packSetupReportSchema.safeParse(parsed)
+    if (check?.success === true) {
+      return {
+        packSetup: check.data as PackSetupReport,
+        disclosure: {
+          state: 'reused' as const,
+          note: 'pack-setup.json reused verbatim; harness pack preparation was not re-run',
+        },
+      }
+    }
+
+    const setupDeclared = manifest.packSetup !== undefined
+    const checkDeclared = manifest.packCheck !== undefined
+    const exerciseDeclared = manifest.packExercise !== undefined
+    if (!setupDeclared && !checkDeclared && !exerciseDeclared) {
+      return {
+        packSetup: undefined,
+        disclosure: {
+          state: 'confirmed-not-used' as const,
+          note: 'manifest confirms no --pack-setup/--pack-check/--pack-exercise was declared on the original run',
+        },
+      }
+    }
+
+    return {
+      packSetup: {
+        mode: derivePackSetupMode(setupDeclared, false, false),
+        setupDeclared,
+        checkDeclared,
+        exerciseDeclared,
+        checks: [],
+        exercises: [],
+      },
+      disclosure: {
+        state: 'unavailable' as const,
+        note: 'manifest shows pack-setup was declared (packSetup/packCheck/packExercise), but pack-setup.json is missing or unreadable — mode below is a conservative lower bound, not verified evidence, and per-run check/exercise rows could not be recovered',
+      },
+    }
+  })
+
+// ---------------------------------------------------------------------------
 // Disclosure rendering + patching the misleading "not requested" judge line
 // ---------------------------------------------------------------------------
 
@@ -534,6 +632,7 @@ const renderProvenanceMd = (p: RebuildProvenance): string => {
     ...(runLines.length === 0 ? [] : ['>', '> Per-run recovery:', ...runLines]),
     '>',
     `> - **judge**: ${p.judge.note}`,
+    `> - **pack setup**: ${p.packSetup.note}`,
     ...pricingLine,
   ].join('\n')
   return `## Rebuild provenance\n\n${body}`
@@ -550,7 +649,7 @@ const renderProvenanceHtml = (p: RebuildProvenance): string => {
     .map((f) => `<li><code>${escapeHtml(f.field)}</code>: ${escapeHtml(SOURCE_LABEL[f.source])}${f.note === '' ? '' : ` — ${escapeHtml(f.note)}`}</li>`)
     .join('')
   const pricingItem = p.pricingWarning === undefined ? '' : `<li><strong>${escapeHtml(p.pricingWarning)}</strong></li>`
-  return `<section class="rebuild-provenance"><h2>Rebuild provenance</h2><p>${escapeHtml(header)}</p><ul>${fieldItems}<li><strong>judge</strong>: ${escapeHtml(p.judge.note)}</li>${pricingItem}</ul></section>`
+  return `<section class="rebuild-provenance"><h2>Rebuild provenance</h2><p>${escapeHtml(header)}</p><ul>${fieldItems}<li><strong>judge</strong>: ${escapeHtml(p.judge.note)}</li><li><strong>pack setup</strong>: ${escapeHtml(p.packSetup.note)}</li>${pricingItem}</ul></section>`
 }
 
 const JUDGE_NOT_REQUESTED_MD = '_Judge was not requested (--judge not set)_'
@@ -710,13 +809,42 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
     return buildSyntheticRunInput(manifest, runRoot, treePaths.results, census, flags, protectGit)
   })()
   const overridden = applyOverrides(baseResolution.runInput, flags)
-  const runInput = overridden.runInput
   const fields = [...baseResolution.fields, ...overridden.fields]
 
-  const customOutput = runInput.outputPath !== treePaths.results
-  const treePathsUsed: WorkspaceTree = customOutput
-    ? { ...treePaths, results: runInput.outputPath, diff: path.join(runInput.outputPath, 'diff') }
-    : treePaths
+  // The explicitly passed --workspace always wins over a recorded
+  // outputPath — never the other way round. `runInput.outputPath` (exact
+  // mode: read straight from the original run's run-input.json; recovered
+  // mode: a --output the original run used) can be an absolute path from
+  // wherever/whenever the ORIGINAL run happened, on a different machine or
+  // location than the workspace this --rebuild was pointed at. Honoring it
+  // let `--rebuild --workspace <copy>` silently redirect writes back onto
+  // the original — the exact scenario copying a workspace exists to avoid
+  // (see the incident this fixes). A disagreement is ignored with a clear
+  // notice, not gated behind an opt-in flag: that would leave the unsafe
+  // behavior one flag away from being the default.
+  const recordedOutputPath = overridden.runInput.outputPath
+  const outputPathIgnored = recordedOutputPath !== treePaths.results
+  const runInput: RunInput = outputPathIgnored
+    ? { ...overridden.runInput, outputPath: treePaths.results }
+    : overridden.runInput
+  if (outputPathIgnored) {
+    console.error(
+      `rebuild: run-input.json records outputPath=${recordedOutputPath}, which is outside this --workspace's results dir (${treePaths.results}) — ignoring it and writing inside the given --workspace, as always. A copied or archived workspace must never redirect rebuild output back to wherever the original run wrote.`,
+    )
+  }
+
+  const treePathsUsed: WorkspaceTree = treePaths
+
+  // Hard guard, independent of the fix above: refuse to proceed if a future
+  // path-handling change ever computes a results/diff path outside the
+  // workspace root again — a regression here must fail loudly, never write
+  // outside the tree the caller pointed --rebuild at.
+  if (!isPathWithin(treePaths.root, treePathsUsed.results) || !isPathWithin(treePaths.root, treePathsUsed.diff)) {
+    console.error(
+      `rebuild: refusing to write outside the workspace root (${treePaths.root}): resolved results=${treePathsUsed.results} diff=${treePathsUsed.diff}`,
+    )
+    return 1
+  }
 
   // Refusal: report.json already exists — never silently overwrite the one
   // artifact `list`/`compare`/`report` all read, unless --force.
@@ -775,6 +903,7 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
       diffOutcome.right.diff,
     ),
   )
+  const packSetupResolution = await Effect.runPromise(resolvePackSetup(treePathsUsed.results, manifest))
 
   const timelineOutcome = await Effect.runPromise(
     Effect.either(timeline({ runInput, manifest, workspace: treePathsUsed, sideResults }, noSubAgentTree)),
@@ -824,6 +953,7 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
       rebuiltAt: new Date().toISOString(),
       rebuiltRunInputMode: runInputMode,
       rebuiltJudgeState: judgeResolution.disclosure.state,
+      rebuiltPackSetupState: packSetupResolution.disclosure.state,
       rebuiltPricingWarning: pricingWarning !== undefined,
     },
   }
@@ -836,6 +966,7 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
     diff: diffOutcome.right.diff,
     summary,
     ...(judgeResolution.judge === undefined ? {} : { judge: judgeResolution.judge }),
+    ...(packSetupResolution.packSetup === undefined ? {} : { packSetup: packSetupResolution.packSetup }),
   }
   const renderOutcome = await Effect.runPromise(Effect.either(reportRender(reportInput)))
   if (renderOutcome._tag === 'Left') {
@@ -849,6 +980,7 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
     fields,
     runs: [...oldSide.provenance, ...newSide.provenance],
     judge: judgeResolution.disclosure,
+    packSetup: packSetupResolution.disclosure,
     pricingWarning,
   }
 

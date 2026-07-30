@@ -4,7 +4,7 @@ import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { makeTempDir } from '../../tests/setup.js'
-import { copyDir, ensureDir, moveDir, readFile, removeDir, writeFile } from '../util/fs.js'
+import { copyDir, ensureDir, moveDir, readFile, removeDir, writeFile, writeJson } from '../util/fs.js'
 import { diff } from './08-diff.js'
 import { PhaseError } from '../errors.js'
 import type { Manifest, RunInput, WorkspaceTree } from '@generated/types'
@@ -59,6 +59,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  allowBaselineTool: false,
   initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
@@ -351,6 +352,46 @@ describe('diff — recovery: missing .git', () => {
     const runInput = makeRunInput({ runs: 1 })
     const err = await runFlip(diff({ runInput, manifest: makeManifest(runInput), workspace: tree }))
     expect(err.code).toBe('E_DISK_FULL')
+  })
+})
+
+describe('diff — recovery: pack-exercise exclude re-apply after .git restore', () => {
+  it('without an exercise record, a restored .git loses the exclude and the pack artifact leaks into the patch', async () => {
+    const tree = makeWorkspace(1)
+    await buildReposFromSource(tree)
+    const oldDir = tree.appsOld[0] ?? ''
+    // The exercise's own output was excluded in the agent's `.git` at
+    // exercise time, but that `.git` is gone below and no
+    // `run-1.exercise.json` was left for phase 08 to re-apply from.
+    await runP(writeFile(path.join(oldDir, 'GRAPH_REPORT.md'), 'pack output\n'))
+    await rm(path.join(oldDir, '.git'), { recursive: true, force: true })
+
+    const runInput = makeRunInput({ runs: 1 })
+    const result = await runP(diff({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    const r = result.diff.old.runs[0]!
+    expect(r.state).toBe('git-restored')
+    expect(r.fullPatch).toContain('GRAPH_REPORT.md')
+  })
+
+  it('an exercise record re-applies the same exclude to the restored .git, so the pack artifact stays out of the patch', async () => {
+    const tree = makeWorkspace(1)
+    await buildReposFromSource(tree)
+    const oldDir = tree.appsOld[0] ?? ''
+    await runP(writeFile(path.join(oldDir, 'GRAPH_REPORT.md'), 'pack output\n'))
+    await runP(writeFile(path.join(oldDir, 'a.txt'), 'bb\n'))
+    await runP(ensureDir(path.join(tree.raw, 'old')))
+    await runP(
+      writeJson(path.join(tree.raw, 'old', 'run-1.exercise.json'), { excludedPaths: ['GRAPH_REPORT.md'] }),
+    )
+    await rm(path.join(oldDir, '.git'), { recursive: true, force: true })
+
+    const runInput = makeRunInput({ runs: 1 })
+    const result = await runP(diff({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    const r = result.diff.old.runs[0]!
+    expect(r.state).toBe('git-restored')
+    expect(r.fullPatch).not.toContain('GRAPH_REPORT.md')
+    expect(r.fullPatch).toContain('a.txt')
+    expect(r.summary.filesChanged).toBe(1)
   })
 })
 

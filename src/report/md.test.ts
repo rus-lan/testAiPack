@@ -7,8 +7,12 @@ import {
   makeDiffResult,
   makeManifest,
   makeJudge,
+  makeSidePhaseSplit,
+  makePhaseDeltas,
+  makePhaseSlice,
+  makePhaseSliceStats,
 } from '../../tests/report-fixture.js'
-import type { FailedRun, JudgeResult, Manifest, MetricDelta, PrimaryDeltas } from '@generated/types'
+import type { FailedRun, JudgeResult, Manifest, MetricDelta, PackSetupReport, PrimaryDeltas, SidePhaseSplit } from '@generated/types'
 import { redactUrlCredentials } from '../util/redact.js'
 import { safeRefDisplay } from '../pack/detector.js'
 
@@ -80,6 +84,19 @@ describe('renderMd — header', () => {
     const m = renderMd(makeReport({ manifest }))
     expect(m).toContain('**Init side:** unknown (report predates --init-side)')
   })
+
+  it('absent entirely when --pack-hint was not used', () => {
+    expect(md).not.toContain('Pack hint:')
+  })
+
+  it('shows the hint text and states plainly that it went to both sides', () => {
+    const manifest = makeManifest({
+      packHint: 'If .graphify/ contains a prepared index, use it. If not, work as usual.',
+    })
+    const m = renderMd(makeReport({ manifest }))
+    expect(m).toContain('**Pack hint:** sent identically to both sides')
+    expect(m).toContain('If .graphify/ contains a prepared index, use it. If not, work as usual.')
+  })
 })
 
 describe('renderMd — summary', () => {
@@ -149,6 +166,141 @@ describe('renderMd — primary metrics table', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// Phase split (metric-split spec §5.7)
+// ---------------------------------------------------------------------------
+
+const PHASE_TABLE_HEADER_LINE = '| Metric | Old (median) | Old [min–max] | New (median) | New [min–max] | Δ | Δ% | Significant | Verdict |'
+
+describe('renderMd — phase split: absent on pre-split reports (regression guard)', () => {
+  const md = renderMd(makeReport())
+
+  it('no Phase split section, no basis line, whole-run table still retitled', () => {
+    expect(md).not.toContain('## Phase split')
+    expect(md).not.toContain('_Basis: task phase only')
+    expect(md).toContain('## Primary metrics — total (init + task)')
+  })
+
+  it('secondary metrics carries no whole-run note when there is no split to disambiguate from', () => {
+    expect(md).not.toContain('Whole-run (init + task) — not split')
+  })
+
+  it('init side line keeps the old wording when no split exists', () => {
+    const manifest = makeManifest({ init: '/graphify .', flagDefaults: { initSide: 'new' } })
+    const m = renderMd(makeReport({ manifest }))
+    expect(m).toContain('that asymmetry is expected, not a measurement error')
+  })
+})
+
+describe('renderMd — phase split: one-sided init (cost figure, never a delta)', () => {
+  const oldNoInitSplit: SidePhaseSplit = {
+    runsWithInit: 0,
+    runsWithLostInit: 0,
+    task: makePhaseSlice({ totalTokens: '500', wallClockMs: '2000', costUsd: 0.005, stepCount: 2, toolCallCount: 1 }),
+    taskStats: makePhaseSliceStats(500),
+  }
+  const newWithInitSplit = makeSidePhaseSplit({ runsWithInit: 3 })
+  const metricsDiff = makeMetricsDiff({
+    old: makeSideAggregates('old', { phaseSplit: oldNoInitSplit }),
+    new: makeSideAggregates('new', { phaseSplit: newWithInitSplit }),
+    taskDeltas: makePhaseDeltas(),
+  })
+  const md = renderMd(makeReport({ metricsDiff }))
+
+  it('renders the Phase split section with a Task phase table and an Init cost block', () => {
+    expect(md).toContain('## Phase split (init vs task)')
+    expect(md).toContain('### Task phase (like-for-like)')
+    expect(md).toContain('### Init cost')
+  })
+
+  it('the side without init reads "no init phase"; the side with init shows median + range, no delta table', () => {
+    expect(md).toContain('- **OLD**: no init phase')
+    expect(md).toContain('- **NEW** (3 run(s) with init):')
+    expect(md).toContain('Total tokens')
+  })
+
+  it('the Init cost block never renders a delta table for one-sided init (only the whole-run table and the Task table use the 9-col header)', () => {
+    const occurrences = md.split(PHASE_TABLE_HEADER_LINE).length - 1
+    expect(occurrences).toBe(2)
+  })
+
+  it('basis line prints under the headline because taskDeltas is present', () => {
+    expect(md).toContain('_Basis: task phase only (init excluded); init cost shown in "Init cost" below._')
+  })
+
+  it('init side line points at the phase-split section instead of the plain asymmetry note', () => {
+    const manifest = makeManifest({ init: '/graphify .', flagDefaults: { initSide: 'new' } })
+    const m = renderMd(makeReport({ manifest, metricsDiff }))
+    expect(m).toContain('metrics below are split — the headline compares task vs task; init cost is reported separately')
+    expect(m).not.toContain('that asymmetry is expected, not a measurement error')
+  })
+
+  it('secondary metrics section carries the whole-run label', () => {
+    expect(md).toContain('Whole-run (init + task) — not split')
+  })
+})
+
+describe('renderMd — phase split: two-sided init renders initDeltas as a delta table', () => {
+  const metricsDiff = makeMetricsDiff({
+    old: makeSideAggregates('old', { phaseSplit: makeSidePhaseSplit({ runsWithInit: 2 }) }),
+    new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit({ runsWithInit: 2 }) }),
+    taskDeltas: makePhaseDeltas(),
+    initDeltas: makePhaseDeltas({ totalTokens: { absolute: 100, percent: 10, significant: false, better: 'worse' } }),
+  })
+  const md = renderMd(makeReport({ metricsDiff }))
+
+  it('both the Task table and the Init cost table use the 9-column delta layout (plus the whole-run table)', () => {
+    const occurrences = md.split(PHASE_TABLE_HEADER_LINE).length - 1
+    expect(occurrences).toBe(3)
+  })
+
+  it('never renders the one-sided "no init phase" / "run(s) with init" bullet lines', () => {
+    expect(md).not.toContain('no init phase')
+    expect(md).not.toContain('run(s) with init')
+  })
+})
+
+describe('renderMd — phase split: setup segment (wall-clock only, never a token/step/cost figure)', () => {
+  const metricsDiff = makeMetricsDiff({
+    old: makeSideAggregates('old', { phaseSplit: makeSidePhaseSplit({ setup: { wallClockMs: '4000' } }) }),
+    new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit() }),
+    taskDeltas: makePhaseDeltas(),
+  })
+  const md = renderMd(makeReport({ metricsDiff }))
+
+  it('renders one line with the median wall-clock, no token/step/cost figures', () => {
+    expect(md).toContain('- **OLD**: pack setup (harness, no model call) — median 4000ms')
+    expect(md).not.toContain('- **NEW**: pack setup')
+  })
+})
+
+describe('renderMd — phase split: costProrated marks the value as derived', () => {
+  const metricsDiff = makeMetricsDiff({
+    old: makeSideAggregates('old', { phaseSplit: makeSidePhaseSplit({ costProrated: true }) }),
+    new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit() }),
+    taskDeltas: makePhaseDeltas(),
+  })
+  const md = renderMd(makeReport({ metricsDiff }))
+
+  it('prefixes the prorated cost cell with ~ and adds the derived footnote', () => {
+    expect(md).toContain('_~ cost prorated from the session total by token share — derived, not measured._')
+  })
+})
+
+describe('renderMd — phase split: runsWithLostInit warns, never silently drops the run', () => {
+  const metricsDiff = makeMetricsDiff({
+    old: makeSideAggregates('old', { phaseSplit: makeSidePhaseSplit({ runsWithLostInit: 2 }) }),
+    new: makeSideAggregates('new', { phaseSplit: makeSidePhaseSplit() }),
+    taskDeltas: makePhaseDeltas(),
+  })
+  const md = renderMd(makeReport({ metricsDiff }))
+
+  it('warns with the exact run count for the affected side only', () => {
+    expect(md).toContain('> ⚠ OLD: 2 run(s) ran --init but the export lost the init session — init cost unmeasured.')
+    expect(md).not.toContain('⚠ NEW:')
+  })
+})
+
 describe('renderMd — failed runs', () => {
   it('omits Failed runs section when there are none', () => {
     const md = renderMd(makeReport())
@@ -210,6 +362,36 @@ describe('renderMd — LLM judge', () => {
     const md = renderMd(withoutJudge)
     expect(md).toContain('## LLM Judge')
     expect(md).toContain('_Judge was not requested (--judge not set)_')
+  })
+
+  it('omits the raw-response block when rawResponse is absent', () => {
+    const md = renderMd(makeReport({ judge: makeJudge() }))
+    expect(md).not.toContain('Raw model response')
+  })
+
+  it('shows the raw response in a collapsible block when present, so a parse failure is not just "Failed to parse" with nothing to look at', () => {
+    const md = renderMd(
+      makeReport({
+        judge: makeJudge({
+          verdict: 'unclear',
+          oldQuality: 0,
+          newQuality: 0,
+          explanation: 'Failed to parse judge response',
+          rawResponse: 'I really cannot decide this one.',
+        }),
+      }),
+    )
+    expect(md).toContain('<details>')
+    expect(md).toContain('<summary>Raw model response</summary>')
+    expect(md).toContain('I really cannot decide this one.')
+    expect(md).toContain('</details>')
+  })
+
+  it('fences the raw response with more backticks than any run already inside it, so the content cannot break out of its own code block', () => {
+    const raw = 'prose\n```json\n{"a":1}\n```\nmore prose'
+    const md = renderMd(makeReport({ judge: makeJudge({ rawResponse: raw }) }))
+    expect(md).toContain('````text')
+    expect(md).toContain(raw)
   })
 
   it('flags unclear verdict', () => {
@@ -563,6 +745,67 @@ describe('renderMd — pack signal (P1)', () => {
     expect(md).toContain('0 call(s), 0 error(s), 0/5 runs called the pack (visibility not confirmed)')
     expect(md).not.toContain('undefined')
   })
+
+  it('exercised mode + zero calls: no "chose not to call it" claim, no "deltas compare baseline vs baseline" claim — informational note instead of a warning', () => {
+    const metricsDiff = makeMetricsDiff({
+      new: makeSideAggregates('new', {
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 2, canDetect: true, visibilityConfirmed: true },
+      }),
+    })
+    const packSetup: PackSetupReport = {
+      mode: 'exercised',
+      setupDeclared: true,
+      checkDeclared: true,
+      exerciseDeclared: true,
+      checks: [],
+      exercises: [{ side: 'new', runIndex: 1, exitCode: 0, durationMs: '10', artifactHash: 'abc' }],
+    }
+    const md = renderMd(makeReport({ metricsDiff, packSetup }))
+    expect(md).not.toContain('chose not to call it')
+    expect(md).not.toContain('Deltas compare baseline vs baseline')
+    expect(md).not.toContain('⚠ **Pack was never invoked')
+    expect(md).toContain('Pack was never called directly on the NEW side')
+    expect(md).toContain('nothing left to trigger')
+    expect(md).toContain('Expected under exercised mode, not a defect')
+  })
+
+  it('exercised mode + at least one call: neither the warning nor the exercised-mode note appears', () => {
+    const metricsDiff = makeMetricsDiff({
+      new: makeSideAggregates('new', {
+        packUse: { calls: 1, errors: 0, runsWithCall: 1, runCount: 2, canDetect: true, visibilityConfirmed: true },
+      }),
+    })
+    const packSetup: PackSetupReport = {
+      mode: 'exercised',
+      setupDeclared: true,
+      checkDeclared: true,
+      exerciseDeclared: true,
+      checks: [],
+      exercises: [],
+    }
+    const md = renderMd(makeReport({ metricsDiff, packSetup }))
+    expect(md).not.toContain('Pack was never invoked')
+    expect(md).not.toContain('Pack was never called directly')
+  })
+
+  it('installed-only mode + zero calls: keeps the original "chose not to call it" warning — the agent genuinely had the option here', () => {
+    const metricsDiff = makeMetricsDiff({
+      new: makeSideAggregates('new', {
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: true },
+      }),
+    })
+    const packSetup: PackSetupReport = {
+      mode: 'installed-only',
+      setupDeclared: true,
+      checkDeclared: false,
+      exerciseDeclared: false,
+      checks: [],
+      exercises: [],
+    }
+    const md = renderMd(makeReport({ metricsDiff, packSetup }))
+    expect(md).toContain('chose not to call it')
+    expect(md).not.toContain('Pack was never called directly')
+  })
 })
 
 describe('renderMd — safety (P2)', () => {
@@ -851,11 +1094,21 @@ describe('renderMd — success-rate denominator counts crashed runs', () => {
   })
 })
 
-describe('renderMd — diff efficiency ratio stays stable across diff failures', () => {
-  it('scales the per-run median by the diffed-run count, not by all metric-successful runs', () => {
+describe('renderMd — diff efficiency ratio: denominator is the agent-session count, not the diffed-run count', () => {
+  it('a run whose exercise failed (agent session skipped, diffs as an ordinary +0/-0 with state "ok") does not inflate the denominator', () => {
+    // Reproduces the real incident: 3 diffed runs, only 2 had an agent
+    // session (stats.totalTokens.samples has 2 entries) — the 3rd's
+    // --pack-exercise failed, so its worktree stayed pristine and phase 08
+    // diffed it as an ordinary +0/-0 with state "ok", not "failed". The old
+    // denominator (diff-state !== 'failed') counted all 3 and inflated the
+    // ratio; the fix counts only the 2 that actually produced tokens.
     const metricsDiff = makeMetricsDiff({
       old: makeSideAggregates('old', {
         primary: { ...makeSideAggregates('old').primary, totalTokens: '1000', costUsd: 2 },
+        stats: {
+          ...makeSideAggregates('old').stats,
+          totalTokens: { median: 1000, min: 1000, max: 1000, samples: [1000, 1000] },
+        },
       }),
     })
     const report = makeReport({
@@ -863,18 +1116,37 @@ describe('renderMd — diff efficiency ratio stays stable across diff failures',
       diff: {
         old: makeDiffResult('old', {
           runs: [
-            {
-              runIndex: 1,
-              fullPatch: 'p',
-              summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] },
-              noChanges: false,
-            },
-            {
-              runIndex: 2,
-              fullPatch: 'p',
-              summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] },
-              noChanges: false,
-            },
+            { runIndex: 1, fullPatch: '', summary: { filesChanged: 0, additions: 0, deletions: 0, perFile: [] }, noChanges: true },
+            { runIndex: 2, fullPatch: 'p', summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] }, noChanges: false },
+            { runIndex: 3, fullPatch: 'p', summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] }, noChanges: false },
+          ],
+        }),
+        new: makeDiffResult('new'),
+      },
+    })
+    const md = renderMd(report)
+    // 2 session runs x median 1000 tokens / 200 changed lines = 10
+    // 2 session runs x median $2 / 4 files = 1 — NOT scaled by 3 (the diffed-run count)
+    expect(md).toContain('Efficiency: tokens per changed line 10, cost per file 1 (scaled from the per-run median over 2 run(s) with an agent session)')
+  })
+
+  it('a run whose diff computation itself failed (state "failed") is irrelevant to the denominator — only stats.totalTokens.samples is', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', {
+        primary: { ...makeSideAggregates('old').primary, totalTokens: '1000', costUsd: 2 },
+        stats: {
+          ...makeSideAggregates('old').stats,
+          totalTokens: { median: 1000, min: 1000, max: 1000, samples: [1000, 1000] },
+        },
+      }),
+    })
+    const report = makeReport({
+      metricsDiff,
+      diff: {
+        old: makeDiffResult('old', {
+          runs: [
+            { runIndex: 1, fullPatch: 'p', summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] }, noChanges: false },
+            { runIndex: 2, fullPatch: 'p', summary: { filesChanged: 2, additions: 50, deletions: 50, perFile: [] }, noChanges: false },
             {
               runIndex: 3,
               fullPatch: '',
@@ -889,9 +1161,7 @@ describe('renderMd — diff efficiency ratio stays stable across diff failures',
       },
     })
     const md = renderMd(report)
-    // 2 diffed runs (1 of 3 failed) x median 1000 tokens / 200 changed lines = 10
-    // 2 diffed runs x median $2 / 4 files = 1
-    expect(md).toContain('Efficiency: tokens per changed line 10, cost per file 1 (scaled from the per-run median over 2 diffed run(s))')
+    expect(md).toContain('Efficiency: tokens per changed line 10, cost per file 1 (scaled from the per-run median over 2 run(s) with an agent session)')
   })
 })
 
@@ -967,5 +1237,93 @@ describe('renderMd — incident-shaped fixture (acceptance criterion, golden-val
 
     // no verify line (run had no --verify)
     expect(md).not.toContain('verify:')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Harness preparation — installed-only banner must not overclaim
+// verification it never performed (review-gate: "verified functional" was
+// shown for setup-only too, where --pack-check never ran)
+// ---------------------------------------------------------------------------
+
+describe('renderMd — Harness preparation: installed-only banner splits "installed" from "installed and checked"', () => {
+  const base = {
+    mode: 'installed-only' as const,
+    setupDeclared: true,
+    exerciseDeclared: false,
+    exercises: [],
+  }
+
+  it('--pack-setup only, no --pack-check: banner says "installed" and states plainly that nothing checked it', () => {
+    const packSetup: PackSetupReport = { ...base, checkDeclared: false, checks: [] }
+    const md = renderMd(makeReport({ packSetup }))
+    expect(md).not.toContain('installed and verified functional')
+    expect(md).not.toContain('installed and checked functional')
+    expect(md).toContain('The pack was installed, but the harness never ran --pack-check to confirm it works')
+    expect(md).toContain('unverified copy')
+  })
+
+  it('--pack-check declared but never actually ran (e.g. preflight disabled, checks stayed empty): still the unchecked wording, not "checked"', () => {
+    const packSetup: PackSetupReport = { ...base, checkDeclared: true, checks: [] }
+    const md = renderMd(makeReport({ packSetup }))
+    expect(md).toContain('the harness never ran --pack-check to confirm it works')
+    expect(md).not.toContain('installed and checked functional')
+  })
+
+  it('--pack-check genuinely ran and passed: banner says "installed and checked functional", not just "installed"', () => {
+    const packSetup: PackSetupReport = {
+      ...base,
+      checkDeclared: true,
+      checks: [{ side: 'new', runIndex: 1, exitCode: 0, durationMs: '400' }],
+    }
+    const md = renderMd(makeReport({ packSetup }))
+    expect(md).toContain('The pack was installed and checked functional')
+    expect(md).not.toContain('harness never ran --pack-check')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Harness preparation — no-artifact warning (review-gate: an exit-0 exercise
+// with no tracked artifact must not read as a silent success)
+// ---------------------------------------------------------------------------
+
+describe('renderMd — Harness preparation: no-artifact warning', () => {
+  const basePackSetup: PackSetupReport = {
+    mode: 'installed-only',
+    setupDeclared: false,
+    checkDeclared: false,
+    exerciseDeclared: true,
+    checks: [],
+    exercises: [],
+  }
+
+  it('every exercise exits 0 but leaves no artifact → warned, not silently rendered as plain success', () => {
+    const packSetup: PackSetupReport = {
+      ...basePackSetup,
+      exercises: [
+        { side: 'new', runIndex: 1, exitCode: 0, durationMs: '10' },
+        { side: 'new', runIndex: 2, exitCode: 0, durationMs: '12' },
+      ],
+    }
+    const md = renderMd(makeReport({ packSetup }))
+    expect(md).toContain('Exercise produced no artifact on any of 2 run(s)')
+  })
+
+  it('at least one run recorded an artifact → no warning', () => {
+    const packSetup: PackSetupReport = {
+      ...basePackSetup,
+      exercises: [
+        { side: 'new', runIndex: 1, exitCode: 0, durationMs: '10', artifactHash: 'abc' },
+        { side: 'new', runIndex: 2, exitCode: 0, durationMs: '12' },
+      ],
+    }
+    const md = renderMd(makeReport({ packSetup }))
+    expect(md).not.toContain('produced no artifact')
+  })
+
+  it('no exercises at all → no warning (nothing to be suspicious about)', () => {
+    const packSetup: PackSetupReport = { ...basePackSetup, exerciseDeclared: false, exercises: [] }
+    const md = renderMd(makeReport({ packSetup }))
+    expect(md).not.toContain('produced no artifact')
   })
 })

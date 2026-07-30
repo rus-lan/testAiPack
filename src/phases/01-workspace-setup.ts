@@ -96,6 +96,10 @@ const buildManifest = (
   ...(runInput.packType !== undefined ? { packType: runInput.packType } : {}),
   ...(runInput.init !== undefined ? { init: runInput.init } : {}),
   ...(runInput.verify !== undefined ? { verify: runInput.verify } : {}),
+  ...(runInput.packSetup !== undefined ? { packSetup: runInput.packSetup } : {}),
+  ...(runInput.packCheck !== undefined ? { packCheck: runInput.packCheck } : {}),
+  ...(runInput.packExercise !== undefined ? { packExercise: runInput.packExercise } : {}),
+  ...(runInput.packHint !== undefined ? { packHint: runInput.packHint } : {}),
 })
 
 /**

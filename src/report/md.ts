@@ -10,29 +10,57 @@
 import type {
   AggregateStats,
   ContaminationSignal,
+  PackCmdResult,
+  PackSetupMode,
+  PackSetupReport,
   PackUse,
+  PhaseDeltas,
+  PhaseSlice,
+  PhaseSliceStats,
   Report,
   RiskyCommand,
   SecondaryMetrics,
   Side,
+  SidePhaseSplit,
   TimelineEvent,
   ToolStat,
 } from '@generated/types'
 import {
+  deltaEntriesFor,
   fmtDurationMs,
   fmtInt,
   fmtPct,
   fmtSigned,
   fmtValue,
+  PHASE_METRICS,
   PRIMARY_METRICS,
   sigLabel,
   toNum,
   verdictFor,
 } from './format.js'
-import type { PrimaryMeta } from './format.js'
+import type { DeltaEntry, PrimaryMeta } from './format.js'
 import { STALL_THRESHOLD_MS } from '../metrics/aggregate.js'
 
 const escapeCell = (s: string): string => s.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ')
+
+/** A fence at least one backtick longer than any run already in `content`, so the raw text can never break out of its own code block. */
+const safeFence = (content: string): string => {
+  const runs = content.match(/`+/g) ?? []
+  const longest = runs.reduce((m, r) => Math.max(m, r.length), 0)
+  return '`'.repeat(Math.max(3, longest + 1))
+}
+
+/**
+ * The model's raw response, collapsed by default. Shown whenever present —
+ * not only on a parse failure — so a reader can check the structured verdict
+ * above against what the model actually said, instead of only "Failed to
+ * parse judge response" with nothing to look at.
+ */
+const renderRawResponse = (raw: string | undefined): readonly string[] => {
+  if (raw === undefined) return []
+  const fence = safeFence(raw)
+  return ['', '<details>', '<summary>Raw model response</summary>', '', `${fence}text`, raw, fence, '', '</details>']
+}
 
 /**
  * Wraps `text` in a Markdown inline code span that carries a literal
@@ -77,6 +105,9 @@ const versionDriftWarning = (report: Report): string | undefined => {
  * reads it defensively. `both` is the mechanism by which a baseline can pick
  * up the pack under test (see the contamination alert), so it's called out.
  */
+const hasPhaseSplit = (report: Report): boolean =>
+  report.metricsDiff.old.phaseSplit !== undefined || report.metricsDiff.new.phaseSplit !== undefined
+
 const initSideLine = (report: Report): string | undefined => {
   if (report.manifest.init === undefined) return undefined
   const raw = report.manifest.flagDefaults['initSide']
@@ -87,8 +118,26 @@ const initSideLine = (report: Report): string | undefined => {
   // One session/export per run — the init call's tokens/steps/tool-calls/wall-clock
   // land entirely on the side that received it, inflating that side's numbers
   // relative to the other. Honest cost of a scoped init, not noise, but only if
-  // the reader knows to expect it.
-  return `**Init side:** ${raw} — only the ${raw.toUpperCase()} side's metrics carry the init call's cost (tokens, steps, tool calls, wall-clock); that asymmetry is expected, not a measurement error`
+  // the reader knows to expect it. When the split exists, "Phase split"
+  // already separates that cost out — point there instead of just naming the
+  // asymmetry.
+  const tail = hasPhaseSplit(report)
+    ? 'metrics below are split — the headline compares task vs task; init cost is reported separately'
+    : 'that asymmetry is expected, not a measurement error'
+  return `**Init side:** ${raw} — only the ${raw.toUpperCase()} side's metrics carry the init call's cost (tokens, steps, tool calls, wall-clock); ${tail}`
+}
+
+/**
+ * `--pack-hint` changes what the agent was told, so it changes what the
+ * comparison measures — a reader needs to see both that a hint ran and what
+ * it said. "Sent identically to both sides" is stated plainly rather than
+ * implied: unlike `--init`, there is no side-targeting flag for the hint (see
+ * `effectiveTaskPrompt` in `06-run-side.ts`), so this line is always true.
+ */
+const hintLine = (report: Report): string | undefined => {
+  const hint = report.manifest.packHint
+  if (hint === undefined || hint === '') return undefined
+  return `**Pack hint:** sent identically to both sides — ${codeSpan(escapeCell(hint))}`
 }
 
 const renderHeader = (report: Report): string => {
@@ -97,6 +146,7 @@ const renderHeader = (report: Report): string => {
     : '_smoke-test (no pack)_'
   const warn = versionDriftWarning(report)
   const initLine = initSideLine(report)
+  const hint = hintLine(report)
   return [
     `# testaipack report: ${report.manifest.runId}`,
     '',
@@ -106,6 +156,7 @@ const renderHeader = (report: Report): string => {
     `**Timestamp:** ${report.manifest.timestamp}`,
     `**Opencode version:** ${report.manifest.opencodeVersion}`,
     ...(initLine === undefined ? [] : [initLine]),
+    ...(hint === undefined ? [] : [hint]),
     ...(warn === undefined ? [] : ['', warn]),
   ].join('\n')
 }
@@ -114,12 +165,32 @@ const renderHeader = (report: Report): string => {
 // Summary (P1 pack-noop alert, P2 risky-command alert)
 // ---------------------------------------------------------------------------
 
+/**
+ * "Chose not to call it" and "deltas compare baseline vs baseline" are both
+ * false under exercised mode: the harness ran the pack's pipeline BEFORE the
+ * agent started, so the agent never had a reason to call it itself, and the
+ * new side genuinely differs from baseline (the dependency's output was
+ * present) even with zero direct tool calls — a real run showed the agent
+ * reading and delegating a subagent to use exactly that output while this
+ * banner still claimed the comparison was worthless. Reserved for
+ * installed-only/delivered-only, where the agent genuinely had the option
+ * and skipped it — see `packExercisedZeroCallsNote` for the exercised case.
+ */
 const packNoopWarning = (report: Report): string | undefined => {
   const pu = report.metricsDiff.new.packUse
   if (pu === undefined || !pu.canDetect || pu.calls !== 0) return undefined
+  if (report.packSetup?.mode === 'exercised') return undefined
   return pu.visibilityConfirmed
     ? '> ⚠ **Pack was never invoked on the NEW side — preflight confirmed it was visible, so the model chose not to call it. Deltas compare baseline vs baseline.**'
     : '> ⚠ **Pack was never invoked on the NEW side — deltas compare baseline vs baseline.**'
+}
+
+/** Companion to `packNoopWarning` for exercised mode: informational, not a warning — zero direct calls is the expected shape here, not a red flag. */
+const packExercisedZeroCallsNote = (report: Report): string | undefined => {
+  const pu = report.metricsDiff.new.packUse
+  if (pu === undefined || !pu.canDetect || pu.calls !== 0) return undefined
+  if (report.packSetup?.mode !== 'exercised') return undefined
+  return '_Pack was never called directly on the NEW side — `--pack-exercise` already ran its pipeline before the agent started, so there was nothing left to trigger. Expected under exercised mode, not a defect; see Harness preparation._'
 }
 
 const riskyCommandAlert = (report: Report): string | undefined => {
@@ -138,34 +209,33 @@ const contaminationAlert = (report: Report): string | undefined => {
 }
 
 const renderSummary = (report: Report): string => {
-  const deltas = report.metricsDiff.deltas
-  const bucket = (
-    heading: string,
-    metas: readonly PrimaryMeta[],
-  ): readonly string[] => {
+  const { entries, basis } = deltaEntriesFor(report.metricsDiff)
+  const bucket = (heading: string, es: readonly DeltaEntry[]): readonly string[] => {
     const rows =
-      metas.length === 0
+      es.length === 0
         ? ['- _none_']
-        : metas.map((m) => {
-            const d = deltas[m.key]
-            return `- **${m.label}**: ${fmtSigned(d.absolute, m.kind)} (${fmtPct(d.percent)}) — ${verdictFor(d)}`
-          })
+        : es.map((e) => `- **${e.label}**: ${fmtSigned(e.d.absolute, e.kind)} (${fmtPct(e.d.percent)}) — ${verdictFor(e.d)}`)
     return [heading, ...rows]
   }
-  const improvements = PRIMARY_METRICS.filter((m) => deltas[m.key].better === 'better')
-  const regressions = PRIMARY_METRICS.filter((m) => deltas[m.key].better === 'worse')
-  const neutral = PRIMARY_METRICS.filter(
-    (m) => deltas[m.key].better === 'neutral' || deltas[m.key].better === 'context-dependent',
-  )
+  const improvements = entries.filter((e) => e.d.better === 'better')
+  const regressions = entries.filter((e) => e.d.better === 'worse')
+  const neutral = entries.filter((e) => e.d.better === 'neutral' || e.d.better === 'context-dependent')
   const alerts = [packNoopWarning(report), riskyCommandAlert(report), contaminationAlert(report)].filter(
     (s): s is string => s !== undefined,
   )
+  const exercisedNote = packExercisedZeroCallsNote(report)
+  const basisLine =
+    basis === 'task'
+      ? ['_Basis: task phase only (init excluded); init cost shown in "Init cost" below._', '']
+      : []
   return [
     '## Summary',
     '',
     ...(alerts.length === 0 ? [] : [...alerts, '']),
+    ...(exercisedNote === undefined ? [] : [exercisedNote, '']),
     report.summary.headlineResult,
     '',
+    ...basisLine,
     ...bucket('### Improvements', improvements),
     '',
     ...bucket('### Regressions', regressions),
@@ -200,7 +270,7 @@ const renderPrimary = (report: Report): string => {
     const newV = fmtValue(report.metricsDiff.new.primary[m.key], m.kind)
     return `| ${m.label} | ${oldV} | ${spreadCell(report, 'old', m)} | ${newV} | ${spreadCell(report, 'new', m)} | ${fmtSigned(d.absolute, m.kind)} | ${fmtPct(d.percent)} | ${sigLabel(d)} | ${verdictFor(d)} |`
   })
-  return ['## Primary metrics (delta)', '', ...warn, ...header, ...rows, '', ...renderStability(report)].join('\n')
+  return ['## Primary metrics — total (init + task)', '', ...warn, ...header, ...rows, '', ...renderStability(report)].join('\n')
 }
 
 const rankHistogram = (samples: readonly number[]): string => {
@@ -257,6 +327,278 @@ const renderStability = (report: Report): readonly string[] => [
 ]
 
 // ---------------------------------------------------------------------------
+// Phase split (metric-split spec §5.7): task-vs-task like-for-like table,
+// init cost (cost figure when one-sided, delta when two-sided), setup
+// wall-clock. Absent entirely when neither side ever ran a split-eligible
+// export.
+// ---------------------------------------------------------------------------
+
+const PHASE_TABLE_HEADER = [
+  '| Metric | Old (median) | Old [min–max] | New (median) | New [min–max] | Δ | Δ% | Significant | Verdict |',
+  '|---|---|---|---|---|---|---|---|---|',
+]
+
+interface ResolvedPhaseDelta {
+  readonly oldSlice: PhaseSlice
+  readonly oldStats: PhaseSliceStats
+  readonly oldProrated: boolean
+  readonly newSlice: PhaseSlice
+  readonly newStats: PhaseSliceStats
+  readonly newProrated: boolean
+  readonly deltas: PhaseDeltas
+}
+
+const resolveTask = (
+  oldSplit: SidePhaseSplit | undefined,
+  newSplit: SidePhaseSplit | undefined,
+  taskDeltas: PhaseDeltas | undefined,
+): ResolvedPhaseDelta | undefined => {
+  if (oldSplit === undefined || newSplit === undefined || taskDeltas === undefined) return undefined
+  return {
+    oldSlice: oldSplit.task,
+    oldStats: oldSplit.taskStats,
+    oldProrated: oldSplit.costProrated === true,
+    newSlice: newSplit.task,
+    newStats: newSplit.taskStats,
+    newProrated: newSplit.costProrated === true,
+    deltas: taskDeltas,
+  }
+}
+
+/** Only defined when BOTH sides ran init (spec §4.1: `initDeltas` present iff `runsWithInit > 0` on both) — never a one-sided delta. */
+const resolveInit = (
+  oldSplit: SidePhaseSplit | undefined,
+  newSplit: SidePhaseSplit | undefined,
+  initDeltas: PhaseDeltas | undefined,
+): ResolvedPhaseDelta | undefined => {
+  if (oldSplit?.init === undefined || oldSplit.initStats === undefined) return undefined
+  if (newSplit?.init === undefined || newSplit.initStats === undefined) return undefined
+  if (initDeltas === undefined) return undefined
+  return {
+    oldSlice: oldSplit.init,
+    oldStats: oldSplit.initStats,
+    oldProrated: oldSplit.costProrated === true,
+    newSlice: newSplit.init,
+    newStats: newSplit.initStats,
+    newProrated: newSplit.costProrated === true,
+    deltas: initDeltas,
+  }
+}
+
+const phaseSpreadCell = (stats: PhaseSliceStats, m: (typeof PHASE_METRICS)[number]): string => {
+  const stat = stats[m.key]
+  const range = `${fmtValue(stat.min, m.kind)}–${fmtValue(stat.max, m.kind)}`
+  return stat.iqr === undefined ? range : `${range} (IQR=${fmtValue(stat.iqr, m.kind)})`
+}
+
+const phaseDeltaRows = (r: ResolvedPhaseDelta): readonly string[] =>
+  PHASE_METRICS.map((m) => {
+    const d = r.deltas[m.key]
+    const oldMark = m.key === 'costUsd' && r.oldProrated ? '~' : ''
+    const newMark = m.key === 'costUsd' && r.newProrated ? '~' : ''
+    const oldV = `${oldMark}${fmtValue(r.oldSlice[m.key], m.kind)}`
+    const newV = `${newMark}${fmtValue(r.newSlice[m.key], m.kind)}`
+    return `| ${m.label} | ${oldV} | ${phaseSpreadCell(r.oldStats, m)} | ${newV} | ${phaseSpreadCell(r.newStats, m)} | ${fmtSigned(d.absolute, m.kind)} | ${fmtPct(d.percent)} | ${sigLabel(d)} | ${verdictFor(d)} |`
+  })
+
+const proratedFootnote = (r: ResolvedPhaseDelta): readonly string[] =>
+  r.oldProrated || r.newProrated
+    ? ['', '_~ cost prorated from the session total by token share — derived, not measured._']
+    : []
+
+const setupLine = (split: SidePhaseSplit | undefined, sideLabel: string): readonly string[] =>
+  split?.setup === undefined
+    ? []
+    : [`- **${sideLabel}**: pack setup (harness, no model call) — median ${fmtInt(split.setup.wallClockMs)}ms`]
+
+/** One-sided (or no-init) rendering: a cost figure only, never a delta. */
+const initCostLines = (split: SidePhaseSplit | undefined, sideLabel: string): readonly string[] => {
+  if (split?.init === undefined || split.initStats === undefined) {
+    return [`- **${sideLabel}**: no init phase`]
+  }
+  const init = split.init
+  const stats = split.initStats
+  const metricsLine = PHASE_METRICS.map((m) => {
+    const mark = m.key === 'costUsd' && split.costProrated === true ? '~' : ''
+    const stat = stats[m.key]
+    return `${m.label} ${mark}${fmtValue(init[m.key], m.kind)} [${fmtValue(stat.min, m.kind)}–${fmtValue(stat.max, m.kind)}]`
+  }).join(', ')
+  return [`- **${sideLabel}** (${String(split.runsWithInit)} run(s) with init): ${metricsLine}`]
+}
+
+const lostInitLines = (report: Report): readonly string[] => {
+  const oldN = report.metricsDiff.old.phaseSplit?.runsWithLostInit ?? 0
+  const newN = report.metricsDiff.new.phaseSplit?.runsWithLostInit ?? 0
+  return [
+    ...(oldN === 0
+      ? []
+      : [`> ⚠ OLD: ${String(oldN)} run(s) ran --init but the export lost the init session — init cost unmeasured.`]),
+    ...(newN === 0
+      ? []
+      : [`> ⚠ NEW: ${String(newN)} run(s) ran --init but the export lost the init session — init cost unmeasured.`]),
+  ]
+}
+
+const renderPhaseSplit = (report: Report): string => {
+  const oldSplit = report.metricsDiff.old.phaseSplit
+  const newSplit = report.metricsDiff.new.phaseSplit
+  if (oldSplit === undefined && newSplit === undefined) return ''
+
+  const task = resolveTask(oldSplit, newSplit, report.metricsDiff.taskDeltas)
+  const taskTable: readonly string[] =
+    task === undefined
+      ? []
+      : ['### Task phase (like-for-like)', '', ...PHASE_TABLE_HEADER, ...phaseDeltaRows(task), ...proratedFootnote(task)]
+
+  const setupLines: readonly string[] = [...setupLine(oldSplit, 'OLD'), ...setupLine(newSplit, 'NEW')]
+
+  const init = resolveInit(oldSplit, newSplit, report.metricsDiff.initDeltas)
+  const initSection: readonly string[] =
+    init === undefined
+      ? ['### Init cost', '', ...initCostLines(oldSplit, 'OLD'), ...initCostLines(newSplit, 'NEW')]
+      : ['### Init cost', '', ...PHASE_TABLE_HEADER, ...phaseDeltaRows(init), ...proratedFootnote(init)]
+
+  const lost = lostInitLines(report)
+
+  return [
+    '## Phase split (init vs task)',
+    '',
+    'The headline compares task vs task — the like-for-like basis. Init cost (the `--init` invocation, when one ran) and pack setup (harness, before the agent session) are reported separately below.',
+    '',
+    ...taskTable,
+    '',
+    ...(setupLines.length === 0 ? [] : [...setupLines, '']),
+    ...initSection,
+    ...(lost.length === 0 ? [] : ['', ...lost]),
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// Harness preparation (pack-setup spec, .research/pack-setup/spec.md §7.3):
+// what the harness did to make the pack functional and exercised BEFORE any
+// measured run — wall-clock only, by construction (setup/check/exercise
+// involve no model, no opencode session; that cost lives in "Phase split"
+// above, never here). Verbatim banner/comparison/footnote wording per §7.3 —
+// this is the sentence a reader uses to know what the numbers mean, so the
+// wording is not paraphrased.
+// ---------------------------------------------------------------------------
+
+const MODE_BANNER: Readonly<Record<Exclude<PackSetupMode, 'installed-only'>, string>> = {
+  exercised:
+    'Pack exercise mode: the harness installed the pack, verified it functional, and ran its pipeline before each measured run. The NEW side measures agent performance WITH the dependency present and its output available. It does NOT measure whether an agent would discover or choose this pack on its own.',
+  'delivered-only':
+    'The pack was delivered but not installed/verified by the harness; whether the underlying tool worked in a given run depended on the agent. Treat per-run comparability as weak.',
+}
+
+/**
+ * `installed-only` is not one story: `derivePackSetupMode` reaches it both
+ * when `--pack-check` genuinely ran and passed (setup + check, nothing to
+ * exercise) and when it never ran at all (setup only, or preflight was
+ * disabled so gate 6 never executed) — two very different claims about the
+ * copied homes. The single old banner said "verified functional" for both,
+ * which was simply false in the unchecked case: homes 2..N are an
+ * unverified copy of the first, and nothing caught a broken one. `checks`
+ * only ever contains PASSING results (gate 6 aborts the whole preflight
+ * outright on a failing one, before any report exists) — so a non-empty
+ * array is sufficient proof a check genuinely ran.
+ */
+const installedOnlyBanner = (ps: PackSetupReport): string =>
+  ps.checkDeclared && ps.checks.length > 0
+    ? 'The pack was installed and checked functional; it exposes nothing for the harness to run. The NEW side measures agent performance with the dependency installed and confirmed working.'
+    : 'The pack was installed, but the harness never ran --pack-check to confirm it works — homes 2..N are an unverified copy of the first, so a silently broken install could feed every median below. The NEW side measures agent performance with the dependency installed, not verified.'
+
+const modeBanner = (ps: PackSetupReport): string =>
+  ps.mode === 'installed-only' ? installedOnlyBanner(ps) : MODE_BANNER[ps.mode]
+
+const COMPARISON_LINE =
+  'Comparison: agent without the dependency vs agent with the dependency installed and its output present.'
+
+/** `runIndex === 0` marks the one-shot experiment-global setup command, not a real run. */
+const cmdStatus = (r: PackCmdResult): string => {
+  const wantsZero = r.side === 'new'
+  const ok = wantsZero ? r.exitCode === 0 : r.exitCode !== 0
+  if (ok) return '✓'
+  return wantsZero ? `✗ (exit ${String(r.exitCode)})` : `✗ tool present on baseline (exit ${String(r.exitCode)})`
+}
+
+const setupRow = (setup: PackCmdResult | undefined): readonly string[] =>
+  setup === undefined
+    ? []
+    : [`| setup | — | — | ${cmdStatus(setup)} | ${fmtDurationMs(setup.durationMs)} | — |`]
+
+const checkRows = (checks: readonly PackCmdResult[]): readonly string[] =>
+  checks.map((c) => `| check | ${c.side} | ${c.runIndex === 0 ? '—' : String(c.runIndex)} | ${cmdStatus(c)} | ${fmtDurationMs(c.durationMs)} | — |`)
+
+const exerciseRows = (exercises: readonly PackCmdResult[]): readonly string[] =>
+  exercises.map(
+    (e) =>
+      `| exercise | ${e.side} | ${String(e.runIndex)} | ${cmdStatus(e)} | ${fmtDurationMs(e.durationMs)} | ${e.artifactHash === undefined ? '—' : escapeCell(e.artifactHash.slice(0, 12))} |`,
+  )
+
+/** All hashes recorded must agree — a pack pipeline is supposed to be deterministic given the same input tree. */
+const artifactDivergenceLine = (exercises: readonly PackCmdResult[]): string | undefined => {
+  const hashes = exercises.flatMap((e) => (e.artifactHash === undefined ? [] : [e.artifactHash]))
+  const distinct = new Set(hashes)
+  if (distinct.size <= 1) return undefined
+  return `> ⚠ **Exercise output is not deterministic**: ${String(distinct.size)} distinct artifact hash(es) across ${String(hashes.length)} run(s) that recorded one — the pack's own pipeline produced different output on identical input trees.`
+}
+
+/**
+ * An exercise that exits 0 but leaves no tracked artifact behind is
+ * indistinguishable from a no-op — the table row above renders a plain ✓
+ * with an empty artifact-hash column, which reads as success with nothing
+ * to hint otherwise. The reader who most needs this warning is the one
+ * deciding whether the NEW side's "after" measurement means anything.
+ */
+const noArtifactLine = (exercises: readonly PackCmdResult[]): string | undefined => {
+  if (exercises.length === 0) return undefined
+  const withArtifact = exercises.filter((e) => e.artifactHash !== undefined)
+  if (withArtifact.length > 0) return undefined
+  return `> ⚠ **Exercise produced no artifact on any of ${String(exercises.length)} run(s)**: exit 0 with no tracked output left behind is indistinguishable from a no-op — verify \`--pack-exercise\` actually ran the pack's pipeline.`
+}
+
+const declaredCommandLines = (report: Report): readonly string[] => {
+  const m = report.manifest
+  const lines: readonly string[] = [
+    ...(m.packSetup === undefined ? [] : [`- Setup: ${codeSpan(escapeCell(m.packSetup))}`]),
+    ...(m.packCheck === undefined ? [] : [`- Check: ${codeSpan(escapeCell(m.packCheck))}`]),
+    ...(m.packExercise === undefined ? [] : [`- Exercise: ${codeSpan(escapeCell(m.packExercise))}`]),
+  ]
+  return lines
+}
+
+const renderPackSetup = (report: Report): string => {
+  const ps = report.packSetup
+  if (ps === undefined) return ''
+  const commands = declaredCommandLines(report)
+  const exerciseCaveat: readonly string[] = ps.exerciseDeclared
+    ? [
+        "_Any API/LLM usage internal to the pack's own CLI during exercise is an external process testaipack does not meter — only its wall-clock is captured._",
+      ]
+    : []
+  const undeclaredWarn = ps.undeclaredDepWarning === undefined ? [] : [`> ⚠ ${ps.undeclaredDepWarning}`, '']
+  const divergence = artifactDivergenceLine(ps.exercises)
+  const noArtifact = noArtifactLine(ps.exercises)
+  const rows = [...setupRow(ps.setup), ...checkRows(ps.checks), ...exerciseRows(ps.exercises)]
+  return [
+    '## Harness preparation',
+    '',
+    ...undeclaredWarn,
+    `> ${modeBanner(ps)}`,
+    '',
+    COMPARISON_LINE,
+    '',
+    ...(commands.length === 0 ? [] : [...commands, '']),
+    '| Step | Side | Run | Result | Wall-clock | Artifact hash |',
+    '|---|---|---|---|---|---|',
+    ...rows,
+    ...(divergence === undefined ? [] : ['', divergence]),
+    ...(noArtifact === undefined ? [] : ['', noArtifact]),
+    ...(exerciseCaveat.length === 0 ? [] : ['', ...exerciseCaveat]),
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
 // Pack signal (P1, new section)
 // ---------------------------------------------------------------------------
 
@@ -270,14 +612,31 @@ const packSignalLine = (side: Side, pu: PackUse | undefined): string => {
       : pu.visibilityConfirmed
         ? ' (confirmed visible, not called)'
         : ' (visibility not confirmed)'
-  return `- **${side}**: ${String(pu.calls)} call(s), ${String(pu.errors)} error(s), ${String(pu.runsWithCall)}/${String(pu.runCount)} runs called the pack${first}${visibility}`
+  const without =
+    pu.runsWithoutCall === undefined || pu.runsWithoutCall.length === 0
+      ? ''
+      : `; never called on run(s) ${pu.runsWithoutCall.join(', ')}`
+  return `- **${side}**: ${String(pu.calls)} call(s), ${String(pu.errors)} error(s), ${String(pu.runsWithCall)}/${String(pu.runCount)} runs called the pack${first}${visibility}${without}`
 }
+
+/** §7.3: under exercise/installed-only mode, agent-side calls are context, not an outcome — the pack's functionality was already proven by the harness above. */
+const packUseFootnote = (mode: PackSetupMode | undefined): string | undefined =>
+  mode === undefined || mode === 'delivered-only'
+    ? undefined
+    : '_Agent-side pack invocations are recorded for context only; under exercise mode they are not an outcome measure._'
 
 const renderPackSignal = (report: Report): string => {
   const old = report.metricsDiff.old.packUse
   const nw = report.metricsDiff.new.packUse
   if (old === undefined && nw === undefined) return ''
-  return ['## Pack signal', '', packSignalLine('old', old), packSignalLine('new', nw)].join('\n')
+  const footnote = packUseFootnote(report.packSetup?.mode)
+  return [
+    '## Pack signal',
+    '',
+    packSignalLine('old', old),
+    packSignalLine('new', nw),
+    ...(footnote === undefined ? [] : ['', footnote]),
+  ].join('\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -458,7 +817,10 @@ const renderSecondary = (report: Report): string => {
       ...outputVolumeGroup(report, side),
     ]
   }
-  return ['## Secondary metrics', '', ...renderSide('old'), '', ...renderSide('new')].join('\n')
+  const wholeRunNote = hasPhaseSplit(report)
+    ? ['', '_Whole-run (init + task) — not split; see known-unsplit metrics in `docs/phases/07-aggregate.ru.md`._']
+    : []
+  return ['## Secondary metrics', ...wholeRunNote, '', ...renderSide('old'), '', ...renderSide('new')].join('\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -511,6 +873,7 @@ const renderJudge = (report: Report): string => {
     `- Quality: old=${String(j.oldQuality)}, new=${String(j.newQuality)}`,
     `- Model: \`${j.modelUsed}\``,
     `- Explanation: ${j.explanation}`,
+    ...renderRawResponse(j.rawResponse),
   ].join('\n')
 }
 
@@ -548,23 +911,48 @@ const stateMarker = (state: Report['diff']['old']['runs'][number]['state']): str
       : ''
 
 /**
- * `stats.totalTokens.samples` covers every run with a successful metric
- * extraction; `diffTotalsFor` only covers runs whose diff also succeeded —
- * a different, often smaller population. Summing both raw drifts with the
- * diff-failure count (same token total, fewer diffed runs -> an inflated,
- * unlabeled ratio). Scaling the per-run median by the diffed-run count keeps
- * both sides on a "typical single diffed run" basis, so the ratio stays
- * stable as the failure count changes, and the label says what it is.
+ * A run contained as failed (`successRank 0` — an exercise failure, crash,
+ * timeout, ...) still gets diffed by phase 08 like any other, most often as
+ * an ordinary-looking `+0/-0` (its agent session was skipped, so the
+ * worktree stayed pristine — see `efficiencyLine`). Rendered identically to
+ * a run where the agent genuinely made zero changes, a reader cannot tell
+ * the two apart from this line alone. This suffix makes the contained case
+ * visibly distinct instead.
+ */
+const containedRunSuffix = (report: Report, side: Side, runIndex: number): string => {
+  const failed = report.metricsDiff[side].failedRuns.find((f) => f.runIndex === runIndex)
+  return failed === undefined
+    ? ''
+    : ` — **contained as failed** (\`${failed.errorCode}\`; excluded from the Efficiency ratio below — see Failed runs)`
+}
+
+/**
+ * `stats.totalTokens.samples` and `primary.totalTokens` (the numerator
+ * below) come from the exact same population — `aggregatePrimary`
+ * (`metrics/aggregate.ts`) builds both from one `list`, which excludes every
+ * `successRank === 0` run outright (never even attempts extraction for it).
+ * Scaling by `report.diff[side].runs` instead — as this used to — counts a
+ * DIFFERENT, larger population: a run whose exercise failed has its agent
+ * session skipped (successRank 0, contained in `failedRuns`), leaves the
+ * worktree pristine, and phase 08 still diffs it happily as `state: "ok"`
+ * with `+0/-0`. Crediting that run with a full median's worth of tokens it
+ * never spent inflates the numerator while the denominator it is divided by
+ * (`changedLines`) is correctly untouched (a `+0/-0` run adds zero lines
+ * either way) — reproduced against a real run: the inflated count made the
+ * new side read as LESS token-efficient than baseline, when the honest
+ * count (excluding the skipped run) reads as more efficient.
+ * `stats.totalTokens.samples.length` is the only count this ratio can
+ * honestly scale by — the exact set of runs the numerator was averaged over.
  */
 const efficiencyLine = (report: Report, side: Side): string => {
   const t = diffTotalsFor(report, side)
-  const diffedRunCount = report.diff[side].runs.filter((r) => r.state !== 'failed').length
+  const sessionRunCount = report.metricsDiff[side].stats.totalTokens.samples.length
   const changedLines = t.add + t.del
   const tokensPerRun = toNum(report.metricsDiff[side].primary.totalTokens)
   const costPerRun = report.metricsDiff[side].primary.costUsd
-  const tokensPerLine = changedLines === 0 ? 'n/a' : fmtInt((tokensPerRun * diffedRunCount) / changedLines)
-  const costPerFile = t.files === 0 ? 'n/a' : fmtValue((costPerRun * diffedRunCount) / t.files, 'cost')
-  return `  - Efficiency: tokens per changed line ${tokensPerLine}, cost per file ${costPerFile} (scaled from the per-run median over ${String(diffedRunCount)} diffed run(s))`
+  const tokensPerLine = changedLines === 0 ? 'n/a' : fmtInt((tokensPerRun * sessionRunCount) / changedLines)
+  const costPerFile = t.files === 0 ? 'n/a' : fmtValue((costPerRun * sessionRunCount) / t.files, 'cost')
+  return `  - Efficiency: tokens per changed line ${tokensPerLine}, cost per file ${costPerFile} (scaled from the per-run median over ${String(sessionRunCount)} run(s) with an agent session)`
 }
 
 const overlapLines = (report: Report): readonly string[] => {
@@ -598,7 +986,7 @@ const renderDiff = (report: Report): string => {
       const patch = `diff/${side}/run-${String(r.runIndex)}/full.patch`
       const html =
         r.htmlPath !== undefined ? `, [html](diff/${side}/run-${String(r.runIndex)}/side.html)` : ''
-      return `  - run-${String(r.runIndex)}: +${String(r.summary.additions)} -${String(r.summary.deletions)} (${String(r.summary.filesChanged)} files) — [patch](${patch})${html}${stateMarker(r.state)}`
+      return `  - run-${String(r.runIndex)}: +${String(r.summary.additions)} -${String(r.summary.deletions)} (${String(r.summary.filesChanged)} files) — [patch](${patch})${html}${stateMarker(r.state)}${containedRunSuffix(report, side, r.runIndex)}`
     })
     return [
       `- **${side}**: +${String(t.add)} -${String(t.del)} (${String(t.files)} files across ${String(runs.length)} run(s)${failedSuffix})`,
@@ -622,6 +1010,8 @@ export const renderMd = (report: Report): string =>
     renderHeader(report),
     renderSummary(report),
     renderPrimary(report),
+    renderPhaseSplit(report),
+    renderPackSetup(report),
     renderPackSignal(report),
     renderSafety(report),
     renderContamination(report),

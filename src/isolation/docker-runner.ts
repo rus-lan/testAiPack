@@ -11,6 +11,7 @@
  */
 import { Data, Effect } from 'effect'
 import { randomBytes } from 'node:crypto'
+import os from 'node:os'
 import { spawnProcess, execCmd } from '../opencode/spawn.js'
 import { inheritEnv } from '../util/env.js'
 
@@ -59,6 +60,14 @@ export interface DockerRunOptions {
   readonly timeoutMs?: number
   /** Optional stdout line sink so callers can stream JSON events. */
   readonly onStdoutLine?: (line: string) => void
+  /**
+   * Written to the container command's stdin, then the stream is closed.
+   * Requires `-i` (`docker run` closes stdin immediately otherwise, regardless
+   * of what the host process pipes in) — added automatically when this is set.
+   * No `-t`: a real pty would corrupt the captured stdout/stderr with escape
+   * sequences, and none of our callers need one.
+   */
+  readonly input?: string
 }
 
 export interface DockerRunResult {
@@ -101,6 +110,7 @@ export const buildDockerRunArgs = (
   return [
     'run',
     '--rm',
+    ...(opts.input === undefined ? [] : ['-i']),
     '--name',
     containerName,
     ...(opts.network === undefined ? [] : ['--network', opts.network]),
@@ -170,6 +180,7 @@ export const dockerRun = (
       env: dockerEnv(),
       ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
       ...(opts.onStdoutLine === undefined ? {} : { onStdoutLine: opts.onStdoutLine }),
+      ...(opts.input === undefined ? {} : { input: opts.input }),
     })
 
     if (out.timedOut) {
@@ -200,6 +211,38 @@ export const dockerRun = (
       durationMs: out.durationMs,
       timedOut: false,
     }
+  })
+
+/**
+ * The `PATH` the image bakes in — used to build a `--pack-setup` run's PATH
+ * (`<home>/.local/bin:<imagePath>`) without clobbering whatever the image
+ * itself already puts on PATH (a language runtime's own bin dir, etc). Runs
+ * in a throwaway container with a scratch dir standing in for both mounts —
+ * `printf %s "$PATH"` touches neither.
+ *
+ * `sh -c`, never `sh -lc`: verified empirically that a login shell
+ * unconditionally re-sources `/etc/profile` on this image, which resets
+ * PATH to a UID-dependent hardcoded value — a different, narrower PATH than
+ * the image's own Docker-level default (missing `/usr/local/sbin` etc. for
+ * a non-root UID) and, worse, one that would silently discard whatever this
+ * probe itself returns if a later `-lc` command reused it. `-c` reports the
+ * same baseline PATH every non-login command in `isolation/shell-runner.ts`
+ * actually starts from.
+ */
+export const probeImagePath = (
+  image: string,
+  network?: string,
+): Effect.Effect<string, DockerError> =>
+  Effect.gen(function* () {
+    const scratch = os.tmpdir()
+    const out = yield* dockerRun({
+      image,
+      cwd: scratch,
+      homeDir: scratch,
+      command: ['sh', '-c', 'printf %s "$PATH"'],
+      ...(network === undefined ? {} : { network }),
+    })
+    return out.stdout.trim()
   })
 
 /** `docker image inspect <image>` exit 0 ⇔ image present locally. */

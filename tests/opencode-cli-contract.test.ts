@@ -124,15 +124,14 @@ describe.skipIf(!HAS_OPENCODE)('opencode CLI arg-shape contract (real binary)', 
         '--agent', '--model', '--session', '--continue', '--auto', '--pure', '--format', 'json',
       ]),
     )
-    // every real flag must come before the `--` separator, with the prompt
-    // tokens strictly after it — `--` itself stops opencode's own option
-    // parsing (verified against the real binary), which is what keeps a
-    // flag-shaped prompt word from being parsed as one of our flags.
-    const sepIndex = args.indexOf('--')
-    expect(sepIndex).toBeGreaterThan(-1)
+    // the prompt travels on stdin now (see cli.ts), never argv — so there is
+    // no `--` separator to find and no risk of a flag-shaped prompt word
+    // landing among these flags at all.
+    expect(args).not.toContain('--')
+    expect(args).not.toContain('hello')
     const help = await helpFor(['run'])
     const recognized = longFlagsIn(help)
-    const emittedFlags = args.slice(0, sepIndex).filter((tok) => tok.startsWith('--'))
+    const emittedFlags = args.filter((tok) => tok.startsWith('--'))
     for (const flag of emittedFlags) {
       expect(recognized.has(flag)).toBe(true)
     }

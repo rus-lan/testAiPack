@@ -99,29 +99,25 @@ const dockerErrorToOpencode =
     })
 
 /**
- * opencode's `run` message is a variadic positional array, not a single
- * string flag (`opencode run --help`). Passing the whole prompt as one argv
- * element is not safe: confirmed empirically against the real binary that
- * opencode wraps any single element containing a space in literal quote
- * characters before storing it as the message text, corrupting every
- * multi-word prompt. Splitting on the space character only — not all
- * whitespace, so embedded newlines/paragraph breaks survive untouched — into
- * separate elements avoids the per-element quoting: no element has an
- * internal space, and opencode's own rejoin reconstructs the original text
- * exactly (verified round-trip, including leading/trailing/doubled spaces).
- */
-export const splitForArgv = (text: string): readonly string[] => text.split(' ')
-
-/**
- * `message` tokens are parsed by yargs as ordinary argv, so a prompt word
- * that happens to look like a flag (`--json`, `--model x`) would otherwise be
- * consumed as one of opencode's own options — at best aborting the run with
- * a usage error, at worst silently overriding a flag we set (e.g. hijacking
- * `--model`). `--` is yargs' standard "stop parsing options" marker: verified
- * empirically that every token after it — including flag-shaped ones — lands
- * in the message text untouched, while a token before it is still parsed as
- * a flag. So all of testaipack's own flags must come BEFORE `--`, and every
- * prompt token must come AFTER it.
+ * opencode's `run` message is a variadic argv positional, not a single string
+ * flag — and every way of delivering the prompt through argv turned out
+ * unsafe: a single element containing a space gets wrapped in literal quote
+ * characters before being stored as the message text (confirmed in the
+ * stored session export, not just observed in argv), and splitting on spaces
+ * to dodge that runs into a SEPARATE bug where any standalone numeric-looking
+ * element ("1", "-3", "2026") crashes opencode's own quote-wrap check
+ * (`G.includes is not a function`) — reproduced against the real binary with
+ * a real judge prompt, and common enough ("fix the 2 failing tests") to hit
+ * routinely.
+ *
+ * Both bugs live in argv handling specifically. Confirmed empirically
+ * (piped stdin, `<` file redirection, and the session export's stored user
+ * message) that opencode reads an unset message positional from stdin
+ * byte-exact — no wrapping, no coercion, no length limit. `run()` sends the
+ * prompt this way instead: `buildRunArgs` never includes the prompt, and the
+ * prompt is piped to the child's stdin (`SpawnInput.input` /
+ * `DockerRunOptions.input`). This removes the whole class of corruption
+ * instead of trading one artifact for another.
  */
 export const buildRunArgs = (opts: OpencodeRunOptions): readonly string[] => [
   'run',
@@ -133,8 +129,6 @@ export const buildRunArgs = (opts: OpencodeRunOptions): readonly string[] => [
   ...(opts.pure === true ? ['--pure'] : []),
   '--format',
   'json',
-  '--',
-  ...splitForArgv(opts.prompt),
 ]
 
 export const sessionIdFromEvent = (ev: unknown): string | undefined => {
@@ -209,6 +203,7 @@ export const run = (
         ...(opts.docker.network === undefined ? {} : { network: opts.docker.network }),
         ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
         ...(onLine === undefined ? {} : { onStdoutLine: onLine }),
+        input: opts.prompt,
       }).pipe(Effect.mapError(dockerErrorToOpencode('run')))
       const sessionId = findSessionIdInText(dres.stdout)
       return {
@@ -229,6 +224,7 @@ export const run = (
       env,
       ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
       ...(onLine === undefined ? {} : { onStdoutLine: onLine }),
+      input: opts.prompt,
     })
 
     if (out.timedOut) {

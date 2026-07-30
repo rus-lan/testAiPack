@@ -19,6 +19,7 @@ import {
   makeSessionId,
   computeMaxConsecutiveSameTool,
   hasRateLimitSignal,
+  effectiveTaskPrompt,
   DOOM_LOOP_THRESHOLD,
   EXPORT_VALIDATION_MAX_RETRIES,
 } from './06-run-side.js'
@@ -108,6 +109,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  allowBaselineTool: false,
   initSide: 'both',
   preflightEnabled: false,
   formats: ['md'],
@@ -223,6 +225,27 @@ const emitThenSucceed = (events: readonly unknown[]) =>
       }
     })
 
+describe('effectiveTaskPrompt — pure', () => {
+  it('no packHint → prompt unchanged', () => {
+    expect(effectiveTaskPrompt(makeRunInput({ prompt: 'do the thing' }))).toBe('do the thing')
+  })
+
+  it('empty-string packHint → prompt unchanged (treated as absent)', () => {
+    expect(effectiveTaskPrompt(makeRunInput({ prompt: 'do the thing', packHint: '' }))).toBe('do the thing')
+  })
+
+  it('packHint present → appended after a blank line', () => {
+    expect(effectiveTaskPrompt(makeRunInput({ prompt: 'do the thing', packHint: 'check .graphify/' }))).toBe(
+      'do the thing\n\ncheck .graphify/',
+    )
+  })
+
+  it('takes no side parameter — the same runInput always produces the same string, by construction', () => {
+    const runInput = makeRunInput({ prompt: 'p', packHint: 'h' })
+    expect(effectiveTaskPrompt(runInput)).toBe(effectiveTaskPrompt(runInput))
+  })
+})
+
 describe('phase 06 — run-side', () => {
   beforeEach(async () => {
     runMock.mockReset()
@@ -265,6 +288,96 @@ describe('phase 06 — run-side', () => {
     const result = await runP(runSide(buildInput(root)))
     expect(result.successRank).toBe(4)
     expect(runMock).toHaveBeenCalledTimes(1)
+  })
+
+  // -------------------------------------------------------------------------
+  // --pack-hint: appended to --prompt, identically for both sides
+  // -------------------------------------------------------------------------
+
+  it('packHint is appended to the --prompt call, not the --init call', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, {
+      runInput: { init: 'do setup', prompt: 'do real work', packHint: 'check .graphify/ if present' },
+    })
+    await runP(runSide(input))
+    const calls = runMock.mock.calls.map((c) => c[0])
+    expect(calls[0]?.prompt).toBe('do setup')
+    expect(calls[1]?.prompt).toBe('do real work\n\ncheck .graphify/ if present')
+  })
+
+  it('no packHint → --prompt call is sent unchanged (byte-identical to today)', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    await runP(runSide(buildInput(root, { runInput: { prompt: 'do real work' } })))
+    expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('do real work')
+  })
+
+  it('empty-string packHint is treated as absent, same as undefined', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    await runP(runSide(buildInput(root, { runInput: { prompt: 'do real work', packHint: '' } })))
+    expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('do real work')
+  })
+
+  it('symmetry: old and new sides receive byte-identical --prompt text from the same runInput+packHint', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const sharedRunInput: Partial<RunInput> = {
+      prompt: 'implement the feature',
+      packHint: 'If .graphify/ contains a prepared index, use it. If not, work as usual.',
+    }
+
+    runMock.mockReset()
+    runMock.mockImplementation(emitThenSucceed([stepFinish('stop')]))
+    await runP(runSide(buildInput(root, { side: 'old', runInput: sharedRunInput })))
+    const oldPrompt = runMock.mock.calls[0]?.[0]?.prompt
+
+    runMock.mockReset()
+    runMock.mockImplementation(emitThenSucceed([stepFinish('stop')]))
+    await runP(runSide(buildInput(root, { side: 'new', runInput: sharedRunInput })))
+    const newPrompt = runMock.mock.calls[0]?.[0]?.prompt
+
+    expect(oldPrompt).toBeDefined()
+    expect(oldPrompt).toBe(newPrompt)
+    expect(oldPrompt).toBe('implement the feature\n\nIf .graphify/ contains a prepared index, use it. If not, work as usual.')
+  })
+
+  // -------------------------------------------------------------------------
+  // metric-split spec §5.1 — per-invocation harness wall-clock instrumentation
+  // -------------------------------------------------------------------------
+
+  it('init + prompt: initRan/initWallMs/promptWallMs are recorded as harness wall-clock', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const input = buildInput(root, { runInput: { init: 'setup first' } })
+    const result = await runP(runSide(input))
+    expect(result.initRan).toBe(true)
+    expect(result.initWallMs).toBeDefined()
+    expect(Number(result.initWallMs)).toBeGreaterThanOrEqual(0)
+    expect(result.promptWallMs).toBeDefined()
+    expect(Number(result.promptWallMs)).toBeGreaterThanOrEqual(0)
+  })
+
+  it('without init: initRan/initWallMs absent, promptWallMs still recorded', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const result = await runP(runSide(buildInput(root)))
+    expect(result.initRan).toBeUndefined()
+    expect(result.initWallMs).toBeUndefined()
+    expect(result.promptWallMs).toBeDefined()
+    expect(Number(result.promptWallMs)).toBeGreaterThanOrEqual(0)
+  })
+
+  it('--init-side mismatch (init skipped on this side): initRan/initWallMs absent, promptWallMs still recorded', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const result = await runP(
+      runSide(buildInput(root, { side: 'old', runInput: { init: '/graphify .', initSide: 'new' } })),
+    )
+    expect(result.initRan).toBeUndefined()
+    expect(result.initWallMs).toBeUndefined()
+    expect(result.promptWallMs).toBeDefined()
   })
 
   // -------------------------------------------------------------------------

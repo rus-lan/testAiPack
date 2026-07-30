@@ -6,6 +6,9 @@ import type {
   Manifest,
   MetricDelta,
   MetricsDiff,
+  PhaseDeltas,
+  PhaseSlice,
+  PhaseSliceStats,
   PrimaryDeltas,
   PrimaryMetrics,
   Report,
@@ -14,6 +17,7 @@ import type {
   RunInput,
   SecondaryMetrics,
   SideAggregates,
+  SidePhaseSplit,
   Timeline,
   WorkspaceTree,
 } from '@generated/types'
@@ -36,6 +40,7 @@ export const makeRunInput = (over: Partial<RunInput> = {}): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  allowBaselineTool: false,
   initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
@@ -141,6 +146,49 @@ export const makeMetricsDiff = (over: Partial<MetricsDiff> = {}): MetricsDiff =>
   new: makeSideAggregates('new'),
   deltas: defaultDeltas,
   bothFailed: false,
+  ...over,
+})
+
+// ---------------------------------------------------------------------------
+// Phase split (metric-split spec) — opt-in fixtures; `makeSideAggregates` /
+// `makeMetricsDiff` above stay phaseSplit-free by default so every existing
+// test (pre-split reports) keeps rendering exactly as before.
+// ---------------------------------------------------------------------------
+
+export const makePhaseSlice = (over: Partial<PhaseSlice> = {}): PhaseSlice => ({
+  totalTokens: '1000',
+  wallClockMs: '5000',
+  costUsd: 0.01,
+  stepCount: 3,
+  toolCallCount: 2,
+  ...over,
+})
+
+export const makePhaseSliceStats = (median: number, over: Partial<PhaseSliceStats> = {}): PhaseSliceStats => ({
+  totalTokens: { median, min: median, max: median, samples: [median] },
+  wallClockMs: { median, min: median, max: median, samples: [median] },
+  costUsd: { median, min: median, max: median, samples: [median] },
+  stepCount: { median, min: median, max: median, samples: [median] },
+  toolCallCount: { median, min: median, max: median, samples: [median] },
+  ...over,
+})
+
+export const makeSidePhaseSplit = (over: Partial<SidePhaseSplit> = {}): SidePhaseSplit => ({
+  runsWithInit: 1,
+  runsWithLostInit: 0,
+  init: makePhaseSlice(),
+  initStats: makePhaseSliceStats(1000),
+  task: makePhaseSlice({ totalTokens: '500', wallClockMs: '2000', costUsd: 0.005, stepCount: 2, toolCallCount: 1 }),
+  taskStats: makePhaseSliceStats(500),
+  ...over,
+})
+
+export const makePhaseDeltas = (over: Partial<PhaseDeltas> = {}): PhaseDeltas => ({
+  totalTokens: { absolute: -500, percent: -50, significant: true, better: 'better' },
+  wallClockMs: { absolute: -1000, percent: -20, significant: false, better: 'better' },
+  costUsd: { absolute: -0.005, percent: -50, significant: false, better: 'better' },
+  stepCount: { absolute: 1, percent: 50, significant: false, better: 'worse' },
+  toolCallCount: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
   ...over,
 })
 

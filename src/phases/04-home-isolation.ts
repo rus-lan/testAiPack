@@ -28,7 +28,8 @@ import type { DockerExec, OpencodeError } from '../opencode/cli.js'
 import { copyDir, copyFile, ensureDir, exists, isPathWithin, pathKind, readFile, removeDir, writeFile, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
-import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
+import { DEFAULT_OPENCODE_IMAGE, probeImagePath } from '../isolation/docker-runner.js'
+import type { DockerError } from '../isolation/docker-runner.js'
 import { redactConfigSecrets } from '../util/redact.js'
 import type { PhaseError } from '../errors.js'
 import { homeIsolationError } from '../errors.js'
@@ -79,6 +80,14 @@ const SKELETON_DIRS: readonly string[] = [
   '.local/share/opencode',
 ]
 
+/**
+ * Only added when `--pack-setup` is declared, on BOTH sides identically —
+ * backward compatible (a run with no new flags gets byte-for-byte today's
+ * skeleton), and symmetric so a HOME-installed binary is equally reachable
+ * (or equally absent) regardless of side; only its actual content differs.
+ */
+const PACK_SETUP_SKELETON_DIRS: readonly string[] = ['.local/bin']
+
 interface AuthEntry {
   readonly flag: keyof HomeIsolationInput['runInput']['auth']
   readonly src: string
@@ -113,10 +122,12 @@ const buildSkeleton = (
   homeDir: string,
   side: Side,
   runIndex: number,
+  packSetupDeclared: boolean,
 ): Effect.Effect<readonly string[], PhaseError> =>
   Effect.gen(function* () {
+    const dirs = packSetupDeclared ? [...SKELETON_DIRS, ...PACK_SETUP_SKELETON_DIRS] : SKELETON_DIRS
     yield* Effect.forEach(
-      SKELETON_DIRS,
+      dirs,
       (rel) =>
         ensureDir(path.join(homeDir, rel)).pipe(Effect.mapError((e) => mapFs(e, side, runIndex))),
       { concurrency: 1 },
@@ -125,7 +136,7 @@ const buildSkeleton = (
       path.join(homeDir, '.config/opencode/agents/build.md'),
       BUILD_AGENT_TEMPLATE,
     ).pipe(Effect.mapError((e) => mapFs(e, side, runIndex)))
-    return [...SKELETON_DIRS]
+    return [...dirs]
   })
 
 const copyOneAuth = (src: string, dst: string): Effect.Effect<boolean, FsError> =>
@@ -479,6 +490,7 @@ const buildEnvVars = (
   side: Side,
   baselineCfg: string,
   newCfg: string,
+  pathValue: string | undefined,
 ): EnvVarSet => ({
   HOME: homeDir,
   OPENCODE_DISABLE_PROJECT_CONFIG: true,
@@ -486,7 +498,26 @@ const buildEnvVars = (
   OPENCODE_DISABLE_EXTERNAL_SKILLS: side === 'old',
   OPENCODE_PURE: side === 'old',
   OPENCODE_CONFIG_CONTENT: side === 'old' ? baselineCfg : newCfg,
+  ...(pathValue === undefined ? {} : { PATH: pathValue }),
 })
+
+/**
+ * `--pack-setup` PATH, identical shape on both sides (§8 fairness: only its
+ * content differs). Docker mode uses the in-CONTAINER home path
+ * (`/home/opencode/...`) — the host `homeDir` value would resolve to nothing
+ * once the process is actually inside the container (the exact class of bug
+ * already fixed once for local-plugin registration, see phase 04's
+ * `pluginConfigPath`). Home mode runs directly on the host, so the real host
+ * path is correct there.
+ */
+const setupPathFor = (
+  homeDir: string,
+  isolation: IsolationMode,
+  imagePath: string,
+): string =>
+  isolation === 'docker'
+    ? `/home/opencode/.local/bin:${imagePath}`
+    : `${path.join(homeDir, '.local/bin')}:${process.env['PATH'] ?? ''}`
 
 interface SideResult {
   readonly trees: readonly HomeTree[]
@@ -509,6 +540,18 @@ export const homeIsolation = (
     const sourceHome = os.homedir()
     const authFlags = input.runInput.auth
     const installSeconds = input.runInput.timeouts.installSeconds
+    const packSetupDeclared = input.runInput.packSetup !== undefined
+    const imagePath: string =
+      packSetupDeclared && isolation === 'docker' && dockerImage !== undefined
+        ? yield* probeImagePath(dockerImage, dockerNetwork).pipe(
+            Effect.mapError((e: DockerError) =>
+              homeIsolationError(`cannot probe image PATH for --pack-setup: ${e.stderr}`, 'E_DOCKER_FAILED', {
+                image: dockerImage,
+                stderr: e.stderr,
+              }),
+            ),
+          )
+        : ''
     const packOutcome = input.packInstall
     const packInfo = packOutcome === undefined ? undefined : packInfoFrom(packOutcome)
     const mcpServers = collectMcpServers(packOutcome?.instructions)
@@ -557,7 +600,7 @@ export const homeIsolation = (
                   }),
                 )
               }
-              const structure = yield* buildSkeleton(homeDir, side, runIndex)
+              const structure = yield* buildSkeleton(homeDir, side, runIndex, packSetupDeclared)
               const copiedAuth = yield* copyAuth(homeDir, sourceHome, authFlags)
               if (copiedAuth.length === 0) {
                 yield* Effect.fail(
@@ -580,7 +623,8 @@ export const homeIsolation = (
                 structure: [...structure],
                 copiedAuth: [...copiedAuth],
               }
-              return { tree, env: buildEnvVars(homeDir, side, baselineCfg, newCfg) }
+              const pathValue = packSetupDeclared ? setupPathFor(homeDir, isolation, imagePath) : undefined
+              return { tree, env: buildEnvVars(homeDir, side, baselineCfg, newCfg, pathValue) }
             }),
           { concurrency: 1 },
         )
