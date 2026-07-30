@@ -29,6 +29,15 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.6.3 (export part validation crash fix)
+
+- **A run killed by the watchdog could crash the timeline phase**: `exportPartSchema` is a `z.union` whose last member is a catch-all `z.object({type, id})` — zod 4 strips undeclared keys, so a part that failed its real variant silently degraded to `{type, id}` while keeping its original `type` tag, defeating every guard that checked `type` alone and then crashing on a field it assumed was there (`part.time.start`). The real trigger: an interrupted reasoning part left behind by a watchdog-killed run, with `time.start` and no `time.end`. `time.end` on the reasoning part and on tool state, and `ExportToolState.input`, are now optional in the contract — an interrupted part now validates as its real variant instead of degrading.
+- Part type guards moved to `src/metrics/parts.ts` and now check shape, not just the type tag — a part that fails a guard contributes nothing instead of crashing. The same crash class existed in `isText` (`p.text.length` on a degraded part), which could take down the aggregate phase; the timeline phase hit it first because it reads every run's export unconditionally, while aggregate happens to skip runs already marked failed.
+- Tool calls with no measurable end are now excluded from the average-latency denominator instead of being counted as 0ms samples — this had been silently halving `avgDurationMs`/`toolLatencyAvgMs`.
+- Duplicate-tool-call detection no longer collides two different input-less calls into a phantom duplicate.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.6.2...v0.6.3
+
 ## v0.6.2 (deterministic pack setup, pack-hint, setup/init/task phase split, judge and rebuild fixes)
 
 - **Deterministic pack setup**: `--pack-setup <cmd>` installs the pack's runtime once and copies the prepared HOME to every new-side run; `--pack-check <cmd>` becomes a verified precondition — gate 6 runs it in every new HOME (must pass) and every old/baseline HOME (must fail, unless `--allow-baseline-tool`); `--pack-exercise <cmd>` runs the pack's own pipeline before each new-side run, so its output exists by construction, not by the model's luck. The report's mode banner (`delivered-only`/`installed-only`/`exercised`) now reflects what actually ran and passed, not just which flags were given.
