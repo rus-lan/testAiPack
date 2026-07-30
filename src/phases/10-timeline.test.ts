@@ -4,6 +4,7 @@ import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, readFile, writeFile, writeJson } from '../util/fs.js'
+import { makeRunResult, makeWorkspaceTree } from '../../tests/helpers/variants.js'
 
 vi.mock('../opencode/cli.js', () => ({
   exportSession: vi.fn(),
@@ -21,16 +22,15 @@ import {
 import type { SessionTreeLoader } from './10-timeline.js'
 import type { SessionTreeNode } from '../metrics/extract.js'
 import { PhaseError } from '../errors.js'
-import { opencodeExportSchema } from '@generated/schemas'
+import { opencodeExportSchema, timelineSchema } from '@generated/schemas'
 import type {
   Manifest,
   OpencodeExport,
   RunInput,
-  RunSideResult,
-  Side,
   Timeline,
   TimelineEvent,
   TimelineMode,
+  VariantSpec,
   WorkspaceTree,
 } from '@generated/types'
 
@@ -44,23 +44,30 @@ const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise
 // Fixtures
 // ---------------------------------------------------------------------------
 
+const defaultVariants: VariantSpec[] = [
+  { name: 'old', packs: [] },
+  { name: 'new', packs: [] },
+]
+
 const makeRunInput = (over: Partial<RunInput>): RunInput => ({
+  schemaVersion: 2,
   repoUrl: '',
   prompt: 'p',
   runs: 1,
+  parallel: 2,
+  baseline: 'old',
+  packs: [],
+  variants: defaultVariants,
   isolation: 'home',
   auth: {
     opencode: false, npmrc: false, anthropic: false, openai: false,
     gemini: false, aws: false, ssh: false, git: false,
   },
-  pureBaseline: true,
-  protectGit: false,
-  allowBaselineTool: false,
-  initSide: 'both',
   preflightEnabled: true,
   formats: ['md', 'html'],
   outputPath: './results',
   diffHtml: false,
+  protectGit: false,
   collapseRepeats: false,
   timelineMode: 'side-by-side',
   timeouts: {
@@ -73,51 +80,30 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
 })
 
 const fakeManifest: Manifest = {
+  schemaVersion: 2,
   runId: 'rid-tl',
   timestamp: '2026-07-21T00:00:00.000Z',
   repoUrl: '',
   prompt: 'p',
   runs: 1,
+  parallel: 2,
+  baseline: 'old',
+  packs: [],
+  variants: defaultVariants,
   isolation: 'home',
   opencodeVersion: '1.0.0',
   flagDefaults: {},
 }
 
-const makeWorkspace = async (runs: number): Promise<WorkspaceTree> => {
+const makeWorkspace = async (names: readonly string[], runs: number): Promise<WorkspaceTree> => {
   const root = makeTempDir()
-  const range = Array.from({ length: runs }, (_, i) => i + 1)
-  const tree: WorkspaceTree = {
-    root,
-    appsSource: path.join(root, 'apps', 'source'),
-    appsOld: range.map((n) => path.join(root, 'apps', 'oldVersion', `run-${String(n)}`)),
-    appsNew: range.map((n) => path.join(root, 'apps', 'newVersion', `run-${String(n)}`)),
-    pack: path.join(root, 'pack'),
-    homeOld: [],
-    homeNew: [],
-    gitDirsOld: [],
-    gitDirsNew: [],
-    config: path.join(root, 'config'),
-    results: path.join(root, 'results'),
-    raw: path.join(root, 'results', 'raw'),
-    diff: path.join(root, 'results', 'diff'),
+  const tree = makeWorkspaceTree(root, runs, [...names])
+  for (const name of names) {
+    await runP(ensureDir(path.join(tree.raw, name)))
   }
-  await runP(ensureDir(path.join(tree.raw, 'old')))
-  await runP(ensureDir(path.join(tree.raw, 'new')))
   await runP(ensureDir(tree.results))
   return tree
 }
-
-const sideResult = (side: Side, runIndex: number, successRank = 4): RunSideResult => ({
-  side,
-  runIndex,
-  exportPath: '',
-  eventsLogPath: '',
-  successRank,
-  finishCause: 'stop',
-  exitCode: 0,
-  durationMs: '0',
-  watchdogTriggered: false,
-})
 
 type PartBuilder = Record<string, unknown>
 
@@ -184,8 +170,8 @@ const makeExport = (o: ExportOpts): Record<string, unknown> => ({
   })),
 })
 
-const writeRaw = async (tree: WorkspaceTree, side: Side, runIndex: number, data: unknown): Promise<void> => {
-  await runP(writeJson(path.join(tree.raw, side, `run-${String(runIndex)}.json`), data))
+const writeRaw = async (tree: WorkspaceTree, variant: string, runIndex: number, data: unknown): Promise<void> => {
+  await runP(writeJson(path.join(tree.raw, variant, `run-${String(runIndex)}.json`), data))
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +186,7 @@ describe('extractEventsFromExport — event types', () => {
     const ev = extractEventsFromExport(baseExport([textPart('hello')]), 'old', 1)
     expect(ev).toHaveLength(1)
     expect(ev[0]!.type).toBe('text')
-    expect(ev[0]!.side).toBe('old')
+    expect(ev[0]!.variant).toBe('old')
     expect(ev[0]!.runIndex).toBe(1)
   })
 
@@ -267,8 +253,13 @@ describe('extractEventsFromExport — event types', () => {
     const ev = extractEventsFromExport(baseExport(parts), 'new', 2)
     const types = ev.map((e) => e.type)
     expect(types).toEqual(['text', 'reasoning', 'tool-call', 'tool-result', 'step-finish'])
-    expect(ev.every((e) => e.side === 'new')).toBe(true)
+    expect(ev.every((e) => e.variant === 'new')).toBe(true)
     expect(ev.every((e) => e.runIndex === 2)).toBe(true)
+  })
+
+  it('accepts any variant name string, not just old/new', () => {
+    const ev = extractEventsFromExport(baseExport([textPart('a')]), 'graphify', 1)
+    expect(ev[0]!.variant).toBe('graphify')
   })
 })
 
@@ -387,7 +378,7 @@ describe('extractEventsFromExport — metadata', () => {
 const callAt = (tStart: number, tool = 'bash'): TimelineEvent => ({
   tStart: String(tStart),
   tEnd: String(tStart + 100),
-  side: 'old',
+  variant: 'old',
   runIndex: 1,
   sessionId: 's',
   swimlaneDepth: 0,
@@ -402,7 +393,7 @@ const resultAt = (
 ): TimelineEvent => ({
   tStart: String(tStart),
   tEnd: String(tStart),
-  side: 'old',
+  variant: 'old',
   runIndex: 1,
   sessionId: 's',
   swimlaneDepth: 0,
@@ -435,14 +426,25 @@ describe('collapseRepeats', () => {
     expect(out[2]!.tool).toBe('bash')
   })
 
-  it('does not merge across different sides / runIndex', () => {
+  it('does not merge across different variants / runIndex', () => {
     const events: TimelineEvent[] = [
-      { ...callAt(100), side: 'old', runIndex: 1 },
-      { ...callAt(200), side: 'new', runIndex: 1 },
-      { ...callAt(300), side: 'old', runIndex: 2 },
+      { ...callAt(100), variant: 'old', runIndex: 1 },
+      { ...callAt(200), variant: 'new', runIndex: 1 },
+      { ...callAt(300), variant: 'old', runIndex: 2 },
     ]
     const out = collapseRepeats(events)
     expect(out).toHaveLength(3)
+  })
+
+  it('does not merge across a 3-variant set (N-way, not just old/new)', () => {
+    const events: TimelineEvent[] = [
+      { ...callAt(100), variant: 'base' },
+      { ...callAt(200), variant: 'graphify' },
+      { ...callAt(300), variant: 'astgrep' },
+    ]
+    const out = collapseRepeats(events)
+    expect(out).toHaveLength(3)
+    expect(out.map((e) => e.variant)).toEqual(['base', 'graphify', 'astgrep'])
   })
 
   it('does not merge a tool-call with its own adjacent tool-result (same tool)', () => {
@@ -479,66 +481,86 @@ describe('collapseRepeats', () => {
 // renderTimelineHtml — pure
 // ---------------------------------------------------------------------------
 
+const BASELINE = 'base'
+
 const sampleTimeline = (mode: TimelineMode): Timeline => ({
-  old: [
-    { tStart: '0', tEnd: '100', side: 'old', runIndex: 1, sessionId: 's1', swimlaneDepth: 0, type: 'reasoning' },
-    { tStart: '100', tEnd: '200', side: 'old', runIndex: 1, sessionId: 's1', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' },
-    { tStart: '200', tEnd: '200', side: 'old', runIndex: 1, sessionId: 's1', swimlaneDepth: 0, type: 'tool-result', tool: 'bash', status: 'completed' },
-  ],
-  new: [
-    { tStart: '0', tEnd: '50', side: 'new', runIndex: 1, sessionId: 's2', swimlaneDepth: 0, type: 'text' },
-    { tStart: '50', tEnd: '150', side: 'new', runIndex: 1, sessionId: 's2', swimlaneDepth: 0, type: 'step-finish', tokens: 99 },
+  lanes: [
+    {
+      variant: 'base',
+      events: [
+        { tStart: '0', tEnd: '100', variant: 'base', runIndex: 1, sessionId: 's1', swimlaneDepth: 0, type: 'reasoning' },
+        { tStart: '100', tEnd: '200', variant: 'base', runIndex: 1, sessionId: 's1', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' },
+        { tStart: '200', tEnd: '200', variant: 'base', runIndex: 1, sessionId: 's1', swimlaneDepth: 0, type: 'tool-result', tool: 'bash', status: 'completed' },
+      ],
+    },
+    {
+      variant: 'graphify',
+      events: [
+        { tStart: '0', tEnd: '50', variant: 'graphify', runIndex: 1, sessionId: 's2', swimlaneDepth: 0, type: 'text' },
+        { tStart: '50', tEnd: '150', variant: 'graphify', runIndex: 1, sessionId: 's2', swimlaneDepth: 0, type: 'step-finish', tokens: 99 },
+      ],
+    },
+    {
+      variant: 'astgrep',
+      events: [
+        { tStart: '0', tEnd: '80', variant: 'astgrep', runIndex: 1, sessionId: 's3', swimlaneDepth: 0, type: 'reasoning' },
+      ],
+    },
   ],
   mode,
 })
 
 describe('renderTimelineHtml', () => {
   it('contains DOCTYPE, title, and inline style', () => {
-    const html = renderTimelineHtml(sampleTimeline('side-by-side'))
+    const html = renderTimelineHtml(sampleTimeline('side-by-side'), BASELINE)
     expect(html).toContain('<!DOCTYPE html>')
     expect(html).toContain('<title>')
     expect(html).toContain('<style>')
   })
 
-  it('renders both OLD and NEW sides', () => {
-    const html = renderTimelineHtml(sampleTimeline('side-by-side'))
-    expect(html).toContain('OLD')
-    expect(html).toContain('NEW')
-    expect(html).toContain('class="side old"')
-    expect(html).toContain('class="side new"')
+  it('renders one .side block per variant, headers show name + baseline suffix', () => {
+    const html = renderTimelineHtml(sampleTimeline('side-by-side'), BASELINE)
+    expect(html.match(/class="side" data-vi="\d+"/g)).toHaveLength(3)
+    expect(html).toContain('<h2>base (baseline)</h2>')
+    expect(html).toContain('<h2>graphify</h2>')
+    expect(html).toContain('<h2>astgrep</h2>')
   })
 
   it('emits event divs with type-based classes and tooltips', () => {
-    const html = renderTimelineHtml(sampleTimeline('side-by-side'))
+    const html = renderTimelineHtml(sampleTimeline('side-by-side'), BASELINE)
     expect(html).toContain('event reasoning')
     expect(html).toContain('event tool-call')
     expect(html).toContain('data-tooltip')
   })
 
   it('tool events get tool-specific class (bash)', () => {
-    const html = renderTimelineHtml(sampleTimeline('side-by-side'))
+    const html = renderTimelineHtml(sampleTimeline('side-by-side'), BASELINE)
     expect(html).toContain('tool-call bash')
   })
 
   it('sanitizes a tool name with unsafe characters before using it as a CSS class', () => {
     const tl: Timeline = {
-      old: [
+      lanes: [
         {
-          tStart: '0',
-          tEnd: '10',
-          side: 'old',
-          runIndex: 1,
-          sessionId: 's',
-          swimlaneDepth: 0,
-          type: 'tool-call',
-          tool: '"><img src=x onerror=alert(1)>',
-          status: 'completed',
+          variant: 'v',
+          events: [
+            {
+              tStart: '0',
+              tEnd: '10',
+              variant: 'v',
+              runIndex: 1,
+              sessionId: 's',
+              swimlaneDepth: 0,
+              type: 'tool-call',
+              tool: '"><img src=x onerror=alert(1)>',
+              status: 'completed',
+            },
+          ],
         },
       ],
-      new: [],
       mode: 'side-by-side',
     }
-    const html = renderTimelineHtml(tl)
+    const html = renderTimelineHtml(tl, 'v')
     expect(html).not.toContain('<img')
     const classAttr = /class="(event tool-call [^"]*)"/.exec(html)
     expect(classAttr).not.toBeNull()
@@ -547,36 +569,49 @@ describe('renderTimelineHtml', () => {
 
   it('caps event width instead of rendering an unbounded pixel value', () => {
     const tl: Timeline = {
-      old: [
-        { tStart: '0', tEnd: '600000', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' },
+      lanes: [
+        {
+          variant: 'v',
+          events: [
+            { tStart: '0', tEnd: '600000', variant: 'v', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' },
+          ],
+        },
       ],
-      new: [],
       mode: 'side-by-side',
     }
-    const html = renderTimelineHtml(tl)
+    const html = renderTimelineHtml(tl, 'v')
     expect(html).not.toContain('width:300000px')
     expect(html).toContain('width:2000px')
   })
 
   it('embeds the timeline JSON so it survives a literal </script> in tool data', () => {
     const tl: Timeline = {
-      old: [
-        { tStart: '0', tEnd: '10', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash & "quoted" <b>', status: 'completed' },
+      lanes: [
+        {
+          variant: 'v',
+          events: [
+            { tStart: '0', tEnd: '10', variant: 'v', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash & "quoted" <b>', status: 'completed' },
+          ],
+        },
       ],
-      new: [],
       mode: 'side-by-side',
     }
-    const html = renderTimelineHtml(tl)
+    const html = renderTimelineHtml(tl, 'v')
     const match = /<script type="application\/json" id="timeline-data">([\s\S]*?)<\/script>/.exec(html)
     expect(match).not.toBeNull()
     const scriptContent = match![1]!
     expect(scriptContent).not.toMatch(/&amp;|&lt;|&quot;/)
     const parsed = JSON.parse(scriptContent) as Timeline
-    expect(parsed.old[0]?.tool).toBe('bash & "quoted" <b>')
+    expect(parsed.lanes[0]?.events[0]?.tool).toBe('bash & "quoted" <b>')
+  })
+
+  it('embeds a schemaVersion note for the v2 lanes[] shape as an html comment', () => {
+    const html = renderTimelineHtml(sampleTimeline('side-by-side'), BASELINE)
+    expect(html).toMatch(/<!--[\s\S]*schemaVersion: 2[\s\S]*-->/)
   })
 
   it('is self-contained: no external resources', () => {
-    const html = renderTimelineHtml(sampleTimeline('side-by-side'))
+    const html = renderTimelineHtml(sampleTimeline('side-by-side'), BASELINE)
     expect(html).not.toMatch(/src\s*=\s*["']https?:/)
     expect(html).not.toMatch(/href\s*=\s*["']https?:/)
     expect(html).not.toMatch(/<link/i)
@@ -585,71 +620,154 @@ describe('renderTimelineHtml', () => {
 
   it('error status is flagged on the event element', () => {
     const tl: Timeline = {
-      old: [{ tStart: '0', tEnd: '10', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'read', status: 'error' }],
-      new: [],
+      lanes: [
+        { variant: 'v', events: [{ tStart: '0', tEnd: '10', variant: 'v', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'read', status: 'error' }] },
+      ],
       mode: 'side-by-side',
     }
-    const html = renderTimelineHtml(tl)
+    const html = renderTimelineHtml(tl, 'v')
     expect(html).toContain('data-status="error"')
   })
 
-  it('merged mode renders a single combined axis', () => {
-    const html = renderTimelineHtml(sampleTimeline('merged'))
-    expect(html).toContain('merged')
+  it('merged mode renders a single combined block with variant palette chips', () => {
+    const html = renderTimelineHtml(sampleTimeline('merged'), BASELINE)
+    expect(html).toContain('MERGED')
+    expect(html.match(/class="chip"/g)).toHaveLength(3)
+    expect(html).toContain('>base (baseline)<')
+    expect(html).toContain('>graphify<')
+    expect(html).toContain('>astgrep<')
   })
 
-  it('tree-diff mode renders both sides without throwing', () => {
-    const html = renderTimelineHtml(sampleTimeline('tree-diff'))
+  it('tree-diff mode renders every lane without throwing', () => {
+    const html = renderTimelineHtml(sampleTimeline('tree-diff'), BASELINE)
     expect(html).toContain('<!DOCTYPE html>')
-    expect(html).toContain('class="side old"')
-    expect(html).toContain('class="side new"')
+    expect(html.match(/class="side" data-vi="\d+"/g)).toHaveLength(3)
     expect(html).toContain('tree-diff')
   })
 
-  it('tree-diff flags events present on only one side (by tool+type)', () => {
+  it('legend shows the tree-diff swatches only in tree-diff mode', () => {
+    const treeDiffHtml = renderTimelineHtml(sampleTimeline('tree-diff'), BASELINE)
+    expect(treeDiffHtml).toContain('only vs baseline')
+    expect(treeDiffHtml).toContain('baseline only')
+    const sideHtml = renderTimelineHtml(sampleTimeline('side-by-side'), BASELINE)
+    expect(sideHtml).not.toContain('only vs baseline')
+    expect(sideHtml).not.toContain('baseline only')
+  })
+
+  it('baseline lane always gets #fafafa, and non-baseline lanes never collide with it or each other', () => {
     const tl: Timeline = {
-      // old has bash tool-call + reasoning; new has read tool-call + reasoning
-      old: [
-        { tStart: '0', tEnd: '10', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'reasoning' },
-        { tStart: '10', tEnd: '20', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' },
+      lanes: [
+        { variant: 'a', events: [] },
+        { variant: 'b', events: [] },
+        { variant: 'base', events: [] },
       ],
-      new: [
-        { tStart: '0', tEnd: '10', side: 'new', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'reasoning' },
-        { tStart: '10', tEnd: '20', side: 'new', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'read', status: 'completed' },
+      mode: 'side-by-side',
+    }
+    const html = renderTimelineHtml(tl, 'base')
+    // baseline sits at lane index 2 (not 0) and still gets the reserved color
+    expect(html).toContain('.side[data-vi="2"]{background:#fafafa}')
+    // non-baseline lanes are colored by their ordinal AMONG NON-BASELINE lanes
+    // (a=0th, b=1st), not by absolute lane index — so lane 0 ('a') does NOT
+    // get palette[0]='#fafafa', which would collide with the baseline
+    expect(html).toContain('.side[data-vi="0"]{background:#f0fff0}')
+    expect(html).toContain('.side[data-vi="1"]{background:#f4f8ff}')
+    const backgrounds = [...html.matchAll(/\.side\[data-vi="\d+"\]\{background:(#[0-9a-f]+)\}/g)].map(
+      (m) => m[1],
+    )
+    expect(new Set(backgrounds).size).toBe(backgrounds.length)
+  })
+
+  const evAt = (variant: string, type: TimelineEvent['type'], tool?: string): TimelineEvent => ({
+    tStart: '0',
+    tEnd: '10',
+    variant,
+    runIndex: 1,
+    sessionId: 's',
+    swimlaneDepth: 0,
+    type,
+    ...(tool === undefined ? {} : { tool, status: 'completed' as const }),
+  })
+
+  const treeDiffFixture: Timeline = {
+    lanes: [
+      { variant: 'base', events: [evAt('base', 'reasoning'), evAt('base', 'tool-call', 'bash'), evAt('base', 'tool-call', 'write')] },
+      { variant: 'b', events: [evAt('b', 'reasoning'), evAt('b', 'tool-call', 'bash'), evAt('b', 'tool-call', 'grep')] },
+      { variant: 'c', events: [evAt('c', 'reasoning'), evAt('c', 'tool-call', 'bash')] },
+    ],
+    mode: 'tree-diff',
+  }
+
+  it('tree-diff outlines a tool present only in a non-baseline variant (green, vs-baseline)', () => {
+    const html = renderTimelineHtml(treeDiffFixture, 'base')
+    expect(html).toMatch(/tool-call grep vs-baseline/)
+  })
+
+  it('tree-diff outlines a baseline event absent from every other variant (red, baseline-only)', () => {
+    const html = renderTimelineHtml(treeDiffFixture, 'base')
+    expect(html).toMatch(/tool-call write baseline-only/)
+  })
+
+  it('tree-diff does not flag a key shared across every variant', () => {
+    const html = renderTimelineHtml(treeDiffFixture, 'base')
+    expect(html).not.toMatch(/tool-call bash[^"]*(vs-baseline|baseline-only)/)
+    expect(html).not.toMatch(/reasoning[^"]*(vs-baseline|baseline-only)/)
+  })
+
+  it('tree-diff with identical events across all variants flags nothing', () => {
+    const tl: Timeline = {
+      lanes: [
+        { variant: 'base', events: [evAt('base', 'tool-call', 'bash')] },
+        { variant: 'b', events: [evAt('b', 'tool-call', 'bash')] },
+        { variant: 'c', events: [evAt('c', 'tool-call', 'bash')] },
       ],
       mode: 'tree-diff',
     }
-    const html = renderTimelineHtml(tl)
-    // reasoning is on both sides → not flagged; bash/read are unique per side
-    expect(html).toContain('only-old')
-    expect(html).toContain('only-new')
-    expect(html).toMatch(/tool-call bash only-old/)
-    expect(html).toMatch(/tool-call read only-new/)
-    expect(html).not.toMatch(/reasoning only/)
+    const html = renderTimelineHtml(tl, 'base')
+    expect(html).not.toMatch(/event \w+[^"]* vs-baseline/)
+    expect(html).not.toMatch(/event \w+[^"]* baseline-only/)
   })
 
-  it('tree-diff with identical sides flags nothing', () => {
+  it('a single lane that IS the baseline is not flagged in tree-diff mode (N=1 config)', () => {
     const tl: Timeline = {
-      old: [{ tStart: '0', tEnd: '5', side: 'old', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' }],
-      new: [{ tStart: '0', tEnd: '5', side: 'new', runIndex: 1, sessionId: 's', swimlaneDepth: 0, type: 'tool-call', tool: 'bash', status: 'completed' }],
+      lanes: [{ variant: 'base', events: [evAt('base', 'tool-call', 'bash'), evAt('base', 'reasoning')] }],
       mode: 'tree-diff',
     }
-    const html = renderTimelineHtml(tl)
-    // no event div carries an only-* flag (legend still lists the swatches)
-    expect(html).not.toMatch(/event \w+[^"]* only-old/)
-    expect(html).not.toMatch(/event \w+[^"]* only-new/)
+    const html = renderTimelineHtml(tl, 'base')
+    expect(html).not.toMatch(/event \w+[^"]* vs-baseline/)
+    expect(html).not.toMatch(/event \w+[^"]* baseline-only/)
+    expect(html).toContain('<h2>base (baseline)</h2>')
   })
 
-  it('empty tree-diff timeline still produces valid HTML', () => {
-    const html = renderTimelineHtml({ old: [], new: [], mode: 'tree-diff' })
-    expect(html).toContain('<!DOCTYPE html>')
-    expect(html).toContain('class="events"')
+  it('a baseline name matching no lane falls back to the first lane (e.g. rebuild drift)', () => {
+    const tl: Timeline = {
+      lanes: [
+        { variant: 'first', events: [evAt('first', 'tool-call', 'bash')] },
+        { variant: 'second', events: [evAt('second', 'tool-call', 'grep')] },
+      ],
+      mode: 'tree-diff',
+    }
+    const html = renderTimelineHtml(tl, 'does-not-exist')
+    expect(html).toContain('<h2>first (baseline)</h2>')
+    expect(html).not.toContain('does-not-exist')
+    // grep is now diffed against the resolved baseline ('first') -> flagged
+    expect(html).toMatch(/tool-call grep vs-baseline/)
   })
 
-  it('empty timeline still produces valid HTML', () => {
-    const html = renderTimelineHtml({ old: [], new: [], mode: 'side-by-side' })
+  it('empty tree-diff timeline (no lanes) still produces valid HTML', () => {
+    const html = renderTimelineHtml({ lanes: [], mode: 'tree-diff' }, 'base')
     expect(html).toContain('<!DOCTYPE html>')
-    expect(html).toContain('class="events"')
+    expect(html).toContain('class="timeline"')
+  })
+
+  it('empty side-by-side timeline (no lanes) still produces valid HTML', () => {
+    const html = renderTimelineHtml({ lanes: [], mode: 'side-by-side' }, 'base')
+    expect(html).toContain('<!DOCTYPE html>')
+    expect(html).toContain('class="timeline"')
+  })
+
+  it('a lane with zero events still renders its block with an empty events row', () => {
+    const html = renderTimelineHtml({ lanes: [{ variant: 'base', events: [] }], mode: 'side-by-side' }, 'base')
+    expect(html).toContain('class="events"></div>')
   })
 })
 
@@ -658,36 +776,36 @@ describe('renderTimelineHtml', () => {
 // ---------------------------------------------------------------------------
 
 describe('timeline — happy path', () => {
-  it('2x3 runs → both arrays filled, json + html written', async () => {
-    const tree = await makeWorkspace(3)
-    const runInput = makeRunInput({ runs: 3, formats: ['md', 'html'], collapseRepeats: false })
+  it('3 variants x 3 runs → every lane filled, json + html written', async () => {
+    const names = ['base', 'graphify', 'astgrep']
+    const tree = await makeWorkspace(names, 3)
+    const runInput = makeRunInput({ runs: 3, baseline: 'base', formats: ['md', 'html'], collapseRepeats: false })
     const parts: readonly PartBuilder[] = [reasoningPart(0, 100), toolPart('bash', 'completed', 100, 200), stepFinishPart(50)]
-    for (const n of [1, 2, 3]) {
-      await writeRaw(tree, 'old', n, makeExport({ id: `old-${String(n)}`, created: 0, messages: [{ role: 'assistant', created: 0, completed: 300, parts }] }))
-      await writeRaw(tree, 'new', n, makeExport({ id: `new-${String(n)}`, created: 0, messages: [{ role: 'assistant', created: 0, completed: 250, parts }] }))
+    for (const name of names) {
+      for (const n of [1, 2, 3]) {
+        await writeRaw(tree, name, n, makeExport({ id: `${name}-${String(n)}`, created: 0, messages: [{ role: 'assistant', created: 0, completed: 300, parts }] }))
+      }
     }
     const result = await runP(timeline({
       runInput,
       manifest: fakeManifest,
       workspace: tree,
-      sideResults: {
-        old: [1, 2, 3].map((n) => sideResult('old', n)),
-        new: [1, 2, 3].map((n) => sideResult('new', n)),
-      },
+      results: names.map((name) => ({ name, runs: [1, 2, 3].map((n) => makeRunResult(name, n)) })),
     }))
-    expect(result.timeline.old.length).toBeGreaterThan(0)
-    expect(result.timeline.new.length).toBeGreaterThan(0)
+    expect(result.timeline.lanes.map((l) => l.variant)).toEqual(names)
+    for (const lane of result.timeline.lanes) {
+      expect(lane.events.length).toBeGreaterThan(0)
+      expect(lane.events.every((e) => e.variant === lane.variant)).toBe(true)
+    }
     expect(result.timeline.mode).toBe('side-by-side')
     expect(result.jsonPath).toBe(path.join(tree.results, 'timeline.json'))
     expect(result.htmlPath).toBe(path.join(tree.results, 'timeline.html'))
     expect(existsSync(result.jsonPath)).toBe(true)
     expect(existsSync(result.htmlPath!)).toBe(true)
-    expect(result.timeline.old.every((e) => e.side === 'old')).toBe(true)
-    expect(result.timeline.new.every((e) => e.side === 'new')).toBe(true)
   })
 
   it('no html format → htmlPath omitted, json still written', async () => {
-    const tree = await makeWorkspace(1)
+    const tree = await makeWorkspace(['old', 'new'], 1)
     const runInput = makeRunInput({ runs: 1, formats: ['md'] })
     await writeRaw(tree, 'old', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] }))
     await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
@@ -695,14 +813,17 @@ describe('timeline — happy path', () => {
       runInput,
       manifest: fakeManifest,
       workspace: tree,
-      sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+      results: [
+        { name: 'old', runs: [makeRunResult('old', 1)] },
+        { name: 'new', runs: [makeRunResult('new', 1)] },
+      ],
     }))
     expect(result.htmlPath).toBeUndefined()
     expect(existsSync(result.jsonPath)).toBe(true)
   })
 
   it('collapseRepeats=true → consecutive same-tool calls collapsed in output', async () => {
-    const tree = await makeWorkspace(1)
+    const tree = await makeWorkspace(['old', 'new'], 1)
     const runInput = makeRunInput({ runs: 1, collapseRepeats: true })
     const parts: readonly PartBuilder[] = [
       toolPart('bash', 'running', 0, 10),
@@ -713,99 +834,125 @@ describe('timeline — happy path', () => {
     await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
     const result = await runP(timeline({
       runInput, manifest: fakeManifest, workspace: tree,
-      sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+      results: [
+        { name: 'old', runs: [makeRunResult('old', 1)] },
+        { name: 'new', runs: [makeRunResult('new', 1)] },
+      ],
     }))
-    const oldCalls = result.timeline.old.filter((e) => e.type === 'tool-call')
+    const oldLane = result.timeline.lanes.find((l) => l.variant === 'old')
+    const oldCalls = oldLane?.events.filter((e) => e.type === 'tool-call') ?? []
     expect(oldCalls).toHaveLength(1)
   })
 
   it('empty parts in export → valid timeline with empty events for that run', async () => {
-    const tree = await makeWorkspace(1)
+    const tree = await makeWorkspace(['old', 'new'], 1)
     const runInput = makeRunInput({ runs: 1 })
     await writeRaw(tree, 'old', 1, makeExport({ created: 0, messages: [] }))
     await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
     const result = await runP(timeline({
       runInput, manifest: fakeManifest, workspace: tree,
-      sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+      results: [
+        { name: 'old', runs: [makeRunResult('old', 1)] },
+        { name: 'new', runs: [makeRunResult('new', 1)] },
+      ],
     }))
-    expect(result.timeline.old).toEqual([])
-    expect(result.timeline.new).toHaveLength(1)
+    expect(result.timeline.lanes.find((l) => l.variant === 'old')?.events).toEqual([])
+    expect(result.timeline.lanes.find((l) => l.variant === 'new')?.events).toHaveLength(1)
   })
 
   it('all modes pass through to timeline.mode', async () => {
-    const tree = await makeWorkspace(1)
+    const tree = await makeWorkspace(['old', 'new'], 1)
     await writeRaw(tree, 'old', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] }))
     await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
     for (const mode of ['side-by-side', 'tree-diff', 'merged'] as const) {
       const result = await runP(timeline({
         runInput: makeRunInput({ runs: 1, timelineMode: mode }),
         manifest: fakeManifest, workspace: tree,
-        sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+        results: [
+          { name: 'old', runs: [makeRunResult('old', 1)] },
+          { name: 'new', runs: [makeRunResult('new', 1)] },
+        ],
       }))
       expect(result.timeline.mode).toBe(mode)
     }
   })
 
-  it('timeline.json validates against Timeline schema (round-trip)', async () => {
-    const tree = await makeWorkspace(1)
+  it('timeline.json validates against the v2 Timeline schema (round-trip)', async () => {
+    const tree = await makeWorkspace(['old', 'new'], 1)
     const runInput = makeRunInput({ runs: 1 })
     await writeRaw(tree, 'old', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [reasoningPart(0, 100), stepFinishPart(10)] }] }))
     await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
     const result = await runP(timeline({
       runInput, manifest: fakeManifest, workspace: tree,
-      sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+      results: [
+        { name: 'old', runs: [makeRunResult('old', 1)] },
+        { name: 'new', runs: [makeRunResult('new', 1)] },
+      ],
     }))
     const raw = await runP(readFile(result.jsonPath))
-    expect(() => { JSON.parse(raw) }).not.toThrow()
-    const parsed = JSON.parse(raw) as Timeline
-    expect(parsed.old.length).toBeGreaterThan(0)
-    expect(parsed.mode).toBe('side-by-side')
+    const parsedJson = JSON.parse(raw) as unknown
+    const check = timelineSchema.safeParse(parsedJson)
+    expect(check.success).toBe(true)
+    const tl = parsedJson as Timeline
+    expect(tl.lanes.find((l) => l.variant === 'old')?.events.length).toBeGreaterThan(0)
+    expect(tl.mode).toBe('side-by-side')
   })
 })
 
 describe('timeline — errors', () => {
-  it('corrupt run-N.json (invalid JSON) -> run contributes no events, phase succeeds', async () => {
-    const tree = await makeWorkspace(1)
-    const runInput = makeRunInput({ runs: 1 })
-    await runP(writeFile(path.join(tree.raw, 'old', 'run-1.json'), '{"info":{"id":"trunc'))
-    await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
+  it('corrupt run-N.json (invalid JSON) -> that variant contributes no events, phase succeeds', async () => {
+    const names = ['base', 'graphify', 'astgrep']
+    const tree = await makeWorkspace(names, 1)
+    const runInput = makeRunInput({ runs: 1, baseline: 'base' })
+    await runP(writeFile(path.join(tree.raw, 'graphify', 'run-1.json'), '{"info":{"id":"trunc'))
+    await writeRaw(tree, 'base', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] }))
+    await writeRaw(tree, 'astgrep', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('z')] }] }))
     const result = await runP(timeline({
       runInput, manifest: fakeManifest, workspace: tree,
-      sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+      results: names.map((name) => ({ name, runs: [makeRunResult(name, 1)] })),
     }))
-    expect(result.timeline.old).toEqual([])
-    expect(result.timeline.new).toHaveLength(1)
+    const byName = (n: string): readonly TimelineEvent[] => result.timeline.lanes.find((l) => l.variant === n)?.events ?? []
+    expect(byName('graphify')).toEqual([])
+    expect(byName('base')).toHaveLength(1)
+    expect(byName('astgrep')).toHaveLength(1)
   })
 
-  it('run-N.json fails schema -> same (no events, phase succeeds)', async () => {
-    const tree = await makeWorkspace(1)
+  it('run-N.json fails schema -> same (no events for that variant, phase succeeds)', async () => {
+    const tree = await makeWorkspace(['old', 'new'], 1)
     const runInput = makeRunInput({ runs: 1 })
     await writeRaw(tree, 'old', 1, { not: 'a valid export' })
     await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
     const result = await runP(timeline({
       runInput, manifest: fakeManifest, workspace: tree,
-      sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+      results: [
+        { name: 'old', runs: [makeRunResult('old', 1)] },
+        { name: 'new', runs: [makeRunResult('new', 1)] },
+      ],
     }))
-    expect(result.timeline.old).toEqual([])
-    expect(result.timeline.new).toHaveLength(1)
+    expect(result.timeline.lanes.find((l) => l.variant === 'old')?.events).toEqual([])
+    expect(result.timeline.lanes.find((l) => l.variant === 'new')?.events).toHaveLength(1)
   })
 
-  it('invalid export on new side -> new contributes no events, old unaffected', async () => {
-    const tree = await makeWorkspace(1)
+  it('invalid export on one variant -> the others are unaffected (containment)', async () => {
+    const tree = await makeWorkspace(['old', 'new'], 1)
     const runInput = makeRunInput({ runs: 1 })
     await writeRaw(tree, 'old', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] }))
     await writeRaw(tree, 'new', 1, { broken: true })
     const result = await runP(timeline({
       runInput, manifest: fakeManifest, workspace: tree,
-      sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+      results: [
+        { name: 'old', runs: [makeRunResult('old', 1)] },
+        { name: 'new', runs: [makeRunResult('new', 1)] },
+      ],
     }))
-    expect(result.timeline.old).toHaveLength(1)
-    expect(result.timeline.new).toEqual([])
+    expect(result.timeline.lanes.find((l) => l.variant === 'old')?.events).toHaveLength(1)
+    expect(result.timeline.lanes.find((l) => l.variant === 'new')?.events).toEqual([])
   })
 })
 
 // ---------------------------------------------------------------------------
 // loadSessionTree — walks parent_id tree (opencode cli mocked)
+// side-free: no `variant`/`side` field anywhere in this mechanism, kept as-is.
 // ---------------------------------------------------------------------------
 
 const setupTreeMocks = (
@@ -944,14 +1091,18 @@ describe('collapseRepeats — swimlane boundary', () => {
 describe('renderTimelineHtml — swimlanes', () => {
   it('renders one lane per sessionId, tagged with its depth', () => {
     const tl: Timeline = {
-      old: [
-        { tStart: '0', tEnd: '10', side: 'old', runIndex: 1, sessionId: 'root', swimlaneDepth: 0, type: 'text' },
-        { tStart: '5', tEnd: '15', side: 'old', runIndex: 1, sessionId: 'child', parentSessionId: 'root', swimlaneDepth: 1, type: 'tool-call', tool: 'bash', status: 'completed' },
+      lanes: [
+        {
+          variant: 'old',
+          events: [
+            { tStart: '0', tEnd: '10', variant: 'old', runIndex: 1, sessionId: 'root', swimlaneDepth: 0, type: 'text' },
+            { tStart: '5', tEnd: '15', variant: 'old', runIndex: 1, sessionId: 'child', parentSessionId: 'root', swimlaneDepth: 1, type: 'tool-call', tool: 'bash', status: 'completed' },
+          ],
+        },
       ],
-      new: [],
       mode: 'side-by-side',
     }
-    const html = renderTimelineHtml(tl)
+    const html = renderTimelineHtml(tl, 'old')
     expect(html).toContain('class="swimlane"')
     expect(html).toContain('data-depth="0"')
     expect(html).toContain('data-depth="1"')
@@ -962,11 +1113,10 @@ describe('renderTimelineHtml — swimlanes', () => {
 
   it('indents depth-1 swimlane via its CSS data attribute', () => {
     const tl: Timeline = {
-      old: [{ tStart: '0', tEnd: '1', side: 'old', runIndex: 1, sessionId: 'c', swimlaneDepth: 1, parentSessionId: 'r', type: 'text' }],
-      new: [],
+      lanes: [{ variant: 'old', events: [{ tStart: '0', tEnd: '1', variant: 'old', runIndex: 1, sessionId: 'c', swimlaneDepth: 1, parentSessionId: 'r', type: 'text' }] }],
       mode: 'side-by-side',
     }
-    const html = renderTimelineHtml(tl)
+    const html = renderTimelineHtml(tl, 'old')
     expect(html).toContain('data-depth="1"')
   })
 
@@ -978,20 +1128,24 @@ describe('renderTimelineHtml — swimlanes', () => {
       tStart: string,
       tEnd: string,
     ): TimelineEvent => ({
-      tStart, tEnd, side: 'old', runIndex: 1, sessionId, swimlaneDepth: depth,
+      tStart, tEnd, variant: 'old', runIndex: 1, sessionId, swimlaneDepth: depth,
       type: 'tool-call', tool, status: 'completed',
     })
     const tl: Timeline = {
-      old: [
-        evt('zzz', 0, 'first', '0', '10'),
-        evt('aaa', 1, 'second', '5', '15'),
-        evt('zzz', 0, 'third', '10', '20'),
-        evt('mmm', 1, 'fourth', '15', '25'),
+      lanes: [
+        {
+          variant: 'old',
+          events: [
+            evt('zzz', 0, 'first', '0', '10'),
+            evt('aaa', 1, 'second', '5', '15'),
+            evt('zzz', 0, 'third', '10', '20'),
+            evt('mmm', 1, 'fourth', '15', '25'),
+          ],
+        },
       ],
-      new: [],
       mode: 'side-by-side',
     }
-    const html = renderTimelineHtml(tl)
+    const html = renderTimelineHtml(tl, 'old')
     const zzzFirst = html.indexOf('data-tooltip="tool-call first')
     const zzzThird = html.indexOf('data-tooltip="tool-call third')
     const aaaIdx = html.indexOf('data-tooltip="tool-call second')
@@ -1014,7 +1168,7 @@ const asTreeLoader = (fn: SessionTreeLoader): SessionTreeLoader => fn
 
 describe('timeline — swimlane (v0.2)', () => {
   it('injected tree -> child events carry depth 1 + parentSessionId', async () => {
-    const tree = await makeWorkspace(1)
+    const tree = await makeWorkspace(['old', 'new'], 1)
     const runInput = makeRunInput({ runs: 1 })
     const rootExp = makeExport({ id: 'root', created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] })
     const childExp = makeExport({ id: 'child', created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('c')] }] })
@@ -1031,21 +1185,25 @@ describe('timeline — swimlane (v0.2)', () => {
     const result = await runP(timeline(
       {
         runInput, manifest: fakeManifest, workspace: tree,
-        sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+        results: [
+          { name: 'old', runs: [makeRunResult('old', 1)] },
+          { name: 'new', runs: [makeRunResult('new', 1)] },
+        ],
       },
       { loadTree },
     ))
 
-    const childEvents = result.timeline.old.filter((e) => e.sessionId === 'child')
+    const oldEvents = result.timeline.lanes.find((l) => l.variant === 'old')?.events ?? []
+    const childEvents = oldEvents.filter((e) => e.sessionId === 'child')
     expect(childEvents.length).toBeGreaterThan(0)
     expect(childEvents.every((e) => e.swimlaneDepth === 1)).toBe(true)
     expect(childEvents.every((e) => e.parentSessionId === 'root')).toBe(true)
     // root lane still present
-    expect(result.timeline.old.some((e) => e.sessionId === 'root' && e.swimlaneDepth === 0)).toBe(true)
+    expect(oldEvents.some((e) => e.sessionId === 'root' && e.swimlaneDepth === 0)).toBe(true)
   })
 
   it('injected loader failure -> degrades to root-only (no throw)', async () => {
-    const tree = await makeWorkspace(1)
+    const tree = await makeWorkspace(['old', 'new'], 1)
     const runInput = makeRunInput({ runs: 1 })
     await writeRaw(tree, 'old', 1, makeExport({ id: 'root', created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] }))
     await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
@@ -1055,11 +1213,15 @@ describe('timeline — swimlane (v0.2)', () => {
     const result = await runP(timeline(
       {
         runInput, manifest: fakeManifest, workspace: tree,
-        sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+        results: [
+          { name: 'old', runs: [makeRunResult('old', 1)] },
+          { name: 'new', runs: [makeRunResult('new', 1)] },
+        ],
       },
       { loadTree },
     ))
     // root-only fallback: only sessionId 'root', depth 0
-    expect(result.timeline.old.every((e) => e.swimlaneDepth === 0)).toBe(true)
+    const oldEvents = result.timeline.lanes.find((l) => l.variant === 'old')?.events ?? []
+    expect(oldEvents.every((e) => e.swimlaneDepth === 0)).toBe(true)
   })
 })

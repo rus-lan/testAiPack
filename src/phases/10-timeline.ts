@@ -1,7 +1,7 @@
 /**
  * Phase 10: timeline
  *
- * Builds a flat event timeline from `raw/<side>/run-N.json` exports: a
+ * Builds a flat event timeline from `raw/<variant>/run-N.json` exports: a
  * `timeline.json` (validated against `Timeline`) and a self-contained
  * `timeline.html` (vanilla, no server). v0.1 is linear (root session only);
  * swimlane tree-diff via `parent_id` is v0.2.
@@ -14,13 +14,13 @@ import path from 'node:path'
 import type {
   ExportPart,
   OpencodeExport,
-  RunSideResult,
-  Side,
+  RunResult,
   Timeline,
   TimelineEvent,
   TimelineInput,
   TimelineMode,
   TimelineResult,
+  VariantTimeline,
 } from '@generated/types'
 import { opencodeExportSchema, timelineSchema } from '@generated/schemas'
 import { timelineError } from '../errors.js'
@@ -44,7 +44,7 @@ const toMs = (s: number | string | undefined, fallback: number): number => {
 }
 
 interface EventBase {
-  readonly side: Side
+  readonly variant: string
   readonly runIndex: number
   readonly sessionId: string
   readonly swimlaneDepth: number
@@ -52,13 +52,13 @@ interface EventBase {
 }
 
 const eventBase = (
-  side: Side,
+  variant: string,
   runIndex: number,
   sessionId: string,
   depth: number,
   parentSessionId: string | null,
 ): EventBase => ({
-  side,
+  variant,
   runIndex,
   sessionId,
   swimlaneDepth: depth,
@@ -134,13 +134,13 @@ const partToEvents = (
 
 export const extractEventsFromExport = (
   exp: OpencodeExport,
-  side: Side,
+  variant: string,
   runIndex: number,
   depth = 0,
   parentSessionId: string | null = null,
 ): readonly TimelineEvent[] => {
   const sessionId = exp.info.id
-  const base = eventBase(side, runIndex, sessionId, depth, parentSessionId)
+  const base = eventBase(variant, runIndex, sessionId, depth, parentSessionId)
 
   const minCreated = exp.messages.reduce<number>((min, msg) => {
     const c = toMs(msg.info.time.created, min)
@@ -184,7 +184,7 @@ const sameToolRun = (a: TimelineEvent, b: TimelineEvent): boolean => {
     tb !== undefined &&
     ta === tb &&
     a.runIndex === b.runIndex &&
-    a.side === b.side &&
+    a.variant === b.variant &&
     a.sessionId === b.sessionId
   )
 }
@@ -412,7 +412,7 @@ const escapeHtml = (s: string): string =>
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
 
-type DiffFlag = 'only-old' | 'only-new' | null
+type DiffFlag = 'vs-baseline' | 'baseline-only' | null
 
 const toolClass = (tool: string | undefined): string =>
   tool === undefined ? '' : escapeHtml(tool.toLowerCase().replace(/[^a-z0-9-]/g, ''))
@@ -461,33 +461,48 @@ const renderEvent = (e: TimelineEvent, flag: DiffFlag = null): string => {
   return `<div class="${cls}" style="width:${String(width)}px" data-tooltip="${tooltip}"${statusAttr}>${escapeHtml(label)}</div>`
 }
 
+const eventDiffKey = (e: TimelineEvent): string =>
+  e.tool === undefined ? e.type : `${e.type}:${e.tool}`
+
+const diffKeysOf = (events: readonly TimelineEvent[]): ReadonlySet<string> =>
+  new Set(events.map(eventDiffKey))
+
 const renderEventRow = (
   events: readonly TimelineEvent[],
-  otherKeys?: ReadonlySet<string>,
-  side?: Side,
+  flagFor?: (key: string) => DiffFlag,
 ): string =>
-  events
-    .map((e) => {
-      const flag: DiffFlag =
-        otherKeys !== undefined && side !== undefined
-          ? otherKeys.has(eventDiffKey(e))
-            ? null
-            : side === 'old'
-              ? 'only-old'
-              : 'only-new'
-          : null
-      return renderEvent(e, flag)
-    })
-    .join('')
+  events.map((e) => renderEvent(e, flagFor === undefined ? null : flagFor(eventDiffKey(e)))).join('')
+
+/**
+ * Palette: index 0 is reserved for the baseline lane; every other lane picks
+ * from the rest of the palette by its ordinal AMONG NON-BASELINE lanes (not
+ * its absolute lane index) — indexing by absolute position would collide
+ * with the reserved baseline color whenever the baseline isn't lane 0
+ * (`--baseline`/config may name any variant; only membership is validated
+ * upstream, not position).
+ */
+const PALETTE: readonly string[] = ['#fafafa', '#f0fff0', '#f4f8ff', '#fff8f0', '#f8f0ff', '#f0ffff']
+const BASELINE_COLOR = PALETTE[0] ?? '#fafafa'
+
+const nonBaselineColor = (ordinal: number): string =>
+  PALETTE[1 + (ordinal % (PALETTE.length - 1))] ?? BASELINE_COLOR
+
+/** One color per lane, index-aligned with `lanes`. */
+const assignLaneColors = (lanes: readonly VariantTimeline[], baseline: string): readonly string[] => {
+  const nonBaselineNames = lanes.filter((l) => l.variant !== baseline).map((l) => l.variant)
+  return lanes.map((lane) =>
+    lane.variant === baseline ? BASELINE_COLOR : nonBaselineColor(nonBaselineNames.indexOf(lane.variant)),
+  )
+}
 
 const TIMELINE_CSS = `body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;margin:20px;color:#222}
 h1{font-size:16px}
 .timeline{display:flex;flex-direction:column;gap:10px}
 .side{border:1px solid #ccc;padding:10px}
-.side.old{background:#fafafa}
-.side.new{background:#f0fff0}
 .side.merged{background:#f4f4ff}
 .side h2{margin:0 0 10px 0;font-size:13px}
+.chips{margin-bottom:10px}
+.chip{display:inline-block;padding:2px 6px;margin-right:6px;border-radius:3px;font-size:11px}
 .events{display:flex;flex-direction:row;overflow-x:auto;gap:2px;align-items:stretch;min-height:30px}
 .event{padding:4px 6px;border-radius:3px;font-size:11px;color:#fff;min-width:4px;position:relative;text-align:center}
 .event.reasoning{background:#888}
@@ -500,8 +515,8 @@ h1{font-size:16px}
 .event.step-finish{background:#000;min-width:2px}
 .event.text{background:#ddd;color:#000}
 .event[data-status="error"]{border:2px solid #d32f2f}
-.event.only-old{outline:2px solid #d32f2f;outline-offset:-1px}
-.event.only-new{outline:2px solid #2e7d32;outline-offset:-1px}
+.event.baseline-only{outline:2px solid #d32f2f;outline-offset:-1px}
+.event.vs-baseline{outline:2px solid #2e7d32;outline-offset:-1px}
 .event:hover::after{content:attr(data-tooltip);position:absolute;bottom:100%;left:0;background:#000;padding:4px;border-radius:3px;white-space:nowrap;z-index:10;color:#fff}
 .legend{margin:10px 0;font-size:12px}
 .legend span{display:inline-block;padding:2px 6px;margin-right:8px;color:#fff;border-radius:3px}
@@ -511,6 +526,13 @@ h1{font-size:16px}
 .swimlane[data-depth="2"]{border-left-color:#aaa;margin-left:40px}
 .swimlane[data-depth="3"]{border-left-color:#bbb;margin-left:60px}
 .swimlane-label{font-size:10px;color:#555;min-width:60px;padding:4px 0;align-self:center;flex-shrink:0}`
+
+const renderLaneCss = (lanes: readonly VariantTimeline[], baseline: string): string => {
+  const colors = assignLaneColors(lanes, baseline)
+  return lanes
+    .map((_, i) => `.side[data-vi="${String(i)}"]{background:${colors[i] ?? BASELINE_COLOR}}`)
+    .join('\n')
+}
 
 const renderLegend = (mode: TimelineMode): string =>
   '<div class="legend">' +
@@ -522,7 +544,7 @@ const renderLegend = (mode: TimelineMode): string =>
   '<span class="event tool-call">other tool</span>' +
   '<span class="event step-finish">step-finish</span>' +
   (mode === 'tree-diff'
-    ? '<span class="event only-old">OLD only</span><span class="event only-new">NEW only</span>'
+    ? '<span class="event vs-baseline">only vs baseline</span><span class="event baseline-only">baseline only</span>'
     : '') +
   '</div>'
 
@@ -534,10 +556,11 @@ interface Swimlane {
 }
 
 /**
- * Group a side's flat event list into one swimlane per `sessionId`, preserving
- * first-appearance order (the events arrive already sorted by runIndex/tStart,
- * so the root lane surfaces before its children). Each lane carries the depth
- * and parent of its first event — these describe the session-tree position.
+ * Group a variant's flat event list into one swimlane per `sessionId`,
+ * preserving first-appearance order (the events arrive already sorted by
+ * runIndex/tStart, so the root lane surfaces before its children). Each lane
+ * carries the depth and parent of its first event — these describe the
+ * session-tree position.
  *
  * `Set` dedupes sessionIds while keeping first-appearance order without
  * rebuilding a growing per-session array on every event (the O(n^2) shape a
@@ -564,58 +587,86 @@ const groupSwimlanes = (events: readonly TimelineEvent[]): readonly Swimlane[] =
 const swimlaneLabel = (lane: Swimlane): string =>
   lane.depth === 0 ? 'main' : `depth ${String(lane.depth)}`
 
-const renderSwimlane = (
-  lane: Swimlane,
-  otherKeys?: ReadonlySet<string>,
-  side?: Side,
-): string =>
+const renderSwimlane = (lane: Swimlane, flagFor?: (key: string) => DiffFlag): string =>
   `<div class="swimlane" data-depth="${String(lane.depth)}">` +
   `<div class="swimlane-label">${escapeHtml(swimlaneLabel(lane))}</div>` +
-  `<div class="events">${renderEventRow(lane.events, otherKeys, side)}</div>` +
+  `<div class="events">${renderEventRow(lane.events, flagFor)}</div>` +
   `</div>`
 
 const renderSideLanes = (
   events: readonly TimelineEvent[],
-  otherKeys?: ReadonlySet<string>,
-  side?: Side,
+  flagFor?: (key: string) => DiffFlag,
 ): string => {
   const lanes = groupSwimlanes(events)
   if (lanes.length === 0) return '<div class="events"></div>'
-  return lanes.map((l) => renderSwimlane(l, otherKeys, side)).join('')
+  return lanes.map((l) => renderSwimlane(l, flagFor)).join('')
 }
 
-const renderSideBySide = (tl: Timeline): string =>
-  `<div class="timeline">` +
-  `<div class="side old"><h2>OLD (baseline)</h2>${renderSideLanes(tl.old)}</div>` +
-  `<div class="side new"><h2>NEW (with pack)</h2>${renderSideLanes(tl.new)}</div>` +
-  `</div>`
+const renderLaneBlock = (
+  lane: VariantTimeline,
+  index: number,
+  baseline: string,
+  flagFor?: (key: string) => DiffFlag,
+): string => {
+  const header = escapeHtml(lane.variant) + (lane.variant === baseline ? ' (baseline)' : '')
+  return `<div class="side" data-vi="${String(index)}"><h2>${header}</h2>${renderSideLanes(lane.events, flagFor)}</div>`
+}
 
-const eventDiffKey = (e: TimelineEvent): string =>
-  e.tool === undefined ? e.type : `${e.type}:${e.tool}`
-
-const diffKeysOf = (events: readonly TimelineEvent[]): ReadonlySet<string> =>
-  new Set(events.map(eventDiffKey))
+const renderSideBySide = (tl: Timeline, baseline: string): string =>
+  `<div class="timeline">${tl.lanes.map((lane, i) => renderLaneBlock(lane, i, baseline)).join('')}</div>`
 
 /**
- * tree-diff: side-by-side lanes, but events whose `type(+tool)` appears on only
- * one side are outlined — red for OLD-only, green for NEW-only. Comparison is
- * coarse on purpose (tool+type), so a renamed/swapped tool still surfaces as a
- * diff without false-precision on timing.
+ * tree-diff: side-by-side lanes, but events whose `type(+tool)` appears in a
+ * non-baseline lane and not in the baseline's key set are outlined green
+ * (`vs-baseline`); baseline events whose key appears in NO other lane are
+ * outlined red (`baseline-only`). Comparison is coarse on purpose
+ * (tool+type), so a renamed/swapped tool still surfaces as a diff without
+ * false-precision on timing. Every non-baseline lane is diffed against
+ * exactly the baseline — no N×N comparison.
  */
-const renderTreeDiff = (tl: Timeline): string => {
-  const oldKeys = diffKeysOf(tl.old)
-  const newKeys = diffKeysOf(tl.new)
-  return `<div class="timeline">` +
-    `<div class="side old"><h2>OLD (baseline)</h2>${renderSideLanes(tl.old, newKeys, 'old')}</div>` +
-    `<div class="side new"><h2>NEW (with pack)</h2>${renderSideLanes(tl.new, oldKeys, 'new')}</div>` +
-    `</div>`
+const renderTreeDiff = (tl: Timeline, baseline: string): string => {
+  // A single lane IS the baseline — there is nothing else to diff it against,
+  // so skip the flagging pass entirely (otherwise otherKeysUnion is empty and
+  // every one of its events would be misread as "absent everywhere else").
+  if (tl.lanes.length < 2) return renderSideBySide(tl, baseline)
+  const baselineLane = tl.lanes.find((l) => l.variant === baseline)
+  const baselineKeys = baselineLane === undefined ? new Set<string>() : diffKeysOf(baselineLane.events)
+  const otherKeysUnion = new Set<string>(
+    tl.lanes.filter((l) => l.variant !== baseline).flatMap((l) => [...diffKeysOf(l.events)]),
+  )
+  const blocks = tl.lanes.map((lane, i) => {
+    const isBaseline = lane.variant === baseline
+    const flagFor = (key: string): DiffFlag =>
+      isBaseline
+        ? otherKeysUnion.has(key)
+          ? null
+          : 'baseline-only'
+        : baselineKeys.has(key)
+          ? null
+          : 'vs-baseline'
+    return renderLaneBlock(lane, i, baseline, flagFor)
+  })
+  return `<div class="timeline">${blocks.join('')}</div>`
 }
 
-const renderMerged = (tl: Timeline): string => {
-  const all = [...tl.old, ...tl.new].sort(
-    (a, b) => Number(a.tStart) - Number(b.tStart),
+const renderPaletteChips = (lanes: readonly VariantTimeline[], baseline: string): string => {
+  const colors = assignLaneColors(lanes, baseline)
+  return lanes
+    .map((lane, i) => {
+      const label = escapeHtml(lane.variant) + (lane.variant === baseline ? ' (baseline)' : '')
+      return `<span class="chip" style="background:${colors[i] ?? BASELINE_COLOR}">${label}</span>`
+    })
+    .join('')
+}
+
+const renderMerged = (tl: Timeline, baseline: string): string => {
+  const all = [...tl.lanes.flatMap((l) => l.events)].sort((a, b) => Number(a.tStart) - Number(b.tStart))
+  return (
+    `<div class="timeline"><div class="side merged">` +
+    `<h2>MERGED</h2><div class="chips">${renderPaletteChips(tl.lanes, baseline)}</div>` +
+    `<div class="events">${renderEventRow(all)}</div>` +
+    `</div></div>`
   )
-  return `<div class="timeline"><div class="side merged"><h2>MERGED (old + new)</h2><div class="events">${renderEventRow(all)}</div></div></div>`
 }
 
 /**
@@ -631,25 +682,40 @@ const toScriptJson = (value: unknown): string =>
     .replace(/>/g, '\\u003e')
     .replace(/&/g, '\\u0026')
 
-export const renderTimelineHtml = (tl: Timeline): string => {
+/**
+ * `runInput.baseline` is validated against `variants[]` by phase 00 for a
+ * live run, but `rebuild` can reconstruct a `runInput` from disk artifacts
+ * that have drifted — fall back to the first lane (matches the config
+ * default in `02-phases.md §00`: "baseline (default variants[0].name)")
+ * instead of silently flagging every event green / dropping the header
+ * suffix.
+ */
+const resolveBaseline = (tl: Timeline, baseline: string): string =>
+  tl.lanes.some((l) => l.variant === baseline) ? baseline : (tl.lanes[0]?.variant ?? baseline)
+
+export const renderTimelineHtml = (tl: Timeline, baseline: string): string => {
+  const resolvedBaseline = resolveBaseline(tl, baseline)
   const body =
     tl.mode === 'merged'
-      ? renderMerged(tl)
+      ? renderMerged(tl, resolvedBaseline)
       : tl.mode === 'tree-diff'
-        ? renderTreeDiff(tl)
-        : renderSideBySide(tl)
+        ? renderTreeDiff(tl, resolvedBaseline)
+        : renderSideBySide(tl, resolvedBaseline)
   const dataJson = toScriptJson(tl)
+  const laneCss = renderLaneCss(tl.lanes, resolvedBaseline)
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>testaipack timeline</title>
-<style>${TIMELINE_CSS}</style>
+<style>${TIMELINE_CSS}
+${laneCss}</style>
 </head>
 <body>
 <h1>testaipack timeline<span class="mode-badge">${escapeHtml(tl.mode)}</span></h1>
 ${renderLegend(tl.mode)}
 ${body}
+<!-- schemaVersion: 2 — Timeline.lanes: VariantTimeline[] (replaces the v1 {old,new} shape); external tooling reading this JSON must migrate -->
 <script type="application/json" id="timeline-data">${dataJson}</script>
 </body>
 </html>`
@@ -659,11 +725,11 @@ ${body}
 // Phase entry point
 // ---------------------------------------------------------------------------
 
-const toExportInvalid = (side: Side, runIndex: number, cause: unknown): PhaseError =>
+const toExportInvalid = (variant: string, runIndex: number, cause: unknown): PhaseError =>
   timelineError(
-    `export invalid for ${side}/run-${String(runIndex)}: schema mismatch`,
+    `export invalid for ${variant}/run-${String(runIndex)}: schema mismatch`,
     'E_EXPORT_INVALID',
-    { side, runIndex, reason: 'invalid-export', cause: String(cause) },
+    { variant, runIndex, reason: 'invalid-export', cause: String(cause) },
   )
 
 const toWriteFailure = (what: string, e: FsError): PhaseError =>
@@ -675,14 +741,14 @@ const toWriteFailure = (what: string, e: FsError): PhaseError =>
   })
 
 const readOneRun = (
-  side: Side,
-  r: RunSideResult,
+  variant: string,
+  r: RunResult,
   rawDir: string,
   homeDirs: readonly string[],
   loader?: SessionTreeLoader,
 ): Effect.Effect<readonly TimelineEvent[], PhaseError> =>
   Effect.gen(function* () {
-    const file = path.join(rawDir, side, `run-${String(r.runIndex)}.json`)
+    const file = path.join(rawDir, variant, `run-${String(r.runIndex)}.json`)
     const readEither = yield* readFile(file).pipe(Effect.either)
     if (readEither._tag === 'Left') {
       return []
@@ -692,19 +758,19 @@ const readOneRun = (
       catch: (e) => e,
     }).pipe(Effect.either)
     if (jsonEither._tag === 'Left') {
-      console.warn(toExportInvalid(side, r.runIndex, jsonEither.left).message)
+      console.warn(toExportInvalid(variant, r.runIndex, jsonEither.left).message)
       return []
     }
     const parsed = opencodeExportSchema.safeParse(jsonEither.right)
     if (!parsed.success) {
-      console.warn(toExportInvalid(side, r.runIndex, parsed.error).message)
+      console.warn(toExportInvalid(variant, r.runIndex, parsed.error).message)
       return []
     }
     const data = parsed.data as OpencodeExport
     const homeDir = homeDirs[r.runIndex - 1] ?? ''
     const tree = yield* loadTreeForRun(homeDir, data, loader)
     return tree.flatMap((node) =>
-      extractEventsFromExport(node.export, side, r.runIndex, node.depth, node.parentId),
+      extractEventsFromExport(node.export, variant, r.runIndex, node.depth, node.parentId),
     )
   })
 
@@ -716,17 +782,17 @@ const byRunStartDepth = (a: TimelineEvent, b: TimelineEvent): number => {
   return a.swimlaneDepth - b.swimlaneDepth
 }
 
-const collectSide = (
-  side: Side,
-  results: readonly RunSideResult[],
+const collectVariant = (
+  variant: string,
+  runs: readonly RunResult[],
   rawDir: string,
   homeDirs: readonly string[],
   loader?: SessionTreeLoader,
 ): Effect.Effect<readonly TimelineEvent[], PhaseError> =>
   Effect.gen(function* () {
     const perRun = yield* Effect.forEach(
-      results,
-      (r) => readOneRun(side, r, rawDir, homeDirs, loader),
+      runs,
+      (r) => readOneRun(variant, r, rawDir, homeDirs, loader),
       { concurrency: 1 },
     )
     return [...perRun.flat()].sort(byRunStartDepth)
@@ -737,32 +803,22 @@ export const timeline = (
   deps?: TimelineDeps,
 ): Effect.Effect<TimelineResult, PhaseError> =>
   Effect.gen(function* () {
-    const { runInput, workspace, sideResults } = input
+    const { runInput, workspace, results } = input
     const loader = deps?.loadTree
 
-    const oldEvents = yield* collectSide(
-      'old',
-      sideResults.old,
-      workspace.raw,
-      workspace.homeOld,
-      loader,
-    )
-    const newEvents = yield* collectSide(
-      'new',
-      sideResults.new,
-      workspace.raw,
-      workspace.homeNew,
-      loader,
+    const lanes = yield* Effect.forEach(
+      results,
+      (vr): Effect.Effect<VariantTimeline, PhaseError> =>
+        Effect.gen(function* () {
+          const homes = workspace.variantTrees.find((vt) => vt.name === vr.name)?.homes ?? []
+          const events = yield* collectVariant(vr.name, vr.runs, workspace.raw, homes, loader)
+          const final = runInput.collapseRepeats ? collapseRepeats(events) : events
+          return { variant: vr.name, events: [...final] }
+        }),
+      { concurrency: 1 },
     )
 
-    const oldFinal = runInput.collapseRepeats ? collapseRepeats(oldEvents) : oldEvents
-    const newFinal = runInput.collapseRepeats ? collapseRepeats(newEvents) : newEvents
-
-    const tl: Timeline = {
-      old: [...oldFinal],
-      new: [...newFinal],
-      mode: runInput.timelineMode,
-    }
+    const tl: Timeline = { lanes: [...lanes], mode: runInput.timelineMode }
 
     const check = timelineSchema.safeParse(tl)
     if (!check.success) {
@@ -785,7 +841,7 @@ export const timeline = (
 
     if (runInput.formats.includes('html')) {
       const htmlPath = path.join(workspace.results, 'timeline.html')
-      yield* writeFile(htmlPath, renderTimelineHtml(tl)).pipe(
+      yield* writeFile(htmlPath, renderTimelineHtml(tl, runInput.baseline)).pipe(
         Effect.mapError((e: FsError) => toWriteFailure('timeline.html', e)),
       )
       return { timeline: tl, jsonPath, htmlPath }
