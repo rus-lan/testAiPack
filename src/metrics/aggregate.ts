@@ -7,6 +7,7 @@
  */
 import type {
   AggregateStats,
+  ContaminationSignal,
   FailedRun,
   MetricDelta,
   MetricDistribution,
@@ -22,6 +23,7 @@ import type {
 } from '@generated/types'
 import type { EventsProfile } from './events-profile.js'
 import type { ExtractedExtras, ExtractedMetrics } from './extract.js'
+import type { UnindexedSignal } from './baseline-contamination.js'
 import { interquartileRange, maximum, median, minimum, percentile, toNum } from './stats.js'
 import { isSignificant } from './significance.js'
 
@@ -257,6 +259,7 @@ const buildPackUse = (
   extras: readonly ExtractedExtras[],
   packName: string | undefined,
   canDetect: boolean,
+  visibilityConfirmed: boolean,
 ): PackUse | undefined => {
   if (packName === undefined) return undefined
   const firstTimes = extras.flatMap((e) => (e.firstPackCallMs === undefined ? [] : [e.firstPackCallMs]))
@@ -267,6 +270,7 @@ const buildPackUse = (
     runsWithCall: extras.filter((e) => e.packCalls > 0).length,
     runCount: extras.length,
     canDetect,
+    visibilityConfirmed,
     ...(firstCallMsMedian === undefined ? {} : { firstCallMsMedian }),
   }
 }
@@ -279,6 +283,22 @@ const buildRiskyCommands = (
 
 const buildOpencodeVersions = (extras: readonly ExtractedExtras[]): readonly string[] =>
   [...new Set(extras.map((e) => e.opencodeVersion).filter((v) => v !== ''))].sort()
+
+/**
+ * Per-run activity signals (attach `runIndex`, same as `buildRiskyCommands`)
+ * plus the side-level config-drift signal, if any. Only ever called for the
+ * `old` (baseline) side — see `buildSideAggregates`.
+ */
+const buildContaminationSignals = (
+  extras: readonly ExtractedExtras[],
+  runIndexes: readonly number[],
+  configDrift: UnindexedSignal | undefined,
+): readonly ContaminationSignal[] => [
+  ...extras.flatMap((e, i) =>
+    e.packActivitySignals.map((s): ContaminationSignal => ({ ...s, runIndex: runIndexes[i] ?? 0 })),
+  ),
+  ...(configDrift === undefined ? [] : [configDrift]),
+]
 
 const emptyPrimary = (): PrimaryMetrics => ({
   totalTokens: '0',
@@ -314,12 +334,24 @@ export interface SideAggregationInput {
   readonly packName?: string
   /** Whether the pack type can be seen in exports at all (false for plugin/mcp/agent/command). */
   readonly canDetect: boolean
+  /**
+   * Whether phase 05's pack-visibility gate proved the pack was present in
+   * this side's HOME before any run started. Always false for the old side —
+   * the pack is deliberately never installed there.
+   */
+  readonly visibilityConfirmed: boolean
   /** Computed by phase 07 from side results (§1.6); passed through unchanged. */
   readonly verifyStats?: VerifyStats
+  /**
+   * The captured-config drift signal for this side (from `installed.json`,
+   * read by phase 07) — only surfaced when `side === 'old'`; see
+   * `baseline-contamination.ts`.
+   */
+  readonly configDriftSignal?: UnindexedSignal
 }
 
 export const buildSideAggregates = (input: SideAggregationInput): SideAggregates => {
-  const packUse = buildPackUse(input.extras, input.packName, input.canDetect)
+  const packUse = buildPackUse(input.extras, input.packName, input.canDetect, input.visibilityConfirmed)
   if (input.extracted.length === 0) {
     return {
       side: input.side,
@@ -346,6 +378,11 @@ export const buildSideAggregates = (input: SideAggregationInput): SideAggregates
     riskyCommands: [...buildRiskyCommands(input.extras, input.runIndexes)],
     opencodeVersions: [...buildOpencodeVersions(input.extras)],
     ...(input.verifyStats === undefined ? {} : { verifyStats: input.verifyStats }),
+    // Contamination only means anything on the baseline — the pack side is
+    // SUPPOSED to show pack activity, so the signal is never computed there.
+    ...(input.side === 'old'
+      ? { contaminationSignals: [...buildContaminationSignals(input.extras, input.runIndexes, input.configDriftSignal)] }
+      : {}),
   }
 }
 

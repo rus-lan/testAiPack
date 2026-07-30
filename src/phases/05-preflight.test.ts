@@ -40,6 +40,7 @@ vi.mock('../opencode/cli.js', () => ({
 
 vi.mock('../isolation/docker-runner.js', () => ({
   ensureImage: vi.fn(),
+  dockerRun: vi.fn(),
   DEFAULT_OPENCODE_IMAGE: 'testaipack-opencode:latest',
   DockerError: class extends Error {
     readonly _tag = 'DockerError'
@@ -66,8 +67,9 @@ vi.mock('../isolation/docker-runner.js', () => ({
 const { version, run, OpencodeError } = await import('../opencode/cli.js')
 const versionMock = vi.mocked(version)
 const runMock = vi.mocked(run)
-const { ensureImage, DockerError, DEFAULT_OPENCODE_IMAGE } = await import('../isolation/docker-runner.js')
+const { ensureImage, dockerRun, DockerError, DEFAULT_OPENCODE_IMAGE } = await import('../isolation/docker-runner.js')
 const ensureImageMock = vi.mocked(ensureImage)
+const dockerRunMock = vi.mocked(dockerRun)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
@@ -97,6 +99,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  initSide: 'both',
   preflightEnabled: true,
   preflightModel: 'cheap/model',
   formats: ['md'],
@@ -159,7 +162,7 @@ const skillOutcome = (packDir: string, name = 'myskill'): PackInstallOutcome => 
   detectedType: 'skill',
   installLogPath: '/tmp/install.log',
   registeredIn: ['skills'],
-  instructions: [{ kind: 'symlink', name, target: packDir }],
+  instructions: [{ kind: 'skill', name, target: packDir }],
 })
 
 const pluginOutcome = (name = 'myplugin'): PackInstallOutcome => ({
@@ -197,12 +200,25 @@ const writeMcpConfig = async (homeDir: string, name: string): Promise<void> => {
   )
 }
 
+/** As phase 04's `applyInstruction` would register a local plugin file. */
+const writePluginConfig = async (homeDir: string, registeredPath: string): Promise<void> => {
+  const cfgDir = path.join(homeDir, '.config', 'opencode')
+  await runP(ensureDir(cfgDir))
+  await runP(
+    writeFile(path.join(cfgDir, 'opencode.json'), JSON.stringify({ plugin: [registeredPath] })),
+  )
+}
+
 describe('phase 05 — preflight', () => {
   beforeEach(() => {
     versionMock.mockReset()
     runMock.mockReset()
     ensureImageMock.mockReset()
     ensureImageMock.mockImplementation(() => Effect.void)
+    dockerRunMock.mockReset()
+    dockerRunMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }),
+    )
     versionMock.mockImplementation(() => Effect.succeed('1.0.0'))
     runMock.mockImplementation(() =>
       Effect.succeed({
@@ -433,11 +449,39 @@ describe('phase 05 — preflight', () => {
     // target's basename is myplugin.mjs, not <name>.js — proves the check
     // uses the delivered filename, not a `${name}.js` guess.
     const srcFile = path.join(homes.root, 'src', 'myplugin.mjs')
-    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.mjs'), 'export default {}'))
+    const dstFile = path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.mjs')
+    await runP(writeFile(dstFile, 'export default {}'))
+    await writePluginConfig(homes.new, dstFile)
     const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
     expect(result.allPassed).toBe(true)
+  })
+
+  it('pack-visibility local plugin: file copied but opencode.json never registered it → E_PREFLIGHT_PACK_INVISIBLE (the file-present-but-unregistered bug)', async () => {
+    const homes = await buildHomes()
+    const srcFile = path.join(homes.root, 'src', 'myplugin.mjs')
+    // file is delivered, but no opencode.json entry points at it — exactly
+    // what a stale/wrong registered path would also look like from gate 4's
+    // point of view: present on disk, never actually loadable.
+    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.mjs'), 'export default {}'))
+    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
+    expect(err.context?.['exitCode']).toBe(3)
+  })
+
+  it('pack-visibility local plugin: opencode.json registers a path that does not resolve (stale/host-only path) → E_PREFLIGHT_PACK_INVISIBLE', async () => {
+    const homes = await buildHomes()
+    const srcFile = path.join(homes.root, 'src', 'myplugin.mjs')
+    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.mjs'), 'export default {}'))
+    // registered entry points somewhere that does not exist — reproduces a
+    // stale or environment-mismatched path (e.g. a host path under docker).
+    await writePluginConfig(homes.new, '/nowhere/myplugin.mjs')
+    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
+    expect(err.context?.['exitCode']).toBe(3)
   })
 
   it('pack-visibility local plugin (target set) invisible when the file was never delivered → E_PREFLIGHT_PACK_INVISIBLE', async () => {
@@ -519,7 +563,9 @@ describe('phase 05 — preflight', () => {
   it('baseline-identical leak (local plugin file, target set) on old side → E_PREFLIGHT_FAILED, exitCode=2', async () => {
     const homes = await buildHomes()
     const srcFile = path.join(homes.root, 'src', 'myplugin.js')
-    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
+    const dstFile = path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js')
+    await runP(writeFile(dstFile, 'module.exports={}'))
+    await writePluginConfig(homes.new, dstFile)
     // leak: same delivered filename accidentally on old side
     await runP(writeFile(path.join(homes.old, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
     runMock.mockImplementation(() =>
@@ -638,6 +684,137 @@ describe('phase 05 — preflight', () => {
       (dockerRunCalls[0]?.[0] as { docker: { image: string; network?: string } }).docker.network,
     ).toBe('host')
   })
+
+  it('docker mode: gate 4 trusts the container, not the host — host has no SKILL.md but the container check succeeds → visible', async () => {
+    const homes = await buildHomes()
+    const packDir = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    // deliberately no file under homes.new/.config/opencode/skills/myskill —
+    // the host filesystem alone would say "not visible". Gate 5 also
+    // re-checks the SAME instruction against homes.old (must stay absent
+    // there), so the mock discriminates by which HOME it was asked about.
+    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
+      opts.homeDir === homes.new
+        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
+        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false })),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker' }, skillOutcome(packDir)),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(dockerRunMock).toHaveBeenCalled()
+  })
+
+  it('docker mode: gate 4 rejects a HOST-only match — file exists on host but the container check fails → E_PREFLIGHT_PACK_INVISIBLE (the exact dangling-symlink-outside-the-mount bug)', async () => {
+    const homes = await buildHomes()
+    const packDir = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    // present on the host (as a dangling-symlink-outside-any-mount would
+    // resolve pre-fix), but the container itself cannot see it.
+    await runP(ensureDir(path.join(homes.new, '.config', 'opencode', 'skills', 'myskill')))
+    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'skills', 'myskill', 'SKILL.md'), '# myskill\n'))
+    dockerRunMock.mockImplementation(() =>
+      Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false })),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker' }, skillOutcome(packDir)),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['check']).toBe('pack-visibility')
+  })
+
+  it('docker mode: local plugin visible when opencode.json registers a container path (/home/opencode/...), not the host path', async () => {
+    const homes = await buildHomes()
+    const srcFile = path.join(homes.root, 'src', 'myplugin.js')
+    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
+    await writePluginConfig(homes.new, '/home/opencode/.config/opencode/plugins/myplugin.js')
+    // only the NEW home has the file; a /home/opencode/... target is only
+    // "real" when the mount backing it is homes.new (the leak-check re-runs
+    // the same relative path against homes.old, which must stay absent).
+    dockerRunMock.mockImplementation((opts: { homeDir: string; command: readonly string[] }) => {
+      const target = opts.command[2] ?? ''
+      return opts.homeDir === homes.new && target.startsWith('/home/opencode/')
+        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
+        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false }))
+    })
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker' }, localPluginOutcome(srcFile, 'myplugin')),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+  })
+
+  it('docker mode: local plugin invisible when opencode.json still registers the HOST-absolute path — reproduces the stale-registration bug that survives even after the file is copied correctly', async () => {
+    const homes = await buildHomes()
+    const srcFile = path.join(homes.root, 'src', 'myplugin.js')
+    const hostDstPath = path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js')
+    await runP(writeFile(hostDstPath, 'module.exports={}'))
+    // the bug: registers the path our own process wrote to, not the path
+    // opencode will see when it reads this config from inside the container.
+    await writePluginConfig(homes.new, hostDstPath)
+    dockerRunMock.mockImplementation((opts: { command: readonly string[] }) => {
+      const target = opts.command[2] ?? ''
+      return target.startsWith('/home/opencode/')
+        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
+        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false }))
+    })
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker' }, localPluginOutcome(srcFile, 'myplugin')),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
+  })
+
+  it('docker mode: baseline-leak check fails loudly on a docker infra error (e.g. missing image) instead of silently reporting "no leak"', async () => {
+    const homes = await buildHomes()
+    const packDir = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
+      opts.homeDir === homes.new
+        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
+        // old-side leak check: an infra failure, NOT a legitimate "file
+        // absent" (exitCode 1) — e.g. exitCode 125 "no such image".
+        : Effect.fail(
+            new DockerError({ command: 'run', exitCode: 125, stderr: 'Error: No such image', timedOut: false }),
+          ),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker' }, skillOutcome(packDir)),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
+    expect(err.context?.['check']).toBe('baseline-identical')
+    expect(err.message).toContain('cannot verify')
+  })
+
+  it('docker mode: baseline-leak check still treats a plain exit-1 "file not found" as no-leak, not an error', async () => {
+    const homes = await buildHomes()
+    const packDir = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
+      opts.homeDir === homes.new
+        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
+        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false })),
+    )
+    const input: PreflightInputExt = {
+      ...buildInput(homes, { isolation: 'docker' }, skillOutcome(packDir)),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+  })
 })
 
 describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {
@@ -646,6 +823,10 @@ describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {
     runMock.mockReset()
     ensureImageMock.mockReset()
     ensureImageMock.mockImplementation(() => Effect.void)
+    dockerRunMock.mockReset()
+    dockerRunMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }),
+    )
     versionMock.mockImplementation(() => Effect.succeed('1.0.0'))
     runMock.mockImplementation(() =>
       Effect.succeed({

@@ -55,6 +55,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: false,
   protectGit: false,
+  initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
   outputPath: '/out',
@@ -161,7 +162,7 @@ describe('phase 03 — packInstall', () => {
     expect(log).toContain('smoke-test')
   })
 
-  it('skill (git): detect → clone → SKILL.md present → symlink instruction', async () => {
+  it('skill (git): detect → clone → SKILL.md present → skill instruction', async () => {
     cloneMock.mockImplementation(
       materializeClone({ 'SKILL.md': '# skill\n', 'README.md': 'r' }),
     )
@@ -173,7 +174,7 @@ describe('phase 03 — packInstall', () => {
     expect(result.packPath).toBe(expected)
     expect(await runP(exists(path.join(expected, 'SKILL.md')))).toBe(true)
     expect(result.instructions).toEqual([
-      { kind: 'symlink', name: 'myskill', target: expected },
+      { kind: 'skill', name: 'myskill', target: expected },
     ])
     expect(cloneMock).toHaveBeenCalledWith(
       'https://github.com/owner/myskill.git',
@@ -193,7 +194,7 @@ describe('phase 03 — packInstall', () => {
     const expected = path.join(built.packDir, path.basename(src))
     expect(result.packPath).toBe(expected)
     expect(await runP(exists(path.join(expected, 'SKILL.md')))).toBe(true)
-    expect(result.instructions[0]!.kind).toBe('symlink')
+    expect(result.instructions[0]!.kind).toBe('skill')
     expect(cloneMock).not.toHaveBeenCalled()
   })
 
@@ -359,12 +360,12 @@ describe('phase 03 — packInstall', () => {
     expect(result.registeredIn).toContain('skills')
     expect(result.registeredIn).toContain('commands')
     const kinds = result.instructions.map((i) => i.kind)
-    expect(kinds).toContain('symlink')
+    expect(kinds).toContain('skill')
     expect(kinds).toContain('file')
-    const symlinkInst = result.instructions.find((i) => i.kind === 'symlink')
-    expect(symlinkInst).toBeDefined()
-    if (symlinkInst?.kind === 'symlink') {
-      expect(symlinkInst.name).toBe('cool')
+    const skillInst = result.instructions.find((i) => i.kind === 'skill')
+    expect(skillInst).toBeDefined()
+    if (skillInst?.kind === 'skill') {
+      expect(skillInst.name).toBe('cool')
     }
   })
 
@@ -452,11 +453,11 @@ describe('phase 03 — packInstall', () => {
     expect(await runP(exists(path.join(expected, 'SKILL.md')))).toBe(true)
     expect(await runP(readFile(path.join(expected, 'SKILL.md')))).toBe('# lower\n')
     expect(result.instructions).toEqual([
-      { kind: 'symlink', name: 'lower', target: expected },
+      { kind: 'skill', name: 'lower', target: expected },
     ])
   })
 
-  it('skill: SKILL.md nested in subdir named after pack → symlink targets subdir', async () => {
+  it('skill: SKILL.md nested in subdir named after pack → skill instruction targets subdir', async () => {
     cloneMock.mockImplementation(
       materializeClone({ 'graphify/SKILL.md': '# nested\n', 'README.md': 'r' }),
     )
@@ -467,11 +468,11 @@ describe('phase 03 — packInstall', () => {
     expect(result.packPath).toBe(nested)
     expect(await runP(exists(path.join(nested, 'SKILL.md')))).toBe(true)
     expect(result.instructions).toEqual([
-      { kind: 'symlink', name: 'graphify', target: nested },
+      { kind: 'skill', name: 'graphify', target: nested },
     ])
   })
 
-  it('skill: lowercase skill.md nested in subdir → mirrored + symlink targets subdir', async () => {
+  it('skill: lowercase skill.md nested in subdir → mirrored + skill instruction targets subdir', async () => {
     cloneMock.mockImplementation(
       materializeClone({ 'graphify/skill.md': '# lower nested\n' }),
     )
@@ -482,8 +483,8 @@ describe('phase 03 — packInstall', () => {
     expect(result.packPath).toBe(nested)
     expect(await runP(exists(path.join(nested, 'SKILL.md')))).toBe(true)
     expect(await runP(readFile(path.join(nested, 'SKILL.md')))).toBe('# lower nested\n')
-    expect(result.instructions[0]!.kind).toBe('symlink')
-    if (result.instructions[0]!.kind === 'symlink') {
+    expect(result.instructions[0]!.kind).toBe('skill')
+    if (result.instructions[0]!.kind === 'skill') {
       expect(result.instructions[0]!.target).toBe(nested)
     }
   })

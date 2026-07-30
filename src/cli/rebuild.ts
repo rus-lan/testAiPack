@@ -64,6 +64,7 @@ import {
   DEFAULT_COLLAPSE_REPEATS,
   DEFAULT_DIFF_HTML,
   DEFAULT_FORMATS,
+  DEFAULT_INIT_SIDE,
   DEFAULT_LOG_LEVEL,
   DEFAULT_PREFLIGHT_ENABLED,
   DEFAULT_PURE_BASELINE,
@@ -201,7 +202,7 @@ const resolveProtectGit = (
   })
 
 const FOREVER_DEFAULTED_FIELDS: readonly string[] = [
-  'auth', 'pureBaseline', 'preflightEnabled', 'dockerNetwork', 'preflightModel', 'timeouts', 'workspacePath', 'logLevel',
+  'auth', 'pureBaseline', 'initSide', 'preflightEnabled', 'dockerNetwork', 'preflightModel', 'timeouts', 'workspacePath', 'logLevel',
 ]
 
 /**
@@ -239,6 +240,7 @@ const buildSyntheticRunInput = (
     ...(manifest.packType === undefined ? {} : { packType: manifest.packType }),
     prompt: manifest.prompt,
     ...(manifest.init === undefined ? {} : { init: manifest.init }),
+    initSide: DEFAULT_INIT_SIDE,
     ...(manifest.verify === undefined ? {} : { verify: manifest.verify }),
     runs: manifest.runs,
     isolation: manifest.isolation,

@@ -59,6 +59,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
   outputPath: './results',

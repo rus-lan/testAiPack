@@ -31,6 +31,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
     gemini: false, aws: false, ssh: false, git: false,
   },
   pureBaseline: true,
+  initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
   outputPath: './results',
@@ -525,6 +526,108 @@ describe('aggregate — pack usage', () => {
     }))
     expect(result.rawAggregates.old.packUse).toBeUndefined()
   })
+
+  it('packVisibilityConfirmed threads into packUse.visibilityConfirmed on new; old always false (the pack is never installed there)', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1, packRef: 'https://github.com/Graphify-Labs/graphify' })
+    await writeRaw(tree, 'old', 1, exportJson({ messages: [] }))
+    await writeRaw(tree, 'new', 1, exportJson({ messages: [] }))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+      packVisibilityConfirmed: true,
+    }))
+    expect(result.rawAggregates.new.packUse?.visibilityConfirmed).toBe(true)
+    expect(result.rawAggregates.old.packUse?.visibilityConfirmed).toBe(false)
+  })
+
+  it('packVisibilityConfirmed omitted (e.g. --no-preflight) -> visibilityConfirmed false on both sides, the honest default', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1, packRef: 'https://github.com/Graphify-Labs/graphify' })
+    await writeRaw(tree, 'old', 1, exportJson({ messages: [] }))
+    await writeRaw(tree, 'new', 1, exportJson({ messages: [] }))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.new.packUse?.visibilityConfirmed).toBe(false)
+    expect(result.rawAggregates.old.packUse?.visibilityConfirmed).toBe(false)
+  })
+})
+
+const bashPart = (command: string, id = 'bash') => ({
+  type: 'tool', tool: 'bash', callID: `c-${id}`, state: { status: 'completed', input: { command } }, id,
+})
+
+const writeInstalledJson = async (
+  tree: WorkspaceTree,
+  side: 'old' | 'new',
+  data: unknown,
+): Promise<void> => {
+  const dir = path.join(tree.config, '.config', 'opencode', side)
+  await runP(ensureDir(dir))
+  await runP(writeJson(path.join(dir, 'installed.json'), data))
+}
+
+describe('aggregate — baseline contamination (end-to-end through phase 07)', () => {
+  it('an install-shaped bash command on old surfaces as a contaminationSignal with the run index attached', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1, packRef: 'https://github.com/Graphify-Labs/graphify' })
+    await writeRaw(tree, 'old', 1, exportJson({
+      messages: [{ info: { role: 'assistant', time: { created: 0 } }, parts: [bashPart('npm install -g @sentropic/graphify')] }],
+    }))
+    await writeRaw(tree, 'new', 1, exportJson({ messages: [] }))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.old.contaminationSignals).toEqual([
+      { kind: 'bash-install', detail: 'npm install -g @sentropic/graphify', runIndex: 1 },
+    ])
+    // the pack side is SUPPOSED to show pack activity — never surfaced there
+    expect(result.rawAggregates.new.contaminationSignals).toBeUndefined()
+  })
+
+  it('a clean old side -> contaminationSignals present but empty (checked, nothing found)', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1, packRef: 'https://github.com/Graphify-Labs/graphify' })
+    await writeRaw(tree, 'old', 1, exportJson({ messages: [] }))
+    await writeRaw(tree, 'new', 1, exportJson({ messages: [] }))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.old.contaminationSignals).toEqual([])
+  })
+
+  it('installed.json drift on old (skills) surfaces as an install-drift signal with no runIndex', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1, packRef: 'https://github.com/Graphify-Labs/graphify' })
+    await writeRaw(tree, 'old', 1, exportJson({ messages: [] }))
+    await writeRaw(tree, 'new', 1, exportJson({ messages: [] }))
+    await writeInstalledJson(tree, 'old', {
+      side: 'old', identicalAcrossRuns: false, driftFiles: ['skills'], runsCompared: 4, skills: [],
+    })
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.old.contaminationSignals).toEqual([
+      { kind: 'install-drift', detail: "captured config differs across this side's own runs in: skills" },
+    ])
+  })
+
+  it('missing installed.json (e.g. --no-preflight or older workspace) does not fail the phase', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1, packRef: 'https://github.com/Graphify-Labs/graphify' })
+    await writeRaw(tree, 'old', 1, exportJson({ messages: [] }))
+    await writeRaw(tree, 'new', 1, exportJson({ messages: [] }))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.old.contaminationSignals).toEqual([])
+  })
 })
 
 describe('aggregate — verify stats (P10)', () => {
@@ -650,8 +753,8 @@ describe.skipIf(!hasGoldenWorkspace)('aggregate — real ground truth (golden-va
     const nw = result.rawAggregates.new
 
     // packUse
-    expect(old.packUse).toEqual({ calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true })
-    expect(nw.packUse).toEqual({ calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true })
+    expect(old.packUse).toEqual({ calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true, visibilityConfirmed: false })
+    expect(nw.packUse).toEqual({ calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: false })
 
     // riskyCommands
     expect(old.riskyCommands).toEqual([

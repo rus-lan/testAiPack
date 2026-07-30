@@ -29,6 +29,17 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.6.1 (docker skill/plugin install fix, baseline contamination, judge fixes)
+
+- **The pack was never actually usable under `--isolation docker`**: skills were installed as a symlink into a cache directory not bind-mounted into the container, so the skill dangled and opencode's skill loader found nothing. Local plugins had the same bug, with a green preflight gate on top — a host-absolute path that the gate resolved on the host but the container never saw. Both now install container-valid; the pack-visibility gate now checks inside the container under docker, and the baseline-leak gate fails loudly on a docker error instead of reading it as "no leak."
+- **`--pure-baseline` didn't stop a pack trigger in `--init` from reaching the baseline** — the baseline could install the pack from the network itself and run it (the incident that produced 43 pack-generated files in a baseline diff). New `--init-side old|new|both` (default `both`, unchanged behavior) scopes it to one side; a warning fires when `--pure-baseline` is on, the baseline still receives init, and the init text looks like it names the pack.
+- New baseline-contamination detector: flags a successful skill call for the pack's name, an install-shaped bash command naming the pack as a whole token (not a substring — dogfooding a pack against its own repo no longer false-positives), or drift in a config file/listing the config-capture phase actually tracks. Summary alert, a dedicated report section, and a caveat on the judge verdict when triggered. Commands and details render byte-identical in the report, backticks included.
+- Prompts containing a space reached the model wrapped in literal quote characters — opencode quotes any single argv element with a space in it, and the whole prompt was passed as one element. Now split into separate argv elements — this also fixed the judge crashing with exit 1 on any run whose diff contained `diff --git` lines, which opencode's CLI parsed as unknown flags before this fix.
+- Judge failures are diagnosable now: stderr is included in the report's explanation, and full stdout/stderr go to `results/judge.log`. The judge prompt also states plainly that it has no file access (so "analyse report.md" can't be honored — phase 09 runs before the report exists anyway) and requires the model to disclose that gap instead of inventing a verdict.
+- The report header now shows which side received `--init` (`both` called out as the contamination mechanism above); pack-usage now distinguishes "confirmed visible, not called" from "visibility not confirmed" instead of rendering both the same way.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.6.0...v0.6.1
+
 ## v0.6.0 (protect-git, offline rebuild, config capture, ~13 new metrics)
 
 - **`--protect-git`** (opt-in, off by default) — keeps each run's `.git` outside the tree the agent works in, so a run can no longer delete or rewrite its own git history. Costs opencode's snapshot/patch export, which needs `.git` in place, so it stays off by default; mainly useful under `--isolation docker`.

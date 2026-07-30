@@ -49,6 +49,37 @@ describe('renderMd — header', () => {
     expect(md).not.toContain('sk-fake-secret')
     expect(md).not.toContain('API_KEY')
   })
+
+  it('absent entirely when --init was not used', () => {
+    expect(md).not.toContain('Init side:')
+  })
+
+  it("'both' is called out as the contamination mechanism", () => {
+    const manifest = makeManifest({ init: '/graphify .', flagDefaults: { initSide: 'both' } })
+    const m = renderMd(makeReport({ manifest }))
+    expect(m).toContain('**Init side:** both — sent to both sides; this is how a baseline can pick up the pack under test')
+  })
+
+  it("'new' discloses the metrics asymmetry (init cost lands only on that side) instead of the contamination note", () => {
+    const manifest = makeManifest({ init: '/graphify .', flagDefaults: { initSide: 'new' } })
+    const m = renderMd(makeReport({ manifest }))
+    expect(m).toContain(
+      "**Init side:** new — only the NEW side's metrics carry the init call's cost (tokens, steps, tool calls, wall-clock); that asymmetry is expected, not a measurement error",
+    )
+    expect(m).not.toContain('sent to both sides')
+  })
+
+  it("'old' discloses the same asymmetry, naming OLD", () => {
+    const manifest = makeManifest({ init: '/graphify .', flagDefaults: { initSide: 'old' } })
+    const m = renderMd(makeReport({ manifest }))
+    expect(m).toContain("only the OLD side's metrics carry the init call's cost")
+  })
+
+  it('unknown when init is used but flagDefaults predates --init-side (older report.json)', () => {
+    const manifest = makeManifest({ init: '/graphify .', flagDefaults: {} })
+    const m = renderMd(makeReport({ manifest }))
+    expect(m).toContain('**Init side:** unknown (report predates --init-side)')
+  })
 })
 
 describe('renderMd — summary', () => {
@@ -475,10 +506,10 @@ describe('renderMd — pack signal (P1)', () => {
   it('renders counts per side; warns when new side never invoked a detectable pack', () => {
     const metricsDiff = makeMetricsDiff({
       old: makeSideAggregates('old', {
-        packUse: { calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true },
+        packUse: { calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true, visibilityConfirmed: false },
       }),
       new: makeSideAggregates('new', {
-        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true },
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: false },
       }),
     })
     const md = renderMd(makeReport({ metricsDiff }))
@@ -490,8 +521,8 @@ describe('renderMd — pack signal (P1)', () => {
 
   it('says "not visible" when canDetect is false; absent entirely when packUse is absent on both sides', () => {
     const metricsDiff = makeMetricsDiff({
-      old: makeSideAggregates('old', { packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 3, canDetect: false } }),
-      new: makeSideAggregates('new', { packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 3, canDetect: false } }),
+      old: makeSideAggregates('old', { packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 3, canDetect: false, visibilityConfirmed: false } }),
+      new: makeSideAggregates('new', { packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 3, canDetect: false, visibilityConfirmed: false } }),
     })
     const md = renderMd(makeReport({ metricsDiff }))
     expect(md).toContain('_pack use is not visible for this pack type_')
@@ -499,6 +530,38 @@ describe('renderMd — pack signal (P1)', () => {
 
     const noPackMd = renderMd(makeReport())
     expect(noPackMd).not.toContain('## Pack signal')
+  })
+
+  it('when preflight confirmed visibility and calls=0, warns that the model chose not to call it, not just "never invoked"', () => {
+    const metricsDiff = makeMetricsDiff({
+      new: makeSideAggregates('new', {
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: true },
+      }),
+    })
+    const md = renderMd(makeReport({ metricsDiff }))
+    expect(md).toContain('preflight confirmed it was visible, so the model chose not to call it')
+    expect(md).toContain('0 call(s), 0 error(s), 0/5 runs called the pack (confirmed visible, not called)')
+  })
+
+  it('when calls=0 and visibility was not confirmed, the signal line says so instead of implying it was reachable', () => {
+    const metricsDiff = makeMetricsDiff({
+      new: makeSideAggregates('new', {
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: false },
+      }),
+    })
+    const md = renderMd(makeReport({ metricsDiff }))
+    expect(md).toContain('0 call(s), 0 error(s), 0/5 runs called the pack (visibility not confirmed)')
+  })
+
+  it('visibilityConfirmed entirely absent (old report.json, pre-dates the field) degrades to "not confirmed", not a crash or "undefined"', () => {
+    const metricsDiff = makeMetricsDiff({
+      new: makeSideAggregates('new', {
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true },
+      }),
+    })
+    const md = renderMd(makeReport({ metricsDiff }))
+    expect(md).toContain('0 call(s), 0 error(s), 0/5 runs called the pack (visibility not confirmed)')
+    expect(md).not.toContain('undefined')
   })
 })
 
@@ -520,6 +583,88 @@ describe('renderMd — safety (P2)', () => {
 
     const emptyMd = renderMd(makeReport())
     expect(emptyMd).not.toContain('## Safety')
+  })
+
+  it('backticks in the command survive byte-identical — the fence widens instead of altering the text', () => {
+    const render = (command: string): string | undefined => {
+      const metricsDiff = makeMetricsDiff({
+        old: makeSideAggregates('old', { riskyCommands: [{ runIndex: 1, command, completed: true, exitCode: 0 }] }),
+      })
+      const md = renderMd(makeReport({ metricsDiff }))
+      return md.split('\n').find((l) => l.startsWith('| old | 1 |'))
+    }
+
+    // one backtick, mid-string: a 2-backtick fence is enough
+    expect(render('echo a`b')).toContain('| ``echo a`b`` |')
+
+    // several — a run of 3 backticks: fence widens to 4 to stay longer than the run
+    expect(render('echo before ``` after')).toContain('| ````echo before ``` after```` |')
+
+    // backtick adjacent to the string's edges: a padding space keeps the
+    // fence and the text's own edge backtick from reading as one run —
+    // CommonMark strips that single shared space back out on render, so the
+    // displayed text is still exactly `cmd`, not ` `cmd` ` with visible padding.
+    expect(render('`cmd`')).toContain('| `` `cmd` `` |')
+  })
+})
+
+describe('renderMd — baseline contamination', () => {
+  it('lists signals with escaped pipe characters; absent when empty', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', {
+        contaminationSignals: [
+          { kind: 'bash-install', detail: 'npm install -g | echo done', runIndex: 2 },
+          { kind: 'install-drift', detail: "captured config differs across this side's own runs in: skills" },
+        ],
+      }),
+    })
+    const md = renderMd(makeReport({ metricsDiff }))
+    expect(md).toContain('## Baseline contamination')
+    expect(md).toContain('npm install -g \\| echo done')
+    expect(md).toContain('| bash-install | 2 |')
+    // install-drift has no runIndex — renders as an em dash, not a fabricated 0
+    expect(md).toContain('| install-drift | — |')
+    expect(md).toContain('2 signal(s) that the OLD side acquired or used the pack under test')
+    expect(md).toContain('⚠ **Baseline contamination: the OLD side shows 2 sign(s)')
+
+    const emptyMd = renderMd(makeReport())
+    expect(emptyMd).not.toContain('## Baseline contamination')
+    expect(emptyMd).not.toContain('Baseline contamination:')
+  })
+
+  it('backticks in detail survive byte-identical — the fence widens instead of altering the text', () => {
+    const render = (detail: string): string | undefined => {
+      const metricsDiff = makeMetricsDiff({
+        old: makeSideAggregates('old', { contaminationSignals: [{ kind: 'bash-install', detail, runIndex: 1 }] }),
+      })
+      const md = renderMd(makeReport({ metricsDiff }))
+      return md.split('\n').find((l) => l.startsWith('| bash-install | 1 |'))
+    }
+
+    // one backtick, mid-string
+    expect(render('npm install a`b')).toContain('| ``npm install a`b`` |')
+
+    // several — a run of 3 backticks
+    expect(render('npm install ``` evil')).toContain('| ````npm install ``` evil```` |')
+
+    // backtick adjacent to the string's edges
+    expect(render('`evil`')).toContain('| `` `evil` `` |')
+  })
+
+  it('warns on the LLM Judge section when contamination is detected, without altering the verdict itself', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', {
+        contaminationSignals: [{ kind: 'skill-call', detail: 'skill tool call succeeded for "graphify"' }],
+      }),
+    })
+    const md = renderMd(makeReport({ metricsDiff, judge: makeJudge() }))
+    const judgeIdx = md.indexOf('## LLM Judge')
+    const warnIdx = md.indexOf('Baseline contamination detected (1 sign(s))', judgeIdx)
+    expect(warnIdx).toBeGreaterThan(judgeIdx)
+    expect(md).toContain(`Verdict: **${makeJudge().verdict}**`)
+
+    const cleanMd = renderMd(makeReport({ judge: makeJudge() }))
+    expect(cleanMd).not.toContain('Baseline contamination detected')
   })
 })
 
@@ -757,7 +902,7 @@ describe('renderMd — incident-shaped fixture (acceptance criterion, golden-val
     })
     const metricsDiff = makeMetricsDiff({
       old: makeSideAggregates('old', {
-        packUse: { calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true },
+        packUse: { calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true, visibilityConfirmed: false },
         riskyCommands: [
           {
             runIndex: 1,
@@ -784,7 +929,7 @@ describe('renderMd — incident-shaped fixture (acceptance criterion, golden-val
         },
       }),
       new: makeSideAggregates('new', {
-        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true },
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: false },
         riskyCommands: [],
         opencodeVersions: ['1.18.4'],
         stats: {

@@ -18,6 +18,8 @@ export type AggregateError = {
 
 export type PackType = 'skill' | 'plugin' | 'agent' | 'command' | 'mcp' | 'all'
 
+export type InitSide = 'both' | 'new' | 'old'
+
 export type IsolationMode = 'home' | 'docker'
 
 export type AuthWhitelist = {
@@ -54,6 +56,7 @@ export type RunInput = {
   promptFiles?: Array<string>
   init?: string
   initFiles?: Array<string>
+  initSide: InitSide
   verify?: string
   runs: number
   isolation: IsolationMode
@@ -246,6 +249,7 @@ export type PackUse = {
   runCount: number
   firstCallMsMedian?: string
   canDetect: boolean
+  visibilityConfirmed?: boolean
 }
 
 export type RiskyCommand = {
@@ -262,6 +266,12 @@ export type VerifyStats = {
   runCount: number
 }
 
+export type ContaminationSignal = {
+  kind: 'skill-call' | 'bash-install' | 'install-drift'
+  detail: string
+  runIndex?: number
+}
+
 export type SideAggregates = {
   side: Side
   primary: PrimaryMetrics
@@ -273,6 +283,7 @@ export type SideAggregates = {
   riskyCommands?: Array<RiskyCommand>
   opencodeVersions?: Array<string>
   verifyStats?: VerifyStats
+  contaminationSignals?: Array<ContaminationSignal>
 }
 
 export type MetricDelta = {

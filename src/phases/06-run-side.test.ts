@@ -108,6 +108,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  initSide: 'both',
   preflightEnabled: false,
   formats: ['md'],
   outputPath: '/out',
@@ -264,6 +265,80 @@ describe('phase 06 — run-side', () => {
     const result = await runP(runSide(buildInput(root)))
     expect(result.successRank).toBe(4)
     expect(runMock).toHaveBeenCalledTimes(1)
+  })
+
+  // -------------------------------------------------------------------------
+  // init-side routing
+  // -------------------------------------------------------------------------
+
+  it('initSide=both (default): init reaches old AND new', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const old = await runP(
+      runSide(buildInput(root, { side: 'old', runInput: { init: '/graphify .' } })),
+    )
+    expect(runMock).toHaveBeenCalledTimes(2)
+    expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('/graphify .')
+
+    runMock.mockClear()
+    const nw = await runP(
+      runSide(buildInput(root, { side: 'new', runInput: { init: '/graphify .' } })),
+    )
+    expect(runMock).toHaveBeenCalledTimes(2)
+    void old
+    void nw
+  })
+
+  it('initSide=new: old side skips init (run called once, no --continue), new side still runs it', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+
+    const oldResult = await runP(
+      runSide(
+        buildInput(root, { side: 'old', runInput: { init: '/graphify .', initSide: 'new' } }),
+      ),
+    )
+    expect(runMock).toHaveBeenCalledTimes(1)
+    expect(runMock.mock.calls[0]?.[0]?.continueSession).toBeFalsy()
+    expect(runMock.mock.calls[0]?.[0]?.prompt).toBe('build the thing')
+    const oldLog = await runP(readFile(path.join(path.dirname(oldResult.eventsLogPath), 'run-1.log')))
+    expect(oldLog).toContain('[INIT] skipped on side=old (--init-side new)')
+    expect(oldLog).not.toContain('[INIT] running --init')
+
+    runMock.mockClear()
+    const newResult = await runP(
+      runSide(
+        buildInput(root, { side: 'new', runInput: { init: '/graphify .', initSide: 'new' } }),
+      ),
+    )
+    expect(runMock).toHaveBeenCalledTimes(2)
+    const newLog = await runP(readFile(path.join(path.dirname(newResult.eventsLogPath), 'run-1.log')))
+    expect(newLog).toContain('[INIT] running --init')
+    expect(newLog).not.toContain('[INIT] skipped')
+  })
+
+  it('initSide=old: new side skips init, old side still runs it', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+
+    const newResult = await runP(
+      runSide(
+        buildInput(root, { side: 'new', runInput: { init: 'npm install', initSide: 'old' } }),
+      ),
+    )
+    expect(runMock).toHaveBeenCalledTimes(1)
+    const newLog = await runP(readFile(path.join(path.dirname(newResult.eventsLogPath), 'run-1.log')))
+    expect(newLog).toContain('[INIT] skipped on side=new (--init-side old)')
+
+    runMock.mockClear()
+    const oldResult = await runP(
+      runSide(
+        buildInput(root, { side: 'old', runInput: { init: 'npm install', initSide: 'old' } }),
+      ),
+    )
+    expect(runMock).toHaveBeenCalledTimes(2)
+    const oldLog = await runP(readFile(path.join(path.dirname(oldResult.eventsLogPath), 'run-1.log')))
+    expect(oldLog).toContain('[INIT] running --init')
   })
 
   it('without verify → verifyExitCode is undefined', async () => {

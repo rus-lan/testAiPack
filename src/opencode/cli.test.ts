@@ -50,6 +50,7 @@ import {
   dbQuery,
   OpencodeError,
   buildRunArgs,
+  splitForArgv,
 } from './cli.js'
 import type { SpawnInput, SpawnOutput, ExecOutput } from './spawn.js'
 
@@ -146,12 +147,12 @@ const okDocker = (overrides: Partial<DockerRunResult> = {}): DockerRunResult => 
 })
 
 describe('opencode cli — buildRunArgs', () => {
-  it('emits positional prompt + --format json + --auto by default', () => {
+  it('emits all flags first, then a `--` separator, then the prompt as separate positional tokens', () => {
     const args = buildRunArgs({ ...baseOpts })
-    expect(args).toEqual(['run', 'fix the bug', '--auto', '--format', 'json'])
+    expect(args).toEqual(['run', '--auto', '--format', 'json', '--', 'fix', 'the', 'bug'])
   })
 
-  it('forwards agent/model/session/--continue/--pure when provided', () => {
+  it('forwards agent/model/session/--continue/--pure — all before the `--` separator, never after', () => {
     const args = buildRunArgs({
       ...baseOpts,
       agent: 'coder',
@@ -162,7 +163,6 @@ describe('opencode cli — buildRunArgs', () => {
     })
     expect(args).toEqual([
       'run',
-      'fix the bug',
       '--agent', 'coder',
       '--model', 'glm-5.2',
       '--session', 's1',
@@ -170,12 +170,81 @@ describe('opencode cli — buildRunArgs', () => {
       '--auto',
       '--pure',
       '--format', 'json',
+      '--',
+      'fix', 'the', 'bug',
     ])
   })
 
   it('omits --auto when auto:false', () => {
     const args = buildRunArgs({ ...baseOpts, auto: false })
     expect(args).not.toContain('--auto')
+  })
+
+  it('single-word prompt (no space) stays one positional token after `--`, unaffected', () => {
+    const args = buildRunArgs({ ...baseOpts, prompt: 'proceed' })
+    expect(args).toEqual(['run', '--auto', '--format', 'json', '--', 'proceed'])
+  })
+
+  it('a flag-shaped word in the prompt (e.g. "--json", "--model") lands after `--`, never before it — the regression this fix targets', () => {
+    const args = buildRunArgs({ ...baseOpts, prompt: 'fix the --json output --model thing' })
+    const sepIndex = args.indexOf('--')
+    expect(sepIndex).toBeGreaterThan(-1)
+    // every flag-shaped word from the prompt must be strictly after the
+    // separator — if any leaked before it, opencode would parse it as a real
+    // flag (abort with a usage error, or silently override --model/--agent).
+    const beforeSep = args.slice(0, sepIndex)
+    const afterSep = args.slice(sepIndex + 1)
+    expect(beforeSep).not.toContain('--json')
+    expect(beforeSep.filter((a) => a === '--model')).toHaveLength(0)
+    expect(afterSep).toEqual(['fix', 'the', '--json', 'output', '--model', 'thing'])
+  })
+
+  it('round-trip: rejoining everything after `--` reconstructs the exact original prompt, flag-shaped words included', () => {
+    const prompts = [
+      'fix the --json output --model thing',
+      '--help me --version this',
+      'plain prompt with no flags',
+    ]
+    for (const prompt of prompts) {
+      const args = buildRunArgs({ ...baseOpts, prompt })
+      const sepIndex = args.indexOf('--')
+      const reconstructed = args.slice(sepIndex + 1).join(' ')
+      expect(reconstructed).toBe(prompt)
+    }
+  })
+})
+
+describe('opencode cli — splitForArgv', () => {
+  // opencode's `run` wraps any single argv element containing a space in
+  // literal quote characters before storing it as the message text (verified
+  // empirically against the real binary — see the pack-install investigation).
+  // Splitting on the space character only, so no element has an internal
+  // space, avoids that per-element quoting.
+  it('splits only on the literal space character, not all whitespace', () => {
+    expect(splitForArgv('fix the bug')).toEqual(['fix', 'the', 'bug'])
+    expect(splitForArgv('proceed')).toEqual(['proceed'])
+    // an internal newline with no surrounding space is not itself a split
+    // point (confirmed newlines alone never trigger opencode's quoting).
+    expect(splitForArgv('line1\nline2')).toEqual(['line1\nline2'])
+  })
+
+  it('a multi-paragraph prompt splits its space-adjacent words but keeps each paragraph break attached to its neighbor token', () => {
+    expect(splitForArgv('Fix the bug.\n\nAdd a test.')).toEqual([
+      'Fix', 'the', 'bug.\n\nAdd', 'a', 'test.',
+    ])
+  })
+
+  it('is a lossless split — Array.join(\' \') on the pieces reconstructs the exact original string, including leading/trailing/doubled spaces', () => {
+    const originals = [
+      'fix the bug',
+      ' Fix  the bug. ',
+      'Fix the bug.\n\nAdd a test.',
+      '',
+      'single',
+    ]
+    for (const s of originals) {
+      expect(splitForArgv(s).join(' ')).toBe(s)
+    }
   })
 })
 
@@ -184,7 +253,7 @@ describe('opencode cli — run', () => {
     await runP(run({ ...baseOpts, agent: 'coder', model: 'glm-5.2' }))
     expect(lastSpawn?.command).toBe('opencode')
     expect(lastSpawn?.args).toEqual([
-      'run', 'fix the bug', '--agent', 'coder', '--model', 'glm-5.2', '--auto', '--format', 'json',
+      'run', '--agent', 'coder', '--model', 'glm-5.2', '--auto', '--format', 'json', '--', 'fix', 'the', 'bug',
     ])
     expect(lastSpawn?.cwd).toBe('/work/app')
   })
@@ -385,7 +454,7 @@ describe('opencode cli — docker mode', () => {
     expect(lastDocker?.cwd).toBe('/work/app')
     expect(lastDocker?.homeDir).toBe('/home/test')
     expect(lastDocker?.command).toEqual([
-      'opencode', 'run', 'fix the bug', '--agent', 'coder', '--auto', '--format', 'json',
+      'opencode', 'run', '--agent', 'coder', '--auto', '--format', 'json', '--', 'fix', 'the', 'bug',
     ])
   })
 

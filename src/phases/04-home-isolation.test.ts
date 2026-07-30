@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { Effect } from 'effect'
 import path from 'node:path'
 import { makeTempDir } from '../../tests/setup.js'
-import { ensureDir, writeFile, exists, readSymlink, readFile } from '../util/fs.js'
+import { ensureDir, writeFile, exists, pathKind, readFile } from '../util/fs.js'
 import { homeIsolation } from './04-home-isolation.js'
 import type { HomeIsolationInputExt } from './04-home-isolation.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
@@ -70,6 +70,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
   outputPath: '/out',
@@ -175,7 +176,7 @@ const skillOutcome = (packDir: string, name = 'myskill'): PackInstallOutcome => 
   detectedType: 'skill',
   installLogPath: '/tmp/install.log',
   registeredIn: ['skills'],
-  instructions: [{ kind: 'symlink', name, target: packDir }],
+  instructions: [{ kind: 'skill', name, target: packDir }],
 })
 
 const pluginOutcome = (name = 'myplugin'): PackInstallOutcome => ({
@@ -211,7 +212,7 @@ describe('phase 04 — homeIsolation', () => {
     restoreHome()
   })
 
-  it('happy-path skill: N=1 builds both HOMEs, new gets symlink, auth copied', async () => {
+  it('happy-path skill: N=1 builds both HOMEs, new gets a real copy (not a symlink to the host pack dir), auth copied', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
@@ -224,13 +225,16 @@ describe('phase 04 — homeIsolation', () => {
     expect(result.envVars[0]).toHaveLength(1)
     expect(result.envVars[1]).toHaveLength(1)
     const newHome = input.workspace.homeNew[0]!
-    const linkPath = path.join(newHome, '.config', 'opencode', 'skills', 'myskill')
-    expect(await runP(exists(linkPath))).toBe(true)
-    expect(await runP(readSymlink(linkPath))).toBe(packDir)
+    const destPath = path.join(newHome, '.config', 'opencode', 'skills', 'myskill')
+    expect(await runP(exists(destPath))).toBe(true)
+    // A real directory copy, not a symlink: a docker container that only
+    // mounts the run HOME (never workspace.pack/) still sees the file.
+    expect(await runP(pathKind(destPath))).toBe('dir')
+    expect(await runP(readFile(path.join(destPath, 'SKILL.md')))).toBe('# myskill\n')
     expect(result.homeTrees.new[0]!.copiedAuth).toContain('.local/share/opencode/auth.json')
   })
 
-  it('symlink instruction whose name escapes the skills dir → E_HOME_SETUP_FAILED, nothing written outside it', async () => {
+  it('skill instruction whose name escapes the skills dir → E_HOME_SETUP_FAILED, nothing written outside it', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
@@ -243,7 +247,7 @@ describe('phase 04 — homeIsolation', () => {
     expect(await runP(exists(path.join(newHome, '.config', 'evil')))).toBe(false)
   })
 
-  it('smoke-test (no packInstall): no symlink, no plugin install, identical configs', async () => {
+  it('smoke-test (no packInstall): no skill install, no plugin install, identical configs', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
@@ -331,6 +335,28 @@ describe('phase 04 — homeIsolation', () => {
     const cfg = JSON.parse(await runP(readFile(cfgPath))) as { plugin?: readonly string[] }
     expect(cfg.plugin).toEqual([dstFile])
     expect(installMock).not.toHaveBeenCalled()
+  })
+
+  it('local plugin file under --isolation docker: registers a container-form path (/home/opencode/...), not the host path our own process wrote to', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const srcDir = makeTempDir('testaipack-plugin-src-')
+    await runP(ensureDir(srcDir))
+    const srcFile = path.join(srcDir, 'myplugin.js')
+    await runP(writeFile(srcFile, 'module.exports = {}'))
+    const input = buildInput({ isolation: 'docker' }, localPluginOutcome(srcFile, 'myplugin'))
+    await runP(homeIsolation(input))
+    const newHome = input.workspace.homeNew[0]!
+    const dstFile = path.join(newHome, '.config/opencode/plugins/myplugin.js')
+    expect(await runP(exists(dstFile))).toBe(true)
+    const cfgPath = path.join(newHome, '.config/opencode/opencode.json')
+    const cfg = JSON.parse(await runP(readFile(cfgPath))) as { plugin?: readonly string[] }
+    // the registered spec must be reachable from INSIDE the container, where
+    // homeDir is mounted at /home/opencode -- the host path (dstFile) does
+    // not exist there.
+    expect(cfg.plugin).toEqual(['/home/opencode/.config/opencode/plugins/myplugin.js'])
+    expect(cfg.plugin?.[0]).not.toBe(dstFile)
   })
 
   it('local plugin file: old (baseline) side never gets the file or a plugin instruction applied', async () => {

@@ -7,7 +7,17 @@
  * @see docs/phases/11-report-render.ru.md
  * @see contract/phases/11-report-render.tsp
  */
-import type { AggregateStats, PackUse, Report, RiskyCommand, SecondaryMetrics, Side, TimelineEvent, ToolStat } from '@generated/types'
+import type {
+  AggregateStats,
+  ContaminationSignal,
+  PackUse,
+  Report,
+  RiskyCommand,
+  SecondaryMetrics,
+  Side,
+  TimelineEvent,
+  ToolStat,
+} from '@generated/types'
 import {
   fmtDurationMs,
   fmtInt,
@@ -23,6 +33,25 @@ import type { PrimaryMeta } from './format.js'
 import { STALL_THRESHOLD_MS } from '../metrics/aggregate.js'
 
 const escapeCell = (s: string): string => s.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ')
+
+/**
+ * Wraps `text` in a Markdown inline code span that carries a literal
+ * backtick through byte-identical — this quotes an agent's actual command or
+ * a contamination `detail`, where substituting or escaping a character would
+ * misrepresent evidence a reader may copy, search for, or judge severity by.
+ * Per CommonMark: the fence must be longer than the longest backtick run
+ * already inside the text, and a single space pads both ends when the text
+ * itself starts or ends with a backtick — otherwise the fence and the text's
+ * own edge backtick would read as one longer run and the span would not
+ * close where intended.
+ */
+const codeSpan = (text: string): string => {
+  const runs = text.match(/`+/g) ?? []
+  const longest = runs.reduce((max, r) => Math.max(max, r.length), 0)
+  const fence = '`'.repeat(longest + 1)
+  const padded = text.startsWith('`') || text.endsWith('`') ? ` ${text} ` : text
+  return `${fence}${padded}${fence}`
+}
 
 const capFirst = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1)
 
@@ -42,11 +71,32 @@ const versionDriftWarning = (report: Report): string | undefined => {
   return `> ⚠ opencode version differs from manifest: manifest says ${manifestVersion}, runs used ${distinct.join(', ')} (manifest may record the HOST binary — see root cause below)`
 }
 
+/**
+ * `flagDefaults` is an untyped disclosure bag (same channel `dockerDowngraded`
+ * uses) — `initSide` was added there, not as its own contract field, so this
+ * reads it defensively. `both` is the mechanism by which a baseline can pick
+ * up the pack under test (see the contamination alert), so it's called out.
+ */
+const initSideLine = (report: Report): string | undefined => {
+  if (report.manifest.init === undefined) return undefined
+  const raw = report.manifest.flagDefaults['initSide']
+  if (typeof raw !== 'string') return '**Init side:** unknown (report predates --init-side)'
+  if (raw === 'both') {
+    return '**Init side:** both — sent to both sides; this is how a baseline can pick up the pack under test'
+  }
+  // One session/export per run — the init call's tokens/steps/tool-calls/wall-clock
+  // land entirely on the side that received it, inflating that side's numbers
+  // relative to the other. Honest cost of a scoped init, not noise, but only if
+  // the reader knows to expect it.
+  return `**Init side:** ${raw} — only the ${raw.toUpperCase()} side's metrics carry the init call's cost (tokens, steps, tool calls, wall-clock); that asymmetry is expected, not a measurement error`
+}
+
 const renderHeader = (report: Report): string => {
   const packLine = report.manifest.packRef
     ? report.manifest.packRef
     : '_smoke-test (no pack)_'
   const warn = versionDriftWarning(report)
+  const initLine = initSideLine(report)
   return [
     `# testaipack report: ${report.manifest.runId}`,
     '',
@@ -55,6 +105,7 @@ const renderHeader = (report: Report): string => {
     `**Runs:** ${String(report.manifest.runs)} per side`,
     `**Timestamp:** ${report.manifest.timestamp}`,
     `**Opencode version:** ${report.manifest.opencodeVersion}`,
+    ...(initLine === undefined ? [] : [initLine]),
     ...(warn === undefined ? [] : ['', warn]),
   ].join('\n')
 }
@@ -66,12 +117,24 @@ const renderHeader = (report: Report): string => {
 const packNoopWarning = (report: Report): string | undefined => {
   const pu = report.metricsDiff.new.packUse
   if (pu === undefined || !pu.canDetect || pu.calls !== 0) return undefined
-  return '> ⚠ **Pack was never invoked on the NEW side — deltas compare baseline vs baseline.**'
+  return pu.visibilityConfirmed
+    ? '> ⚠ **Pack was never invoked on the NEW side — preflight confirmed it was visible, so the model chose not to call it. Deltas compare baseline vs baseline.**'
+    : '> ⚠ **Pack was never invoked on the NEW side — deltas compare baseline vs baseline.**'
 }
 
 const riskyCommandAlert = (report: Report): string | undefined => {
   const n = (report.metricsDiff.old.riskyCommands?.length ?? 0) + (report.metricsDiff.new.riskyCommands?.length ?? 0)
   return n === 0 ? undefined : `> ⚠ ${String(n)} risky command(s) detected — see Safety`
+}
+
+const contaminationSignalsOf = (report: Report): readonly ContaminationSignal[] =>
+  report.metricsDiff.old.contaminationSignals ?? []
+
+const contaminationAlert = (report: Report): string | undefined => {
+  const n = contaminationSignalsOf(report).length
+  return n === 0
+    ? undefined
+    : `> ⚠ **Baseline contamination: the OLD side shows ${String(n)} sign(s) of having acquired or used the pack under test — deltas below may not compare a clean baseline against a treatment.** See Baseline contamination.`
 }
 
 const renderSummary = (report: Report): string => {
@@ -94,7 +157,9 @@ const renderSummary = (report: Report): string => {
   const neutral = PRIMARY_METRICS.filter(
     (m) => deltas[m.key].better === 'neutral' || deltas[m.key].better === 'context-dependent',
   )
-  const alerts = [packNoopWarning(report), riskyCommandAlert(report)].filter((s): s is string => s !== undefined)
+  const alerts = [packNoopWarning(report), riskyCommandAlert(report), contaminationAlert(report)].filter(
+    (s): s is string => s !== undefined,
+  )
   return [
     '## Summary',
     '',
@@ -199,7 +264,13 @@ const packSignalLine = (side: Side, pu: PackUse | undefined): string => {
   if (pu === undefined) return `- **${side}**: _no data_`
   if (!pu.canDetect) return `- **${side}**: _pack use is not visible for this pack type_`
   const first = pu.firstCallMsMedian === undefined ? '' : `, first-call median ${fmtInt(pu.firstCallMsMedian)}ms`
-  return `- **${side}**: ${String(pu.calls)} call(s), ${String(pu.errors)} error(s), ${String(pu.runsWithCall)}/${String(pu.runCount)} runs called the pack${first}`
+  const visibility =
+    pu.calls !== 0
+      ? ''
+      : pu.visibilityConfirmed
+        ? ' (confirmed visible, not called)'
+        : ' (visibility not confirmed)'
+  return `- **${side}**: ${String(pu.calls)} call(s), ${String(pu.errors)} error(s), ${String(pu.runsWithCall)}/${String(pu.runCount)} runs called the pack${first}${visibility}`
 }
 
 const renderPackSignal = (report: Report): string => {
@@ -216,7 +287,7 @@ const renderPackSignal = (report: Report): string => {
 const riskyRows = (side: string, list: readonly RiskyCommand[]): readonly string[] =>
   list.map(
     (r) =>
-      `| ${side} | ${String(r.runIndex)} | \`${escapeCell(r.command)}\` | ${String(r.completed)} | ${r.exitCode === undefined ? '—' : String(r.exitCode)} |`,
+      `| ${side} | ${String(r.runIndex)} | ${codeSpan(escapeCell(r.command))} | ${String(r.completed)} | ${r.exitCode === undefined ? '—' : String(r.exitCode)} |`,
   )
 
 const renderSafety = (report: Report): string => {
@@ -232,6 +303,32 @@ const renderSafety = (report: Report): string => {
     ...header,
     ...riskyRows('old', old),
     ...riskyRows('new', nw),
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// Baseline contamination — signs the OLD (baseline) side acquired or used
+// the pack under test, which would silently invalidate the comparison.
+// ---------------------------------------------------------------------------
+
+/** `detail` quotes agent-authored text (a bash command, a drift summary) — treat as untrusted, same as `RiskyCommand.command` above. */
+const contaminationRows = (signals: readonly ContaminationSignal[]): readonly string[] =>
+  signals.map(
+    (s) =>
+      `| ${escapeCell(s.kind)} | ${s.runIndex === undefined ? '—' : String(s.runIndex)} | ${codeSpan(escapeCell(s.detail))} |`,
+  )
+
+const renderContamination = (report: Report): string => {
+  const signals = contaminationSignalsOf(report)
+  if (signals.length === 0) return ''
+  const header = ['| Kind | Run | Detail |', '|---|---|---|']
+  return [
+    '## Baseline contamination',
+    '',
+    `${String(signals.length)} signal(s) that the OLD side acquired or used the pack under test. This is a heuristic tripwire over observed actions, not proof — it can miss routes that leave no trace here; it does not by itself mean the run is invalid. See \`src/metrics/baseline-contamination.ts\`.`,
+    '',
+    ...header,
+    ...contaminationRows(signals),
   ].join('\n')
 }
 
@@ -398,9 +495,18 @@ const renderJudge = (report: Report): string => {
     return ['## LLM Judge', '', `_Judge did not run: ${j.explanation}_`].join('\n')
   }
   const note = j.verdict === 'unclear' ? ' _(unclear)_' : ''
+  const contamination = contaminationSignalsOf(report)
+  const contaminationWarn =
+    contamination.length === 0
+      ? []
+      : [
+          `> ⚠ **Baseline contamination detected (${String(contamination.length)} sign(s)) — this verdict may be comparing two sides that both used the pack under test.**`,
+          '',
+        ]
   return [
     '## LLM Judge',
     '',
+    ...contaminationWarn,
     `- Verdict: **${j.verdict}**${note}`,
     `- Quality: old=${String(j.oldQuality)}, new=${String(j.newQuality)}`,
     `- Model: \`${j.modelUsed}\``,
@@ -518,6 +624,7 @@ export const renderMd = (report: Report): string =>
     renderPrimary(report),
     renderPackSignal(report),
     renderSafety(report),
+    renderContamination(report),
     renderSecondary(report),
     renderFailures(report),
     renderJudge(report),

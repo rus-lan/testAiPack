@@ -16,7 +16,7 @@ import type { PreflightCheck, PreflightInput, PreflightResult, Side } from '@gen
 import type { PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
 import { run as opencodeRun, version as opencodeVersion } from '../opencode/cli.js'
 import type { DockerExec, OpencodeError } from '../opencode/cli.js'
-import { ensureImage } from '../isolation/docker-runner.js'
+import { dockerRun, ensureImage } from '../isolation/docker-runner.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import type { DockerError } from '../isolation/docker-runner.js'
 import { appendFile, ensureDir, exists, readFile } from '../util/fs.js'
@@ -251,7 +251,7 @@ const gateBuildAgent = (
 
 const instructionName = (inst: RegistrationInstruction): string => {
   switch (inst.kind) {
-    case 'symlink':
+    case 'skill':
       return inst.name
     case 'file':
       return inst.name
@@ -261,6 +261,107 @@ const instructionName = (inst: RegistrationInstruction): string => {
       return inst.name
   }
 }
+
+/**
+ * Existence check for an ABSOLUTE path, fail-closed (docker/host errors read
+ * as "does not exist"). Under `--isolation docker` it runs `test -e` inside a
+ * throwaway container with the run HOME mounted, instead of trusting the
+ * host filesystem: a path can resolve on the host (e.g. one outside every
+ * bind mount) while being unreachable inside the container the agent
+ * actually runs in. `homeDir` only supplies the mount for the docker case —
+ * the path checked is `absPath` verbatim, so this also works for a path that
+ * came from inside a config file (e.g. a registered plugin spec) rather than
+ * one we constructed ourselves.
+ */
+const absPathExists = (
+  homeDir: string,
+  absPath: string,
+  docker: DockerExec | undefined,
+): Effect.Effect<boolean> => {
+  if (docker === undefined) return exists(absPath)
+  return dockerRun({
+    image: docker.image,
+    cwd: homeDir,
+    homeDir,
+    command: ['test', '-e', absPath],
+    ...(docker.network === undefined ? {} : { network: docker.network }),
+  }).pipe(
+    Effect.map(() => true),
+    Effect.catchAll(() => Effect.succeed(false)),
+  )
+}
+
+/** Existence check for a path relative to a run HOME (fail-closed, see `absPathExists`). */
+const homeSubExists = (
+  homeDir: string,
+  relPath: string,
+  docker: DockerExec | undefined,
+): Effect.Effect<boolean> =>
+  absPathExists(homeDir, docker === undefined ? path.join(homeDir, relPath) : `/home/opencode/${relPath}`, docker)
+
+/**
+ * Fail-CLOSED is right for a positive visibility check (an error means "not
+ * proven visible", which correctly fails gate 4) but wrong for a leak check:
+ * `homeSubExists`' `catchAll(() => false)` would read a docker hiccup as "no
+ * leak", silently passing gate 5. `test -e` exiting 1 is the ordinary "path
+ * absent" result and stays safe to treat as false; any other failure (docker
+ * unreachable, missing image, timeout, permission error) means the check
+ * itself didn't run, and must fail loudly instead of reading as a clean bill
+ * of health.
+ */
+const homeSubExistsOrFail = (
+  homeDir: string,
+  relPath: string,
+  docker: DockerExec | undefined,
+): Effect.Effect<boolean, PhaseError> => {
+  if (docker === undefined) return exists(path.join(homeDir, relPath))
+  return dockerRun({
+    image: docker.image,
+    cwd: homeDir,
+    homeDir,
+    command: ['test', '-e', `/home/opencode/${relPath}`],
+    ...(docker.network === undefined ? {} : { network: docker.network }),
+  }).pipe(
+    Effect.map(() => true),
+    Effect.catchAll((e: DockerError) => {
+      if (e.exitCode === 1 && !e.timedOut) return Effect.succeed(false)
+      return Effect.fail(
+        preflightError(
+          `cannot verify pack did not leak onto old side: ${e.stderr || (e.timedOut ? 'docker check timed out' : `docker exit ${String(e.exitCode)}`)}`,
+          'E_PREFLIGHT_FAILED',
+          { check: 'baseline-identical', side: 'old', exitCode: 2, path: relPath },
+        ),
+      )
+    }),
+  )
+}
+
+/**
+ * The copied plugin FILE existing is not proof the plugin loads — opencode
+ * reads the path from opencode.json's `plugin` array, and that registered
+ * string can point somewhere that never resolves (the exact bug: a
+ * host-absolute path registered while running inside a container). Reads the
+ * array entry matching the delivered file's basename.
+ */
+const pluginEntryPath = (
+  homeDir: string,
+  basename: string,
+): Effect.Effect<string | undefined> =>
+  Effect.gen(function* () {
+    const cfgPath = path.join(homeDir, '.config/opencode/opencode.json')
+    if (!(yield* exists(cfgPath))) return undefined
+    const raw = yield* readFile(cfgPath).pipe(Effect.catchAll(() => Effect.succeed('')))
+    if (raw === '') return undefined
+    try {
+      const obj = JSON.parse(raw) as unknown
+      if (!isRecord(obj)) return undefined
+      const arr = obj['plugin']
+      if (!Array.isArray(arr)) return undefined
+      return arr.find((p): p is string => typeof p === 'string' && p.endsWith(`/${basename}`))
+    } catch {
+      return undefined
+    }
+  })
 
 const mcpPresentIn = (
   homeDir: string,
@@ -281,32 +382,42 @@ const mcpPresentIn = (
 
 const instructionVisible = (
   inst: RegistrationInstruction,
-  homePaths: PreflightInput['homePaths'],
+  homeDir: string,
+  docker: DockerExec | undefined,
 ): Effect.Effect<boolean> =>
   Effect.gen(function* () {
-    if (inst.kind === 'symlink') {
-      // A skill is registered as a symlink under .config/opencode/skills/<name>
-      // → <pack>/SKILL.md. The deterministic visibility signal is that the
-      // symlink resolves to a readable SKILL.md. We deliberately do NOT probe
-      // the LLM with "list available skills": opencode only surfaces built-in
-      // skills that way, so the probe would always fail for user packs.
-      return yield* exists(
-        path.join(homePaths.new, '.config/opencode/skills', inst.name, 'SKILL.md'),
-      )
+    if (inst.kind === 'skill') {
+      // A skill is registered by copying it under
+      // .config/opencode/skills/<name>/SKILL.md (see phase 04). The
+      // deterministic visibility signal is a readable SKILL.md at that path.
+      // We deliberately do NOT probe the LLM with "list available skills":
+      // opencode only surfaces built-in skills that way, so the probe would
+      // always fail for user packs.
+      return yield* homeSubExists(homeDir, `.config/opencode/skills/${inst.name}/SKILL.md`, docker)
     }
     if (inst.kind === 'file') {
-      return yield* exists(
-        path.join(homePaths.new, '.config/opencode', sectionDir(inst.section), `${inst.name}.md`),
+      return yield* homeSubExists(
+        homeDir,
+        `.config/opencode/${sectionDir(inst.section)}/${inst.name}.md`,
+        docker,
       )
     }
     if (inst.kind === 'plugin') {
-      const dir = path.join(homePaths.new, '.config/opencode/plugins')
+      const relDir = '.config/opencode/plugins'
       if (inst.target !== undefined) {
-        return yield* exists(path.join(dir, path.basename(inst.target)))
+        const basename = path.basename(inst.target)
+        const fileCopied = yield* homeSubExists(homeDir, `${relDir}/${basename}`, docker)
+        if (!fileCopied) return false
+        const registered = yield* pluginEntryPath(homeDir, basename)
+        if (registered === undefined) return false
+        return yield* absPathExists(homeDir, registered, docker)
       }
-      return (yield* exists(path.join(dir, `${inst.name}.js`))) || (yield* exists(path.join(dir, inst.name)))
+      return (
+        (yield* homeSubExists(homeDir, `${relDir}/${inst.name}.js`, docker)) ||
+        (yield* homeSubExists(homeDir, `${relDir}/${inst.name}`, docker))
+      )
     }
-    return yield* mcpPresentIn(homePaths.new, inst.name)
+    return yield* mcpPresentIn(homeDir, inst.name)
   })
 
 const gatePackVisibility = (
@@ -327,8 +438,9 @@ const gatePackVisibility = (
         },
       ]
     }
+    const docker = dockerFromInput(input)
     for (const inst of pack.instructions) {
-      const visible = yield* instructionVisible(inst, input.homePaths)
+      const visible = yield* instructionVisible(inst, input.homePaths.new, docker)
       if (!visible) {
         yield* fail(
           'E_PREFLIGHT_PACK_INVISIBLE',
@@ -348,25 +460,31 @@ const gatePackVisibility = (
 
 const leakedOntoOld = (
   inst: RegistrationInstruction,
-  homePaths: PreflightInput['homePaths'],
-): Effect.Effect<boolean> =>
+  homeDir: string,
+  docker: DockerExec | undefined,
+): Effect.Effect<boolean, PhaseError> =>
   Effect.gen(function* () {
-    if (inst.kind === 'symlink') {
-      return yield* exists(path.join(homePaths.old, '.config/opencode/skills', inst.name))
+    if (inst.kind === 'skill') {
+      return yield* homeSubExistsOrFail(homeDir, `.config/opencode/skills/${inst.name}`, docker)
     }
     if (inst.kind === 'file') {
-      return yield* exists(
-        path.join(homePaths.old, '.config/opencode', sectionDir(inst.section), `${inst.name}.md`),
+      return yield* homeSubExistsOrFail(
+        homeDir,
+        `.config/opencode/${sectionDir(inst.section)}/${inst.name}.md`,
+        docker,
       )
     }
     if (inst.kind === 'plugin') {
-      const dir = path.join(homePaths.old, '.config/opencode/plugins')
+      const relDir = '.config/opencode/plugins'
       if (inst.target !== undefined) {
-        return yield* exists(path.join(dir, path.basename(inst.target)))
+        return yield* homeSubExistsOrFail(homeDir, `${relDir}/${path.basename(inst.target)}`, docker)
       }
-      return (yield* exists(path.join(dir, `${inst.name}.js`))) || (yield* exists(path.join(dir, inst.name)))
+      return (
+        (yield* homeSubExistsOrFail(homeDir, `${relDir}/${inst.name}.js`, docker)) ||
+        (yield* homeSubExistsOrFail(homeDir, `${relDir}/${inst.name}`, docker))
+      )
     }
-    return yield* mcpPresentIn(homePaths.old, inst.name)
+    return yield* mcpPresentIn(homeDir, inst.name)
   })
 
 const gateBaselineIdentical = (
@@ -384,11 +502,11 @@ const gateBaselineIdentical = (
     yield* runOpencodeLaunch(input.homePaths.old, 'old', docker, checks)
     yield* runAuthPing(input.homePaths.old, 'old', model, input.configs?.old, timeoutMs, docker, checks)
     yield* runBuildAgent(input.homePaths.old, 'old', checks)
-    // Pack-leak assertion: no pack files/symlinks may have landed on the old side.
+    // Pack-leak assertion: no pack files may have landed on the old side.
     const pack = input.packInstall
     if (pack !== undefined && pack.detectedType !== null) {
       for (const inst of pack.instructions) {
-        const leaked = yield* leakedOntoOld(inst, input.homePaths)
+        const leaked = yield* leakedOntoOld(inst, input.homePaths.old, docker)
         if (leaked) {
           yield* fail(
             'E_PREFLIGHT_FAILED',

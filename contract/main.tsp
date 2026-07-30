@@ -33,6 +33,16 @@ enum TimelineMode {
   Merged: "merged";
 }
 
+// Which side(s) receive `init` text. `Both` is the historical default:
+// correct for environment prep (dependency installs) both sides need for a
+// fair comparison, but wrong for a pack TRIGGER (e.g. a slash command),
+// which only the pack-under-test side should ever see.
+enum InitSide {
+  Both: "both";
+  New: "new";
+  Old: "old";
+}
+
 enum LogLevel {
   Debug: "debug";
   Info: "info";
@@ -122,6 +132,7 @@ model RunInput {
   promptFiles?: string[];
   "init"?: string;
   initFiles?: string[];
+  initSide: InitSide;
   verify?: string;
   runs: int32;
   isolation: IsolationMode;
@@ -420,6 +431,17 @@ model PackUse {
   firstCallMsMedian?: int64;
   /** false when the pack type cannot be seen in exports (plugin, mcp, agent, command). */
   canDetect: boolean;
+  /**
+   * True when preflight's pack-visibility gate proved the pack was present in
+   * the new-side HOME before any run started. Only meaningful together with
+   * `calls === 0`: with this true, zero calls means the model chose not to
+   * use the pack; with this false or absent, zero calls could also mean the
+   * pack was never reachable (preflight skipped, disabled, or ran before
+   * this field existed). Optional so a `report.json` written before this
+   * field existed still parses — render sites must treat absent the same as
+   * `false`.
+   */
+  visibilityConfirmed?: boolean;
 }
 
 /** One dangerous shell command found in a run's exports. */
@@ -431,6 +453,19 @@ model RiskyCommand {
   completed: boolean;
   /** state.metadata.exit when present. */
   exitCode?: int32;
+}
+
+/**
+ * One observed sign that the baseline (`old`) side acquired or used the
+ * pack under test — a heuristic tripwire, not proof. See
+ * `src/metrics/baseline-contamination.ts`.
+ */
+model ContaminationSignal {
+  kind: "skill-call" | "bash-install" | "install-drift";
+  /** Free text — agent-authored (a quoted command, or a drift summary), truncated for display. Render as untrusted content. */
+  detail: string;
+  /** Absent for `install-drift`, which is side-level, not tied to one run. */
+  runIndex?: int32;
 }
 
 /** Outcome of the --verify command across one side's runs. Omitted when --verify is unset. */
@@ -465,6 +500,8 @@ model SideAggregates {
   /** Distinct export info.version values seen across the side's runs. */
   opencodeVersions?: string[];
   verifyStats?: VerifyStats;
+  /** Only ever populated for `side: "old"` — see `ContaminationSignal`. */
+  contaminationSignals?: ContaminationSignal[];
 }
 
 model AggregateStats {

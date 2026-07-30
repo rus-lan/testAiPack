@@ -11,6 +11,7 @@ import type {
   AuthWhitelist,
   CliParseInput,
   CliParseResult,
+  InitSide,
   IsolationMode,
   LogLevel,
   OutputFormat,
@@ -21,6 +22,7 @@ import type {
 } from '@generated/types'
 import {
   authWhitelistSchema,
+  initSideSchema,
   isolationModeSchema,
   logLevelSchema,
   outputFormatSchema,
@@ -72,6 +74,7 @@ export const DEFAULT_DIFF_HTML = false
 export const DEFAULT_PROTECT_GIT = false
 export const DEFAULT_COLLAPSE_REPEATS = false
 export const DEFAULT_TIMELINE_MODE: TimelineMode = 'side-by-side'
+export const DEFAULT_INIT_SIDE: InitSide = 'both'
 export const DEFAULT_LOG_LEVEL: LogLevel = 'info'
 export const DEFAULT_OUTPUT_PATH = './results'
 export const DEFAULT_WORKSPACE_PATH = './.testaipack'
@@ -91,6 +94,7 @@ const configFileSchema = z
     promptFiles: z.array(z.string()).optional(),
     init: z.string().optional(),
     initFiles: z.array(z.string()).optional(),
+    initSide: initSideSchema.optional(),
     verify: z.string().optional(),
     judge: z.string().optional(),
     judgeFiles: z.array(z.string()).optional(),
@@ -123,6 +127,7 @@ interface CliRaw {
   readonly repoUrl?: string
   readonly prompts: readonly string[]
   readonly inits: readonly string[]
+  readonly initSide?: InitSide
   readonly verifies: readonly string[]
   readonly judges: readonly string[]
   readonly runs?: number
@@ -165,6 +170,7 @@ export const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '--prompt': 'prompts',
   '-p': 'prompts',
   '--init': 'inits',
+  '--init-side': 'initSide',
   '--verify': 'verifies',
   '--judge': 'judges',
   '--format': 'formats',
@@ -302,6 +308,10 @@ const parseValueFlag = (
     if (dest === 'timelineMode') {
       const v = yield* parseEnum(raw, timelineModeSchema, '--timeline-mode')
       return setScalar(acc, 'timelineMode', v)
+    }
+    if (dest === 'initSide') {
+      const v = yield* parseEnum(raw, initSideSchema, '--init-side')
+      return setScalar(acc, 'initSide', v)
     }
     if (dest === 'logLevel') {
       const v = yield* parseEnum(raw, logLevelSchema, '--log-level')
@@ -605,6 +615,8 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const initResolved: ResolvedText | undefined =
       initSpecs.length > 0 ? yield* resolveTextSpecs([...initSpecs], input.cwd, 'init') : undefined
 
+    const initSidePick = pick(cli.initSide, cfg?.initSide)
+
     const verifySpecs: readonly string[] =
       cli.verifies.length > 0 ? cli.verifies : cfg?.verify !== undefined ? [cfg.verify] : []
     const verifyResolved: ResolvedText | undefined =
@@ -721,6 +733,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       protectGitPick.src,
       collapsePick.src,
       timelinePick.src,
+      initSidePick.src,
       logPick.src,
       outputPick.src,
       workspacePick.src,
@@ -749,6 +762,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       protectGit: protectGitPick.value ?? DEFAULT_PROTECT_GIT,
       collapseRepeats: collapsePick.value ?? DEFAULT_COLLAPSE_REPEATS,
       timelineMode: timelinePick.value ?? DEFAULT_TIMELINE_MODE,
+      initSide: initSidePick.value ?? DEFAULT_INIT_SIDE,
       timeouts,
       workspacePath: workspacePick.value ?? DEFAULT_WORKSPACE_PATH,
       logLevel: logPick.value ?? DEFAULT_LOG_LEVEL,
@@ -778,9 +792,13 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       )
     }
 
+    // `initSide` has no dedicated report section (see 06-run-side.ru.md) — the
+    // open `flagDefaults` record is how a run's report/manifest discloses which
+    // side(s) actually got `--init`, the same channel `dockerDowngraded` uses.
     const flagDefaults: Record<string, unknown> = {
       dockerDowngraded,
       configSource,
+      initSide: runInput.initSide,
     }
 
     return {

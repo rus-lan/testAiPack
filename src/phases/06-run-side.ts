@@ -590,7 +590,16 @@ export const runSide = (
     const runResults: OnceResult[] = []
     let realSessionId: string | undefined
 
-    const hasInit = runInput.init !== undefined && runInput.init !== ''
+    // `initSide` picks which side(s) get `--init` text: `both` (default) is
+    // correct for environment prep both sides need for a fair comparison, but
+    // a pack-trigger init (e.g. a slash command) must stay `new`-only or the
+    // baseline installs and runs the pack itself — see 00-cli-parse.ru.md.
+    const initTargetsThisSide = runInput.initSide === 'both' || runInput.initSide === side
+    const hasInitText = runInput.init !== undefined && runInput.init !== ''
+    const hasInit = hasInitText && initTargetsThisSide
+    if (hasInitText && !initTargetsThisSide) {
+      yield* log(`[INIT] skipped on side=${side} (--init-side ${runInput.initSide})`)
+    }
     if (hasInit) {
       yield* log('[INIT] running --init')
       state.lastEvent.time = Date.now()

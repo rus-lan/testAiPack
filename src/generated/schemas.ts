@@ -20,6 +20,8 @@ export const aggregateErrorSchema = z.object({
 
 export const packTypeSchema = z.enum(['skill', 'plugin', 'agent', 'command', 'mcp', 'all'])
 
+export const initSideSchema = z.enum(['both', 'new', 'old'])
+
 export const isolationModeSchema = z.enum(['home', 'docker'])
 
 export const authWhitelistSchema = z.object({
@@ -56,6 +58,7 @@ export const runInputSchema = z.object({
   promptFiles: z.array(z.string()).optional(),
   init: z.string().optional(),
   initFiles: z.array(z.string()).optional(),
+  initSide: initSideSchema,
   verify: z.string().optional(),
   runs: z.number().int(),
   isolation: isolationModeSchema,
@@ -256,6 +259,7 @@ export const packUseSchema = z.object({
   runCount: z.number().int(),
   firstCallMsMedian: z.string().optional(),
   canDetect: z.boolean(),
+  visibilityConfirmed: z.boolean().optional(),
 })
 
 export const riskyCommandSchema = z.object({
@@ -272,6 +276,12 @@ export const verifyStatsSchema = z.object({
   runCount: z.number().int(),
 })
 
+export const contaminationSignalSchema = z.object({
+  kind: z.union([z.literal('skill-call'), z.literal('bash-install'), z.literal('install-drift')]),
+  detail: z.string(),
+  runIndex: z.number().int().optional(),
+})
+
 export const sideAggregatesSchema = z.object({
   side: sideSchema,
   primary: primaryMetricsSchema,
@@ -283,6 +293,7 @@ export const sideAggregatesSchema = z.object({
   riskyCommands: z.array(riskyCommandSchema).optional(),
   opencodeVersions: z.array(z.string()).optional(),
   verifyStats: verifyStatsSchema.optional(),
+  contaminationSignals: z.array(contaminationSignalSchema).optional(),
 })
 
 export const metricDeltaSchema = z.object({

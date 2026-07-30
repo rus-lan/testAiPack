@@ -44,6 +44,7 @@ describe('cliParse — happy path', () => {
     expect(ri.preflightEnabled).toBe(true)
     expect(ri.collapseRepeats).toBe(false)
     expect(ri.timelineMode).toBe('side-by-side')
+    expect(ri.initSide).toBe('both')
     expect(ri.logLevel).toBe('info')
     expect(ri.outputPath).toBe('./results')
     expect(ri.workspacePath).toBe('./.testaipack')
@@ -168,6 +169,13 @@ describe('cliParse — validation errors', () => {
   it('invalid --timeline-mode → E_CONFIG_INVALID', async () => {
     const cwd = makeTempDir()
     const err = await runFlip(cliParse({ argv: ['run', REPO, '--prompt', 'x', '--timeline-mode', 'wat'], cwd }))
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_CONFIG_INVALID')
+  })
+
+  it('invalid --init-side → E_CONFIG_INVALID', async () => {
+    const cwd = makeTempDir()
+    const err = await runFlip(cliParse({ argv: ['run', REPO, '--prompt', 'x', '--init-side', 'wat'], cwd }))
     expect(err).toBeInstanceOf(PhaseError)
     expect(err.code).toBe('E_CONFIG_INVALID')
   })
@@ -372,6 +380,54 @@ describe('cliParse — docker downgrade', () => {
     const cwd = makeTempDir()
     const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
     expect(result.runInput.dockerNetwork).toBeUndefined()
+  })
+})
+
+describe('cliParse — init-side', () => {
+  it('no --init-side → defaults to "both"', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.runInput.initSide).toBe('both')
+  })
+
+  it('--init-side new is parsed onto runInput.initSide', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--init-side', 'new'], cwd }),
+    )
+    expect(result.runInput.initSide).toBe('new')
+  })
+
+  it('--init-side old is parsed onto runInput.initSide', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--init-side', 'old'], cwd }),
+    )
+    expect(result.runInput.initSide).toBe('old')
+  })
+
+  it('config-file initSide is honored; CLI --init-side still wins over it', async () => {
+    const cwd = makeTempDir()
+    await ensureDirP(path.join(cwd, '.testaipack'))
+    await writeFileP(
+      path.join(cwd, '.testaipack', 'config.json'),
+      JSON.stringify({ repoUrl: REPO, prompt: 'x', initSide: 'old' }),
+    )
+    const fromConfig = await runP(cliParse({ argv: ['run'], cwd }))
+    expect(fromConfig.runInput.initSide).toBe('old')
+
+    const overridden = await runP(
+      cliParse({ argv: ['run', '--init-side', 'new'], cwd }),
+    )
+    expect(overridden.runInput.initSide).toBe('new')
+  })
+
+  it('resolved initSide is disclosed on flagDefaults for the report/manifest', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--init-side', 'new'], cwd }),
+    )
+    expect(result.flagDefaults.initSide).toBe('new')
   })
 })
 

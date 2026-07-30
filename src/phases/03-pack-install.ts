@@ -43,7 +43,7 @@ import type { PhaseError } from '../errors.js'
  * are an internal 03↔04 hand-off, not part of the wire contract.
  */
 export type RegistrationInstruction =
-  | { readonly kind: 'symlink'; readonly name: string; readonly target: string }
+  | { readonly kind: 'skill'; readonly name: string; readonly target: string }
   | {
       readonly kind: 'file'
       readonly section: 'agents' | 'commands'
@@ -277,7 +277,7 @@ const deliverSkill = (
     return {
       packPath: skillRoot,
       registeredIn: ['skills'],
-      instructions: [{ kind: 'symlink', name: ref.name, target: skillRoot }],
+      instructions: [{ kind: 'skill', name: ref.name, target: skillRoot }],
     }
   })
 
@@ -363,7 +363,7 @@ const scanSkills = (skillsDir: string): Effect.Effect<ScanResult, PhaseError> =>
         const kind = yield* pathKind(skillDir)
         const hasSkill = kind === 'dir' && (yield* exists(path.join(skillDir, 'SKILL.md')))
         if (!hasSkill) return [] as readonly RegistrationInstruction[]
-        return [{ kind: 'symlink', name, target: skillDir }] as readonly RegistrationInstruction[]
+        return [{ kind: 'skill', name, target: skillDir }] as readonly RegistrationInstruction[]
       }),
       { concurrency: 1 },
     )

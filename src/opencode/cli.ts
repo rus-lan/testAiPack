@@ -98,9 +98,33 @@ const dockerErrorToOpencode =
       timedOut: d.timedOut,
     })
 
+/**
+ * opencode's `run` message is a variadic positional array, not a single
+ * string flag (`opencode run --help`). Passing the whole prompt as one argv
+ * element is not safe: confirmed empirically against the real binary that
+ * opencode wraps any single element containing a space in literal quote
+ * characters before storing it as the message text, corrupting every
+ * multi-word prompt. Splitting on the space character only — not all
+ * whitespace, so embedded newlines/paragraph breaks survive untouched — into
+ * separate elements avoids the per-element quoting: no element has an
+ * internal space, and opencode's own rejoin reconstructs the original text
+ * exactly (verified round-trip, including leading/trailing/doubled spaces).
+ */
+export const splitForArgv = (text: string): readonly string[] => text.split(' ')
+
+/**
+ * `message` tokens are parsed by yargs as ordinary argv, so a prompt word
+ * that happens to look like a flag (`--json`, `--model x`) would otherwise be
+ * consumed as one of opencode's own options — at best aborting the run with
+ * a usage error, at worst silently overriding a flag we set (e.g. hijacking
+ * `--model`). `--` is yargs' standard "stop parsing options" marker: verified
+ * empirically that every token after it — including flag-shaped ones — lands
+ * in the message text untouched, while a token before it is still parsed as
+ * a flag. So all of testaipack's own flags must come BEFORE `--`, and every
+ * prompt token must come AFTER it.
+ */
 export const buildRunArgs = (opts: OpencodeRunOptions): readonly string[] => [
   'run',
-  opts.prompt,
   ...(opts.agent !== undefined ? ['--agent', opts.agent] : []),
   ...(opts.model !== undefined ? ['--model', opts.model] : []),
   ...(opts.session !== undefined ? ['--session', opts.session] : []),
@@ -109,6 +133,8 @@ export const buildRunArgs = (opts: OpencodeRunOptions): readonly string[] => [
   ...(opts.pure === true ? ['--pure'] : []),
   '--format',
   'json',
+  '--',
+  ...splitForArgv(opts.prompt),
 ]
 
 export const sessionIdFromEvent = (ev: unknown): string | undefined => {

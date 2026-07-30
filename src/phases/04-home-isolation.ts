@@ -25,7 +25,7 @@ import type {
 import type { PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
 import { installPlugin } from '../opencode/cli.js'
 import type { DockerExec, OpencodeError } from '../opencode/cli.js'
-import { copyDir, copyFile, ensureDir, exists, isPathWithin, pathKind, readFile, removeDir, symlink, writeFile, writeJson } from '../util/fs.js'
+import { copyDir, copyFile, ensureDir, exists, isPathWithin, pathKind, readFile, removeDir, writeFile, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
@@ -264,6 +264,26 @@ const addLocalPlugin = (
   return prev.includes(absPath) ? existing : { ...existing, plugin: [...prev, absPath] }
 }
 
+/**
+ * The path opencode.json's `plugin` array must reference at RUNTIME, not the
+ * path our own process just wrote the file to. Under `--isolation docker`
+ * opencode reads that config from inside the container, where `homeDir` is
+ * mounted at `/home/opencode` — the host-absolute `dstFile` does not exist
+ * there, so a plugin registered with it silently fails to load (same bug
+ * class as the skill symlink, one layer down: the FILE is copied correctly,
+ * only the recorded PATH is wrong). Home isolation runs the process directly
+ * on the host, where `dstFile` already is the real path.
+ */
+const pluginConfigPath = (
+  dstFile: string,
+  homeDir: string,
+  docker: DockerExec | undefined,
+): string => {
+  if (docker === undefined) return dstFile
+  const rel = path.relative(homeDir, dstFile).split(path.sep).join('/')
+  return path.posix.join('/home/opencode', rel)
+}
+
 const applyInstruction = (
   inst: RegistrationInstruction,
   homeDir: string,
@@ -271,24 +291,31 @@ const applyInstruction = (
   docker: DockerExec | undefined,
 ): Effect.Effect<void, PhaseError> => {
   switch (inst.kind) {
-    case 'symlink':
+    case 'skill':
       return Effect.gen(function* () {
         const skillsDir = path.join(homeDir, '.config/opencode/skills')
-        const linkPath = path.join(skillsDir, inst.name)
-        if (!isPathWithin(skillsDir, linkPath)) {
+        const destDir = path.join(skillsDir, inst.name)
+        if (!isPathWithin(skillsDir, destDir)) {
           yield* Effect.fail(
-            setupFail(`skill link escapes skills dir: ${linkPath}`, {
+            setupFail(`skill dest escapes skills dir: ${destDir}`, {
               name: inst.name,
-              path: linkPath,
+              path: destDir,
             }),
           )
         }
-        yield* removeDir(linkPath).pipe(Effect.catchAll(() => Effect.void))
-        yield* symlink(inst.target, linkPath).pipe(
+        yield* removeDir(destDir).pipe(Effect.catchAll(() => Effect.void))
+        // A symlink to `inst.target` (the shared pack cache under
+        // workspace.pack/) would dangle under `--isolation docker`: only the
+        // run HOME and the app cwd are bind-mounted into the container, so a
+        // path outside both is invisible there even though it resolves fine
+        // on the host. Copying the skill into the HOME tree — the same thing
+        // the `file`/`plugin` instruction kinds already do — makes it
+        // genuinely present inside the mount for both isolation modes.
+        yield* copyDir(inst.target, destDir).pipe(
           Effect.mapError((e: FsError) =>
-            setupFail(`cannot create skill symlink: ${e.path}`, {
-              target: inst.target,
-              link: linkPath,
+            setupFail(`cannot copy skill into HOME: ${e.path}`, {
+              source: inst.target,
+              dest: destDir,
             }),
           ),
         )
@@ -354,7 +381,7 @@ const applyInstruction = (
         )
         const cfgPath = path.join(homeDir, '.config/opencode/opencode.json')
         const existing = yield* readOpendcodeConfig(cfgPath)
-        const merged = addLocalPlugin(existing, dstFile)
+        const merged = addLocalPlugin(existing, pluginConfigPath(dstFile, homeDir, docker))
         yield* writeFile(cfgPath, `${JSON.stringify(merged, null, 2)}\n`).pipe(
           Effect.mapError((e: FsError) =>
             setupFail(`cannot write opencode.json: ${e.path}`, { path: e.path }),

@@ -26,6 +26,8 @@ import type { PricingTable } from '../pricing/lookup.js'
 import { computeCost, lookupPrice } from '../pricing/lookup.js'
 import { isRecord } from '../util/types.js'
 import { findRiskyCommand } from './risky-commands.js'
+import { findPackActivitySignals } from './baseline-contamination.js'
+import type { UnindexedSignal } from './baseline-contamination.js'
 import { percentile, toNum } from './stats.js'
 
 /**
@@ -43,6 +45,13 @@ export interface ExtractedExtras {
   readonly bashFailCount: number
   readonly toolErrorTexts: readonly string[]
   readonly riskyCommands: readonly Omit<RiskyCommand, 'runIndex'>[]
+  /**
+   * Side-neutral: whether this counts as baseline contamination depends on
+   * which side the run is on, a judgment `metrics/aggregate.ts` makes (only
+   * the baseline side surfaces these as `contaminationSignals`) — see
+   * `baseline-contamination.ts`.
+   */
+  readonly packActivitySignals: readonly UnindexedSignal[]
   readonly opencodeVersion: string
   readonly firstStepInputTokens: number | undefined
   readonly lastStepInputTokens: number | undefined
@@ -360,6 +369,7 @@ const extractExtras = (exp: OpencodeExport, opts: ExtractOptions): ExtractedExtr
       typeof p.state.error === 'string' ? [p.state.error.slice(0, TOOL_ERROR_TEXT_MAX)] : [],
     ),
     riskyCommands: riskyCommandsOf(tools),
+    packActivitySignals: findPackActivitySignals(tools, opts.packName),
     opencodeVersion: exp.info.version,
     firstStepInputTokens,
     lastStepInputTokens,
@@ -519,6 +529,7 @@ const emptyExtras = (): ExtractedExtras => ({
   bashFailCount: 0,
   toolErrorTexts: [],
   riskyCommands: [],
+  packActivitySignals: [],
   opencodeVersion: '',
   firstStepInputTokens: undefined,
   lastStepInputTokens: undefined,
@@ -555,6 +566,7 @@ const mergeExtrasAcrossNodes = (
     bashFailCount: sumOf((e) => e.bashFailCount),
     toolErrorTexts: list.flatMap((e) => e.toolErrorTexts),
     riskyCommands: list.flatMap((e) => e.riskyCommands),
+    packActivitySignals: list.flatMap((e) => e.packActivitySignals),
     opencodeVersion: root.opencodeVersion,
     firstStepInputTokens: root.firstStepInputTokens,
     lastStepInputTokens: root.lastStepInputTokens,

@@ -36,12 +36,13 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
     64 (EX_USAGE).
 
 `RunInput` (общий тип из `contract/main.tsp`) содержит: `repoUrl`, `packRef?`,
-`packType?`, `prompt`, `promptFiles?`, `init?`, `initFiles?`, `verify?`, `runs`
-(int32), `isolation` (`IsolationMode`), `dockerNetwork?`, `opencodeVersion?`,
-`auth` (`AuthWhitelist`), `pureBaseline` (boolean), `judge?`, `judgeFiles?`,
-`preflightEnabled` (boolean), `preflightModel?`, `model?`, `formats` (`OutputFormat[]`),
-`outputPath`, `diffHtml` (boolean), `protectGit` (boolean), `collapseRepeats`
-(boolean), `timelineMode` (`TimelineMode`), `timeouts` (`TimeoutConfig`),
+`packType?`, `prompt`, `promptFiles?`, `init?`, `initFiles?`, `initSide`
+(`InitSide`), `verify?`, `runs` (int32), `isolation` (`IsolationMode`),
+`dockerNetwork?`, `opencodeVersion?`, `auth` (`AuthWhitelist`), `pureBaseline`
+(boolean), `judge?`, `judgeFiles?`, `preflightEnabled` (boolean),
+`preflightModel?`, `model?`, `formats` (`OutputFormat[]`), `outputPath`,
+`diffHtml` (boolean), `protectGit` (boolean), `collapseRepeats` (boolean),
+`timelineMode` (`TimelineMode`), `timeouts` (`TimeoutConfig`),
 `workspacePath`, `logLevel` (`LogLevel`), `pricingPath?`. Все поля
 обязательные, кроме явно помеченных `?`.
 
@@ -58,6 +59,24 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
   потребляется фазой 04.
 - `pureBaseline` — `true` по умолчанию; если `true`, baseline-сторона получает
   `OPENCODE_PURE=1` (см. `EnvVarSet` в фазе 04).
+- `initSide` (`InitSide`: `both | new | old`) — `both` по умолчанию (`--init-side
+  <side>`). Определяет, какая сторона(ы) фазы 06 реально выполняет `--init` (см.
+  `docs/phases/06-run-side.ru.md`). `both` верно для подготовки окружения
+  (установка зависимостей и т.п.), которая нужна обеим сторонам для честного
+  сравнения — историческое и единственное поведение до появления флага. Но если
+  `--init` — это на самом деле ТРИГГЕР тестируемого пакета (например, slash-команда
+  `/graphify .`), `both` ломает `--pure-baseline`: baseline-сторона тоже получает
+  триггер, не находит команду и способна сама поставить и вызвать пакет —
+  реальный инцидент, из-за которого появился флаг. `new` отправляет `--init`
+  только на сторону с пакетом; `old` — только на baseline (редкий кейс). Если
+  `--pure-baseline` включён (default) и `initSide` ∈ {`both`, `old`}, а текст
+  `--init` похож на упоминание пакета (совпадает короткое имя пакета из `--pack`,
+  включая слэш-триггер вида `/<name>`), `src/cli/pipeline.ts`
+  (`initPackContaminationWarning`) печатает warning в stderr — не fail, просто
+  громкий сигнал, что сравнение может быть загрязнено. Значение сохраняется в
+  `flagDefaults.initSide` (см. шаг 6 и `Manifest.flagDefaults`) — у самого отчёта
+  нет отдельной секции "параметры прогона", это единственное место, где значение
+  видно постфактум.
 - `protectGit` — `false` по умолчанию (`--protect-git` / `--no-protect-git`).
   Если `true`: фаза 02 переносит `.git` каждого прогона за пределы примонтированного
   дерева (`gitdirs/<side>/run-N/`, см. `docs/phases/02-repo-clone.ru.md`), фаза 08
@@ -120,8 +139,16 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
    (`src/cli/pipeline.ts`, `dockerDowngradeWarning`), читая этот флаг сразу
    после вызова `cliParse`, до `reporter.header`.
 7. Валидировать `--timeline-mode ∈ {side-by-side, tree-diff, merged}`,
-   `--log-level ∈ {debug, info, warn, error}`. Любое нарушение →
-   `E_CONFIG_INVALID`. Выбор IDE для review-workspace (`vscode | cursor |
+   `--log-level ∈ {debug, info, warn, error}`, `--init-side ∈ {both, new, old}`.
+   Любое нарушение → `E_CONFIG_INVALID`. `--init-side` без флага и без
+   config-file → `both` (`DEFAULT_INIT_SIDE`), записывается в
+   `flagDefaults.initSide`, чтобы значение было видно постфактум в отчёте и
+   манифесте. Если `--pure-baseline`
+   включён (default) и резолвенный `initSide` ∈ {`both`, `old`}, а текст `--init`
+   похож на упоминание пакета из `--pack` — orchestrator
+   (`src/cli/pipeline.ts`, `initPackContaminationWarning`) печатает warning в
+   stderr тем же способом, что и `dockerDowngradeWarning` выше (фаза 00 сама
+   ничего не печатает). Выбор IDE для review-workspace (`vscode | cursor |
    code-insiders`) и параметр `--review-run` живут в `flagDefaults` и фазой 00
    отдельно не валидируются.
 8. Валидировать `--model <provider/model>` (и независимо `--preflight-model`)
@@ -164,6 +191,9 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
 | `--pack` не задан                                  | Smoke-test режим: `packRef = null`                         | —                            |
 | Неизвестный флаг                                   | Fail прогона, exit 64                                      | `E_CONFIG_INVALID`           |
 | `--format all`                                     | Раскрыть в `[md, html, json, yaml]`                        | —                            |
+| `--init-side` не задан                             | `RunInput.initSide = "both"` (историческое поведение)      | —                            |
+| Невалидный `--init-side foo`                       | Fail прогона, exit 64                                      | `E_CONFIG_INVALID`           |
+| `--init` похож на триггер `--pack`, `--pure-baseline` on, `initSide` ∈ {both, old} | Warning в stderr (не fail), см. `initPackContaminationWarning` | — |
 
 ## 6. Тест-кейсы (по одному на ветку контракта)
 
@@ -198,6 +228,21 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
   заданы — CLI побеждает.
 - ✅ `--model` не задан (ни CLI, ни config-file) → `RunInput.model` остаётся
   `undefined`, downstream-поведение (фаза 04) не меняется.
+- ✅ `--init-side` не задан → `RunInput.initSide = "both"`.
+- ✅ `--init-side new` / `--init-side old` парсятся в `RunInput.initSide`.
+- ✅ config-file `initSide` учитывается; CLI `--init-side` побеждает над ним.
+- ✅ резолвенный `initSide` пишется в `flagDefaults.initSide`.
+- ✅ invalid `--init-side foo` → throw `E_CONFIG_INVALID`.
+- ✅ contamination-warning (не эта фаза, `src/cli/pipeline.test.ts`,
+  `initPackContaminationWarning`): `--pure-baseline` on, `initSide` ∈
+  {`both`,`old`}, `--init` содержит короткое имя пакета из `--pack` → warning в
+  stderr, упоминает `--init-side new`; `initSide = "new"` уже само по себе
+  снимает предупреждение, как и `--pure-baseline` off или `--init`, не
+  упоминающий пакет.
+- ✅ init-side routing (не эта фаза, `06-run-side.test.ts`): `initSide = "new"`
+  на стороне `old` → `--init` пропускается (`run` вызывается один раз, без
+  `--continue`), лог содержит `[INIT] skipped on side=old (--init-side new)`;
+  на стороне `new` — выполняется как обычно.
 - ❌ НЕ покрыто (ticket): `compare <id1> <id2>` — валидация существования обоих
   run-id делается в отдельной субкоманде, не в этой фазе.
 
@@ -211,6 +256,8 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
 - `flagDefaults.dockerDowngraded` (зеркалируется в `Manifest` фазой 01)
   однозначно отличает явный запрос `docker` от default `home`, чтобы отчёт мог
   показать предупреждение пользователю.
+- `RunInput.initSide` всегда одно из `{both, new, old}`; `flagDefaults.initSide`
+  зеркалирует резолвенное значение тем же путём, что `dockerDowngraded`.
 - Никаких побочных эффектов на диск: фаза чистая и детерминированная
   (только чтение файлов по известным путям).
 

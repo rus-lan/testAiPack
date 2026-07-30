@@ -11,7 +11,16 @@
  * @see docs/phases/11-report-render.ru.md
  * @see contract/phases/11-report-render.tsp
  */
-import type { AggregateStats, PackUse, Report, RiskyCommand, SecondaryMetrics, Side, ToolStat } from '@generated/types'
+import type {
+  AggregateStats,
+  ContaminationSignal,
+  PackUse,
+  Report,
+  RiskyCommand,
+  SecondaryMetrics,
+  Side,
+  ToolStat,
+} from '@generated/types'
 import { fmtDurationMs, fmtInt, fmtPct, fmtSigned, fmtValue, PRIMARY_METRICS, sigLabel, toNum, verdictFor } from './format.js'
 import type { PrimaryMeta } from './format.js'
 import { STALL_THRESHOLD_MS } from '../metrics/aggregate.js'
@@ -49,16 +58,39 @@ const versionDriftWarning = (report: Report): string | undefined => {
   return `opencode version differs from manifest: manifest says ${manifestVersion}, runs used ${distinct.join(', ')} (manifest may record the HOST binary — see root cause below)`
 }
 
+/**
+ * `flagDefaults` is an untyped disclosure bag (same channel `dockerDowngraded`
+ * uses) — `initSide` was added there, not as its own contract field, so this
+ * reads it defensively. `both` is the mechanism by which a baseline can pick
+ * up the pack under test (see the contamination alert), so it's called out.
+ */
+const initSideLine = (report: Report): string | undefined => {
+  if (report.manifest.init === undefined) return undefined
+  const raw = report.manifest.flagDefaults['initSide']
+  if (typeof raw !== 'string') return '<strong>Init side:</strong> unknown (report predates --init-side)'
+  if (raw === 'both') {
+    return '<strong>Init side:</strong> both — sent to both sides; this is how a baseline can pick up the pack under test'
+  }
+  // One session/export per run — the init call's tokens/steps/tool-calls/wall-clock
+  // land entirely on the side that received it, inflating that side's numbers
+  // relative to the other. Honest cost of a scoped init, not noise, but only if
+  // the reader knows to expect it.
+  const note = ` — only the ${raw.toUpperCase()} side's metrics carry the init call's cost (tokens, steps, tool calls, wall-clock); that asymmetry is expected, not a measurement error`
+  return `<strong>Init side:</strong> ${escapeHtml(raw)}${escapeHtml(note)}`
+}
+
 const renderHeader = (report: Report): string => {
   const pack = report.manifest.packRef ?? '_smoke-test (no pack)_'
   const warn = versionDriftWarning(report)
   const warnHtml = warn === undefined ? '' : `<p class="warn">⚠ ${escapeHtml(warn)}</p>`
+  const initLine = initSideLine(report)
+  const initHtml = initLine === undefined ? '' : `<br>\n${initLine}`
   return `<h1>testaipack report: ${escapeHtml(report.manifest.runId)}</h1>
 <p class="meta"><strong>Repo:</strong> ${escapeHtml(report.manifest.repoUrl)}<br>
 <strong>Pack:</strong> ${escapeHtml(pack)}<br>
 <strong>Runs:</strong> ${escapeHtml(String(report.manifest.runs))} per side<br>
 <strong>Opencode:</strong> ${escapeHtml(report.manifest.opencodeVersion)}<br>
-<strong>Timestamp:</strong> ${escapeHtml(report.manifest.timestamp)}</p>
+<strong>Timestamp:</strong> ${escapeHtml(report.manifest.timestamp)}${initHtml}</p>
 ${warnHtml}`
 }
 
@@ -69,12 +101,24 @@ ${warnHtml}`
 const packNoopWarning = (report: Report): string | undefined => {
   const pu = report.metricsDiff.new.packUse
   if (pu === undefined || !pu.canDetect || pu.calls !== 0) return undefined
-  return 'Pack was never invoked on the NEW side — deltas compare baseline vs baseline.'
+  return pu.visibilityConfirmed
+    ? 'Pack was never invoked on the NEW side — preflight confirmed it was visible, so the model chose not to call it. Deltas compare baseline vs baseline.'
+    : 'Pack was never invoked on the NEW side — deltas compare baseline vs baseline.'
 }
 
 const riskyCommandAlert = (report: Report): string | undefined => {
   const n = (report.metricsDiff.old.riskyCommands?.length ?? 0) + (report.metricsDiff.new.riskyCommands?.length ?? 0)
   return n === 0 ? undefined : `${String(n)} risky command(s) detected — see Safety`
+}
+
+const contaminationSignalsOf = (report: Report): readonly ContaminationSignal[] =>
+  report.metricsDiff.old.contaminationSignals ?? []
+
+const contaminationAlert = (report: Report): string | undefined => {
+  const n = contaminationSignalsOf(report).length
+  return n === 0
+    ? undefined
+    : `Baseline contamination: the OLD side shows ${String(n)} sign(s) of having acquired or used the pack under test — deltas below may not compare a clean baseline against a treatment. See Baseline contamination.`
 }
 
 const renderSummary = (report: Report): string => {
@@ -96,7 +140,9 @@ const renderSummary = (report: Report): string => {
   const neutral = PRIMARY_METRICS.filter(
     (m) => deltas[m.key].better === 'neutral' || deltas[m.key].better === 'context-dependent',
   )
-  const alerts = [packNoopWarning(report), riskyCommandAlert(report)].filter((s): s is string => s !== undefined)
+  const alerts = [packNoopWarning(report), riskyCommandAlert(report), contaminationAlert(report)].filter(
+    (s): s is string => s !== undefined,
+  )
   const alertsHtml = alerts.map((a) => `<p class="warn">⚠ ${escapeHtml(a)}</p>`).join('')
   return `<section id="summary">
 <h2>Summary</h2>
@@ -198,7 +244,9 @@ const packSignalLine = (side: Side, pu: PackUse | undefined): string => {
   if (pu === undefined) return `<li><strong>${escapeHtml(side)}</strong>: <em>no data</em></li>`
   if (!pu.canDetect) return `<li><strong>${escapeHtml(side)}</strong>: <em>pack use is not visible for this pack type</em></li>`
   const first = pu.firstCallMsMedian === undefined ? '' : `, first-call median ${escapeHtml(fmtInt(pu.firstCallMsMedian))}ms`
-  return `<li><strong>${escapeHtml(side)}</strong>: ${String(pu.calls)} call(s), ${String(pu.errors)} error(s), ${String(pu.runsWithCall)}/${String(pu.runCount)} runs called the pack${first}</li>`
+  const visibility =
+    pu.calls !== 0 ? '' : pu.visibilityConfirmed ? ' (confirmed visible, not called)' : ' (visibility not confirmed)'
+  return `<li><strong>${escapeHtml(side)}</strong>: ${String(pu.calls)} call(s), ${String(pu.errors)} error(s), ${String(pu.runsWithCall)}/${String(pu.runCount)} runs called the pack${first}${escapeHtml(visibility)}</li>`
 }
 
 const renderPackSignal = (report: Report): string => {
@@ -228,6 +276,26 @@ const renderSafety = (report: Report): string => {
 }
 
 // ---------------------------------------------------------------------------
+// Baseline contamination — signs the OLD (baseline) side acquired or used
+// the pack under test, which would silently invalidate the comparison.
+// ---------------------------------------------------------------------------
+
+/** `detail` quotes agent-authored text (a bash command, a drift summary) — treat as untrusted, same as `RiskyCommand.command` above. */
+const contaminationRows = (signals: readonly ContaminationSignal[]): string =>
+  signals
+    .map(
+      (s) =>
+        `<tr><td>${escapeHtml(s.kind)}</td><td>${s.runIndex === undefined ? '—' : String(s.runIndex)}</td><td><code>${escapeHtml(s.detail)}</code></td></tr>`,
+    )
+    .join('')
+
+const renderContamination = (report: Report): string => {
+  const signals = contaminationSignalsOf(report)
+  if (signals.length === 0) return ''
+  return `<section><h2>Baseline contamination</h2><p>${String(signals.length)} signal(s) that the OLD side acquired or used the pack under test. This is a heuristic tripwire over observed actions, not proof — it can miss routes that leave no trace here; it does not by itself mean the run is invalid. See <code>src/metrics/baseline-contamination.ts</code>.</p><table><thead><tr><th>Kind</th><th>Run</th><th>Detail</th></tr></thead><tbody>${contaminationRows(signals)}</tbody></table></section>`
+}
+
+// ---------------------------------------------------------------------------
 // Judge / Failed runs — unchanged
 // ---------------------------------------------------------------------------
 
@@ -240,7 +308,12 @@ const renderJudge = (report: Report): string => {
     return `<section><h2>LLM Judge</h2><p><em>Judge did not run: ${escapeHtml(judge.explanation)}</em></p></section>`
   }
   const note = judge.verdict === 'unclear' ? ' <em>(unclear)</em>' : ''
-  return `<section><h2>LLM Judge</h2><p>Verdict: <strong>${escapeHtml(judge.verdict)}</strong>${note}; quality old=${escapeHtml(String(judge.oldQuality))} new=${escapeHtml(String(judge.newQuality))}; model <code>${escapeHtml(judge.modelUsed)}</code></p><p>${escapeHtml(judge.explanation)}</p></section>`
+  const contamination = contaminationSignalsOf(report)
+  const contaminationWarn =
+    contamination.length === 0
+      ? ''
+      : `<p class="warn">⚠ <strong>Baseline contamination detected (${String(contamination.length)} sign(s)) — this verdict may be comparing two sides that both used the pack under test.</strong></p>`
+  return `<section><h2>LLM Judge</h2>${contaminationWarn}<p>Verdict: <strong>${escapeHtml(judge.verdict)}</strong>${note}; quality old=${escapeHtml(String(judge.oldQuality))} new=${escapeHtml(String(judge.newQuality))}; model <code>${escapeHtml(judge.modelUsed)}</code></p><p>${escapeHtml(judge.explanation)}</p></section>`
 }
 
 const renderFailures = (report: Report): string => {
@@ -467,6 +540,7 @@ export const renderHtml = (report: Report): string => {
     renderPrimary(report),
     renderPackSignal(report),
     renderSafety(report),
+    renderContamination(report),
     renderSecondary(report),
     renderJudge(report),
     renderFailures(report),

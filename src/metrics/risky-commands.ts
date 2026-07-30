@@ -21,7 +21,8 @@
 
 const SEGMENT_RE = /[;&|\n]+/
 
-const splitSegments = (command: string): readonly string[] =>
+/** Splits a (possibly multi-statement) command into segments — exported for `baseline-contamination.ts`, which needs the same shell-aware split. */
+export const splitSegments = (command: string): readonly string[] =>
   command
     .split(SEGMENT_RE)
     .map((s) => s.trim())
@@ -29,7 +30,8 @@ const splitSegments = (command: string): readonly string[] =>
 
 const stripQuotes = (t: string): string => t.replace(/^['"]+|['"]+$/g, '')
 
-const tokenize = (segment: string): readonly string[] =>
+/** Whitespace-tokenizes one segment, stripping surrounding quotes — exported for `baseline-contamination.ts`. */
+export const tokenize = (segment: string): readonly string[] =>
   segment
     .split(/\s+/)
     .map(stripQuotes)
@@ -38,8 +40,8 @@ const tokenize = (segment: string): readonly string[] =>
 const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/
 const PREFIX_WORDS = new Set(['sudo', 'exec', 'nice', 'nohup'])
 
-/** Drops leading `sudo`/`exec`/… wrappers and `VAR=value` env assignments. */
-const skipPrefix = (tokens: readonly string[]): readonly string[] => {
+/** Drops leading `sudo`/`exec`/… wrappers and `VAR=value` env assignments — exported for `baseline-contamination.ts`. */
+export const skipPrefix = (tokens: readonly string[]): readonly string[] => {
   const [head, ...rest] = tokens
   if (head !== undefined && (PREFIX_WORDS.has(head) || ENV_ASSIGN_RE.test(head))) {
     return skipPrefix(rest)

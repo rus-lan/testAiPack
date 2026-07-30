@@ -36,6 +36,7 @@ const makeRunInput = (overrides: Partial<RunInput> & { workspacePath: string }):
   },
   pureBaseline: true,
   protectGit: false,
+  initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
   outputPath: './results',

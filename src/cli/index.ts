@@ -60,6 +60,7 @@ import {
   DEFAULT_PROTECT_GIT,
   DEFAULT_COLLAPSE_REPEATS,
   DEFAULT_TIMELINE_MODE,
+  DEFAULT_INIT_SIDE,
   DEFAULT_LOG_LEVEL,
   DEFAULT_OUTPUT_PATH,
   DEFAULT_WORKSPACE_PATH,
@@ -70,6 +71,7 @@ import {
   packTypeSchema,
   isolationModeSchema,
   timelineModeSchema,
+  initSideSchema,
   logLevelSchema,
   outputFormatSchema,
 } from '@generated/schemas'
@@ -373,6 +375,7 @@ const FLAG_DESCRIPTIONS: Readonly<Record<string, string>> = {
   repoUrl: 'Git repository URL to run the A/B comparison against.',
   prompts: 'Prompt for the agent on the build side. Repeatable; @file reads the file content.',
   inits: 'Optional prompt run BEFORE --prompt in the same session (environment setup).',
+  initSide: 'Which side(s) receive --init text. `both` (default) is right for environment prep both sides need for a fair comparison; use `new` for a pack TRIGGER (e.g. a slash command) so the baseline stays unaware of the pack under test; `old` sends it to the baseline only.',
   verifies: 'Optional shell command run after the agent finishes (e.g. "npm test").',
   judges: 'Prompt for an LLM judge that scores the semantic diff between the two sides.',
   formats: 'Report formats to write. Repeatable, e.g. --format md --format html.',
@@ -434,6 +437,7 @@ const valueFlagType = (dest: string): string => {
   if (dest === 'isolation') return enumChoices(isolationModeSchema)
   if (dest === 'packType') return enumChoices(packTypeSchema)
   if (dest === 'timelineMode') return enumChoices(timelineModeSchema)
+  if (dest === 'initSide') return enumChoices(initSideSchema)
   if (dest === 'logLevel') return enumChoices(logLevelSchema)
   if (dest === 'formats') return `${enumChoices(outputFormatSchema)} (repeatable)`
   if (dest === 'auth') return `${[...AUTH_KEYS].join('|')} (repeatable)`
@@ -446,6 +450,7 @@ const valueFlagDefault = (dest: string): string => {
   if (dest === 'isolation') return DEFAULT_ISOLATION
   if (dest === 'packType') return 'auto (from --pack)'
   if (dest === 'timelineMode') return DEFAULT_TIMELINE_MODE
+  if (dest === 'initSide') return DEFAULT_INIT_SIDE
   if (dest === 'logLevel') return DEFAULT_LOG_LEVEL
   if (dest === 'outputPath') return DEFAULT_OUTPUT_PATH
   if (dest === 'workspacePath') return DEFAULT_WORKSPACE_PATH

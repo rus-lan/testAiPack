@@ -85,11 +85,20 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
 2. Для одного прогона `runSide({side, runIndex, ...})`:
    a. `sessionId` приходит уже сгенерированным в `RunSideInput.sessionId`
       (формат `<runId>-<side>-<runIndex>-<rand6hex>`).
-   b. Если `manifest.init !== null`: запустить
+   b. Если `runInput.init` задан (непустая строка) **и** `runInput.initSide`
+      включает эту сторону (`"both"`, либо совпадает с `side` — `"new"` только
+      на `side = "new"`, `"old"` только на `side = "old"`): запустить
       `HOME=<env> opencode run --agent build --session <sessionId> --format json --auto "<init>"`
       с `homeEnv` (`EnvVarSet`) из `RunSideInput`. Стрим событий в
       `raw/<side>/run-<runIndex>.events.ndjson`. Таймаут —
-      `timeouts.runSeconds`, watchdog — `timeouts.watchdogSeconds`.
+      `timeouts.runSeconds`, watchdog — `timeouts.watchdogSeconds`. Если `init`
+      задан, но `initSide` эту сторону не включает — `--init` целиком
+      пропускается для этой стороны (в лог пишется `[INIT] skipped on
+      side=<side> (--init-side <initSide>)`), и `--prompt` ниже стартует без
+      `--continue` (свежая сессия). `initSide` существует именно для того,
+      чтобы `--init`-текст, который на самом деле является ТРИГГЕРОМ пакета
+      (например, slash-команда), не долетал до baseline-стороны и не портил
+      `--pure-baseline` — см. `docs/phases/00-cli-parse.ru.md`.
    c. Запустить основной промпт:
       `HOME=<env> opencode run --agent build --continue --session <sessionId> --format json --auto "<prompt>"`.
       Если `--init` не было, `--continue` опускается. Все события дописываются
@@ -186,6 +195,7 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
 | `--verify` exit ≠ 0                                 | понижение `successRank`, не фатально              | `E_VERIFY_FAILED`          |
 | `--verify` таймаут                                  | `successRank = 0`, failed                         | `E_VERIFY_TIMEOUT`         |
 | `--init` без `--prompt` (невозможно, клирится в 00) | ошибка контракта                                  | — (через 00)               |
+| `--init` задан, но `runInput.initSide` не включает эту сторону | `--init` пропущен для этой стороны, `[INIT] skipped` в логе, `--prompt` без `--continue` | — |
 | `opencode export` вернул невалидный по схеме JSON (первые попытки) | ограниченный retry с backoff (до 3 раз) | —              |
 | `opencode export` невалиден и после исчерпания retry | фаза ОК, `successRank = 0`, `--verify` пропущен, данные в `.events.ndjson` живут | `E_EXPORT_INVALID` |
 | `opencode export` падает как процесс / таймаут       | retry не делается; фаза ОК, `successRank = 0`, `--verify` пропущен | `E_RUN_CRASH` / `E_RUN_TIMEOUT` |
@@ -231,6 +241,12 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
   завершается нулём → `RunSideResult.exitCode` = код `--init`.
 - ✅ `--init` then `--prompt`: два вызова opencode с одним `--session`,
   `--continue` на втором.
+- ✅ `initSide = "both"` (default): `--init` выполняется на обеих сторонах.
+- ✅ `initSide = "new"`: на `side = "old"` `--init` пропущен (`run` вызван один
+  раз, без `--continue`), лог содержит `[INIT] skipped on side=old
+  (--init-side new)`; на `side = "new"` `--init` выполняется как обычно.
+- ✅ `initSide = "old"`: зеркально — пропущен на `side = "new"`, выполняется на
+  `side = "old"`.
 - ✅ `--verify` ok: verify exit 0 → `successRank` без изменений.
 - ✅ `--verify` fail: verify exit 2 → `successRank` понижен, `RunSideResult`
   содержит `verifyExitCode = 2`.
@@ -254,8 +270,11 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
   получает 0).
 - Стороны old и new стартуют в пределах ≤ 1s друг от друга (параллельный старт
   через `zipPar`); прогоны внутри стороны строго последовательны.
-- `--init` и `--prompt` (если оба заданы) выполняются в одной opencode-сессии
-  (`--continue`).
+- `--init` и `--prompt` выполняются в одной opencode-сессии (`--continue`) на
+  стороне, для которой `runInput.initSide` включает `--init`; на другой
+  стороне (когда `initSide` её не включает) `--prompt` стартует свежую сессию.
+- `runInput.initSide` определяет это ЗА КАЖДУЮ сторону независимо — `both`
+  затрагивает обе, `new`/`old` — ровно одну (см. `docs/phases/00-cli-parse.ru.md`).
 - Watchdog и жёсткий таймаут взаимоисключающи по эффекту, но оба могут
   сработать: watchdog срабатывает раньше и помечает причину как hang.
 

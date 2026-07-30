@@ -18,6 +18,7 @@ import type {
   JudgeResult,
   Manifest,
   MetricsDiff,
+  PreflightCheck,
   ReportRenderInput,
   ReportRenderResult,
   ReportSummary,
@@ -102,6 +103,56 @@ export const protectGitHomeWarning = (runInput: RunInput): string | undefined =>
   runInput.protectGit && runInput.isolation === 'home'
     ? 'warning: --protect-git with --isolation home only hides .git from the workspace; a host-level agent can still reach it'
     : undefined
+
+/**
+ * A short, comparable name out of a `--pack` ref: strips the `npm:`/`mcp:`/
+ * `agent:`/`command:` prefix, an `mcp:name:config` payload, a trailing
+ * `.git`, and takes the last `/`-segment (handles scoped npm names, git
+ * URLs, and local paths alike). Approximate on purpose — this only feeds a
+ * best-effort warning heuristic, not `pack/detector.ts`'s real detection
+ * (which the caller may not have run, e.g. when `--pack-type` is explicit).
+ */
+export const packShortName = (ref: string): string => {
+  const prefixMatch = /^(npm:|mcp:|agent:|command:)/i.exec(ref)
+  const afterPrefix = prefixMatch === null ? ref : ref.slice(prefixMatch[0].length)
+  const afterMcpConfig =
+    prefixMatch?.[0].toLowerCase() === 'mcp:' && afterPrefix.includes(':')
+      ? afterPrefix.slice(0, afterPrefix.indexOf(':'))
+      : afterPrefix
+  const clean = afterMcpConfig.replace(/\.git$/, '').replace(/\/+$/, '')
+  const parts = clean.split('/')
+  return (parts[parts.length - 1] ?? clean).toLowerCase()
+}
+
+/** Below this length a substring match is mostly noise (e.g. a pack ref like `npm:x`). */
+const PACK_NAME_MIN_LENGTH = 3
+
+/**
+ * `--pure-baseline`'s whole point is a baseline unaware of the pack under
+ * test — but `initSide: "both"` (the default) sends `--init` to that
+ * baseline too, so an init text that is really a pack TRIGGER (e.g. a slash
+ * command) makes the "pure" baseline install and invoke the pack itself. A
+ * warning, not a hard failure: dependency-setup init genuinely does belong
+ * on both sides, so this only flags the case that looks like a trigger.
+ */
+export const initPackContaminationWarning = (runInput: RunInput): string | undefined => {
+  if (!runInput.pureBaseline) return undefined
+  if (runInput.initSide === 'new') return undefined
+  if (runInput.init === undefined || runInput.init === '') return undefined
+  if (runInput.packRef === undefined) return undefined
+  const name = packShortName(runInput.packRef)
+  if (name.length < PACK_NAME_MIN_LENGTH) return undefined
+  if (!runInput.init.toLowerCase().includes(name)) return undefined
+  return `warning: --init looks like it references the pack under test ("${name}") and --pure-baseline is on with --init-side ${runInput.initSide} — the baseline will receive it too, contaminating the comparison. Use --init-side new to send it to the new side only.`
+}
+
+/**
+ * A "no pack to check" run (gate 4's early-return in 05-preflight.ts) reports
+ * `passed: true, details: 'skipped (no pack)'` — that means "not applicable",
+ * not "confirmed visible", and must not count as visibility confirmation.
+ */
+export const resolvePackVisibilityConfirmed = (checks: readonly PreflightCheck[]): boolean =>
+  checks.some((c) => c.name === 'pack-visibility' && c.passed && c.details !== 'skipped (no pack)')
 
 /**
  * Redacts the same two fields `buildManifest` already redacts
@@ -280,6 +331,9 @@ export const runPipeline = (opts: PipelineOptions): Effect.Effect<PipelineOutcom
     const protectGitWarning = protectGitHomeWarning(baseRunInput)
     if (protectGitWarning !== undefined) reporter.log(protectGitWarning)
 
+    const initContaminationWarning = initPackContaminationWarning(baseRunInput)
+    if (initContaminationWarning !== undefined) reporter.log(initContaminationWarning)
+
     const runId = yield* generateRunId()
     reporter.header(runId)
 
@@ -389,7 +443,7 @@ export const runPipeline = (opts: PipelineOptions): Effect.Effect<PipelineOutcom
             ? `${String(r.checks.length)} checks passed`
             : 'skipped (--no-preflight)',
       )
-      void preflightResult
+      const packVisibilityConfirmed = resolvePackVisibilityConfirmed(preflightResult.checks)
 
       // 06 run-side (old || new, sequential within side)
       reporter.sub(`run-side: ${String(runInput.runs)} run(s) per side`)
@@ -449,7 +503,13 @@ export const runPipeline = (opts: PipelineOptions): Effect.Effect<PipelineOutcom
       const agg = yield* timedPhase(
         7,
         'aggregate',
-        aggregate({ runInput, manifest, workspace: treePathsUsed, sideResults }),
+        aggregate({
+          runInput,
+          manifest,
+          workspace: treePathsUsed,
+          sideResults,
+          packVisibilityConfirmed,
+        }),
         reporter,
         (r) => (r.metricsDiff.bothFailed ? 'both sides failed' : 'metricsDiff computed'),
       )

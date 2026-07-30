@@ -29,6 +29,18 @@ describe('renderJson', () => {
     expect(err.code).toBe('E_EXPORT_INVALID')
     expect(err.message).toContain('schema validation')
   })
+
+  it('an old report.json missing PackUse.visibilityConfirmed (pre-dates the field) still passes schema validation', async () => {
+    const report = makeReport({
+      metricsDiff: makeMetricsDiff({
+        new: makeSideAggregates('new', {
+          packUse: { calls: 1, errors: 0, runsWithCall: 1, runCount: 3, canDetect: true },
+        }),
+      }),
+    })
+    const parsed = JSON.parse(await runP(renderJson(report))) as unknown
+    expect(reportSchema.safeParse(parsed).success).toBe(true)
+  })
 })
 
 describe('renderYaml', () => {
@@ -86,6 +98,23 @@ describe('renderHtml', () => {
     const html = renderHtml(makeReport())
     expect(html).toContain('run-abc-001')
     expect(html).toContain('https://example.com/repo.git')
+  })
+
+  it('header init-side: absent without --init; "both" called out as the contamination mechanism; "new" plain', () => {
+    const withoutInit = renderHtml(makeReport())
+    expect(withoutInit).not.toContain('Init side:')
+
+    const both = renderHtml(makeReport({ manifest: makeManifest({ init: '/graphify .', flagDefaults: { initSide: 'both' } }) }))
+    expect(both).toContain('<strong>Init side:</strong> both — sent to both sides; this is how a baseline can pick up the pack under test')
+
+    const onNew = renderHtml(makeReport({ manifest: makeManifest({ init: '/graphify .', flagDefaults: { initSide: 'new' } }) }))
+    expect(onNew).toContain(
+      '<strong>Init side:</strong> new — only the NEW side&#39;s metrics carry the init call&#39;s cost (tokens, steps, tool calls, wall-clock); that asymmetry is expected, not a measurement error',
+    )
+    expect(onNew).not.toContain('sent to both sides')
+
+    const preDates = renderHtml(makeReport({ manifest: makeManifest({ init: '/graphify .', flagDefaults: {} }) }))
+    expect(preDates).toContain('<strong>Init side:</strong> unknown (report predates --init-side)')
   })
 
   it('never echoes a credential when given an already-redacted manifest (the shape buildManifest produces)', () => {
@@ -305,10 +334,10 @@ describe('renderHtml', () => {
   it('pack section renders counts; warns when new side calls=0 and canDetect; not-visible when canDetect false; absent when packUse absent', () => {
     const metricsDiff = makeMetricsDiff({
       old: makeSideAggregates('old', {
-        packUse: { calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true },
+        packUse: { calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true, visibilityConfirmed: false },
       }),
       new: makeSideAggregates('new', {
-        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true },
+        packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: false },
       }),
     })
     const html = renderHtml(makeReport({ metricsDiff }))
@@ -319,7 +348,7 @@ describe('renderHtml', () => {
     const notVisible = renderHtml(
       makeReport({
         metricsDiff: makeMetricsDiff({
-          old: makeSideAggregates('old', { packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 3, canDetect: false } }),
+          old: makeSideAggregates('old', { packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 3, canDetect: false, visibilityConfirmed: false } }),
         }),
       }),
     )
@@ -327,6 +356,46 @@ describe('renderHtml', () => {
 
     const absent = renderHtml(makeReport())
     expect(absent).not.toContain('Pack signal')
+  })
+
+  it('pack section distinguishes confirmed-visible-but-unused from visibility-not-confirmed at calls=0', () => {
+    const confirmed = renderHtml(
+      makeReport({
+        metricsDiff: makeMetricsDiff({
+          new: makeSideAggregates('new', {
+            packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: true },
+          }),
+        }),
+      }),
+    )
+    expect(confirmed).toContain('preflight confirmed it was visible, so the model chose not to call it')
+    expect(confirmed).toContain('(confirmed visible, not called)')
+
+    const unconfirmed = renderHtml(
+      makeReport({
+        metricsDiff: makeMetricsDiff({
+          new: makeSideAggregates('new', {
+            packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true, visibilityConfirmed: false },
+          }),
+        }),
+      }),
+    )
+    expect(unconfirmed).toContain('(visibility not confirmed)')
+    expect(unconfirmed).not.toContain('confirmed visible, not called')
+  })
+
+  it('visibilityConfirmed entirely absent (old report.json, pre-dates the field) degrades to "not confirmed", not a crash or "undefined"', () => {
+    const html = renderHtml(
+      makeReport({
+        metricsDiff: makeMetricsDiff({
+          new: makeSideAggregates('new', {
+            packUse: { calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true },
+          }),
+        }),
+      }),
+    )
+    expect(html).toContain('(visibility not confirmed)')
+    expect(html).not.toContain('undefined')
   })
 
   it('safety section lists commands escaped; absent when empty', () => {
@@ -341,6 +410,72 @@ describe('renderHtml', () => {
 
     const empty = renderHtml(makeReport())
     expect(empty).not.toContain('>Safety<')
+  })
+
+  it('backticks in a risky command survive byte-identical in HTML — backtick has no special meaning in <code>, so nothing needs escaping or substituting', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', {
+        riskyCommands: [{ runIndex: 1, command: 'echo `whoami` ``` `edge`', completed: true, exitCode: 0 }],
+      }),
+    })
+    const html = renderHtml(makeReport({ metricsDiff }))
+    expect(html).toContain('<code>echo `whoami` ``` `edge`</code>')
+  })
+
+  it('baseline contamination section lists signals escaped; absent when empty; alert in Summary', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', {
+        contaminationSignals: [
+          { kind: 'bash-install', detail: 'graphify install <danger>', runIndex: 2 },
+          { kind: 'install-drift', detail: "captured config differs across this side's own runs in: skills" },
+        ],
+      }),
+    })
+    const html = renderHtml(makeReport({ metricsDiff }))
+    expect(html).toContain('Baseline contamination')
+    expect(html).toContain('graphify install &lt;danger&gt;')
+    expect(html).toContain('<td>bash-install</td><td>2</td>')
+    // install-drift has no runIndex — renders as an em dash, not a fabricated 0
+    expect(html).toContain('<td>install-drift</td><td>—</td>')
+    expect(html).toContain('Baseline contamination: the OLD side shows 2 sign(s)')
+
+    const empty = renderHtml(makeReport())
+    expect(empty).not.toContain('>Baseline contamination<')
+    expect(empty).not.toContain('Baseline contamination:')
+  })
+
+  it('backticks in a contamination detail survive byte-identical in HTML', () => {
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', {
+        contaminationSignals: [{ kind: 'bash-install', detail: 'npm install `evil` ``` `edge`', runIndex: 1 }],
+      }),
+    })
+    const html = renderHtml(makeReport({ metricsDiff }))
+    expect(html).toContain('<code>npm install `evil` ``` `edge`</code>')
+  })
+
+  it('warns on the LLM Judge section when contamination is detected, without altering the verdict itself', () => {
+    const ranJudge: JudgeResult = {
+      verdict: 'ok',
+      oldQuality: 7,
+      newQuality: 8,
+      explanation: 'New side produces cleaner output.',
+      modelUsed: 'gpt-test',
+      timestamp: '2025-01-01T00:05:00.000Z',
+    }
+    const metricsDiff = makeMetricsDiff({
+      old: makeSideAggregates('old', {
+        contaminationSignals: [{ kind: 'skill-call', detail: 'skill tool call succeeded for "graphify"' }],
+      }),
+    })
+    const html = renderHtml(makeReport({ metricsDiff, judge: ranJudge }))
+    const judgeIdx = html.indexOf('<h2>LLM Judge</h2>')
+    const warnIdx = html.indexOf('Baseline contamination detected (1 sign(s))', judgeIdx)
+    expect(warnIdx).toBeGreaterThan(judgeIdx)
+    expect(html).toContain('Verdict: <strong>ok</strong>')
+
+    const clean = renderHtml(makeReport({ judge: ranJudge }))
+    expect(clean).not.toContain('Baseline contamination detected')
   })
 
   it('secondary renders four groups as <details>, first one open', () => {

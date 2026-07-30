@@ -43,6 +43,14 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
   "unclear"`, `ran = true`, `explanation = rawResponse` (ответ был получен,
   просто не распарсился).
 
+  `explanation` для model-unavailable/timeout/crash **всегда** несёт хвост
+  `stderr` (первые 200 символов) — раньше только ветка model-unavailable его
+  включала, а crash/timeout откидывали `stderr` целиком, из-за чего
+  «judge crashed (exit 1)» не говорило пользователю вообще ничего о причине.
+  Полный (не обрезанный) stdout/stderr того самого вызова opencode
+  дополнительно пишется в `results/judge.log` (см. §4) — падение
+  диагностируется постфактум без повторного прогона.
+
 `judge.json` (сериализованный `JudgeResult`):
 ```jsonc
 {
@@ -67,13 +75,31 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
    `diff/old/run-1/full.patch` и `diff/new/run-1/full.patch` (run-1 как
    репрезентативный прогон). Если run-1 failed или `noChanges` — fallback на
    первый непустой прогон.
-3. Собрать промпт судьи:
-   - системный/первый блок: контекст задачи (`manifest.prompt`,
-     `manifest.init`, `manifest.verify`).
-   - второй блок: `runInput.judge` (то, что пользователь передал через
-     `--judge`, возможно из `@file`).
-   - третий блок: `<OLD_PATCH>...</OLD_PATCH>`.
-   - четвёртый блок: `<NEW_PATCH>...</NEW_PATCH>`.
+3. Собрать промпт судьи (`buildJudgePrompt`):
+   - `<system context>`: задача (`runInput.prompt`), редактированный `packRef`
+     (см. ниже), и **прямое заявление, что у судьи нет файлового доступа
+     никакого рода** — ни `report.md/json/html`, ни репозитория, ни
+     `results/`. Единственный материал судьи — то, что реально лежит в
+     промпте. Это заявление печатается **всегда**, независимо от того, что
+     написано в `--judge` — см. «Судья не видит report.md» ниже.
+   - `<old side diff>` / `<new side diff>` — на каждую сторону: **сводка по
+     всем прогонам** (`summarizeDiffRuns`: по одной строке на `runIndex` —
+     `noChanges`/`failed`/счётчики файлов+`+/-`, список путей при ≤20
+     изменённых файлах, маркер `[git-restored]`/`[git-replaced]`, если
+     protect-git восстанавливал `.git`) **плюс** один репрезентативный патч
+     (см. п.2 выше — `run-1`, либо первый непустой). Раньше судья видел
+     ТОЛЬКО сырой патч одного прогона и вообще не знал, сколько прогонов было
+     и не упал ли кто-то из них — сводка это восполняет данными, которые уже
+     лежат в `JudgeInput.diff` (без изменений контракта).
+   - если `runInput.judge` (текст инструкции) содержит `report.md`/`.json`/
+     `.html`/`.yaml` (регэксп `judgeInstructionMentionsReportFile`,
+     регистронезависимый) — вставляется явный блок `<note>`, прямо говорящий
+     модели: файл, на который ссылается инструкция, недоступен, и это надо
+     явно отразить в `explanation`, а не домысливать содержимое файла. Плюс
+     `console.warn` один раз за вызов фазы — оператор видит это в логе
+     прогона, а не только в ответе модели.
+   - `<judge instruction>`: `runInput.judge` (то, что пользователь передал
+     через `--judge`, возможно из `@file`) и JSON-схема ответа.
 4. Запустить судью:
    `HOME=<real $HOME> opencode run --agent plan --format json "<prompt>"`
    (без `--auto`), с моделью `runInput.preflightModel` (эта опция теперь
@@ -91,12 +117,20 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
      `JudgeError({ code: "E_MODEL_UNAVAILABLE" })`, валило весь пайплайн после
      того, как все прогоны и диффы уже посчитаны); возвращаем
      `JudgeResult.verdict = "unclear"`, `ran = false`, `explanation` содержит
-     модель и хвост stderr.
+     модель и хвост stderr (первые 200 символов).
    - Иные сбои (таймаут/crash/429, не удалось создать scratch-директорию) —
      тоже **не** throw; `JudgeResult.verdict = "unclear"`, `ran = false`,
-     `explanation` содержит описание сбоя (контракт 09 не выделяет для них
-     кода). После этого шага в `computeJudge` не остаётся ни одной ветки
+     `explanation` содержит описание сбоя **и тот же хвост stderr** (для
+     scratch-директории — нет, opencode вообще не вызывался, `stderr` неоткуда
+     взять). Раньше crash/timeout откидывали `stderr` целиком — «judge crashed
+     (exit 1)» без единой детали, два прогона подряд, пока не нашли причину
+     вручную. После этого шага в `computeJudge` не остаётся ни одной ветки
      `throw`/`Effect.fail` — фаза 09 гарантированно не абортит пайплайн.
+   - Полный (не обрезанный) stdout/stderr вызова opencode пишется в
+     `results/judge.log` (best-effort, как и `judge.json`) для КАЖДОГО
+     реального вызова opencode — успешного или нет; отсутствует только когда
+     opencode не вызывался вовсе (`--judge` не задан, оба патча пусты,
+     scratch-директория не создалась).
 6. Попытаться распарсить ответ как JSON `{ verdict, oldQuality, newQuality,
    explanation }` (допускается JSON в markdown code-fence — извлекаем).
    - Успех → использовать распарсенные поля, `ran = true`.
@@ -109,7 +143,52 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
    диапазона → clamp + warning. Если поле вообще не число (строка,
    отсутствует) — весь ответ считается невалидным (см. шаг 6).
 8. Записать `results/judge.json` (сериализованный `JudgeResult` с
-   `modelUsed` и `timestamp`) и вернуть `JudgeResultOutput { judge: <result> }`.
+   `modelUsed` и `timestamp`) и, если opencode реально вызывался,
+   `results/judge.log` (см. шаг 5). Вернуть `JudgeResultOutput { judge:
+   <result> }`.
+
+### Судья не видит `report.md` — почему, и что с этим сделано
+
+Фаза 09 всегда выполняется **до** фазы 11 (report-render) — `report.md` физически
+не может существовать в момент, когда судья работает, независимо от того, что
+написано в `--judge`. Вдобавок судья запускается в одноразовой пустой
+scratch-директории (шаг 4), а не в клоне репозитория — файлов репозитория она
+тоже не видит.
+
+Решение (в `src/phases/09-judge.ts`, без изменений контракта/фазы 11):
+
+1. **Дать судье реальный материал вместо report.md** — сводка по всем прогонам
+   каждой стороны (`summarizeDiffRuns`, шаг 3) вместо одного сырого патча.
+   Это уже данные `JudgeInput.diff` (per-run `summary`/`state`/`noChanges`),
+   просто раньше `computeJudge` их не читал. Полноценный `MetricsDiff` (токены,
+   стоимость, `successRank`) судье по-прежнему недоступен — `JudgeInput`
+   контрактно его не несёт, а добавление такого поля выходит за рамки этой
+   фазы (нужен contract-change и проводка через `pipeline.ts`).
+2. **Явно и всегда** говорить модели в системном блоке промпта, что у неё нет
+   файлового доступа — не только когда инструкция ссылается на файл, а
+   вообще всегда, поэтому это не зависит от того, удалось ли распознать
+   ссылку на файл в тексте пользователя.
+3. Когда `--judge` дословно упоминает `report.md`/`.json`/`.html`/`.yaml`
+   (`judgeInstructionMentionsReportFile`) — вставлять ЕЩЁ более явный
+   `<note>` в промпт (модель обязана написать в `explanation`, что файл был
+   недоступен, а не выдумывать его содержимое) и один раз печатать
+   `console.warn` при выполнении фазы, чтобы оператор увидел это в логе
+   прогона сразу, а не только докопался бы до объяснения модели постфактум.
+
+`judgeFiles?: string[]` (`RunInput`) **не имеет отношения к этой проблеме** —
+это провенанс `@file`-ссылок, из которых собран сам текст `--judge`
+(идентично `promptFiles`/`initFiles` для `--prompt`/`--init`), а не механизм
+дать судье доступ к report.md или любому другому файлу репозитория/отчёта.
+
+### Инъекция через промпт судьи
+
+Фаза 09 передаёт единственную строку — собранный промпт — одним полем
+(`prompt`) в `opencodeRun()` (`src/opencode/cli.ts`). Сама фаза 09 не строит
+никакой командной строки из diff-контента, не сплитует и не интерполирует
+промпт в shell — единственная точка, где `prompt` превращается в argv, это
+`buildRunArgs`/`splitForArgv` в `cli.ts`, вне области этой фазы. Класс бага,
+из-за которого судья падала с exit 1 (diff-текст читался как CLI-флаги),
+целиком локализован там же и чинится отдельно.
 
 ## 4. Входные/выходные файлы
 
@@ -117,6 +196,7 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
 | --------------------------------- | ------------- | -------------------- |
 | `diff/<side>/run-<n>/full.patch`  | Чтение        | текст                |
 | `results/judge.json`              | Запись        | `JudgeResult`        |
+| `results/judge.log`               | Запись (best-effort, только если opencode реально вызывался) | текст (stdout+stderr) |
 | `manifest.json`                   | Чтение        | `Manifest`           |
 
 ## 5. Edge-cases и ошибки
@@ -136,6 +216,9 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
 | Не удалось создать scratch-директорию                | `verdict = "unclear"`, `ran = false`, opencode не вызывается | —              |
 | Оба патча очень большие (>100KB)                    | truncate до 50KB каждый, warning                | —                          |
 | `judge` ссылается на `@file`, которого нет           | клирится ещё в фазе 00 → сюда не доходит        | — (через 00)               |
+| `--judge` упоминает `report.md`/`.json`/`.html`/`.yaml` | `<note>` в промпте + `console.warn` один раз; модель не должна выдумывать содержимое | — |
+| Прогон одной из сторон помечен `state = "failed"`    | попадает в `summarizeDiffRuns` явной строкой, не пропускается молча | —      |
+| Crash/timeout судьи со stderr в выводе               | `explanation` несёт хвост (200 симв.), полный stdout/stderr — в `judge.log` | — |
 
 ## 6. Тест-кейсы (по одному на ветку контракта)
 
@@ -178,8 +261,33 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
 - ✅ report renderer: `judge.ran === false` → md/html рендерят «Judge did not
   run: <explanation>» без блока verdict/quality; `ran` отсутствует (старый
   `report.json`) → рендерится как раньше.
+- ✅ crash explanation includes stderr tail: opencode падает с непустым
+  `stderr` → `explanation` содержит и «crash», и сам текст stderr (раньше
+  откидывался целиком — «judge crashed (exit 1)» без единой детали).
+- ✅ timeout explanation includes stderr tail: то же для таймаута, если
+  процесс успел что-то написать до kill.
+- ✅ judge.log: `results/judge.log` пишется с полным stdout при успешном
+  ответе и с полным stderr при crash — доступен без повторного прогона.
+- ✅ judge.log absent: `--judge` не задан, оба патча пусты, или scratch-
+  директория не создалась → `judge.log` не пишется (opencode не вызывался).
+- ✅ report-file note in prompt: `--judge` содержит `report.md` →
+  `buildJudgePrompt` вставляет `<note>`, объясняющий недоступность файла;
+  инструкция без такого упоминания — `<note>` отсутствует.
+- ✅ report-file console warning: то же условие → `console.warn` с текстом,
+  упоминающим `report.md/json/html`, ровно один раз за вызов фазы; для
+  обычной инструкции — не печатается вовсе.
+- ✅ no-file-access disclaimer always present: `buildJudgePrompt` для ЛЮБОЙ
+  инструкции (не только упоминающей report.md) содержит явное заявление,
+  что у судьи нет файлового доступа.
+- ✅ summarizeDiffRuns: сортировка по `runIndex`; `noChanges` и `failed`
+  (с `error.message`) отражены отдельными строками, а не пропущены;
+  список файлов показывается при ≤20 изменённых, иначе — только счётчик;
+  `state = "git-restored"/"git-replaced"` отражается маркером в строке.
 - ❌ НЕ покрыто (ticket): multi-run judge (оценка по всем N прогонам с
   усреднением) — ticket про v0.2.
+- ❌ НЕ покрыто (ticket): полноценный `MetricsDiff` (токены/стоимость/
+  `successRank`) в промпте судьи — требует contract-change на `JudgeInput`,
+  вне рамок этой фазы (см. «Судья не видит report.md» выше).
 
 ## 7. Инварианты
 
@@ -202,6 +310,17 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
   scratch-директория, никогда не `homeDir`; `homeDir` остаётся реальным
   `$HOME` — только там есть креды opencode, нужные, чтобы судья вообще
   смогла авторизоваться у провайдера.
+- Судья никогда не имеет файлового доступа (ни `report.md`, ни репозитория,
+  ни `results/`) — промпт заявляет это явно и безусловно, а не только когда
+  `--judge` упоминает конкретный файл; это инвариант промпта, не гарантия
+  поведения модели.
+- Фаза 09 передаёт `prompt` единственной строкой в `opencodeRun()` — она сама
+  не строит командную строку из diff-контента и не сплитует/интерполирует
+  промпт; вся ответственность за безопасное превращение строки в argv лежит
+  на `src/opencode/cli.ts`.
+- `results/judge.log` существует тогда и только тогда, когда opencode был
+  реально вызван за этот прогон (независимо от исхода) — как и `judge.json`,
+  запись best-effort и не валит фазу при сбое диска.
 
 ## 8. Зависимости от других фаз
 

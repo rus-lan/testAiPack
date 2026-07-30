@@ -53,6 +53,7 @@ const extras = (over: Partial<ExtractedExtras> = {}): ExtractedExtras => ({
   bashFailCount: 0,
   toolErrorTexts: [],
   riskyCommands: [],
+  packActivitySignals: [],
   opencodeVersion: '1.18.4',
   firstStepInputTokens: undefined,
   lastStepInputTokens: undefined,
@@ -219,6 +220,7 @@ describe('buildSideAggregates', () => {
     runIndexes: [] as readonly number[],
     eventsProfiles: [] as readonly EventsProfile[],
     canDetect: false,
+    visibilityConfirmed: false,
   }
 
   it('aggregates successful runs and carries failedRuns', () => {
@@ -231,6 +233,7 @@ describe('buildSideAggregates', () => {
       runIndexes: [1, 3],
       eventsProfiles: [],
       canDetect: false,
+      visibilityConfirmed: false,
     })
     expect(agg.side).toBe('new')
     expect(agg.primary.totalTokens).toBe('20') // median of [10,30]
@@ -253,6 +256,67 @@ describe('buildSideAggregates', () => {
     expect(agg.stats.totalTokens.samples).toEqual([])
     expect(agg.riskyCommands).toBeUndefined()
     expect(agg.opencodeVersions).toBeUndefined()
+  })
+})
+
+describe('buildSideAggregates — contaminationSignals only ever surface on the baseline (old) side', () => {
+  const extracted = (): ExtractedMetrics => ({
+    primary: primary({}),
+    secondary: emptySecondary(),
+    extras: extras(),
+  })
+
+  it('attaches runIndex to per-run activity signals and appends the config-drift signal, on old', () => {
+    const agg = buildSideAggregates({
+      side: 'old',
+      extracted: [extracted(), extracted()],
+      failedRuns: [],
+      rawRunIds: ['s1', 's2'],
+      extras: [
+        extras({ packActivitySignals: [{ kind: 'bash-install', detail: 'npm install -g @sentropic/graphify' }] }),
+        extras({ packActivitySignals: [] }),
+      ],
+      runIndexes: [1, 2],
+      eventsProfiles: [],
+      canDetect: false,
+      visibilityConfirmed: false,
+      configDriftSignal: { kind: 'install-drift', detail: "captured config differs across this side's own runs in: skills" },
+    })
+    expect(agg.contaminationSignals).toEqual([
+      { kind: 'bash-install', detail: 'npm install -g @sentropic/graphify', runIndex: 1 },
+      { kind: 'install-drift', detail: "captured config differs across this side's own runs in: skills" },
+    ])
+  })
+
+  it('present but empty on old when nothing was observed — checked and clean, not "not checked"', () => {
+    const agg = buildSideAggregates({
+      side: 'old',
+      extracted: [extracted()],
+      failedRuns: [],
+      rawRunIds: ['s1'],
+      extras: [extras()],
+      runIndexes: [1],
+      eventsProfiles: [],
+      canDetect: false,
+      visibilityConfirmed: false,
+    })
+    expect(agg.contaminationSignals).toEqual([])
+  })
+
+  it('never surfaced on new, even with the same signals present in extras', () => {
+    const agg = buildSideAggregates({
+      side: 'new',
+      extracted: [extracted()],
+      failedRuns: [],
+      rawRunIds: ['s1'],
+      extras: [extras({ packActivitySignals: [{ kind: 'skill-call', detail: 'skill tool call succeeded for "graphify"' }] })],
+      runIndexes: [1],
+      eventsProfiles: [],
+      canDetect: true,
+      visibilityConfirmed: true,
+      configDriftSignal: { kind: 'install-drift', detail: 'irrelevant on new' },
+    })
+    expect(agg.contaminationSignals).toBeUndefined()
   })
 })
 
@@ -459,6 +523,7 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       runIndexes: [1],
       eventsProfiles: [],
       canDetect: true,
+      visibilityConfirmed: true,
     })
     expect(agg.packUse).toBeUndefined()
   })
@@ -478,6 +543,7 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       eventsProfiles: [],
       packName: 'graphify',
       canDetect: true,
+      visibilityConfirmed: true,
     })
     expect(agg.packUse).toEqual({
       calls: 3,
@@ -486,6 +552,7 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       runCount: 3,
       firstCallMsMedian: '200',
       canDetect: true,
+      visibilityConfirmed: true,
     })
   })
 
@@ -502,6 +569,7 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       runIndexes: [1, 2],
       eventsProfiles: [],
       canDetect: false,
+      visibilityConfirmed: false,
     })
     expect(agg.riskyCommands).toEqual([{ command: 'rm -rf x', completed: true, exitCode: 0, runIndex: 1 }])
   })
@@ -520,6 +588,7 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       runIndexes: [1, 2, 3],
       eventsProfiles: [],
       canDetect: false,
+      visibilityConfirmed: false,
     })
     expect(agg.opencodeVersions).toEqual(['1.18.3', '1.18.4'])
   })
@@ -541,7 +610,7 @@ describe('computeDelta', () => {
     const oldAgg = sideFromPrimary('old', [primary({ totalTokens: '100' })])
     const newAgg = buildSideAggregates({
       side: 'new', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false,
+      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false, visibilityConfirmed: false,
     })
     const diff = computeDelta(oldAgg, newAgg)
     expect(diff.bothFailed).toBe(false)
@@ -552,11 +621,11 @@ describe('computeDelta', () => {
   it('both sides empty -> bothFailed true, all neutral', () => {
     const oldAgg = buildSideAggregates({
       side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false,
+      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false, visibilityConfirmed: false,
     })
     const newAgg = buildSideAggregates({
       side: 'new', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false,
+      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false, visibilityConfirmed: false,
     })
     const diff = computeDelta(oldAgg, newAgg)
     expect(diff.bothFailed).toBe(true)
@@ -566,7 +635,7 @@ describe('computeDelta', () => {
   it('old side empty (0 tokens) vs a new side with tokens -> percent omitted, not 0', () => {
     const oldAgg = buildSideAggregates({
       side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false,
+      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false, visibilityConfirmed: false,
     })
     const newAgg = sideFromPrimary('new', [primary({ totalTokens: '100' })])
     const diff = computeDelta(oldAgg, newAgg)

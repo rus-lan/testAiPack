@@ -16,6 +16,7 @@ import path from 'node:path'
 import os from 'node:os'
 import type {
   DiffResult,
+  DiffRunResult,
   JudgeInput,
   JudgeResult,
   JudgeResultOutput,
@@ -24,7 +25,7 @@ import type {
 } from '@generated/types'
 import { run as opencodeRun } from '../opencode/cli.js'
 import type { OpencodeRunOptions } from '../opencode/cli.js'
-import { ensureDir, removeDir, writeJson } from '../util/fs.js'
+import { ensureDir, removeDir, writeFile, writeJson } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
 import type { PhaseError } from '../errors.js'
 import { safeRefDisplay } from '../pack/detector.js'
@@ -72,6 +73,38 @@ const firstNonEmptyPatch = (
 }
 
 // ---------------------------------------------------------------------------
+// Pure: report-shaped summary (the judge only ever sees run-1's raw patch —
+// this gives it the multi-run shape report.md would show, from data already
+// on JudgeInput, without needing report.md itself)
+// ---------------------------------------------------------------------------
+
+/** A run with more changed files than this lists only the count, not every path. */
+const PER_FILE_LIST_MAX = 20
+
+const runSummaryLine = (r: DiffRunResult): string => {
+  if (r.state === 'failed') {
+    return `run-${String(r.runIndex)}: failed${r.error === undefined ? '' : ` (${r.error.message})`}`
+  }
+  if (r.noChanges) {
+    return `run-${String(r.runIndex)}: no changes`
+  }
+  const stateSuffix = r.state === 'git-restored' || r.state === 'git-replaced' ? ` [${r.state}]` : ''
+  const counts = `${String(r.summary.filesChanged)} file(s), +${String(r.summary.additions)}/-${String(r.summary.deletions)}`
+  const files =
+    r.summary.perFile.length > 0 && r.summary.perFile.length <= PER_FILE_LIST_MAX
+      ? ` — ${r.summary.perFile.map((f) => `${f.path} (+${String(f.additions)}/-${String(f.deletions)})`).join(', ')}`
+      : ''
+  return `run-${String(r.runIndex)}: ${counts}${stateSuffix}${files}`
+}
+
+/** One line per run, sorted by runIndex, covering every run — not just the one whose patch is embedded. */
+export const summarizeDiffRuns = (diff: DiffResult): string =>
+  [...diff.runs]
+    .sort((a, b) => a.runIndex - b.runIndex)
+    .map(runSummaryLine)
+    .join('\n')
+
+// ---------------------------------------------------------------------------
 // Pure: prompt builder
 // ---------------------------------------------------------------------------
 
@@ -84,38 +117,81 @@ const truncatePatch = (patch: string): string => {
   return `[truncated from ${String(patch.length)} chars]\n${patch.slice(0, TRUNCATED_PATCH_CHARS)}`
 }
 
+/**
+ * Matches the literal artifact names this project actually writes
+ * (report.md/json/html/yaml). Deliberately narrow — a fixed, known
+ * vocabulary rather than a guess at every way a user might phrase "look at
+ * the results", so it stays a high-confidence signal, not a noisy one.
+ */
+const REPORT_FILE_RE = /\breport\.(?:md|json|html|yaml)\b/i
+
+/** True when a `--judge` instruction references a report artifact the judge cannot read (see below). */
+export const judgeInstructionMentionsReportFile = (judgeText: string): boolean =>
+  REPORT_FILE_RE.test(judgeText)
+
+export interface JudgeSideDiff {
+  readonly patch: string
+  readonly summary: string
+}
+
+/**
+ * Phase 09 runs before phase 11 (report-render) even exists, and always in an
+ * empty scratch dir — so `report.md` can never be on disk for it to read, no
+ * matter what the user's `--judge` instruction asks for. Rather than silently
+ * feeding the model nothing (or letting it invent report contents), every
+ * prompt states plainly what material it does and does not have, and a
+ * `--judge` instruction that names a report file gets an explicit, louder
+ * call-out — see `judgeInstructionMentionsReportFile`.
+ */
 export const buildJudgePrompt = (
   runInput: RunInput,
-  oldPatch: string,
-  newPatch: string,
+  old: JudgeSideDiff,
+  nw: JudgeSideDiff,
 ): string => {
   // packRef reaches the judge model verbatim below — an inline mcp: ref can
   // carry a provider secret in its config payload, so it goes through the
   // same redaction as the on-disk manifest before it is embedded.
   const packRef =
     runInput.packRef === undefined ? 'n/a' : safeRefDisplay(redactUrlCredentials(runInput.packRef))
-  const oldTrunc = truncatePatch(oldPatch)
-  const newTrunc = truncatePatch(newPatch)
+  const oldTrunc = truncatePatch(old.patch)
+  const newTrunc = truncatePatch(nw.patch)
+  const judgeInstruction = runInput.judge ?? ''
+  const mentionsReportFile = judgeInstructionMentionsReportFile(judgeInstruction)
   return [
     '<system context>',
     'You are judging an A/B test of an opencode integration.',
+    'You have NO file-system access: no report.md/json/html, no repository worktree, no results directory. Your only inputs are exactly what appears below — the task prompt, a per-run diff summary for each side, one representative patch per side, and the instruction that follows. If an instruction asks you to read or analyse a file, you cannot: say so plainly in your explanation instead of guessing what it might contain.',
     `Task prompt was: ${runInput.prompt}`,
     '</system context>',
     '',
     '<old side diff (baseline, no pack)>',
+    'per-run summary:',
+    old.summary,
+    'representative patch:',
     '```diff',
     oldTrunc,
     '```',
     '</old side>',
     '',
     `<new side diff (with pack: ${packRef})>`,
+    'per-run summary:',
+    nw.summary,
+    'representative patch:',
     '```diff',
     newTrunc,
     '```',
     '</new side>',
     '',
+    ...(mentionsReportFile
+      ? [
+          '<note>',
+          'The instruction below mentions a report file (report.md/json/html). This judge has no access to it — base your verdict only on the material above, and state in your explanation that the referenced report file was not available to you.',
+          '</note>',
+          '',
+        ]
+      : []),
     '<judge instruction>',
-    runInput.judge ?? '',
+    judgeInstruction,
     '',
     'Respond as JSON: { "verdict": "ok" | "fail" | "unclear", "oldQuality": 0-10, "newQuality": 0-10, "explanation": "..." }',
     '</judge instruction>',
@@ -256,35 +332,82 @@ const unclearFromFailure = (
   ran,
 })
 
+/** How much of stderr rides along in a one-line explanation (the rest is in judge.log). */
+const STDERR_TAIL_CHARS = 200
+
+interface JudgeRunOutcome {
+  readonly exitCode: number | null
+  readonly stdout: string
+  readonly stderr: string
+  readonly timedOut: boolean
+}
+
+/**
+ * Full stdout/stderr for whatever opencode call actually happened — written
+ * to `results/judge.log` so a crash/timeout/parse-failure is diagnosable
+ * after the fact without re-running the judge (the `explanation` field only
+ * carries a short tail, not the whole output).
+ */
+const buildJudgeLog = (model: string, outcome: JudgeRunOutcome): string =>
+  [
+    '=== testaipack judge log ===',
+    `model: ${model === '' ? '(default)' : model}`,
+    `timestamp: ${nowIso()}`,
+    `exitCode: ${outcome.exitCode === null ? 'unknown' : String(outcome.exitCode)}`,
+    `timedOut: ${String(outcome.timedOut)}`,
+    '',
+    '--- stdout ---',
+    outcome.stdout,
+    '',
+    '--- stderr ---',
+    outcome.stderr,
+    '',
+  ].join('\n')
+
 // ---------------------------------------------------------------------------
 // Phase entry point
 // ---------------------------------------------------------------------------
 
+/** `computeJudge`'s result plus the full opencode transcript for `results/judge.log` (null when opencode was never invoked). */
+interface JudgeCompute {
+  readonly result: JudgeResult | null
+  readonly log: string | null
+}
+
 /**
  * Computes the judge result (or null when the judge was not requested). Does
- * not touch disk. Never fails: model-unavailable, timeout, crash and 429 all
- * return a `JudgeResult` with verdict "unclear" and `ran: false`.
+ * not touch disk beyond the one console warning below. Never fails:
+ * model-unavailable, timeout, crash and 429 all return a `JudgeResult` with
+ * verdict "unclear" and `ran: false`.
  */
 const computeJudge = (
   input: JudgeInput,
-): Effect.Effect<JudgeResult | null> =>
+): Effect.Effect<JudgeCompute> =>
   Effect.gen(function* () {
     const { runInput, diff } = input
 
     if (runInput.judge === undefined || runInput.judge === '') {
-      return null
+      return { result: null, log: null }
+    }
+
+    if (judgeInstructionMentionsReportFile(runInput.judge)) {
+      yield* Effect.sync(() => {
+        console.warn(
+          'judge: --judge instruction references a report file (report.md/json/html), which this judge cannot see — phase 09 runs before the report is rendered, in an isolated scratch dir with no repository access. The model has been told this plainly in its prompt; consider rewriting the instruction to work from the diff/summary instead.',
+        )
+      })
     }
 
     const oldPatch = firstNonEmptyPatch(diff.old)
     const newPatch = firstNonEmptyPatch(diff.new)
     if (oldPatch === null && newPatch === null) {
-      return bothEmptyResult()
+      return { result: bothEmptyResult(), log: null }
     }
 
     const prompt = buildJudgePrompt(
       runInput,
-      oldPatch?.patch ?? '',
-      newPatch?.patch ?? '',
+      { patch: oldPatch?.patch ?? '', summary: summarizeDiffRuns(diff.old) },
+      { patch: newPatch?.patch ?? '', summary: summarizeDiffRuns(diff.new) },
     )
 
     const model = runInput.preflightModel
@@ -313,42 +436,53 @@ const computeJudge = (
     ).pipe(Effect.either)
 
     if (acquireOutcome._tag === 'Left') {
-      return unclearFromFailure('could not create scratch directory for judge', '', model ?? '', false)
+      return {
+        result: unclearFromFailure('could not create scratch directory for judge', '', model ?? '', false),
+        log: null,
+      }
     }
     const outcome = acquireOutcome.right
 
     if (outcome._tag === 'Left') {
       const err = outcome.left
+      const log = buildJudgeLog(model ?? '', err)
       if (isModelUnavailable(err.stderr)) {
-        return unclearFromFailure(
-          `judge model unavailable${model === undefined ? '' : ` (${model})`}: ${err.stderr.slice(0, 200)}`,
-          '',
-          model ?? '',
-          false,
-        )
+        return {
+          result: unclearFromFailure(
+            `judge model unavailable${model === undefined ? '' : ` (${model})`}: ${err.stderr.slice(0, STDERR_TAIL_CHARS)}`,
+            '',
+            model ?? '',
+            false,
+          ),
+          log,
+        }
       }
       const explanation = err.timedOut
-        ? `judge timeout after ${String(runInput.timeouts.runSeconds)}s`
-        : `judge crashed (exit ${err.exitCode === null ? 'unknown' : String(err.exitCode)})`
-      return unclearFromFailure(explanation, '', model ?? '', false)
+        ? `judge timeout after ${String(runInput.timeouts.runSeconds)}s: ${err.stderr.slice(0, STDERR_TAIL_CHARS)}`
+        : `judge crashed (exit ${err.exitCode === null ? 'unknown' : String(err.exitCode)}): ${err.stderr.slice(0, STDERR_TAIL_CHARS)}`
+      return { result: unclearFromFailure(explanation, '', model ?? '', false), log }
     }
 
+    const log = buildJudgeLog(model ?? '', outcome.right)
     const raw = extractAssistantText(outcome.right.stdout)
     const parsed = parseJudgeResponse(raw)
     if (parsed === null) {
-      return unclearFromFailure('Failed to parse judge response', raw, model ?? '', true)
+      return { result: unclearFromFailure('Failed to parse judge response', raw, model ?? '', true), log }
     }
 
     return {
-      verdict: parsed.verdict,
-      oldQuality: parsed.oldQuality,
-      newQuality: parsed.newQuality,
-      explanation: parsed.explanation,
-      ...(raw === '' ? {} : { rawResponse: raw }),
-      modelUsed: model ?? '',
-      timestamp: nowIso(),
-      ran: true,
-    } satisfies JudgeResult
+      result: {
+        verdict: parsed.verdict,
+        oldQuality: parsed.oldQuality,
+        newQuality: parsed.newQuality,
+        explanation: parsed.explanation,
+        ...(raw === '' ? {} : { rawResponse: raw }),
+        modelUsed: model ?? '',
+        timestamp: nowIso(),
+        ran: true,
+      } satisfies JudgeResult,
+      log,
+    }
   })
 
 /**
@@ -381,12 +515,47 @@ const writeJudgeJson = (
     )
   })
 
+/**
+ * Writes `results/judge.log` with the full opencode stdout/stderr for the
+ * judge call, so a crash/timeout/parse-failure is diagnosable after the fact
+ * without re-running the judge (`JudgeResult.explanation` only carries a
+ * short stderr tail). Best-effort, same as `writeJudgeJson`.
+ */
+const writeJudgeLog = (
+  resultsDir: string,
+  content: string,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const judgeLogPath = path.join(resultsDir, 'judge.log')
+    yield* ensureDir(resultsDir).pipe(
+      Effect.catchAll((e) =>
+        Effect.sync(() => {
+          console.warn(
+            `judge: cannot create results dir: ${e.operation} on ${e.path}: ${String(e.cause)}`,
+          )
+        }),
+      ),
+    )
+    yield* writeFile(judgeLogPath, content).pipe(
+      Effect.catchAll((e) =>
+        Effect.sync(() => {
+          console.warn(
+            `judge: cannot write judge.log: ${e.operation} on ${e.path}: ${String(e.cause)}`,
+          )
+        }),
+      ),
+    )
+  })
+
 export const judge = (
   input: JudgeInput,
 ): Effect.Effect<JudgeResultOutput, PhaseError> =>
   Effect.gen(function* () {
-    const result = yield* computeJudge(input)
+    const { result, log } = yield* computeJudge(input)
     const resultsDir = path.resolve(input.runInput.outputPath)
     yield* writeJudgeJson(resultsDir, result)
+    if (log !== null) {
+      yield* writeJudgeLog(resultsDir, log)
+    }
     return { judge: result }
   })

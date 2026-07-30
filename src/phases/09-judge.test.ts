@@ -3,7 +3,14 @@ import { Effect, Fiber } from 'effect'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { judge, parseJudgeResponse, buildJudgePrompt } from './09-judge.js'
+import {
+  judge,
+  parseJudgeResponse,
+  buildJudgePrompt,
+  judgeInstructionMentionsReportFile,
+  summarizeDiffRuns,
+} from './09-judge.js'
+import type { JudgeSideDiff } from './09-judge.js'
 import { makeTempDir } from '../../tests/setup.js'
 import { readFile, writeFile, ensureDir, removeDir } from '../util/fs.js'
 import { judgeResultSchema } from '@generated/schemas'
@@ -47,6 +54,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
   },
   pureBaseline: true,
   protectGit: false,
+  initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
   outputPath: makeTempDir(),
@@ -215,10 +223,12 @@ describe('parseJudgeResponse — tabular', () => {
 // buildJudgePrompt — pure
 // ---------------------------------------------------------------------------
 
+const sideDiff = (patch: string, summary = ''): JudgeSideDiff => ({ patch, summary })
+
 describe('buildJudgePrompt', () => {
   it('contains task prompt, pack ref, both patches, judge instruction and JSON schema', () => {
     const runInput = makeRunInput({})
-    const prompt = buildJudgePrompt(runInput, 'OLDPATCH', 'NEWPATCH')
+    const prompt = buildJudgePrompt(runInput, sideDiff('OLDPATCH'), sideDiff('NEWPATCH'))
     expect(prompt).toContain('build the thing')
     expect(prompt).toContain('myorg/mypack')
     expect(prompt).toContain('OLDPATCH')
@@ -231,14 +241,14 @@ describe('buildJudgePrompt', () => {
 
   it('uses n/a when packRef is absent', () => {
     const runInput = without(makeRunInput({}), 'packRef')
-    const prompt = buildJudgePrompt(runInput, 'a', 'b')
+    const prompt = buildJudgePrompt(runInput, sideDiff('a'), sideDiff('b'))
     expect(prompt).toContain('with pack: n/a')
   })
 
   it('redacts an inline mcp: packRef instead of sending its secret config to the judge model', () => {
     const dangerousPackRef = 'mcp:myserver:{"env":{"API_KEY":"sk-secret-12345"}}'
     const runInput = makeRunInput({ packRef: dangerousPackRef })
-    const prompt = buildJudgePrompt(runInput, 'a', 'b')
+    const prompt = buildJudgePrompt(runInput, sideDiff('a'), sideDiff('b'))
     expect(prompt).not.toContain('sk-secret-12345')
     expect(prompt).not.toContain('API_KEY')
     expect(prompt).not.toContain('{"env"')
@@ -248,7 +258,7 @@ describe('buildJudgePrompt', () => {
   it('truncates patches larger than 100KB to 50KB with a notice', () => {
     const runInput = makeRunInput({})
     const big = 'X'.repeat(200_000)
-    const prompt = buildJudgePrompt(runInput, big, 'NEWPATCH')
+    const prompt = buildJudgePrompt(runInput, sideDiff(big), sideDiff('NEWPATCH'))
     expect(prompt).toContain('[truncated from 200000 chars]')
     // truncated body is the 50_000-char slice, not the full 200_000
     const fullMatch = prompt.match(/X+/g) ?? []
@@ -261,8 +271,157 @@ describe('buildJudgePrompt', () => {
   it('does not truncate patches at or below 100KB', () => {
     const runInput = makeRunInput({})
     const exact = 'Y'.repeat(100_000)
-    const prompt = buildJudgePrompt(runInput, exact, 'n')
+    const prompt = buildJudgePrompt(runInput, sideDiff(exact), sideDiff('n'))
     expect(prompt).not.toContain('[truncated')
+  })
+
+  it('embeds the per-side run summary alongside the representative patch', () => {
+    const runInput = makeRunInput({})
+    const prompt = buildJudgePrompt(
+      runInput,
+      sideDiff('OLDPATCH', 'run-1: 2 file(s), +5/-1'),
+      sideDiff('NEWPATCH', 'run-1: 3 file(s), +9/-2'),
+    )
+    expect(prompt).toContain('run-1: 2 file(s), +5/-1')
+    expect(prompt).toContain('run-1: 3 file(s), +9/-2')
+  })
+
+  it('states plainly that the judge has no file-system access', () => {
+    const runInput = makeRunInput({})
+    const prompt = buildJudgePrompt(runInput, sideDiff('a'), sideDiff('b'))
+    expect(prompt.toLowerCase()).toContain('no file-system access')
+    expect(prompt).toContain('report.md/json/html')
+  })
+
+  it('adds an explicit note when the judge instruction names a report file the judge cannot read', () => {
+    const runInput = makeRunInput({ judge: 'Analyse the report from report.md and decide.' })
+    const prompt = buildJudgePrompt(runInput, sideDiff('a'), sideDiff('b'))
+    expect(prompt).toContain('<note>')
+    expect(prompt).toContain('report file was not available')
+  })
+
+  it('does not add the report-file note for an instruction that never mentions one', () => {
+    const runInput = makeRunInput({ judge: 'Judge which side is better.' })
+    const prompt = buildJudgePrompt(runInput, sideDiff('a'), sideDiff('b'))
+    expect(prompt).not.toContain('<note>')
+  })
+})
+
+describe('judgeInstructionMentionsReportFile', () => {
+  it.each(['report.md', 'report.json', 'report.html', 'report.yaml', 'Report.MD'])(
+    'detects %s',
+    (name) => {
+      expect(judgeInstructionMentionsReportFile(`please read ${name} first`)).toBe(true)
+    },
+  )
+
+  it('is false for ordinary instructions with no report-file mention', () => {
+    expect(judgeInstructionMentionsReportFile('Judge which side handled errors better.')).toBe(false)
+  })
+
+  it('does not false-positive on the unrelated word "report" alone', () => {
+    expect(judgeInstructionMentionsReportFile('Write a short report of your findings.')).toBe(false)
+  })
+})
+
+describe('summarizeDiffRuns', () => {
+  it('one line per run, sorted by runIndex, with file counts and totals', () => {
+    const diff = makeDiff('old', [
+      { runIndex: 2, patch: 'diff --git a/b b/b\n+x' },
+      { runIndex: 1, patch: 'diff --git a/a b/a\n+y' },
+    ])
+    const summary = summarizeDiffRuns(diff)
+    const lines = summary.split('\n')
+    expect(lines[0]).toContain('run-1')
+    expect(lines[1]).toContain('run-2')
+    expect(summary).toContain('1 file(s), +1/-0')
+  })
+
+  it('marks a run with no changes distinctly from a run with a real diff', () => {
+    const diff = makeDiff('old', [{ runIndex: 1, patch: '' }])
+    expect(summarizeDiffRuns(diff)).toContain('no changes')
+  })
+
+  it('surfaces a failed run instead of silently omitting it', () => {
+    const diff: DiffResult = {
+      side: 'old',
+      runs: [
+        {
+          runIndex: 1,
+          fullPatch: '',
+          summary: { filesChanged: 0, additions: 0, deletions: 0, perFile: [] },
+          noChanges: true,
+          state: 'failed',
+          error: { code: 'E_WORKTREE_BROKEN', message: 'worktree missing' },
+        },
+      ],
+    }
+    const summary = summarizeDiffRuns(diff)
+    expect(summary).toContain('failed')
+    expect(summary).toContain('worktree missing')
+  })
+
+  it('lists individual file paths when the run touched a small number of files', () => {
+    const diff: DiffResult = {
+      side: 'new',
+      runs: [
+        {
+          runIndex: 1,
+          fullPatch: 'diff --git a/src/x.ts b/src/x.ts\n+x',
+          summary: {
+            filesChanged: 2,
+            additions: 12,
+            deletions: 3,
+            perFile: [
+              { path: 'src/x.ts', additions: 10, deletions: 1 },
+              { path: 'src/y.ts', additions: 2, deletions: 2 },
+            ],
+          },
+          noChanges: false,
+        },
+      ],
+    }
+    const summary = summarizeDiffRuns(diff)
+    expect(summary).toContain('src/x.ts (+10/-1)')
+    expect(summary).toContain('src/y.ts (+2/-2)')
+  })
+
+  it('falls back to just the file count when a run touched too many files to list', () => {
+    const manyFiles = Array.from({ length: 25 }, (_, i) => ({
+      path: `src/f${String(i)}.ts`,
+      additions: 1,
+      deletions: 0,
+    }))
+    const diff: DiffResult = {
+      side: 'new',
+      runs: [
+        {
+          runIndex: 1,
+          fullPatch: 'diff --git a/src/f0.ts b/src/f0.ts\n+x',
+          summary: { filesChanged: 25, additions: 25, deletions: 0, perFile: manyFiles },
+          noChanges: false,
+        },
+      ],
+    }
+    const summary = summarizeDiffRuns(diff)
+    expect(summary).toContain('25 file(s)')
+    expect(summary).not.toContain('src/f0.ts')
+  })
+
+  it('shows a git-restored/git-replaced marker when protect-git recovery kicked in', () => {
+    const diff: DiffResult = {
+      side: 'old',
+      runs: [
+        {
+          runIndex: 1,
+          fullPatch: 'diff --git a/x b/x\n+x',
+          summary: { filesChanged: 1, additions: 1, deletions: 0, perFile: [] },
+          noChanges: false,
+          state: 'git-restored',
+        },
+      ],
+    }
+    expect(summarizeDiffRuns(diff)).toContain('[git-restored]')
   })
 })
 
@@ -455,13 +614,22 @@ describe('judge — LLM failures (non-fatal → unclear, ran false)', () => {
     expect(j.explanation.toLowerCase()).toContain('timeout')
   })
 
-  it('crash (exit 1) → verdict unclear, ran false, explanation mentions crash', async () => {
-    runMock.mockImplementation(failWith({ exitCode: 1, stderr: 'boom', timedOut: false }))
+  it('crash (exit 1) → verdict unclear, ran false, explanation mentions crash AND includes the stderr tail (was silently discarded)', async () => {
+    runMock.mockImplementation(failWith({ exitCode: 1, stderr: 'boom: opencode printed usage and exited', timedOut: false }))
     const result = await runP(judge(buildInput({})))
     const j = result.judge as JudgeResult
     expect(j.verdict).toBe('unclear')
     expect(j.ran).toBe(false)
     expect(j.explanation.toLowerCase()).toContain('crash')
+    expect(j.explanation).toContain('boom: opencode printed usage and exited')
+  })
+
+  it('timeout explanation also includes a stderr tail when the process wrote something before being killed', async () => {
+    runMock.mockImplementation(failWith({ exitCode: null, stderr: 'partial output before kill', timedOut: true }))
+    const result = await runP(judge(buildInput({})))
+    const j = result.judge as JudgeResult
+    expect(j.explanation.toLowerCase()).toContain('timeout')
+    expect(j.explanation).toContain('partial output before kill')
   })
 
   it('rate-limit (429 stderr, not auth) → verdict unclear, ran false', async () => {
@@ -527,6 +695,60 @@ describe('judge — results/judge.json artifact', () => {
       judge: JudgeResult | null
     }
     expect((onDisk.judge as JudgeResult).verdict).toBe('unclear')
+  })
+})
+
+describe('judge — results/judge.log artifact (full transcript for post-mortem)', () => {
+  it('writes judge.log with the full stdout on a successful run', async () => {
+    const stdout = textEvent('{"verdict":"ok","oldQuality":7,"newQuality":9,"explanation":"new wins"}')
+    runMock.mockImplementation(succeedWith(stdout))
+    const input = buildInput({})
+    await runP(judge(input))
+    const logPath = `${input.runInput.outputPath}/judge.log`
+    expect(existsSync(logPath)).toBe(true)
+    const log = await runP(readFile(logPath))
+    expect(log).toContain(stdout.trim())
+    expect(log).toContain('exitCode: 0')
+  })
+
+  it('writes judge.log with the full stderr on a crash — diagnosable without re-running', async () => {
+    runMock.mockImplementation(
+      failWith({ exitCode: 1, stderr: 'diff --git a/x b/x looked like a flag and opencode printed usage', timedOut: false }),
+    )
+    const input = buildInput({})
+    await runP(judge(input))
+    const log = await runP(readFile(`${input.runInput.outputPath}/judge.log`))
+    expect(log).toContain('diff --git a/x b/x looked like a flag and opencode printed usage')
+    expect(log).toContain('exitCode: 1')
+  })
+
+  it('does not write judge.log when the judge was never invoked (not requested, both patches empty, scratch dir blocked)', async () => {
+    const notRequested = directInput(without(makeRunInput({}), 'judge'))
+    await runP(judge(notRequested))
+    expect(existsSync(`${notRequested.runInput.outputPath}/judge.log`)).toBe(false)
+
+    const diffOld = makeDiff('old', [{ runIndex: 1, patch: '' }])
+    const diffNew = makeDiff('new', [{ runIndex: 1, patch: '' }])
+    const bothEmpty = buildInput({ diffOld, diffNew })
+    await runP(judge(bothEmpty))
+    expect(existsSync(`${bothEmpty.runInput.outputPath}/judge.log`)).toBe(false)
+  })
+})
+
+describe('judge — report-file reference warning (console, best-effort surfacing)', () => {
+  it('warns on stderr when --judge references a report file the judge cannot see', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const input = buildInput({ runInput: { judge: 'Read report.md and judge accordingly.' } })
+    await runP(judge(input))
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('report.md/json/html'))
+    warnSpy.mockRestore()
+  })
+
+  it('does not warn for an instruction with no report-file reference', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    await runP(judge(buildInput({})))
+    expect(warnSpy).not.toHaveBeenCalled()
+    warnSpy.mockRestore()
   })
 })
 

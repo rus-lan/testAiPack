@@ -33,6 +33,8 @@ import type { ExtractedMetrics } from '../metrics/extract.js'
 import { profileEvents } from '../metrics/events-profile.js'
 import type { EventsProfile } from '../metrics/events-profile.js'
 import { buildSideAggregates, computeDelta } from '../metrics/aggregate.js'
+import { findConfigDriftSignal, parseInstalledInventory } from '../metrics/baseline-contamination.js'
+import type { UnindexedSignal } from '../metrics/baseline-contamination.js'
 import { detectPack } from '../pack/detector.js'
 import { loadTreeForRun } from './10-timeline.js'
 import type { SessionTreeLoader } from './10-timeline.js'
@@ -41,6 +43,17 @@ import type { RunSideResultExt } from './06-run-side.js'
 /** Injectable tree loader for v0.2 sub-agent aggregation (tests pass a stub). */
 export interface AggregateDeps {
   readonly loadTree?: SessionTreeLoader
+}
+
+/**
+ * Local input extension: carries phase 05's pack-visibility gate outcome so
+ * `packUse.visibilityConfirmed` reflects the check that actually ran (docker-
+ * aware, see phase 05) instead of aggregate re-deriving its own separate
+ * existence check. Absent (`--no-preflight`, or preflight never reached the
+ * gate) means "not confirmed", the honest default.
+ */
+export interface AggregateInputExt extends AggregateInput {
+  readonly packVisibilityConfirmed?: boolean
 }
 
 type ProcessedRun =
@@ -134,6 +147,21 @@ const readAndExtract = (
     }
   })
 
+/**
+ * `installed.json` (phase 06) has no contract schema of its own — it is a
+ * disk artifact, not part of the Report contract — so a missing or
+ * malformed file yields no signal rather than failing the phase;
+ * `parseInstalledInventory` is already defensive about the parse itself.
+ */
+const readConfigDriftSignal = (
+  configRoot: string,
+  side: Side,
+): Effect.Effect<UnindexedSignal | undefined> =>
+  readFile(path.join(configRoot, '.config', 'opencode', side, 'installed.json')).pipe(
+    Effect.map((raw) => findConfigDriftSignal(parseInstalledInventory(raw))),
+    Effect.catchAll(() => Effect.succeed(undefined)),
+  )
+
 const buildVerifyStats = (results: readonly RunSideResultExt[]): VerifyStats | undefined => {
   const passed = results.filter((r) => r.verifyExitCode === 0).length
   const failed = results.filter((r) => r.verifyExitCode !== undefined && r.verifyExitCode !== 0).length
@@ -151,9 +179,12 @@ const aggregateSide = (
   timestamp: string,
   packName: string | undefined,
   canDetect: boolean,
+  visibilityConfirmed: boolean,
+  configRoot: string,
   loader?: SessionTreeLoader,
 ): Effect.Effect<SideAggregates, PhaseError> =>
   Effect.gen(function* () {
+    const configDriftSignal = yield* readConfigDriftSignal(configRoot, side)
     const processed = yield* Effect.forEach(
       results,
       (r): Effect.Effect<ProcessedRun, PhaseError> =>
@@ -183,15 +214,17 @@ const aggregateSide = (
       runIndexes,
       eventsProfiles,
       canDetect,
+      visibilityConfirmed,
       ...(packName === undefined ? {} : { packName }),
       ...(verifyStats === undefined ? {} : { verifyStats }),
+      ...(configDriftSignal === undefined ? {} : { configDriftSignal }),
     })
   })
 
 const ignorePricingError = (): Effect.Effect<null> => Effect.succeed(null)
 
 export const aggregate = (
-  input: AggregateInput,
+  input: AggregateInputExt,
   deps?: AggregateDeps,
 ): Effect.Effect<AggregateResult, PhaseError> =>
   Effect.gen(function* () {
@@ -214,6 +247,10 @@ export const aggregate = (
         : yield* detectPack(packRef).pipe(Effect.catchAll(() => Effect.succeed(null)))
     const packName = pack?.name
     const canDetect = pack !== null && pack.type === 'skill'
+    // The pack is only ever installed on the new side (old is the baseline);
+    // gate 4 (pack-visibility) only ever checks homePaths.new. A zero-call
+    // reading on old is expected, not "the model chose not to call it".
+    const newVisibilityConfirmed = input.packVisibilityConfirmed ?? false
 
     const timestamp = manifest.timestamp
     const oldAgg = yield* aggregateSide(
@@ -225,6 +262,8 @@ export const aggregate = (
       timestamp,
       packName,
       canDetect,
+      false,
+      workspace.config,
       loader,
     )
     const newAgg = yield* aggregateSide(
@@ -236,6 +275,8 @@ export const aggregate = (
       timestamp,
       packName,
       canDetect,
+      newVisibilityConfirmed,
+      workspace.config,
       loader,
     )
     const metricsDiff = computeDelta(oldAgg, newAgg)
