@@ -61,6 +61,17 @@ export const fmtPct = (v: number | undefined): string => {
   return v > 0 ? `+${body}%` : `${body}%`
 }
 
+/**
+ * Millisecond duration with a minutes hint above one minute — plain "ms" at
+ * six figures (e.g. "252915ms") does not read as "four minutes" on a skim.
+ */
+export const fmtDurationMs = (v: string | number): string => {
+  const ms = toNum(v)
+  const msPart = fmtInt(ms)
+  if (!Number.isFinite(ms) || ms < 60_000) return `${msPart}ms`
+  return `${msPart}ms (~${(ms / 60_000).toFixed(1)}min)`
+}
+
 const VERDICT_MAP: Record<MetricDelta['better'], string> = {
   better: '✓ better',
   worse: '⚠ worse',

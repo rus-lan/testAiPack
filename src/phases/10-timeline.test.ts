@@ -3,7 +3,7 @@ import { Effect } from 'effect'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { makeTempDir } from '../../tests/setup.js'
-import { ensureDir, readFile, writeJson } from '../util/fs.js'
+import { ensureDir, readFile, writeFile, writeJson } from '../util/fs.js'
 
 vi.mock('../opencode/cli.js', () => ({
   exportSession: vi.fn(),
@@ -53,6 +53,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
     gemini: false, aws: false, ssh: false, git: false,
   },
   pureBaseline: true,
+  protectGit: false,
   preflightEnabled: true,
   formats: ['md', 'html'],
   outputPath: './results',
@@ -90,6 +91,8 @@ const makeWorkspace = async (runs: number): Promise<WorkspaceTree> => {
     pack: path.join(root, 'pack'),
     homeOld: [],
     homeNew: [],
+    gitDirsOld: [],
+    gitDirsNew: [],
     config: path.join(root, 'config'),
     results: path.join(root, 'results'),
     raw: path.join(root, 'results', 'raw'),
@@ -688,32 +691,43 @@ describe('timeline — happy path', () => {
 })
 
 describe('timeline — errors', () => {
-  it('invalid export (schema mismatch) → E_EXPORT_INVALID with side + runIndex', async () => {
+  it('corrupt run-N.json (invalid JSON) -> run contributes no events, phase succeeds', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1 })
+    await runP(writeFile(path.join(tree.raw, 'old', 'run-1.json'), '{"info":{"id":"trunc'))
+    await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
+    const result = await runP(timeline({
+      runInput, manifest: fakeManifest, workspace: tree,
+      sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
+    }))
+    expect(result.timeline.old).toEqual([])
+    expect(result.timeline.new).toHaveLength(1)
+  })
+
+  it('run-N.json fails schema -> same (no events, phase succeeds)', async () => {
     const tree = await makeWorkspace(1)
     const runInput = makeRunInput({ runs: 1 })
     await writeRaw(tree, 'old', 1, { not: 'a valid export' })
-    await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [] }))
-    const err = await runFlip(timeline({
+    await writeRaw(tree, 'new', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('y')] }] }))
+    const result = await runP(timeline({
       runInput, manifest: fakeManifest, workspace: tree,
       sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
     }))
-    expect(err).toBeInstanceOf(PhaseError)
-    expect(err.code).toBe('E_EXPORT_INVALID')
-    expect(err.context?.['side']).toBe('old')
-    expect(err.context?.['runIndex']).toBe(1)
+    expect(result.timeline.old).toEqual([])
+    expect(result.timeline.new).toHaveLength(1)
   })
 
-  it('invalid export on new side → E_EXPORT_INVALID side=new', async () => {
+  it('invalid export on new side -> new contributes no events, old unaffected', async () => {
     const tree = await makeWorkspace(1)
     const runInput = makeRunInput({ runs: 1 })
-    await writeRaw(tree, 'old', 1, makeExport({ created: 0, messages: [] }))
+    await writeRaw(tree, 'old', 1, makeExport({ created: 0, messages: [{ role: 'assistant', created: 0, parts: [textPart('x')] }] }))
     await writeRaw(tree, 'new', 1, { broken: true })
-    const err = await runFlip(timeline({
+    const result = await runP(timeline({
       runInput, manifest: fakeManifest, workspace: tree,
       sideResults: { old: [sideResult('old', 1)], new: [sideResult('new', 1)] },
     }))
-    expect(err.code).toBe('E_EXPORT_INVALID')
-    expect(err.context?.['side']).toBe('new')
+    expect(result.timeline.old).toHaveLength(1)
+    expect(result.timeline.new).toEqual([])
   })
 })
 

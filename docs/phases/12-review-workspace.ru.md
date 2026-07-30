@@ -129,6 +129,17 @@ Namespace: `TestAiPack.ReviewWorkspace` (см.
   отражает факт успешного запуска (обычно `false`).
 - `reviewRun` ≤ `manifest.runs` (после fallback).
 
+## 7a. Стоимость `--protect-git`
+
+Фаза сама не падает и не меняет поведение под `--protect-git`, но её
+результат для пользователя беднее: открытые в редакторе `apps/<side>Version/run-N`
+для защищённых прогонов **не содержат `.git`** (он перенесён в `gitdirs/<side>/run-N/`,
+см. `docs/phases/02-repo-clone.ru.md`) — значит VSCode/Cursor не показывает
+git-декорации (gutter-маркеры изменённых строк, blame, панель Source Control) для
+этих папок. Диффы в самом testaipack (`diff/<side>/run-<n>/full.patch`) при этом
+корректны — это только визуальная потеря в IDE-обвязке review-фазы, часть честной
+цены фичи наравне с потерей opencode-снапшотов (см. `docs/phases/08-diff.ru.md`).
+
 ## 8. Зависимости от других фаз
 
 - Зависит от: **01 workspace-setup** (`Manifest`, `WorkspaceTree`), **02

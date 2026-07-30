@@ -96,6 +96,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
     git: false,
   },
   pureBaseline: true,
+  protectGit: false,
   preflightEnabled: true,
   preflightModel: 'cheap/model',
   formats: ['md'],

@@ -3,10 +3,10 @@
  *
  * If `--judge` is set, run an LLM judge over the old/new diffs and return a
  * `JudgeResult` (verdict ok/fail/unclear, quality scores, explanation). Without
- * `--judge` the phase is a no-op returning `{ judge: null }`. Timeout / crash /
- * rate-limit of the judge model are non-fatal (verdict "unclear"); only a hard
- * model-unavailable failure (auth/model-not-found) fails the phase with
- * `E_MODEL_UNAVAILABLE`.
+ * `--judge` the phase is a no-op returning `{ judge: null }`. No judge failure
+ * aborts the phase: model-unavailable, timeout, crash and rate-limit all
+ * degrade to `verdict: "unclear"` with `ran: false` — `JudgeResult.ran`
+ * distinguishes "judge could not run" from "judge ran and was unsure".
  *
  * @see docs/phases/09-judge.ru.md
  * @see contract/phases/09-judge.tsp
@@ -26,7 +26,6 @@ import { run as opencodeRun } from '../opencode/cli.js'
 import type { OpencodeRunOptions } from '../opencode/cli.js'
 import { ensureDir, removeDir, writeJson } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
-import { judgeError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
 import { safeRefDisplay } from '../pack/detector.js'
 import { redactUrlCredentials } from '../util/redact.js'
@@ -238,9 +237,15 @@ const bothEmptyResult = (): JudgeResult => ({
   explanation: 'Both sides produced no changes',
   modelUsed: '',
   timestamp: nowIso(),
+  ran: false,
 })
 
-const unclearFromFailure = (explanation: string, rawResponse: string, modelUsed: string): JudgeResult => ({
+const unclearFromFailure = (
+  explanation: string,
+  rawResponse: string,
+  modelUsed: string,
+  ran: boolean,
+): JudgeResult => ({
   verdict: 'unclear',
   oldQuality: 0,
   newQuality: 0,
@@ -248,6 +253,7 @@ const unclearFromFailure = (explanation: string, rawResponse: string, modelUsed:
   ...(rawResponse === '' ? {} : { rawResponse }),
   modelUsed,
   timestamp: nowIso(),
+  ran,
 })
 
 // ---------------------------------------------------------------------------
@@ -256,13 +262,12 @@ const unclearFromFailure = (explanation: string, rawResponse: string, modelUsed:
 
 /**
  * Computes the judge result (or null when the judge was not requested). Does
- * not touch disk. The only failure path is `E_MODEL_UNAVAILABLE` (hard model
- * unavailability); timeout/crash/429 return a `JudgeResult` with verdict
- * "unclear".
+ * not touch disk. Never fails: model-unavailable, timeout, crash and 429 all
+ * return a `JudgeResult` with verdict "unclear" and `ran: false`.
  */
 const computeJudge = (
   input: JudgeInput,
-): Effect.Effect<JudgeResult | null, PhaseError> =>
+): Effect.Effect<JudgeResult | null> =>
   Effect.gen(function* () {
     const { runInput, diff } = input
 
@@ -308,31 +313,30 @@ const computeJudge = (
     ).pipe(Effect.either)
 
     if (acquireOutcome._tag === 'Left') {
-      return unclearFromFailure('could not create scratch directory for judge', '', model ?? '')
+      return unclearFromFailure('could not create scratch directory for judge', '', model ?? '', false)
     }
     const outcome = acquireOutcome.right
 
     if (outcome._tag === 'Left') {
       const err = outcome.left
       if (isModelUnavailable(err.stderr)) {
-        return yield* Effect.fail(
-          judgeError('judge model unavailable', 'E_MODEL_UNAVAILABLE', {
-            ...(model === undefined ? {} : { model }),
-            stderr: err.stderr,
-            ...(err.timedOut ? { timedOut: true } : {}),
-          }),
+        return unclearFromFailure(
+          `judge model unavailable${model === undefined ? '' : ` (${model})`}: ${err.stderr.slice(0, 200)}`,
+          '',
+          model ?? '',
+          false,
         )
       }
       const explanation = err.timedOut
         ? `judge timeout after ${String(runInput.timeouts.runSeconds)}s`
         : `judge crashed (exit ${err.exitCode === null ? 'unknown' : String(err.exitCode)})`
-      return unclearFromFailure(explanation, '', model ?? '')
+      return unclearFromFailure(explanation, '', model ?? '', false)
     }
 
     const raw = extractAssistantText(outcome.right.stdout)
     const parsed = parseJudgeResponse(raw)
     if (parsed === null) {
-      return unclearFromFailure('Failed to parse judge response', raw, model ?? '')
+      return unclearFromFailure('Failed to parse judge response', raw, model ?? '', true)
     }
 
     return {
@@ -343,13 +347,13 @@ const computeJudge = (
       ...(raw === '' ? {} : { rawResponse: raw }),
       modelUsed: model ?? '',
       timestamp: nowIso(),
+      ran: true,
     } satisfies JudgeResult
   })
 
 /**
  * Writes `results/judge.json` with `{ judge: <result | null> }`. Best-effort:
- * a disk failure is logged but never fails the phase (the only contract error
- * is `E_MODEL_UNAVAILABLE`, which is unrelated to disk writes).
+ * a disk failure is logged but never fails the phase.
  */
 const writeJudgeJson = (
   resultsDir: string,

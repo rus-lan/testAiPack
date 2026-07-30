@@ -22,6 +22,7 @@ const buildWorkspaceTree = async (runs = 1): Promise<ReturnType<typeof makeWorks
   for (const p of [
     path.join(workspace.root, 'apps'),
     path.join(workspace.root, 'home'),
+    path.join(workspace.root, 'gitdirs'),
     workspace.pack,
     workspace.config,
     workspace.results,
@@ -29,6 +30,7 @@ const buildWorkspaceTree = async (runs = 1): Promise<ReturnType<typeof makeWorks
     await runP(ensureDir(p))
   }
   await runP(writeFile(path.join(workspace.pack, 'marker.txt'), 'pack\n'))
+  await runP(writeFile(path.join(workspace.root, 'gitdirs', 'marker.txt'), 'gitdirs\n'))
   return workspace
 }
 
@@ -62,21 +64,26 @@ describe('cleanup — ephemeral off (default)', () => {
     expect(result.kept).toContain(workspace.results)
     expect(result.kept).toContain(workspace.config)
     expect(result.kept).toContain(workspace.pack)
+    for (const p of [...workspace.gitDirsOld, ...workspace.gitDirsNew]) {
+      expect(result.kept).toContain(p)
+    }
   })
 })
 
 describe('cleanup — ephemeral on', () => {
-  it('removes apps/, home/, pack/ and keeps results/', async () => {
+  it('removes apps/, home/, gitdirs/, pack/ and keeps results/', async () => {
     const workspace = await buildWorkspaceTree()
     const result = await runP(
       cleanup({ runInput: makeRunInput(), manifest: makeManifest(), workspace, ephemeral: true }),
     )
-    expect(result.deleted).toHaveLength(3)
+    expect(result.deleted).toHaveLength(4)
     expect(result.deleted).toContain(path.join(workspace.root, 'apps'))
     expect(result.deleted).toContain(path.join(workspace.root, 'home'))
+    expect(result.deleted).toContain(path.join(workspace.root, 'gitdirs'))
     expect(result.deleted).toContain(workspace.pack)
     expect(existsSync(path.join(workspace.root, 'apps'))).toBe(false)
     expect(existsSync(path.join(workspace.root, 'home'))).toBe(false)
+    expect(existsSync(path.join(workspace.root, 'gitdirs'))).toBe(false)
     expect(existsSync(workspace.pack)).toBe(false)
     expect(existsSync(workspace.results)).toBe(true)
     expect(result.kept).toContain(workspace.results)
@@ -113,6 +120,7 @@ describe('cleanup — ephemeral on', () => {
     expect(result.kept).toContain(workspace.results)
     // transient dirs are not in kept
     expect(result.kept).not.toContain(path.join(workspace.root, 'apps'))
+    expect(result.kept).not.toContain(path.join(workspace.root, 'gitdirs'))
   })
 })
 

@@ -702,11 +702,13 @@ const readOneRun = (
       catch: (e) => e,
     }).pipe(Effect.either)
     if (jsonEither._tag === 'Left') {
-      return yield* Effect.fail(toExportInvalid(side, r.runIndex, jsonEither.left))
+      console.warn(toExportInvalid(side, r.runIndex, jsonEither.left).message)
+      return []
     }
     const parsed = opencodeExportSchema.safeParse(jsonEither.right)
     if (!parsed.success) {
-      return yield* Effect.fail(toExportInvalid(side, r.runIndex, parsed.error))
+      console.warn(toExportInvalid(side, r.runIndex, parsed.error).message)
+      return []
     }
     const data = parsed.data as OpencodeExport
     const homeDir = homeDirs[r.runIndex - 1] ?? ''

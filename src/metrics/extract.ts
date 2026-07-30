@@ -13,20 +13,52 @@ import type {
   ExportPart,
   ExportReasoningPart,
   ExportStepFinishPart,
+  ExportTextPart,
   ExportToolPart,
   OpencodeExport,
   PrimaryMetrics,
+  RiskyCommand,
   SecondaryMetrics,
   SuccessRank,
   ToolStat,
 } from '@generated/types'
 import type { PricingTable } from '../pricing/lookup.js'
 import { computeCost, lookupPrice } from '../pricing/lookup.js'
+import { isRecord } from '../util/types.js'
+import { findRiskyCommand } from './risky-commands.js'
 import { percentile, toNum } from './stats.js'
+
+/**
+ * Per-run signals outside primary/secondary: pack usage, dangerous commands,
+ * hallucinated/duplicate tool calls, bash failures, and the wave-2 latency/
+ * context/output signals. Aggregation across runs (sum/median/max/concat)
+ * lives in `metrics/aggregate.ts`.
+ */
+export interface ExtractedExtras {
+  readonly packCalls: number
+  readonly packErrors: number
+  readonly firstPackCallMs: number | undefined
+  readonly invalidToolCalls: number
+  readonly duplicateToolCalls: number
+  readonly bashFailCount: number
+  readonly toolErrorTexts: readonly string[]
+  readonly riskyCommands: readonly Omit<RiskyCommand, 'runIndex'>[]
+  readonly opencodeVersion: string
+  readonly firstStepInputTokens: number | undefined
+  readonly lastStepInputTokens: number | undefined
+  readonly textChars: number
+  readonly reasoningChars: number
+  readonly cacheWriteTokens: number
+}
 
 export interface ExtractedMetrics {
   readonly primary: PrimaryMetrics
   readonly secondary: SecondaryMetrics
+  readonly extras: ExtractedExtras
+}
+
+export interface ExtractOptions {
+  readonly packName?: string
 }
 
 /**
@@ -76,6 +108,8 @@ export const computeMaxParallelism = (
 const isTool = (p: ExportPart): p is ExportToolPart => p.type === 'tool'
 const isReasoning = (p: ExportPart): p is ExportReasoningPart => p.type === 'reasoning'
 const isStepFinish = (p: ExportPart): p is ExportStepFinishPart => p.type === 'step-finish'
+const isText = (p: ExportPart): p is ExportTextPart => p.type === 'text'
+const isInvalid = (p: ExportToolPart): boolean => p.tool === 'invalid'
 
 const durationOf = (start: number | string, end: number | string): number => {
   const d = toNum(end) - toNum(start)
@@ -240,17 +274,115 @@ const resolveCost = (exp: OpencodeExport, pricing: PricingTable | null): number 
   return infoCost > 0 ? infoCost : pricing ? costFromPricing(exp, pricing) : 0
 }
 
+const TOOL_ERROR_TEXT_MAX = 200
+const RISKY_COMMAND_MAX = 300
+
+const metadataExit = (state: ExportToolPart['state']): number | undefined => {
+  const exit = isRecord(state.metadata) ? state.metadata['exit'] : undefined
+  return typeof exit === 'number' ? exit : undefined
+}
+
+const isSkillCall = (p: ExportToolPart, packName: string): boolean =>
+  p.tool === 'skill' && isRecord(p.state.input) && p.state.input['name'] === packName
+
+const packUseOf = (
+  exp: OpencodeExport,
+  tools: readonly ExportToolPart[],
+  packName: string | undefined,
+): { readonly calls: number; readonly errors: number; readonly firstMs: number | undefined } => {
+  if (packName === undefined) return { calls: 0, errors: 0, firstMs: undefined }
+  const matches = tools.filter((p) => isSkillCall(p, packName))
+  const first = matches[0]
+  const firstMs =
+    first?.state.time === undefined ? undefined : toNum(first.state.time.start) - toNum(exp.info.time.created)
+  return {
+    calls: matches.length,
+    errors: matches.filter((p) => p.state.status === 'error').length,
+    firstMs,
+  }
+}
+
+const duplicateToolCallsOf = (tools: readonly ExportToolPart[]): number => {
+  const counts = tools.reduce<Readonly<Record<string, number>>>((m, p) => {
+    const key = `${p.tool} ${JSON.stringify(p.state.input)}`
+    return { ...m, [key]: (m[key] ?? 0) + 1 }
+  }, {})
+  return Object.values(counts).reduce((sum, c) => sum + Math.max(0, c - 1), 0)
+}
+
+const riskyCommandsOf = (tools: readonly ExportToolPart[]): readonly Omit<RiskyCommand, 'runIndex'>[] =>
+  tools.flatMap((p) => {
+    if (p.tool !== 'bash' || !isRecord(p.state.input)) return []
+    const command = p.state.input['command']
+    if (typeof command !== 'string' || !findRiskyCommand(command)) return []
+    const exitCode = metadataExit(p.state)
+    return [
+      {
+        command: command.slice(0, RISKY_COMMAND_MAX),
+        completed: p.state.status === 'completed',
+        ...(exitCode === undefined ? {} : { exitCode }),
+      },
+    ]
+  })
+
+/**
+ * First/last `step-finish` `tokens.input` in message order. Last skips a
+ * trailing zero-usage step (real data: a final step-finish can carry
+ * `tokens.input: 0`, which is not a real "final context size" reading) and
+ * falls back to the literal last part when every one is zero/undefined.
+ */
+const stepInputTokensOf = (
+  exp: OpencodeExport,
+): { readonly first: number | undefined; readonly last: number | undefined } => {
+  const steps = allParts(exp).filter(isStepFinish)
+  const first = steps[0]?.tokens?.input
+  const lastPositive = [...steps].reverse().find((p) => (p.tokens?.input ?? 0) > 0)
+  const lastFallback = steps[steps.length - 1]
+  const last = (lastPositive ?? lastFallback)?.tokens?.input
+  return { first, last }
+}
+
+const extractExtras = (exp: OpencodeExport, opts: ExtractOptions): ExtractedExtras => {
+  const tools = toolPartsOf(exp)
+  const pack = packUseOf(exp, tools, opts.packName)
+  const { first: firstStepInputTokens, last: lastStepInputTokens } = stepInputTokensOf(exp)
+  const parts = allParts(exp)
+  return {
+    packCalls: pack.calls,
+    packErrors: pack.errors,
+    firstPackCallMs: pack.firstMs,
+    invalidToolCalls: tools.filter(isInvalid).length,
+    duplicateToolCalls: duplicateToolCallsOf(tools),
+    bashFailCount: tools.filter(
+      (p) => p.tool === 'bash' && metadataExit(p.state) !== undefined && metadataExit(p.state) !== 0,
+    ).length,
+    toolErrorTexts: tools.flatMap((p) =>
+      typeof p.state.error === 'string' ? [p.state.error.slice(0, TOOL_ERROR_TEXT_MAX)] : [],
+    ),
+    riskyCommands: riskyCommandsOf(tools),
+    opencodeVersion: exp.info.version,
+    firstStepInputTokens,
+    lastStepInputTokens,
+    textChars: parts.filter(isText).reduce((sum, p) => sum + p.text.length, 0),
+    reasoningChars: parts.filter(isReasoning).reduce((sum, p) => sum + p.text.length, 0),
+    cacheWriteTokens: exp.info.tokens.cache.write,
+  }
+}
+
 export const extractMetrics = (
   exp: OpencodeExport,
   pricing: PricingTable | null,
   successRank: SuccessRank,
+  opts: ExtractOptions = {},
 ): ExtractedMetrics => {
   const t = exp.info.tokens
   const totalTokens = t.input + t.output + t.reasoning + t.cache.read
   const wallClockMs = durationOf(exp.info.time.created, exp.info.time.updated)
   const tools = toolPartsOf(exp)
+  const realTools = tools.filter((p) => !isInvalid(p))
   const stepDur = stepDurations(exp)
   const parts = allParts(exp)
+  const realParts = parts.filter((p) => !(isTool(p) && isInvalid(p)))
 
   const primary: PrimaryMetrics = {
     totalTokens: String(totalTokens),
@@ -270,16 +402,18 @@ export const extractMetrics = (
     outputTokens: String(t.output),
     reasoningTokens: String(t.reasoning),
     cacheReadTokens: String(t.cache.read),
-    perTool: perToolStats(tools),
+    // Hallucinated tool calls ("invalid") are not real tools — excluded here
+    // and from maxConsecutiveSameTool; invalidToolCalls (extras) counts them.
+    perTool: perToolStats(realTools),
     reasoningTimeMs: String(Math.round(reasoningTimeMs(exp))),
     stepLatencyP50Ms: String(Math.round(percentile(stepDur, 50))),
     stepLatencyP95Ms: String(Math.round(percentile(stepDur, 95))),
     toolLatencyAvgMs: String(Math.round(toolLatencyAverage(tools))),
     finishCauseDistribution: finishCauseDistribution(exp),
-    maxConsecutiveSameTool: maxConsecutiveSameTool(parts),
+    maxConsecutiveSameTool: maxConsecutiveSameTool(realParts),
   }
 
-  return { primary, secondary }
+  return { primary, secondary, extras: extractExtras(exp, opts) }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +510,60 @@ const mergeSecondaryAcrossNodes = (list: readonly SecondaryMetrics[]): Secondary
   }
 }
 
+const emptyExtras = (): ExtractedExtras => ({
+  packCalls: 0,
+  packErrors: 0,
+  firstPackCallMs: undefined,
+  invalidToolCalls: 0,
+  duplicateToolCalls: 0,
+  bashFailCount: 0,
+  toolErrorTexts: [],
+  riskyCommands: [],
+  opencodeVersion: '',
+  firstStepInputTokens: undefined,
+  lastStepInputTokens: undefined,
+  textChars: 0,
+  reasoningChars: 0,
+  cacheWriteTokens: 0,
+})
+
+/**
+ * Folds extras over a session tree. Count-like fields (pack/invalid/duplicate/
+ * bashFail, plus textChars/reasoningChars/cacheWriteTokens per spec) sum
+ * across nodes, same as the rest of the tree fold; lists concatenate.
+ * `firstPackCallMs` takes the earliest defined value (spec is silent on the
+ * multi-node case; nodes are sub-agent sessions with their own time origin,
+ * so "earliest across the tree" is the closest match to "first call").
+ * `opencodeVersion`/`firstStepInputTokens`/`lastStepInputTokens` come from the
+ * ROOT node only — sub-agent context sizes are separate conversations.
+ */
+const mergeExtrasAcrossNodes = (
+  tree: readonly SessionTreeNode[],
+  list: readonly ExtractedExtras[],
+): ExtractedExtras => {
+  if (list.length === 0) return emptyExtras()
+  const rootIndex = tree.findIndex((n) => n.parentId === null)
+  const root = list[rootIndex === -1 ? 0 : rootIndex] ?? emptyExtras()
+  const sumOf = (sel: (e: ExtractedExtras) => number): number => list.reduce((a, e) => a + sel(e), 0)
+  const firstPackTimes = list.flatMap((e) => (e.firstPackCallMs === undefined ? [] : [e.firstPackCallMs]))
+  return {
+    packCalls: sumOf((e) => e.packCalls),
+    packErrors: sumOf((e) => e.packErrors),
+    firstPackCallMs: firstPackTimes.length === 0 ? undefined : Math.min(...firstPackTimes),
+    invalidToolCalls: sumOf((e) => e.invalidToolCalls),
+    duplicateToolCalls: sumOf((e) => e.duplicateToolCalls),
+    bashFailCount: sumOf((e) => e.bashFailCount),
+    toolErrorTexts: list.flatMap((e) => e.toolErrorTexts),
+    riskyCommands: list.flatMap((e) => e.riskyCommands),
+    opencodeVersion: root.opencodeVersion,
+    firstStepInputTokens: root.firstStepInputTokens,
+    lastStepInputTokens: root.lastStepInputTokens,
+    textChars: sumOf((e) => e.textChars),
+    reasoningChars: sumOf((e) => e.reasoningChars),
+    cacheWriteTokens: sumOf((e) => e.cacheWriteTokens),
+  }
+}
+
 /**
  * Fold metrics over a whole session tree (root + sub-agents):
  * - totalTokens / costUsd / stepCount / toolCallCount: SUM across nodes.
@@ -391,6 +579,7 @@ export const extractMetricsFromTree = (
   tree: readonly SessionTreeNode[],
   pricing: PricingTable | null,
   successRank: SuccessRank,
+  opts: ExtractOptions = {},
 ): ExtractedMetrics => {
   if (tree.length === 0) {
     return {
@@ -404,9 +593,10 @@ export const extractMetricsFromTree = (
         maxParallelism: 0,
       },
       secondary: emptySecondaryMetrics(),
+      extras: emptyExtras(),
     }
   }
-  const perNode = tree.map((n) => extractMetrics(n.export, pricing, successRank))
+  const perNode = tree.map((n) => extractMetrics(n.export, pricing, successRank, opts))
   const intervals = tree.map((n) => ({
     timeCreated: toNum(n.export.info.time.created),
     timeUpdated: toNum(n.export.info.time.updated),
@@ -425,5 +615,9 @@ export const extractMetricsFromTree = (
     maxParallelism: computeMaxParallelism(intervals),
   }
 
-  return { primary, secondary: mergeSecondaryAcrossNodes(perNode.map((p) => p.secondary)) }
+  return {
+    primary,
+    secondary: mergeSecondaryAcrossNodes(perNode.map((p) => p.secondary)),
+    extras: mergeExtrasAcrossNodes(tree, perNode.map((p) => p.extras)),
+  }
 }

@@ -4,9 +4,10 @@
  * Executes ONE side for ONE run index: `--init` (optional) → `--prompt` →
  * `opencode export`, with a soft hang-watchdog and a hard run timeout, then
  * optionally runs the `--verify` shell command. Crash / hang / timeout /
- * context-overflow / rate-limit are all VALID run outcomes returned with a
- * reduced `successRank`; only a missing export (`E_RUN_CRASH`) or an
- * invalid export (`E_EXPORT_INVALID`) fail the phase.
+ * context-overflow / rate-limit / a missing or invalid export are all VALID
+ * run outcomes returned with `successRank: 0` and an `errorCode`; only a
+ * genuine `E_DISK_FULL` (machine-global, not this run's problem) fails the
+ * phase.
  *
  * @see docs/phases/06-run-side.ru.md
  * @see contract/phases/06-run-side.tsp
@@ -28,7 +29,7 @@ import { run as opencodeRun, exportSession, sessionIdFromEvent } from '../openco
 import type { DockerExec, OpencodeError, OpencodeRunOptions, OpencodeRunResult } from '../opencode/cli.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import { spawnProcess } from '../opencode/spawn.js'
-import { appendFile, ensureDir, readJson, writeFile } from '../util/fs.js'
+import { appendFile, ensureDir, readJson, writeFile, writeJson } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
 import type { PhaseError } from '../errors.js'
 import { runSideError } from '../errors.js'
@@ -699,12 +700,26 @@ export const runSide = (
       )
     })
 
-    yield* exportOnce.pipe(
+    const exportOutcome = yield* exportOnce.pipe(
       Effect.retry({
         schedule: exportRetrySchedule,
         while: (e: PhaseError) => e.code === 'E_EXPORT_INVALID',
       }),
+      Effect.either,
     )
+    // A per-run export failure degrades the run to rank 0 instead of failing the
+    // whole phase — one broken export must not interrupt the other side's
+    // in-flight runs. E_DISK_FULL is machine-global, so it still aborts.
+    const exportFailed =
+      exportOutcome._tag === 'Left' && exportOutcome.left.code !== 'E_DISK_FULL'
+        ? exportOutcome.left
+        : undefined
+    if (exportOutcome._tag === 'Left' && exportFailed === undefined) {
+      return yield* Effect.fail(exportOutcome.left)
+    }
+    if (exportFailed !== undefined) {
+      yield* log(`[EXPORT_FAILED] code=${exportFailed.code} message=${exportFailed.message}`)
+    }
 
     const outcome = analyzeOutcome({
       events: state.events,
@@ -716,8 +731,10 @@ export const runSide = (
 
     let rank = outcome.rank
     let errorCode = outcome.errorCode
+    let finish = outcome.finish
     let verifyExitCode: number | undefined
-    const hasVerify = runInput.verify !== undefined && runInput.verify !== ''
+    const hasVerify =
+      exportFailed === undefined && runInput.verify !== undefined && runInput.verify !== ''
     if (hasVerify) {
       yield* log(`[VERIFY] running "${runInput.verify ?? ''}"`)
       const vres = yield* executeVerify(runInput.verify ?? '', appCwd, timeouts.verifySeconds, {
@@ -741,9 +758,23 @@ export const runSide = (
       }
     }
 
+    if (exportFailed !== undefined) {
+      rank = 0
+      errorCode = exportFailed.code
+      // The agent's own finish cause (e.g. "stop") is no longer the honest
+      // summary of this run once the export step is why it counts as failed —
+      // a `[STOP] finish=stop rank=0` line reads as "finished cleanly, rank
+      // separately zeroed" with no clue why. `errorCode` says why here (it
+      // survives in run-N.result.json), but a log-based recovery (no
+      // result.json) cannot read `errorCode` at all (never recoverable, see
+      // `src/recovery/run-recovery.ts`) — only `finish`, so it must already
+      // read as a failure on its own.
+      finish = 'error'
+    }
+
     const durationMs = Date.now() - startedAt
     yield* log(
-      `[STOP] finish=${outcome.finish} rank=${String(rank)} durationMs=${String(durationMs)}`,
+      `[STOP] finish=${finish} rank=${String(rank)} durationMs=${String(durationMs)}`,
     )
 
     const result: RunSideResultExt = {
@@ -752,12 +783,18 @@ export const runSide = (
       exportPath,
       eventsLogPath,
       successRank: rank,
-      finishCause: outcome.finish,
+      finishCause: finish,
       exitCode: combinedExit,
       durationMs: String(durationMs),
       watchdogTriggered: anyWatchdog,
       ...(verifyExitCode === undefined ? {} : { verifyExitCode }),
       ...(errorCode === undefined ? {} : { errorCode }),
     }
+
+    const resultPath = path.join(sideRawDir, `run-${String(runIndex)}.result.json`)
+    yield* writeJson(resultPath, result).pipe(
+      Effect.catchAll((e) => log(`[RESULT_WRITE_FAILED] ${e.operation} on ${e.path}: ${String(e.cause)}`)),
+    )
+
     return result
   })

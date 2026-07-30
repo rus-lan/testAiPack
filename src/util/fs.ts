@@ -8,6 +8,7 @@ import {
   readFile as fsReadFile,
   readdir as fsReaddir,
   readlink,
+  rename as fsRename,
   rm as fsRm,
   stat as fsStat,
   symlink as fsSymlink,
@@ -49,6 +50,17 @@ export const copyDir = (src: string, dst: string): Effect.Effect<void, FsError> 
   Effect.tryPromise({
     try: () => fsCp(src, dst, { recursive: true }),
     catch: wrap('copyDir', src),
+  })
+
+/**
+ * `src` and `dst` must be on the same filesystem (one run tree, one mount) —
+ * a cross-device move would throw `EXDEV`, which surfaces as a plain FsError
+ * like any other move failure rather than a silent copy+delete fallback.
+ */
+export const moveDir = (src: string, dst: string): Effect.Effect<void, FsError> =>
+  Effect.tryPromise({
+    try: () => fsRename(src, dst),
+    catch: wrap('moveDir', src),
   })
 
 export const writeFile = (

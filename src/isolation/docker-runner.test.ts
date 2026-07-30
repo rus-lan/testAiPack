@@ -132,6 +132,13 @@ describe('docker-runner — buildDockerRunArgs', () => {
     expect(args[nameIdx + 1]).toBe('--network')
     expect(args[nameIdx + 2]).toBe('host')
   })
+
+  it('mounts exactly two paths (cwd, homeDir) — --protect-git\'s gitdirs/ is a disjoint sibling path, never mounted', () => {
+    const args = buildDockerRunArgs(baseOpts, 'cnt-1')
+    const mountFlags = args.filter((a) => a === '-v')
+    expect(mountFlags).toHaveLength(2)
+    expect(args.join(' ')).not.toContain('gitdirs')
+  })
 })
 
 describe('docker-runner — dockerRun', () => {

@@ -25,7 +25,10 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
   "merged" }`.
 - Ошибки: `@error TimelineError` — `{ code, message, side?: Side, runIndex?:
   int32, context? }`, где `code` принимает только одно значение:
-  - `E_EXPORT_INVALID` — `raw/<side>/run-N.json` не парсится как `OpencodeExport`.
+  - `E_EXPORT_INVALID` — только для внутренних сбоев самой фазы (собранный
+    `Timeline` не проходит свою же схему, запись `timeline.json`/`.html`
+    упала). **Не** для чтения одного `raw/<side>/run-N.json` — отсутствующий
+    или повреждённый export одного прогона не фейлит фазу, см. §3.1 и §5.
 
   Неизвестный `mode` или невозможность построить `merged` здесь не выделены в
   отдельный код (контракт 10 имеет только `E_EXPORT_INVALID`); `mode` уже
@@ -51,8 +54,13 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
 
 ## 3. Шаги алгоритма
 
-1. Для каждой пары `(side, n)` прочитать `raw/<side>/run-N.json`. Невалидный
-   парс → throw `TimelineError({ code: "E_EXPORT_INVALID", side, runIndex: n })`.
+1. Для каждой пары `(side, n)` прочитать `raw/<side>/run-N.json`. Отсутствующий
+   файл **и** файл, не парсящийся как JSON или не проходящий схему
+   `OpencodeExport`, обрабатываются одинаково: этот run не вносит events
+   (`[]`), в консоль идёт `console.warn`, фаза продолжает остальные прогоны —
+   не throw. (Контейнмент фазы 06 может оставить на диске ровно такой
+   невалидный export для проваленного прогона; ужесточать здесь было бы
+   излишним, раз 06 уже разрешила это как валидный исход.)
 2. **v0.1 (linear):** извлечь `parts[]` из root-сессии, нормализовать каждый
    part в `TimelineEvent` (`type: TimelineEventType`):
    - `"reasoning"` для reasoning parts → `tStart/tEnd` из part timing.
@@ -109,7 +117,7 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
 
 | Кейс                                                | Поведение                                          | Код                  |
 | --------------------------------------------------- | -------------------------------------------------- | -------------------- |
-| `raw/<side>/run-N.json` повреждён                   | throw                                              | `E_EXPORT_INVALID`   |
+| `raw/<side>/run-N.json` повреждён (не JSON / не по схеме) | пропускаем этот run в timeline (events = []), warning | —              |
 | Прогон failed (нет export)                          | пропускаем этот run в timeline, warning            | —                    |
 | root session без parts                             | events = [], не fail                               | —                    |
 | Цикл по parent_id (v0.2)                            | visited-set обрывает, warning                      | —                    |
@@ -145,7 +153,9 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
   `swimlaneDepth` растёт с глубиной.
 - ✅ cycle in parent_id: зацикленный `parent_id` → visited-set обрывает,
   warning, не падает.
-- ✅ invalid export: повреждённый JSON → throw `E_EXPORT_INVALID` с `runIndex`.
+- ✅ invalid export: повреждённый JSON (или прошедший JSON.parse, но не по
+  схеме `OpencodeExport`) → этот run вносит 0 events, фаза не падает, events
+  других прогонов присутствуют.
 - ✅ empty parts: root session без parts → соответствующий массив events
   пуст, не fail.
 - ❌ НЕ покрыто (ticket): рендер tree-diff с >20 swimlane (производительность

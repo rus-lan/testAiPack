@@ -71,6 +71,7 @@ export const runInputSchema = z.object({
   formats: z.array(outputFormatSchema),
   outputPath: z.string(),
   diffHtml: z.boolean(),
+  protectGit: z.boolean(),
   collapseRepeats: z.boolean(),
   timelineMode: timelineModeSchema,
   timeouts: timeoutConfigSchema,
@@ -102,6 +103,8 @@ export const workspaceTreeSchema = z.object({
   pack: z.string(),
   homeOld: z.array(z.string()),
   homeNew: z.array(z.string()),
+  gitDirsOld: z.array(z.string()),
+  gitDirsNew: z.array(z.string()),
   config: z.string(),
   results: z.string(),
   raw: z.string(),
@@ -119,6 +122,37 @@ export const finishCauseSchema = z.enum([
   'unknown',
 ])
 
+export const errorCodeSchema = z.enum([
+  'E_REPO_TIMEOUT',
+  'E_REPO_CLONE_FAILED',
+  'E_PACK_INVALID_REF',
+  'E_PACK_UNKNOWN_TYPE',
+  'E_PACK_INSTALL_TIMEOUT',
+  'E_PACK_INSTALL_FAILED',
+  'E_HOME_SETUP_FAILED',
+  'E_PREFLIGHT_TIMEOUT',
+  'E_PREFLIGHT_FAILED',
+  'E_PREFLIGHT_PACK_INVISIBLE',
+  'E_RUN_TIMEOUT',
+  'E_RUN_HANG_WATCHDOG',
+  'E_RUN_CRASH',
+  'E_VERIFY_TIMEOUT',
+  'E_VERIFY_FAILED',
+  'E_INSTALL_TIMEOUT',
+  'E_INSTALL_FAILED',
+  'E_TOTAL_TIMEOUT',
+  'E_OOM',
+  'E_DISK_FULL',
+  'E_WORKTREE_BROKEN',
+  'E_PORT_CONFLICT',
+  'E_DOCKER_FAILED',
+  'E_EXPORT_INVALID',
+  'E_CONFIG_INVALID',
+  'E_AUTH_MISSING',
+  'E_MODEL_UNAVAILABLE',
+  'E_RATE_LIMIT_EXHAUSTED',
+])
+
 export const runSideResultSchema = z.object({
   side: sideSchema,
   runIndex: z.number().int(),
@@ -130,6 +164,7 @@ export const runSideResultSchema = z.object({
   durationMs: z.string(),
   verifyExitCode: z.number().int().optional(),
   watchdogTriggered: z.boolean(),
+  errorCode: errorCodeSchema.optional(),
 })
 
 export const aggregateInputSchema = z.object({
@@ -174,6 +209,20 @@ export const secondaryMetricsSchema = z.object({
   toolLatencyAvgMs: z.string(),
   finishCauseDistribution: recordInt32Schema,
   maxConsecutiveSameTool: z.number().int(),
+  invalidToolCalls: z.number().int().optional(),
+  duplicateToolCalls: z.number().int().optional(),
+  bashFailCount: z.number().int().optional(),
+  toolErrorTexts: z.array(z.string()).optional(),
+  timeToFirstToolMs: z.string().optional(),
+  timeToFirstEditMs: z.string().optional(),
+  maxEventGapMs: z.string().optional(),
+  stallCount: z.number().int().optional(),
+  stalledRunCount: z.number().int().optional(),
+  firstStepInputTokens: z.string().optional(),
+  lastStepInputTokens: z.string().optional(),
+  textChars: z.string().optional(),
+  reasoningChars: z.string().optional(),
+  cacheWriteTokens: z.string().optional(),
 })
 
 export const metricDistributionSchema = z.object({
@@ -193,41 +242,34 @@ export const aggregateStatsSchema = z.object({
   successRank: metricDistributionSchema,
 })
 
-export const errorCodeSchema = z.enum([
-  'E_REPO_TIMEOUT',
-  'E_REPO_CLONE_FAILED',
-  'E_PACK_INVALID_REF',
-  'E_PACK_UNKNOWN_TYPE',
-  'E_PACK_INSTALL_TIMEOUT',
-  'E_PACK_INSTALL_FAILED',
-  'E_HOME_SETUP_FAILED',
-  'E_PREFLIGHT_TIMEOUT',
-  'E_PREFLIGHT_FAILED',
-  'E_PREFLIGHT_PACK_INVISIBLE',
-  'E_RUN_TIMEOUT',
-  'E_RUN_HANG_WATCHDOG',
-  'E_RUN_CRASH',
-  'E_VERIFY_TIMEOUT',
-  'E_VERIFY_FAILED',
-  'E_INSTALL_TIMEOUT',
-  'E_INSTALL_FAILED',
-  'E_TOTAL_TIMEOUT',
-  'E_OOM',
-  'E_DISK_FULL',
-  'E_PORT_CONFLICT',
-  'E_DOCKER_FAILED',
-  'E_EXPORT_INVALID',
-  'E_CONFIG_INVALID',
-  'E_AUTH_MISSING',
-  'E_MODEL_UNAVAILABLE',
-  'E_RATE_LIMIT_EXHAUSTED',
-])
-
 export const failedRunSchema = z.object({
   runIndex: z.number().int(),
   errorCode: errorCodeSchema,
   errorMessage: z.string(),
   timestamp: z.string(),
+})
+
+export const packUseSchema = z.object({
+  calls: z.number().int(),
+  errors: z.number().int(),
+  runsWithCall: z.number().int(),
+  runCount: z.number().int(),
+  firstCallMsMedian: z.string().optional(),
+  canDetect: z.boolean(),
+})
+
+export const riskyCommandSchema = z.object({
+  runIndex: z.number().int(),
+  command: z.string(),
+  completed: z.boolean(),
+  exitCode: z.number().int().optional(),
+})
+
+export const verifyStatsSchema = z.object({
+  passed: z.number().int(),
+  failed: z.number().int(),
+  timedOut: z.number().int(),
+  runCount: z.number().int(),
 })
 
 export const sideAggregatesSchema = z.object({
@@ -237,6 +279,10 @@ export const sideAggregatesSchema = z.object({
   stats: aggregateStatsSchema,
   failedRuns: z.array(failedRunSchema),
   rawRunIds: z.array(z.string()),
+  packUse: packUseSchema.optional(),
+  riskyCommands: z.array(riskyCommandSchema).optional(),
+  opencodeVersions: z.array(z.string()).optional(),
+  verifyStats: verifyStatsSchema.optional(),
 })
 
 export const metricDeltaSchema = z.object({
@@ -307,7 +353,7 @@ export const cliParseResultSchema = z.object({
 })
 
 export const diffErrorSchema = z.object({
-  code: z.literal('E_DISK_FULL'),
+  code: z.union([z.literal('E_DISK_FULL'), z.literal('E_WORKTREE_BROKEN')]),
   message: z.string(),
   side: sideSchema,
   runIndex: z.number().int().optional(),
@@ -333,12 +379,21 @@ export const diffSummarySchema = z.object({
   perFile: z.array(fileChangeSchema),
 })
 
+export const diffRunStateSchema = z.enum(['ok', 'git-restored', 'git-replaced', 'failed'])
+
+export const diffRunErrorSchema = z.object({
+  code: z.literal('E_WORKTREE_BROKEN'),
+  message: z.string(),
+})
+
 export const diffRunResultSchema = z.object({
   runIndex: z.number().int(),
   fullPatch: z.string(),
   summary: diffSummarySchema,
   htmlPath: z.string().optional(),
   noChanges: z.boolean(),
+  state: diffRunStateSchema.optional(),
+  error: diffRunErrorSchema.optional(),
 })
 
 export const diffResultSchema = z.object({
@@ -464,6 +519,7 @@ export const exportToolStateSchema = z.object({
   ]),
   input: z.unknown(),
   output: z.string().optional(),
+  error: z.string().optional(),
   metadata: recordUnknownSchema.optional(),
   title: z.string().optional(),
   time: z
@@ -601,6 +657,7 @@ export const judgeResultSchema = z.object({
   rawResponse: z.string().optional(),
   modelUsed: z.string(),
   timestamp: z.string(),
+  ran: z.boolean().optional(),
 })
 
 export const judgeResultOutputSchema = z.object({

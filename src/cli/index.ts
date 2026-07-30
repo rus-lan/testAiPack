@@ -19,6 +19,8 @@ import { Effect } from 'effect'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { runPipeline } from './pipeline.js'
+import { executeRebuild } from './rebuild.js'
+import type { RebuildFlags } from './rebuild.js'
 import { createProgressReporter, stderrSink } from './progress.js'
 import type { ProgressReporter } from './progress.js'
 import {
@@ -55,6 +57,7 @@ import {
   DEFAULT_PURE_BASELINE,
   DEFAULT_PREFLIGHT_ENABLED,
   DEFAULT_DIFF_HTML,
+  DEFAULT_PROTECT_GIT,
   DEFAULT_COLLAPSE_REPEATS,
   DEFAULT_TIMELINE_MODE,
   DEFAULT_LOG_LEVEL,
@@ -70,6 +73,7 @@ import {
   logLevelSchema,
   outputFormatSchema,
 } from '@generated/schemas'
+import type { OutputFormat, TimelineMode } from '@generated/types'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import pkg from '../../package.json' with { type: 'json' }
 
@@ -131,7 +135,11 @@ export const executeRun = async (
     ),
   )
   if (outcome._tag === 'Right') {
-    return 0
+    // The run completed and a report was written, but an entire side's diff
+    // came back with no usable patches (every run's worktree was broken) —
+    // the comparison has nothing to show for that side, so a CI consumer
+    // needs a non-zero exit even though nothing threw.
+    return outcome.right.diffEscalated ? 1 : 0
   }
   const err = outcome.left
   rep.error(formatPhaseError(err))
@@ -206,6 +214,16 @@ export const executeReport = async (
   process.stdout.write(`${renderMd(report)}\n`)
   return 0
 }
+
+// ---------------------------------------------------------------------------
+// report --rebuild
+// ---------------------------------------------------------------------------
+
+const firstInvalidFormat = (raw: readonly string[]): string | undefined =>
+  raw.find((f) => !outputFormatSchema.safeParse(f).success)
+
+const toOutputFormats = (raw: readonly string[]): readonly OutputFormat[] =>
+  raw.filter((f): f is OutputFormat => outputFormatSchema.safeParse(f).success)
 
 // ---------------------------------------------------------------------------
 // list
@@ -382,6 +400,7 @@ const FLAG_DESCRIPTIONS: Readonly<Record<string, string>> = {
   pureBaseline: 'Run the old (baseline) side with --pure (no third-party plugins/skills besides the pack under test). The new side is never pure, or the pack under test would not load.',
   preflightEnabled: 'Pre-flight stage (model ping, pack check).',
   diffHtml: 'Generate an HTML side-by-side diff.',
+  protectGit: 'Keeps each run\'s git dir outside the workspace so the agent cannot delete it; costs you opencode\'s snapshot/patch export parts, which need /workspace/.git (exports get poorer). Weak under --isolation home (agent can still reach it). Default: off.',
   collapseRepeats: 'Collapse consecutive identical tool-call sequences in the timeline.',
 }
 
@@ -444,7 +463,7 @@ const valueFlagDefault = (dest: string): string => {
 }
 
 const BOOLEAN_KEY_ORDER: readonly RunBooleanKey[] = [
-  'pureBaseline', 'preflightEnabled', 'diffHtml', 'collapseRepeats',
+  'pureBaseline', 'preflightEnabled', 'diffHtml', 'collapseRepeats', 'protectGit',
 ]
 
 const BOOLEAN_DEFAULTS: Readonly<Record<RunBooleanKey, boolean>> = {
@@ -452,6 +471,7 @@ const BOOLEAN_DEFAULTS: Readonly<Record<RunBooleanKey, boolean>> = {
   preflightEnabled: DEFAULT_PREFLIGHT_ENABLED,
   diffHtml: DEFAULT_DIFF_HTML,
   collapseRepeats: DEFAULT_COLLAPSE_REPEATS,
+  protectGit: DEFAULT_PROTECT_GIT,
 }
 
 const namesForBooleanKey = (key: RunBooleanKey, value: boolean): string =>
@@ -657,14 +677,74 @@ class ReportCommand extends Command {
   static override usage = Command.Usage({
     category: 'Results',
     description: 'Re-print a run report as Markdown to stdout.',
+    details:
+      '`--rebuild` recomputes the report from artifacts already on disk (aggregate, diff, timeline, report-render) instead of re-printing `report.json` — no agent, LLM, or docker call is made by default, and an existing judge verdict is reused verbatim rather than re-requested. For a workspace that predates `run-input.json`, unrecoverable inputs are supplied via `--format`/`--judge`/`--pricing-path`/`--diff-html`/`--collapse-repeats`/`--timeline-mode`, or otherwise fall back to a default disclosed in the rebuilt report. `--rejudge` is the one opt-in exception to the no-LLM rule: it permits exactly one fresh judge call against the rebuilt diff, using `--judge` as the instructions (falling back to the original run-input.json instructions when not given); the report then states the verdict came from a re-judge, not the original run.',
   })
   runId = Option.String({ required: false, name: 'run-id' })
   workspace = Option.String('--workspace', '.testaipack', {
     description: 'Root of the testaipack workspace.',
   })
+  rebuild = Option.Boolean('--rebuild', false, {
+    description: 'Recompute the report from disk artifacts instead of re-printing report.json.',
+  })
+  force = Option.Boolean('--force', false, {
+    description: '--rebuild only: overwrite an existing report.json.',
+  })
+  format = Option.Array('--format', [], {
+    description: '--rebuild only: report format(s), used when not recoverable from run-input.json. Repeatable.',
+  })
+  judge = Option.String('--judge', {
+    required: false,
+    description:
+      '--rebuild only: disclosure-only hint for whether/how judging was originally requested. Without --rejudge, rebuild never invokes an LLM and this never produces a verdict; with --rejudge, this becomes the instructions for the one permitted judge call.',
+  })
+  rejudge = Option.Boolean('--rejudge', false, {
+    description:
+      '--rebuild only: the one opt-in exception to "rebuild invokes no LLM" — permits exactly one live judge call against the rebuilt diff. Off by default.',
+  })
+  pricingPath = Option.String('--pricing-path', {
+    required: false,
+    description: '--rebuild only: pricing table, used when not recoverable from run-input.json.',
+  })
+  diffHtml = Option.Boolean('--diff-html', {
+    required: false,
+    description: '--rebuild only: generate diff/*.html, used when not recoverable from run-input.json.',
+  })
+  collapseRepeats = Option.Boolean('--collapse-repeats', {
+    required: false,
+    description: '--rebuild only: collapse repeated tool calls in the timeline, used when not recoverable.',
+  })
+  timelineMode = Option.String('--timeline-mode', {
+    required: false,
+    description: '--rebuild only: side-by-side|tree-diff|merged, used when not recoverable.',
+  })
 
   async execute(): Promise<number> {
-    return executeReport(this.runId, this.workspace)
+    if (!this.rebuild) return executeReport(this.runId, this.workspace)
+
+    const invalidFormat = firstInvalidFormat(this.format)
+    if (invalidFormat !== undefined) {
+      console.error(`invalid --format: ${invalidFormat} (expected md|html|json|yaml)`)
+      return 2
+    }
+    if (this.timelineMode !== undefined && !timelineModeSchema.safeParse(this.timelineMode).success) {
+      console.error(`invalid --timeline-mode: ${this.timelineMode} (expected side-by-side|tree-diff|merged)`)
+      return 2
+    }
+
+    const flags: RebuildFlags = {
+      runId: this.runId,
+      workspace: this.workspace,
+      force: this.force,
+      formats: toOutputFormats(this.format),
+      judge: this.judge,
+      rejudge: this.rejudge,
+      pricingPath: this.pricingPath,
+      diffHtml: this.diffHtml,
+      collapseRepeats: this.collapseRepeats,
+      timelineMode: this.timelineMode as TimelineMode | undefined,
+    }
+    return executeRebuild(flags)
   }
 }
 

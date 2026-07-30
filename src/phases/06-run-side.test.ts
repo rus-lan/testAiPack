@@ -2,7 +2,15 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Effect } from 'effect'
 import path from 'node:path'
 import { makeTempDir } from '../../tests/setup.js'
-import { ensureDir, readFile } from '../util/fs.js'
+
+vi.mock('../util/fs.js', async () => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  const actual = await vi.importActual<typeof import('../util/fs.js')>('../util/fs.js')
+  return { ...actual, writeFile: vi.fn(actual.writeFile) }
+})
+
+import { existsSync } from 'node:fs'
+import { ensureDir, readFile, writeFile, FsError } from '../util/fs.js'
 import {
   runSide,
   analyzeOutcome,
@@ -17,6 +25,7 @@ import {
 import type { AnalyzeInput } from './06-run-side.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import type { RunInput, Manifest, WorkspaceTree, EnvVarSet, RunSideInput, ErrorCode } from '@generated/types'
+import { runSideResultSchema } from '@generated/schemas'
 import type { OpencodeRunOptions } from '../opencode/cli.js'
 
 vi.mock('../opencode/cli.js', () => ({
@@ -65,6 +74,7 @@ const runMock = vi.mocked(run)
 const exportMock = vi.mocked(exportSession)
 const { spawnProcess } = await import('../opencode/spawn.js')
 const spawnMock = vi.mocked(spawnProcess)
+const writeFileMock = vi.mocked(writeFile)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
@@ -97,6 +107,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
     git: false,
   },
   pureBaseline: true,
+  protectGit: false,
   preflightEnabled: false,
   formats: ['md'],
   outputPath: '/out',
@@ -128,6 +139,8 @@ const buildWorkspace = (root: string): WorkspaceTree => ({
   pack: path.join(root, 'pack'),
   homeOld: [path.join(root, 'home', 'old', 'run-1')],
   homeNew: [path.join(root, 'home', 'new', 'run-1')],
+  gitDirsOld: [path.join(root, 'gitdirs', 'old', 'run-1')],
+  gitDirsNew: [path.join(root, 'gitdirs', 'new', 'run-1')],
   config: path.join(root, 'config'),
   results: path.join(root, 'results'),
   raw: path.join(root, 'results', 'raw'),
@@ -210,7 +223,7 @@ const emitThenSucceed = (events: readonly unknown[]) =>
     })
 
 describe('phase 06 — run-side', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     runMock.mockReset()
     exportMock.mockReset()
     spawnMock.mockReset()
@@ -219,6 +232,9 @@ describe('phase 06 — run-side', () => {
     spawnMock.mockImplementation(() =>
       Effect.succeed({ stdout: '', stderr: '', exitCode: 0, durationMs: 1, timedOut: false }),
     )
+    // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+    const fsActual = await vi.importActual<typeof import('../util/fs.js')>('../util/fs.js')
+    writeFileMock.mockImplementation(fsActual.writeFile)
     void okRun
   })
 
@@ -445,7 +461,7 @@ describe('phase 06 — run-side', () => {
   // phase-level failures
   // -------------------------------------------------------------------------
 
-  it('export.json not written (exportSession fails) → E_RUN_CRASH', async () => {
+  it('export returns no data -> phase succeeds, rank 0, errorCode E_RUN_CRASH, events.ndjson written, verify skipped', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     exportMock.mockImplementation(() =>
@@ -453,18 +469,92 @@ describe('phase 06 — run-side', () => {
         new OpencodeError({ command: 'export', exitCode: 1, stderr: 'no session', stdout: '', timedOut: false }),
       ),
     )
-    const err = await runFlip(runSide(buildInput(root)))
-    expect(err.code).toBe('E_RUN_CRASH')
-    expect(err.phase).toBe('run-side')
+    const input = buildInput(root, { runInput: { verify: 'npm test' } })
+    const result = await runP(runSide(input))
+    expect(result.successRank).toBe(0)
+    expect(result.errorCode).toBe('E_RUN_CRASH')
+    expect(result.verifyExitCode).toBeUndefined()
+    expect(spawnMock).not.toHaveBeenCalled()
+    const events = await runP(readFile(result.eventsLogPath))
+    expect(events).toContain('step-finish')
   })
 
-  it('export.json invalid (schema mismatch) → E_EXPORT_INVALID after exhausting retries', async () => {
+  it('export failure overrides finishCause to "error" (not the agent\'s own "stop") so a log-based recovery cannot read it as a clean run', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    // the agent itself finishes cleanly ("stop") — only the export step fails.
+    runMock.mockImplementation(emitThenSucceed([stepFinish('stop')]))
+    exportMock.mockImplementation(() =>
+      Effect.fail(
+        new OpencodeError({ command: 'export', exitCode: 1, stderr: 'no session', stdout: '', timedOut: false }),
+      ),
+    )
+    const result = await runP(runSide(buildInput(root)))
+    expect(result.successRank).toBe(0)
+    expect(result.errorCode).toBe('E_RUN_CRASH')
+    expect(result.finishCause).toBe('error')
+    const log = await runP(readFile(path.join(path.dirname(result.eventsLogPath), 'run-1.log')))
+    expect(log).toContain('[STOP] finish=error rank=0')
+    expect(log).not.toContain('[STOP] finish=stop')
+  })
+
+  it('export invalid after all retries -> rank 0, errorCode E_EXPORT_INVALID, invalid file left on disk', async () => {
     const root = makeTempDir()
     await runP(ensureDir(path.join(root, 'results', 'raw')))
     exportMock.mockImplementation(() => Effect.succeed('{"not":"valid export"}'))
-    const err = await runFlip(runSide(buildInput(root)))
-    expect(err.code).toBe('E_EXPORT_INVALID')
+    const result = await runP(runSide(buildInput(root)))
+    expect(result.successRank).toBe(0)
+    expect(result.errorCode).toBe('E_EXPORT_INVALID')
     expect(exportMock.mock.calls.length).toBe(EXPORT_VALIDATION_MAX_RETRIES + 1)
+    const exported = await runP(readFile(result.exportPath))
+    expect(exported).toBe('{"not":"valid export"}')
+  })
+
+  it('export times out -> rank 0, errorCode E_RUN_TIMEOUT', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    exportMock.mockImplementation(() =>
+      Effect.gen(function* () {
+        yield* Effect.sleep(500)
+        return validExport()
+      }),
+    )
+    const input = buildInput(root, {
+      runInput: { timeouts: { ...baseTimeouts, runSeconds: 0.05 } },
+    })
+    const result = await runP(runSide(input))
+    expect(result.successRank).toBe(0)
+    expect(result.errorCode).toBe('E_RUN_TIMEOUT')
+  })
+
+  it('events.ndjson write fails (fs) -> phase still FAILS with E_DISK_FULL', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    writeFileMock.mockImplementation((p) =>
+      p.includes('.events.ndjson')
+        ? Effect.fail(
+            new FsError({ path: p, operation: 'writeFile', cause: new Error('ENOSPC: no space left on device') }),
+          )
+        : Effect.succeed(undefined),
+    )
+    const err = await runFlip(runSide(buildInput(root)))
+    expect(err.code).toBe('E_DISK_FULL')
+    expect(err.phase).toBe('run-side')
+  })
+
+  it('export.json write fails (fs) -> phase still FAILS with E_DISK_FULL', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    writeFileMock.mockImplementation((p) =>
+      p.endsWith('.json')
+        ? Effect.fail(
+            new FsError({ path: p, operation: 'writeFile', cause: new Error('ENOSPC: no space left on device') }),
+          )
+        : Effect.succeed(undefined),
+    )
+    const err = await runFlip(runSide(buildInput(root)))
+    expect(err.code).toBe('E_DISK_FULL')
+    expect(err.phase).toBe('run-side')
   })
 
   it('export carrying messages[].info.finish="unknown" parses — no longer E_EXPORT_INVALID', async () => {
@@ -518,6 +608,33 @@ describe('phase 06 — run-side', () => {
     const ws: WorkspaceTree = { ...input.workspace, appsOld: [], appsNew: [] }
     const err = await runFlip(runSide({ ...input, workspace: ws }))
     expect(err.code).toBe('E_RUN_CRASH')
+  })
+
+  // -------------------------------------------------------------------------
+  // run-N.result.json persistence
+  // -------------------------------------------------------------------------
+
+  it('run-N.result.json is written after a run and parses with the schema', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const result = await runP(runSide(buildInput(root)))
+    const resultPath = path.join(root, 'results', 'raw', 'old', 'run-1.result.json')
+    expect(existsSync(resultPath)).toBe(true)
+    const raw = await runP(readFile(resultPath))
+    const parsed = JSON.parse(raw) as { successRank: number }
+    expect(runSideResultSchema.safeParse(parsed).success).toBe(true)
+    expect(parsed.successRank).toBe(result.successRank)
+  })
+
+  it('run-N.result.json write failure (fs) does not fail the run', async () => {
+    const root = makeTempDir()
+    await runP(ensureDir(path.join(root, 'results', 'raw')))
+    const sideRawDir = path.join(root, 'results', 'raw', 'old')
+    // a directory sitting at the exact result-file path makes the real write
+    // fail (EISDIR) without needing to mock writeJson/writeFile.
+    await runP(ensureDir(path.join(sideRawDir, 'run-1.result.json')))
+    const result = await runP(runSide(buildInput(root)))
+    expect(result.successRank).toBe(4)
   })
 
   // -------------------------------------------------------------------------

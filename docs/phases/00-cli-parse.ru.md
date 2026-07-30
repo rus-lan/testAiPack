@@ -40,9 +40,10 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
 (int32), `isolation` (`IsolationMode`), `dockerNetwork?`, `opencodeVersion?`,
 `auth` (`AuthWhitelist`), `pureBaseline` (boolean), `judge?`, `judgeFiles?`,
 `preflightEnabled` (boolean), `preflightModel?`, `model?`, `formats` (`OutputFormat[]`),
-`outputPath`, `diffHtml` (boolean), `collapseRepeats` (boolean), `timelineMode`
-(`TimelineMode`), `timeouts` (`TimeoutConfig`), `workspacePath`, `logLevel`
-(`LogLevel`), `pricingPath?`. Все поля обязательные, кроме явно помеченных `?`.
+`outputPath`, `diffHtml` (boolean), `protectGit` (boolean), `collapseRepeats`
+(boolean), `timelineMode` (`TimelineMode`), `timeouts` (`TimeoutConfig`),
+`workspacePath`, `logLevel` (`LogLevel`), `pricingPath?`. Все поля
+обязательные, кроме явно помеченных `?`.
 
 Ключевые поля `RunInput`:
 
@@ -57,6 +58,16 @@ Namespace: `TestAiPack.CliParse` (см. `contract/phases/00-cli-parse.tsp`).
   потребляется фазой 04.
 - `pureBaseline` — `true` по умолчанию; если `true`, baseline-сторона получает
   `OPENCODE_PURE=1` (см. `EnvVarSet` в фазе 04).
+- `protectGit` — `false` по умолчанию (`--protect-git` / `--no-protect-git`).
+  Если `true`: фаза 02 переносит `.git` каждого прогона за пределы примонтированного
+  дерева (`gitdirs/<side>/run-N/`, см. `docs/phases/02-repo-clone.ru.md`), фаза 08
+  работает с ним через `--git-dir`/`--work-tree` и **не** запускает восстановление
+  `.git` (см. `docs/phases/08-diff.ru.md`, раздел про protect-git). Цена: exports
+  теряют snapshot/patch-части opencode (нужен `/workspace/.git`), а
+  `review.code-workspace` (фаза 12) теряет git-декорации в редакторе для защищённых
+  прогонов — обе стороны платы явно задокументированы, не только здесь. При
+  `isolation = "home"` защита слабая (агент работает без песочницы, может дойти до
+  `gitdirs/` по пути) — предупреждение печатается один раз (`src/cli/pipeline.ts`).
 - `timeouts` (`TimeoutConfig`) — `preflightSeconds`, `runSeconds`,
   `verifySeconds`, `installSeconds`, `watchdogSeconds`, опциональный
   `totalSeconds`.

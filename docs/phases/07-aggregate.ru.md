@@ -54,12 +54,13 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
   `reasoningTokens`, `cacheReadTokens`, `perTool: Record<toolName,
   {count, errorRate, avgDurationMs}>`, `reasoningTimeMs`, `stepLatencyP50Ms`,
   `stepLatencyP95Ms`, `toolLatencyAvgMs`, `finishCauseDistribution`,
-  `maxConsecutiveSameTool`. Файловые дельты (additions/deletions/filesChanged)
-  сюда не входят — `SecondaryMetrics` больше не несёт `fileDiffStats` (поле
-  было убрано: оно строилось из `info.summary` экспорта opencode, а этот
-  API реальными числами не заполняется, и фаза 07 в принципе не может увидеть
-  результат фазы 08). Единственный источник этих чисел — `report.diff` из
-  фазы 08 (см. `docs/phases/08-diff.ru.md`); рендереры читают их оттуда.
+  `maxConsecutiveSameTool`, плюс новые опциональные поля (см. ниже). Файловые
+  дельты (additions/deletions/filesChanged) сюда не входят — `SecondaryMetrics`
+  не несёт `fileDiffStats` (поле было убрано: оно строилось из `info.summary`
+  экспорта opencode, а этот API реальными числами не заполняется, и фаза 07 в
+  принципе не может увидеть результат фазы 08). Единственный источник этих
+  чисел — `report.diff` из фазы 08 (см. `docs/phases/08-diff.ru.md`);
+  рендереры читают их оттуда.
 - `stats: AggregateStats` — полное распределение (`MetricDistribution`:
   `median`/`min`/`max`/`iqr?`/`samples[]`) по N прогонам для каждой первичной
   метрики (`totalTokens`, `wallClockMs`, `costUsd`, `stepCount`,
@@ -68,13 +69,89 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
 - `failedRuns: FailedRun[]` — массив `FailedRun = { runIndex, errorCode:
   ErrorCode, errorMessage, timestamp }` для прогонов со `successRank = 0`.
 - `rawRunIds: string[]` — `sessionId` прогонов, вошедших в агрегацию.
+- `packUse?: PackUse` — использование пака за все прогоны стороны (см. ниже).
+  Отсутствует, если `--pack` вообще не задан.
+- `riskyCommands?: RiskyCommand[]` — опасные bash-команды, найденные во всех
+  прогонах стороны. Присутствует (может быть пустым `[]`) всякий раз, когда
+  хотя бы один прогон был успешно извлечён; отсутствует целиком, если ни один
+  прогон стороны не дошёл до извлечения (нечего было проверять).
+- `opencodeVersions?: string[]` — различные значения `export.info.version`,
+  встреченные в прогонах стороны, отсортированные. Та же логика присутствия,
+  что у `riskyCommands`.
+- `verifyStats?: VerifyStats` — исход `--verify` по всем прогонам стороны
+  (включая failed — verify мог пройти до краха). Отсутствует, если `--verify`
+  не задавался (нет ни одного прогона с verify-данными).
 
 `MetricDelta` — построчная разница `new − old` с `significant: boolean` и
 `better` ∈ `"better" | "worse" | "neutral" | "context-dependent"`.
 
+### Новые модели (waves 1+2, см. `.research/metrics-expansion/spec.md`)
+
+```tsp
+model PackUse {
+  calls: int32;               // сумма подходящих skill-вызовов по успешным прогонам
+  errors: int32;               // из них с state.status === "error"
+  runsWithCall: int32;         // прогонов хотя бы с одним вызовом
+  runCount: int32;              // всего успешных прогонов, инспектировано
+  firstCallMsMedian?: int64;   // медиана (state.time.start − info.time.created) по прогонам-с-вызовом
+  canDetect: boolean;          // false для plugin/mcp/agent/command — их не видно в экспортах
+}
+
+model RiskyCommand {
+  runIndex: int32;
+  command: string;             // bash input.command, обрезан до 300 симв.
+  completed: boolean;          // state.status === "completed"
+  exitCode?: int32;            // state.metadata.exit, если есть
+}
+
+model VerifyStats {
+  passed: int32;    // verifyExitCode === 0
+  failed: int32;    // verifyExitCode есть и ≠ 0
+  timedOut: int32;  // errorCode === "E_VERIFY_TIMEOUT"
+  runCount: int32;  // passed + failed + timedOut
+}
+```
+
+`SecondaryMetrics` расширена (все поля optional — старый `report.json` без
+них по-прежнему парсится):
+
+| Поле | Семантика | Агрегация |
+|---|---|---|
+| `invalidToolCalls?` | сумма tool-частей с `tool === "invalid"` (галлюцинированные вызовы) | **сумма** по прогонам |
+| `duplicateToolCalls?` | сумма точных повторов (тот же tool + идентичный JSON input), считая повторы сверх первого | **сумма** |
+| `bashFailCount?` | сумма bash-вызовов с `state.metadata.exit !== 0` | **сумма** |
+| `toolErrorTexts?` | топ-5 различных `state.error`-текстов по частоте, каждый обрезан до 200 симв. | ранжирование по частоте |
+| `timeToFirstToolMs?` | первый `tool_use`-таймстамп минус первый таймстамп события | медиана по прогонам |
+| `timeToFirstEditMs?` | то же для первого `tool_use` с `part.tool ∈ {edit, write, patch}` | медиана по прогонам-с-правкой, опущено если ни одной |
+| `maxEventGapMs?` | наибольший разрыв между соседними таймстампами событий | **MAX** по прогонам (не медиана — иначе (10с,10с,240с) превратится в незаметные 10с) |
+| `firstStepInputTokens?` | `tokens.input` ПЕРВОЙ `step-finish`-части | медиана по прогонам |
+| `lastStepInputTokens?` | `tokens.input` ПОСЛЕДНЕЙ `step-finish`-части **с `tokens.input > 0`** (fallback — буквально последняя, если такой нет) | медиана по прогонам |
+| `textChars?` | сумма длин `text`-частей | медиана по прогонам |
+| `reasoningChars?` | сумма длин `reasoning`-частей | медиана по прогонам |
+| `cacheWriteTokens?` | `info.tokens.cache.write` | медиана по прогонам (не участвует в дельте/вердикте — см. `.research/metrics-expansion/spec.md`) |
+
+Почему `lastStepInputTokens` не берёт буквально последнюю часть: в реальных
+данных последний `step-finish` может нести `tokens.input: 0` (шаг с обнулённым
+usage), что искажает «финальный размер контекста». Фолбэк на буквально
+последнюю часть срабатывает только если ВСЕ `step-finish` несут `0`.
+
+Почему счётчики редких событий — **сумма**, а не медиана: `(0, 0, 0, 0, 3)` —
+медиана 0 спрятала бы единственный реальный инцидент (например,
+`rm -rf .git` в одном прогоне из пяти). Тот же аргумент для `maxEventGapMs`
+как MAX, а не медианы.
+
 ## 3. Шаги алгоритма
 
-1. Для каждой стороны `side ∈ {old, new}`:
+1. Один раз за фазу (до цикла по сторонам): определить пак — `runInput.packRef`
+   → `detectPack` (`src/pack/detector.ts`, чистая функция; ошибка детекции
+   считается «пака нет»). `packName = pack?.name` (имя резолвится для ЛЮБОГО
+   типа пака, не только skill — иначе `packUse` пришлось бы либо опускать для
+   plugin/mcp/agent/command, что неотличимо от «--pack вообще не задан», либо
+   не показывать `canDetect: false` вовсе). `canDetect = pack !== null &&
+   pack.type === "skill"` — только skill-паки видны как tool-части в
+   экспортах; plugin/mcp/agent/command невидимы, и это явно помечается, а не
+   тихо читается как «0 вызовов».
+2. Для каждой стороны `side ∈ {old, new}`:
    a. Для каждого `runIndex ∈ 1..runs`: прочитать `raw/<side>/run-<runIndex>.json`.
       Если файл отсутствует или невалиден по схеме `OpencodeExport`:
       - если `sideResults[side][runIndex-1].successRank = 0` (failed run из
@@ -98,16 +175,35 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
         mapping сделан в фазе 06).
       - (v0.2) `maxParallelism` = макс. одновременных активных сессий в
         дереве (по `time_created`/`time_updated` интервалам).
-   c. Извлечь вторичные метрики (см. секцию 2, `SecondaryMetrics`).
-2. Агрегировать по N **успешных** прогонов (failedRuns исключены):
+   c. Извлечь вторичные метрики (см. секцию 2, `SecondaryMetrics`) и `extras`
+      (pack-вызовы, опасные команды, дубли, невалидные вызовы, тексты ошибок,
+      P11/P12-сигналы — `src/metrics/extract.ts`, функция `extractExtras`).
+   d. Прочитать `raw/<side>/run-<runIndex>.events.ndjson`
+      (`RunSideResult.eventsLogPath`) и построить P5-профиль через
+      `src/metrics/events-profile.ts#profileEvents` (чистый модуль, фаза 07
+      только читает файл). Файл отсутствует/не читается (старый workspace) →
+      прогон не даёт P5-точку данных вообще (не `0` — иначе фиктивный «нет
+      задержки» смешается с настоящим измерением).
+   e. Посчитать `VerifyStats` по всем `sideResults[side]` (успешным и
+      failed — verify мог отработать до краха): `passed` = число с
+      `verifyExitCode === 0`, `failed` = число с `verifyExitCode` заданным и
+      `≠ 0`, `timedOut` = число с `errorCode === "E_VERIFY_TIMEOUT"`,
+      `runCount` = сумма трёх. `runCount === 0` → `verifyStats` не задаётся
+      (`--verify` не использовался).
+3. Агрегировать по N **успешных** прогонов (failedRuns исключены):
    - `MetricDistribution` для каждой первичной метрики (`stats`):
      `median`, `min`, `max`, `samples[]`. Если `N ≥ 4` → `iqr = q3 − q1`;
      иначе `iqr` не задаётся.
    - `primary` (`PrimaryMetrics`) заполняется медианами (или эквивалентной
      сводкой) по каждой метрике.
+   - `secondary` дополнительно агрегирует `extras` (сумма/медиана/MAX — см.
+     таблицу в §2) и P5-профили (медиана `timeToFirstToolMs`/
+     `timeToFirstEditMs`, MAX `maxEventGapMs`).
+   - `packUse`/`riskyCommands`/`opencodeVersions`/`verifyStats` собираются на
+     `SideAggregates` (не внутри `secondary`) — см. §2.
    - `bothFailed = true` (поле `MetricsDiff`) выставляется, если обе стороны
      имеют пустой набор успешных прогонов.
-3. Вычислить `MetricDelta` для каждой первичной метрики (`PrimaryDeltas`):
+4. Вычислить `MetricDelta` для каждой первичной метрики (`PrimaryDeltas`):
    - `absolute = new.primary.<m> − old.primary.<m>`.
    - `percent`: если `old.primary.<m> = 0` — `0`, когда `absolute` тоже `0`
      (действительно нет изменения), и **опущен** (не задан), когда
@@ -118,18 +214,20 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
    - `better` ∈ `"better" | "worse" | "neutral" | "context-dependent"` — для
      «меньше = лучше» (токены, время, стоимость) отрицательный delta = `"better"`;
      для `successRank` положительный delta = `"better"`; для `maxParallelism`
-     нейтрально → `"context-dependent"`.
-4. Если **все** прогоны обеих сторон failed → выставить
+     нейтрально → `"context-dependent"`. Новые метрики (waves 1+2) не входят в
+     `PrimaryDeltas` — они render-only, без дельты и вердикта.
+5. Если **все** прогоны обеих сторон failed → выставить
    `MetricsDiff.bothFailed = true` (не throw; контракт не выделяет кода).
-5. Сериализовать `AggregateResult` (включая `metricsDiff` и `rawAggregates`) в
+6. Сериализовать `AggregateResult` (включая `metricsDiff` и `rawAggregates`) в
    `results/metrics.json` (stable keys).
-6. Вернуть `AggregateResult { metricsDiff, rawAggregates }`.
+7. Вернуть `AggregateResult { metricsDiff, rawAggregates }`.
 
 ## 4. Входные/выходные файлы
 
 | Файл                          | Чтение/Запись | Схема (TypeSpec/Zod) |
 | ----------------------------- | ------------- | -------------------- |
 | `raw/<side>/run-<n>.json`     | Чтение        | `OpencodeExport`     |
+| `raw/<side>/run-<n>.events.ndjson` | Чтение   | streamed events (P5) |
 | `pricing.json` (если задан)   | Чтение        | `Pricing`            |
 | `results/metrics.json`        | Запись        | `AggregateResult`    |
 
@@ -148,6 +246,12 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
 | `old.primary.<m> = 0`, `new.primary.<m> ≠ 0`         | `deltas.<m>.percent` не задан (не `0`)              | —                    |
 | `old.primary.<m> = 0`, `new.primary.<m> = 0`         | `deltas.<m>.percent = 0`                            | —                    |
 | (v0.2) дерево сессий с циклом по parent_id          | visited-set обрывает цикл, warning                 | —                    |
+| `--pack` не задан                                   | `packUse` не задаётся ни на одной стороне          | —                    |
+| `--pack` задан, но тип не `skill` (plugin/mcp/agent/command) | `packUse` присутствует, `canDetect: false`, `calls: 0` | — |
+| Ни одного успешного прогона на стороне              | `riskyCommands`/`opencodeVersions` не заданы (нечего было проверить); `packUse`, если пак задан, всё равно есть с нулями | — |
+| `events.ndjson` отсутствует/не читается для прогона | прогон не даёт P5-точку данных (не участвует в медиане/MAX) | — |
+| Ни у одного прогона нет `events.ndjson`             | `timeToFirstToolMs`/`timeToFirstEditMs`/`maxEventGapMs` не заданы | — |
+| Ни один прогон стороны не звал `--verify`           | `verifyStats` не задаётся                          | —                    |
 
 ## 6. Тест-кейсы (по одному на ветку контракта)
 
@@ -179,6 +283,30 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
 - ❌ НЕ покрыто (ticket): значимость через bootstrap CI (v0.2.1).
 - ❌ НЕ покрыто (ticket): `maxParallelism` при очень глубоком дереве (>100
   сессий) — ticket по производительности обхода.
+- ✅ pack detected by name: skill packRef → `packUse.calls` считает только
+  подходящие по имени вызовы.
+- ✅ pack not detectable: plugin/mcp packRef → `packUse.canDetect === false`,
+  `calls === 0`.
+- ✅ pack absent: `--pack` не задан → `packUse` не задаётся ни на одной стороне.
+- ✅ risky command captured: `rm -rf .git`-подобная команда в bash-вызове →
+  попадает в `riskyCommands` с `runIndex`.
+- ✅ invalid tool excluded from perTool: `tool === "invalid"` часть →
+  считается в `invalidToolCalls`, не в `perTool`, не ломает
+  `maxConsecutiveSameTool`.
+- ✅ duplicate calls summed across runs: (3,0,1,1,0) → сумма 5, не медиана.
+- ✅ bashFailCount summed, not averaged: (0,0,0,0,3) → сумма 3.
+- ✅ toolErrorTexts top-5 by frequency, truncated to 200 chars.
+- ✅ events profile wired: `events.ndjson` прогона профилируется, поля P5
+  агрегируются медианой/MAX; отсутствующий файл → прогон не даёт точку данных
+  (не `0`).
+- ✅ verifyStats: exit 0 → passed; exit ≠ 0 → failed; `E_VERIFY_TIMEOUT` →
+  timedOut; ни одного verify-прогона → `verifyStats` не задаётся.
+- ✅ backcompat: `reportSchema`/`aggregateResult`-схема парсит `metrics.json`,
+  записанный до появления новых полей (все они optional).
+- ✅ real ground truth: агрегаты по реальной sample-workspace
+  (`.research/metrics-expansion/golden-values.md`) совпадают с рукописно
+  вычисленными значениями (тест скипается, если workspace недоступен на
+  машине).
 
 ## 7. Инварианты
 
@@ -196,12 +324,21 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
 - `MetricsDiff.bothFailed = true` ⇔ обе стороны не имеют успешных прогонов.
 - Происхождение `costUsd` фиксировано приоритетом в реализации:
   `info.cost` > `pricing.json` > `0` (поле `sourceCost` в контракт не входит).
+- Новые поля `SecondaryMetrics`/`SideAggregates` (waves 1+2) все optional —
+  отсутствие поля означает «не измерено», а не `0`; редкие события (invalid/
+  duplicate/bashFail) суммируются по прогонам, никогда не усредняются;
+  `maxEventGapMs` — MAX, не медиана. Ни одно новое поле не входит в
+  `PrimaryDeltas` и не влияет на вердикт.
 
 ## 8. Зависимости от других фаз
 
 - Зависит от: **06 run-side** (`sideResults: RunSideResult[]` + массив
-  `raw/<side>/run-N.json`), опционально от `pricing.json` (внешний файл).
+  `raw/<side>/run-N.json` + `raw/<side>/run-N.events.ndjson`), **00 cli-parse**
+  (`runInput.packRef` для pack-детекции), опционально от `pricing.json`
+  (внешний файл). Использует чистые модули `src/pack/detector.ts`
+  (`detectPack`) и `src/metrics/events-profile.ts` (`profileEvents`) — оба без
+  side-effects, фаза 07 только вызывает их и пишет результат.
 - Блокирует: **11 report-render** (нужен `MetricsDiff` для главной таблицы
-  дельт).
+  дельт и для новых секций Pack signal / Safety / Stability).
 - Параллелизуется с: **08 diff**, **09 judge** — все три читают независимые
   артефакты фазы 06 и не мешают друг другу.

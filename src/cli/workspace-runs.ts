@@ -123,8 +123,13 @@ export const planGc = (
       (r, i, arr) => arr.findIndex((x) => x.dir === r.dir) === i,
     )
     const toKeep = keepLastApplied.filter((r) => !staleDirs.has(r.dir))
+    // `gitdirs/` holds the `--protect-git` relocated git dirs (a full clone
+    // per run) — phase 13's own ephemeral cleanup already prunes it for
+    // ephemeral runs; aggressive gc needs the same target so a retained run
+    // does not keep those clones alive forever, which defeats most of what
+    // `--aggressive` is meant to reclaim.
     const pruneHome = opts.aggressive
-      ? toKeep.flatMap((r) => [path.join(r.dir, 'home'), path.join(r.dir, 'apps')])
+      ? toKeep.flatMap((r) => [path.join(r.dir, 'home'), path.join(r.dir, 'apps'), path.join(r.dir, 'gitdirs')])
       : []
     return {
       delete: toDelete.map((r) => r.dir),

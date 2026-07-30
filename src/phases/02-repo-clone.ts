@@ -11,7 +11,7 @@ import { repoCloneError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
 import { clone, revParseHead, lsFilesStage } from '../util/git.js'
 import type { GitError } from '../util/git.js'
-import { copyDir, exists } from '../util/fs.js'
+import { copyDir, exists, moveDir } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import { redactUrlCredentials } from '../util/redact.js'
 
@@ -40,10 +40,22 @@ const toCopyFailed = (safeRepoUrl: string, dest: string, e: FsError): PhaseError
   })
 }
 
-const fingerprint = (repoPath: string): Effect.Effect<string, GitError> =>
+const toMoveFailed = (safeRepoUrl: string, dest: string, gitDir: string, e: FsError): PhaseError => {
+  const cause = e.cause
+  const text = typeof cause === 'string' ? cause : cause instanceof Error ? cause.message : `${e.operation} on ${e.path}`
+  return repoCloneError(`protect-git move of ${dest}/.git to ${gitDir} failed: ${text}`, 'E_REPO_CLONE_FAILED', {
+    repoUrl: safeRepoUrl,
+    dest,
+    gitDir,
+    reason: 'protect-git-move',
+    cause: text,
+  })
+}
+
+const fingerprint = (repoPath: string, gitDir?: string): Effect.Effect<string, GitError> =>
   Effect.gen(function* () {
-    const head = yield* revParseHead(repoPath)
-    const staged = yield* lsFilesStage(repoPath)
+    const head = yield* revParseHead(repoPath, gitDir)
+    const staged = yield* lsFilesStage(repoPath, gitDir)
     return `${head}\n${staged}`
   })
 
@@ -58,17 +70,29 @@ const fingerprintError = (
     path: where,
   })
 
+interface DestGitDir {
+  readonly dest: string
+  readonly gitDir: string
+}
+
+/**
+ * `protectGit` picks which layout the check validates: unprotected copies
+ * still carry `.git` in-tree (single-path); protected copies had it moved to
+ * `gitDir` by `repoClone` before this runs, so the fingerprint must read the
+ * relocated git dir, not a `.git` that no longer exists in `dest`.
+ */
 const checkDeterminism = (
   sourcePath: string,
-  copies: readonly string[],
+  copies: readonly DestGitDir[],
+  protectGit: boolean,
   safeRepoUrl: string,
 ): Effect.Effect<void, PhaseError> =>
   Effect.gen(function* () {
     const sourceFp = yield* fingerprint(sourcePath).pipe(
       Effect.mapError((e: GitError) => fingerprintError(safeRepoUrl, sourcePath, e)),
     )
-    for (const dest of copies) {
-      const copyFp = yield* fingerprint(dest).pipe(
+    for (const { dest, gitDir } of copies) {
+      const copyFp = yield* fingerprint(dest, protectGit ? gitDir : undefined).pipe(
         Effect.mapError((e: GitError) => fingerprintError(safeRepoUrl, dest, e)),
       )
       if (copyFp !== sourceFp) {
@@ -125,14 +149,28 @@ export const repoClone = (
       )
     }
 
-    const allDestinations = [...workspace.appsOld, ...workspace.appsNew]
-    for (const dest of allDestinations) {
+    const pairUp = (dests: readonly string[], gitDirs: readonly string[]): readonly DestGitDir[] =>
+      dests.map((dest, i) => ({ dest, gitDir: gitDirs[i] ?? '' }))
+    const allPairs = [
+      ...pairUp(workspace.appsOld, workspace.gitDirsOld),
+      ...pairUp(workspace.appsNew, workspace.gitDirsNew),
+    ]
+
+    for (const { dest } of allPairs) {
       yield* copyDir(sourcePath, dest).pipe(
         Effect.mapError((e: FsError) => toCopyFailed(safeRepoUrl, dest, e)),
       )
     }
 
-    yield* checkDeterminism(sourcePath, allDestinations, safeRepoUrl)
+    if (runInput.protectGit) {
+      for (const { dest, gitDir } of allPairs) {
+        yield* moveDir(path.join(dest, '.git'), gitDir).pipe(
+          Effect.mapError((e: FsError) => toMoveFailed(safeRepoUrl, dest, gitDir, e)),
+        )
+      }
+    }
+
+    yield* checkDeterminism(sourcePath, allPairs, runInput.protectGit, safeRepoUrl)
 
     return {
       sourcePath,

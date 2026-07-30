@@ -18,16 +18,17 @@ vi.mock('../util/git.js', async () => {
 vi.mock('../util/fs.js', async () => {
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   const actual = await vi.importActual<typeof import('../util/fs.js')>('../util/fs.js')
-  return { ...actual, copyDir: vi.fn(actual.copyDir) }
+  return { ...actual, copyDir: vi.fn(actual.copyDir), moveDir: vi.fn(actual.moveDir) }
 })
 
 import { clone } from '../util/git.js'
 import { GitError } from '../util/git.js'
-import { init, addAll, commit } from '../util/git.js'
-import { copyDir, FsError } from '../util/fs.js'
+import { init, addAll, commit, revParseHead } from '../util/git.js'
+import { copyDir, moveDir, FsError, exists } from '../util/fs.js'
 
 const cloneMock = vi.mocked(clone)
 const copyDirMock = vi.mocked(copyDir)
+const moveDirMock = vi.mocked(moveDir)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
@@ -45,6 +46,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
     gemini: false, aws: false, ssh: false, git: false,
   },
   pureBaseline: true,
+  protectGit: false,
   preflightEnabled: true,
   formats: ['md'],
   outputPath: './results',
@@ -73,6 +75,8 @@ const makeWorkspace = async (runs: number): Promise<{ readonly root: string; rea
   const root = makeTempDir()
   await ensureDirP(path.join(root, 'apps', 'oldVersion'))
   await ensureDirP(path.join(root, 'apps', 'newVersion'))
+  await ensureDirP(path.join(root, 'gitdirs', 'old'))
+  await ensureDirP(path.join(root, 'gitdirs', 'new'))
   const range = Array.from({ length: runs }, (_, i) => i + 1)
   const tree: WorkspaceTree = {
     root,
@@ -82,6 +86,8 @@ const makeWorkspace = async (runs: number): Promise<{ readonly root: string; rea
     pack: path.join(root, 'pack'),
     homeOld: [],
     homeNew: [],
+    gitDirsOld: range.map((n) => path.join(root, 'gitdirs', 'old', `run-${n.toString()}`)),
+    gitDirsNew: range.map((n) => path.join(root, 'gitdirs', 'new', `run-${n.toString()}`)),
     config: path.join(root, 'config'),
     results: path.join(root, 'results'),
     raw: path.join(root, 'results', 'raw'),
@@ -104,10 +110,14 @@ const makeManifest = (runInput: RunInput): Manifest => ({
 beforeEach(async () => {
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   const gitActual = await vi.importActual<typeof import('../util/git.js')>('../util/git.js')
+  cloneMock.mockReset()
   cloneMock.mockImplementation(gitActual.clone)
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   const fsActual = await vi.importActual<typeof import('../util/fs.js')>('../util/fs.js')
+  copyDirMock.mockReset()
   copyDirMock.mockImplementation(fsActual.copyDir)
+  moveDirMock.mockReset()
+  moveDirMock.mockImplementation(fsActual.moveDir)
 })
 
 describe('repoClone — happy path', () => {
@@ -289,5 +299,60 @@ describe('repoClone — copy failure', () => {
     expect(err).toBeInstanceOf(PhaseError)
     expect(err.code).toBe('E_REPO_CLONE_FAILED')
     expect(err.context?.['reason']).toBe('non-deterministic')
+  })
+})
+
+describe('repoClone — protectGit', () => {
+  it('protect ON: no .git left in any run dir, every gitdirs/<side>/run-N holds HEAD, determinism check passes', async () => {
+    const src = await buildSourceRepo()
+    const { tree } = await makeWorkspace(2)
+    const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 2, protectGit: true })
+    const result = await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+
+    expect(existsSync(path.join(tree.appsSource, '.git'))).toBe(true)
+    for (const dest of [...tree.appsOld, ...tree.appsNew]) {
+      expect(existsSync(path.join(dest, '.git'))).toBe(false)
+      expect(existsSync(path.join(dest, 'README.md'))).toBe(true)
+    }
+    for (const gitDir of [...tree.gitDirsOld, ...tree.gitDirsNew]) {
+      expect(existsSync(path.join(gitDir, 'HEAD'))).toBe(true)
+    }
+    expect(result.copyPaths.old).toEqual(tree.appsOld)
+    expect(result.copyPaths.new).toEqual(tree.appsNew)
+  })
+
+  it('protect ON: two-path revParseHead against the relocated gitDir returns the same HEAD as source', async () => {
+    const src = await buildSourceRepo()
+    const { tree } = await makeWorkspace(1)
+    const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 1, protectGit: true })
+    await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    const sourceHead = await runP(revParseHead(tree.appsSource))
+    const copyHead = await runP(revParseHead(tree.appsOld[0] ?? '', tree.gitDirsOld[0]))
+    expect(copyHead).toBe(sourceHead)
+  })
+
+  it('protect ON, move failure → E_REPO_CLONE_FAILED with reason protect-git-move', async () => {
+    const src = await buildSourceRepo()
+    const { tree } = await makeWorkspace(1)
+    const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 1, protectGit: true })
+    moveDirMock.mockImplementation(() =>
+      Effect.fail(new FsError({ path: 'x', operation: 'moveDir', cause: new Error('boom') })),
+    )
+    const err = await runFlip(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    expect(err).toBeInstanceOf(PhaseError)
+    expect(err.code).toBe('E_REPO_CLONE_FAILED')
+    expect(err.context?.['reason']).toBe('protect-git-move')
+  })
+
+  it('protect OFF (default): no move attempted, .git stays in every run dir, gitdirs/ stays empty', async () => {
+    const src = await buildSourceRepo()
+    const { tree } = await makeWorkspace(1)
+    const runInput = makeRunInput({ repoUrl: `file://${src}`, runs: 1, protectGit: false })
+    await runP(repoClone({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    expect(moveDirMock).not.toHaveBeenCalled()
+    for (const dest of [...tree.appsOld, ...tree.appsNew]) {
+      expect(existsSync(path.join(dest, '.git'))).toBe(true)
+    }
+    expect(await runP(exists(tree.gitDirsOld[0] ?? ''))).toBe(false)
   })
 })

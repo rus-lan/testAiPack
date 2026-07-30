@@ -19,20 +19,46 @@ export class GitError extends Data.TaggedError('GitError')<{
 
 const GIT_MAX_BUFFER = 64 * 1024 * 1024
 
+/**
+ * Every git invocation goes through `execGit`, so forcing the C locale here
+ * — the one shared point, not per call site — makes git's own stdout/stderr
+ * text stable and parseable everywhere: the disk-full classifier below
+ * (`08-diff.ts`, `02-repo-clone.ts`), the auth-failure hint
+ * (`02-repo-clone.ts`), any future text match, all currently assume English
+ * output. Without this, a git built against the host's locale (verified
+ * directly: a Russian-locale git prints "Нет такого файла или каталога"
+ * where a C-locale git prints "No such file or directory" for the exact same
+ * error) silently defeats every one of them — worst case, a real full disk
+ * gets contained as an ordinary broken worktree instead of aborting the
+ * phase, the same failure mode this classifier exists to catch. Node's own
+ * `fs` errors are unaffected either way — they carry the `ENOSPC` errno code
+ * regardless of locale.
+ */
+const GIT_ENV: NodeJS.ProcessEnv = { LC_ALL: 'C', LANG: 'C' }
+
 interface GitRunResult {
   readonly stdout: string
   readonly stderr: string
   readonly exitCode: number
 }
 
-const execGit = (args: readonly string[], cwd: string): Effect.Effect<GitRunResult> =>
+const execGit = (
+  args: readonly string[],
+  cwd: string,
+  env?: NodeJS.ProcessEnv,
+): Effect.Effect<GitRunResult> =>
   Effect.async<GitRunResult>((resume) => {
     const controller = new AbortController()
     let settled = false
     execFile(
       'git',
       [...args],
-      { cwd, maxBuffer: GIT_MAX_BUFFER, signal: controller.signal },
+      {
+        cwd,
+        maxBuffer: GIT_MAX_BUFFER,
+        signal: controller.signal,
+        env: { ...process.env, ...GIT_ENV, ...env },
+      },
       (err, stdout, stderr) => {
         if (settled) return
         settled = true
@@ -50,9 +76,10 @@ const runGit = (
   command: string,
   args: readonly string[],
   cwd: string,
+  env?: NodeJS.ProcessEnv,
 ): Effect.Effect<{ readonly stdout: string; readonly stderr: string }, GitError> =>
   Effect.gen(function* () {
-    const result = yield* execGit(args, cwd)
+    const result = yield* execGit(args, cwd, env)
     if (result.exitCode !== 0) {
       yield* Effect.fail(
         new GitError({
@@ -64,6 +91,28 @@ const runGit = (
     }
     return { stdout: result.stdout, stderr: result.stderr }
   })
+
+/**
+ * `--git-dir`/`--work-tree` global options, prefixed before the subcommand
+ * args so a helper can run against a git dir moved outside its work tree
+ * (`--protect-git`). Both paths are passed explicitly rather than relying on
+ * git's cwd-defaulting rule, so behavior is pinned regardless of process cwd.
+ * Omitted entirely when `gitDir` is absent — the single-path form this
+ * produces is byte-identical to what every helper sent before this existed.
+ */
+const gitDirArgs = (cwd: string, gitDir: string | undefined): readonly string[] =>
+  gitDir === undefined ? [] : ['--git-dir', gitDir, '--work-tree', cwd]
+
+/**
+ * `GIT_INDEX_FILE` is env-based, not arg-based like `--git-dir`/`--work-tree`
+ * above, so it is threaded as an env override rather than an extra arg.
+ * Pointing a caller at a fresh index file sidesteps a stale `.git/index.lock`
+ * from a killed process (a fresh path can never already hold one) and keeps
+ * the caller's own index file untouched — useful when the caller's index is
+ * itself evidence, not scratch state.
+ */
+const indexEnv = (indexFile: string | undefined): NodeJS.ProcessEnv | undefined =>
+  indexFile === undefined ? undefined : { GIT_INDEX_FILE: indexFile }
 
 export const init = (cwd: string): Effect.Effect<void, GitError> =>
   Effect.as(runGit('init', ['init', '--quiet', cwd], process.cwd()), undefined)
@@ -82,8 +131,11 @@ export const clone = (
   return Effect.as(runGit('clone', args, process.cwd()), undefined)
 }
 
-export const addAll = (cwd: string): Effect.Effect<void, GitError> =>
-  Effect.as(runGit('add', ['add', '-A'], cwd), undefined)
+export const addAll = (cwd: string, gitDir?: string, indexFile?: string): Effect.Effect<void, GitError> =>
+  Effect.as(
+    runGit('add', [...gitDirArgs(cwd, gitDir), 'add', '-A'], cwd, indexEnv(indexFile)),
+    undefined,
+  )
 
 export const commit = (
   cwd: string,
@@ -98,8 +150,11 @@ export const commit = (
     undefined,
   )
 
-export const diffCached = (cwd: string): Effect.Effect<string, GitError> =>
-  Effect.map(runGit('diff', ['diff', '--cached'], cwd), (r) => r.stdout)
+export const diffCached = (cwd: string, gitDir?: string, indexFile?: string): Effect.Effect<string, GitError> =>
+  Effect.map(
+    runGit('diff', [...gitDirArgs(cwd, gitDir), 'diff', '--cached'], cwd, indexEnv(indexFile)),
+    (r) => r.stdout,
+  )
 
 const parseNumStatField = (field: string | undefined): number => {
   if (field === undefined || field === '-') return 0
@@ -130,9 +185,18 @@ export const diffStat = (cwd: string): Effect.Effect<DiffStat, GitError> =>
  * emits `additions\tdeletions\tpath` per line; binary files show `-` for both
  * counts (mapped to 0 — the contract FileChange has no binary flag).
  */
-export const diffStatFull = (cwd: string): Effect.Effect<DiffSummary, GitError> =>
+export const diffStatFull = (
+  cwd: string,
+  gitDir?: string,
+  indexFile?: string,
+): Effect.Effect<DiffSummary, GitError> =>
   Effect.gen(function* () {
-    const { stdout } = yield* runGit('numstat-full', ['diff', '--cached', '--numstat'], cwd)
+    const { stdout } = yield* runGit(
+      'numstat-full',
+      [...gitDirArgs(cwd, gitDir), 'diff', '--cached', '--numstat'],
+      cwd,
+      indexEnv(indexFile),
+    )
     return stdout.split('\n').reduce<DiffSummary>(
       (acc, line) => {
         const trimmed = line.trim()
@@ -154,20 +218,73 @@ export const diffStatFull = (cwd: string): Effect.Effect<DiffSummary, GitError> 
     )
   })
 
-export const revParseHead = (cwd: string): Effect.Effect<string, GitError> => {
-  if (!existsSync(cwd) || !existsSync(path.join(cwd, '.git'))) {
+export const revParseHead = (cwd: string, gitDir?: string): Effect.Effect<string, GitError> => {
+  if (!existsSync(cwd) || !existsSync(gitDir ?? path.join(cwd, '.git'))) {
     return Effect.fail(
       new GitError({ command: 'rev-parse', exitCode: -1, stderr: 'cwd does not exist or is not a git repo' }),
     )
   }
-  return Effect.map(runGit('rev-parse', ['rev-parse', 'HEAD'], cwd), (r) => r.stdout.trim())
+  return Effect.map(
+    runGit('rev-parse', [...gitDirArgs(cwd, gitDir), 'rev-parse', 'HEAD'], cwd),
+    (r) => r.stdout.trim(),
+  )
 }
 
-export const lsFilesStage = (cwd: string): Effect.Effect<string, GitError> => {
-  if (!existsSync(cwd) || !existsSync(path.join(cwd, '.git'))) {
+export type HeadState = { readonly _tag: 'commit'; readonly sha: string } | { readonly _tag: 'unborn' }
+
+/**
+ * `git rev-parse --verify -q HEAD` exits 0 with the sha for a normal repo,
+ * exits exactly 1 (silently — `-q` suppresses the "ambiguous argument"
+ * message) for a repo with zero commits yet ("unborn" HEAD, a legitimate
+ * state — e.g. testing an agent's ability to bootstrap a fresh project), and
+ * exits with a different code (128, verified against real git) for anything
+ * actually broken (missing `.git`, corrupted refs). `revParseHead` above
+ * cannot make this distinction — it surfaces both as the same plain failure.
+ */
+export const headState = (cwd: string, gitDir?: string): Effect.Effect<HeadState, GitError> =>
+  Effect.gen(function* () {
+    if (!existsSync(cwd) || !existsSync(gitDir ?? path.join(cwd, '.git'))) {
+      return yield* Effect.fail(
+        new GitError({ command: 'rev-parse --verify -q HEAD', exitCode: -1, stderr: 'cwd does not exist or is not a git repo' }),
+      )
+    }
+    const result = yield* execGit([...gitDirArgs(cwd, gitDir), 'rev-parse', '--verify', '-q', 'HEAD'], cwd)
+    if (result.exitCode === 0) return { _tag: 'commit' as const, sha: result.stdout.trim() }
+    if (result.exitCode === 1) return { _tag: 'unborn' as const }
+    return yield* Effect.fail(
+      new GitError({
+        command: 'rev-parse --verify -q HEAD',
+        exitCode: result.exitCode,
+        stderr: redactUrlCredentials(result.stderr),
+      }),
+    )
+  })
+
+export const headsMatch = (a: HeadState, b: HeadState): boolean =>
+  a._tag === 'unborn' ? b._tag === 'unborn' : b._tag === 'commit' && a.sha === b.sha
+
+/**
+ * Primes an index (normally a scratch `GIT_INDEX_FILE`) with HEAD's tree
+ * before `git add -A` runs against it. A brand-new index starts with zero
+ * entries, and `git add -A` only re-adds a path that is *already tracked but
+ * gitignored* if the index already carries an entry for it — otherwise it
+ * silently skips the working-tree copy (still gitignored, still untracked as
+ * far as this empty index knows), so `git diff --cached` reports that
+ * committed-but-ignored path as deleted. `read-tree HEAD` fails on an unborn
+ * HEAD (nothing to read) — callers must check `headState` first and skip
+ * this call entirely in that case, where an empty index is already correct.
+ */
+export const readTreeHead = (cwd: string, gitDir?: string, indexFile?: string): Effect.Effect<void, GitError> =>
+  Effect.as(
+    runGit('read-tree', [...gitDirArgs(cwd, gitDir), 'read-tree', 'HEAD'], cwd, indexEnv(indexFile)),
+    undefined,
+  )
+
+export const lsFilesStage = (cwd: string, gitDir?: string): Effect.Effect<string, GitError> => {
+  if (!existsSync(cwd) || !existsSync(gitDir ?? path.join(cwd, '.git'))) {
     return Effect.fail(
       new GitError({ command: 'ls-files', exitCode: -1, stderr: 'cwd does not exist or is not a git repo' }),
     )
   }
-  return Effect.map(runGit('ls-files', ['ls-files', '-s'], cwd), (r) => r.stdout)
+  return Effect.map(runGit('ls-files', [...gitDirArgs(cwd, gitDir), 'ls-files', '-s'], cwd), (r) => r.stdout)
 }

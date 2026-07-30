@@ -69,6 +69,7 @@ export const DEFAULT_ISOLATION: IsolationMode = 'home'
 export const DEFAULT_PURE_BASELINE = true
 export const DEFAULT_PREFLIGHT_ENABLED = true
 export const DEFAULT_DIFF_HTML = false
+export const DEFAULT_PROTECT_GIT = false
 export const DEFAULT_COLLAPSE_REPEATS = false
 export const DEFAULT_TIMELINE_MODE: TimelineMode = 'side-by-side'
 export const DEFAULT_LOG_LEVEL: LogLevel = 'info'
@@ -105,6 +106,7 @@ const configFileSchema = z
     formats: z.union([z.array(outputFormatSchema), z.literal('all')]).optional(),
     outputPath: z.string().optional(),
     diffHtml: z.boolean().optional(),
+    protectGit: z.boolean().optional(),
     collapseRepeats: z.boolean().optional(),
     timelineMode: timelineModeSchema.optional(),
     timeouts: timeoutPartialSchema.optional(),
@@ -133,6 +135,7 @@ interface CliRaw {
   readonly pureBaseline?: boolean
   readonly preflightEnabled?: boolean
   readonly diffHtml?: boolean
+  readonly protectGit?: boolean
   readonly collapseRepeats?: boolean
   readonly timelineMode?: TimelineMode
   readonly logLevel?: LogLevel
@@ -192,7 +195,7 @@ export const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '--timeout-total': 'totalSeconds',
 }
 
-export type RunBooleanKey = 'pureBaseline' | 'preflightEnabled' | 'diffHtml' | 'collapseRepeats'
+export type RunBooleanKey = 'pureBaseline' | 'preflightEnabled' | 'diffHtml' | 'protectGit' | 'collapseRepeats'
 
 export const BOOLEAN_FLAGS: Readonly<
   Record<string, { readonly key: RunBooleanKey; readonly value: boolean }>
@@ -203,6 +206,8 @@ export const BOOLEAN_FLAGS: Readonly<
   '--no-preflight': { key: 'preflightEnabled', value: false },
   '--diff-html': { key: 'diffHtml', value: true },
   '--no-diff-html': { key: 'diffHtml', value: false },
+  '--protect-git': { key: 'protectGit', value: true },
+  '--no-protect-git': { key: 'protectGit', value: false },
   '--collapse-repeats': { key: 'collapseRepeats', value: true },
   '--no-collapse-repeats': { key: 'collapseRepeats', value: false },
 }
@@ -657,6 +662,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const pureBaselinePick = pick(cli.pureBaseline, cfg?.pureBaseline)
     const preflightPick = pick(cli.preflightEnabled, cfg?.preflightEnabled)
     const diffHtmlPick = pick(cli.diffHtml, cfg?.diffHtml)
+    const protectGitPick = pick(cli.protectGit, cfg?.protectGit)
     const collapsePick = pick(cli.collapseRepeats, cfg?.collapseRepeats)
     const timelinePick = pick(cli.timelineMode, cfg?.timelineMode)
     const logPick = pick(cli.logLevel, cfg?.logLevel)
@@ -712,6 +718,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       pureBaselinePick.src,
       preflightPick.src,
       diffHtmlPick.src,
+      protectGitPick.src,
       collapsePick.src,
       timelinePick.src,
       logPick.src,
@@ -739,6 +746,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       formats: [...formats],
       outputPath: outputPick.value ?? DEFAULT_OUTPUT_PATH,
       diffHtml: diffHtmlPick.value ?? DEFAULT_DIFF_HTML,
+      protectGit: protectGitPick.value ?? DEFAULT_PROTECT_GIT,
       collapseRepeats: collapsePick.value ?? DEFAULT_COLLAPSE_REPEATS,
       timelineMode: timelinePick.value ?? DEFAULT_TIMELINE_MODE,
       timeouts,

@@ -13,12 +13,14 @@
 import { Effect } from 'effect'
 import path from 'node:path'
 import type {
+  DiffResultOutput,
   EnvVarSet,
   JudgeResult,
   Manifest,
   MetricsDiff,
   ReportRenderInput,
   ReportRenderResult,
+  ReportSummary,
   RunInput,
   RunSideResult,
   Side,
@@ -26,8 +28,12 @@ import type {
 } from '@generated/types'
 import { judgeResultSchema } from '@generated/schemas'
 import type { PhaseError } from '../errors.js'
-import { runSideError } from '../errors.js'
+import { runSideError, serializePhaseError } from '../errors.js'
 import { generateRunId } from '../util/run-id.js'
+import { writeJson } from '../util/fs.js'
+import type { FsError } from '../util/fs.js'
+import { redactUrlCredentials } from '../util/redact.js'
+import { safeRefDisplay } from '../pack/detector.js'
 import { cliParse } from '../phases/00-cli-parse.js'
 import { workspaceSetup } from '../phases/01-workspace-setup.js'
 import { repoClone } from '../phases/02-repo-clone.js'
@@ -36,6 +42,7 @@ import type { PackInstallOutcome } from '../phases/03-pack-install.js'
 import { homeIsolation } from '../phases/04-home-isolation.js'
 import { preflight } from '../phases/05-preflight.js'
 import { runSide } from '../phases/06-run-side.js'
+import { captureOpencodeConfig } from '../phases/06-config-capture.js'
 import { aggregate } from '../phases/07-aggregate.js'
 import { diff } from '../phases/08-diff.js'
 import { judge } from '../phases/09-judge.js'
@@ -69,10 +76,10 @@ export interface PipelineOutcome {
   readonly reportPaths: ReportRenderResult['paths']
   readonly reviewCommand: string
   readonly summary: string
+  readonly diffEscalated: boolean
 }
 
-const range = (n: number): readonly number[] =>
-  Array.from({ length: n }, (_, i) => i)
+const range = (n: number): readonly number[] => Array.from({ length: n }, (_, i) => i)
 
 /**
  * `resolveIsolation` (phase 00) falls back to `home` isolation when Docker is
@@ -85,6 +92,86 @@ export const dockerDowngradeWarning = (
   flagDefaults['dockerDowngraded'] === true
     ? 'warning: --isolation docker requested but Docker is unavailable — falling back to --isolation home'
     : undefined
+
+/**
+ * `--protect-git` moves each run's git dir out of the mounted tree, but under
+ * `--isolation home` the agent runs unsandboxed on the host and can still
+ * path-walk to the relocated dir — protection is only strong under docker.
+ */
+export const protectGitHomeWarning = (runInput: RunInput): string | undefined =>
+  runInput.protectGit && runInput.isolation === 'home'
+    ? 'warning: --protect-git with --isolation home only hides .git from the workspace; a host-level agent can still reach it'
+    : undefined
+
+/**
+ * Redacts the same two fields `buildManifest` already redacts
+ * (`src/phases/01-workspace-setup.ts`) before the resolved `RunInput` is
+ * persisted for post-mortem / rebuild: `repoUrl` and `packRef` are the only
+ * fields that can carry a credential (a git URL's userinfo, or an inline
+ * `mcp:<name>:<config>` ref's `env` block).
+ */
+export interface DiffFailureStatus {
+  readonly oldFailed: number
+  readonly oldTotal: number
+  readonly newFailed: number
+  readonly newTotal: number
+  readonly oldSideFailed: boolean
+  readonly newSideFailed: boolean
+  readonly escalate: boolean
+}
+
+const countFailedRuns = (runs: DiffResultOutput['diff']['old']['runs']): number =>
+  runs.filter((r) => r.state === 'failed').length
+
+/**
+ * A contained per-run diff failure (`state: "failed"`) is expected to happen
+ * occasionally and stays quiet in the headline — that is the whole point of
+ * containment (phase 08 keeps going instead of aborting). An entire side
+ * failing is a different signal: the comparison has nothing to show for that
+ * side, so it needs to be loud rather than read like an ordinary "N
+ * improvements, M regressions" run.
+ */
+export const diffFailureStatus = (diff: DiffResultOutput['diff']): DiffFailureStatus => {
+  const oldTotal = diff.old.runs.length
+  const newTotal = diff.new.runs.length
+  const oldFailed = countFailedRuns(diff.old.runs)
+  const newFailed = countFailedRuns(diff.new.runs)
+  const oldSideFailed = oldTotal > 0 && oldFailed === oldTotal
+  const newSideFailed = newTotal > 0 && newFailed === newTotal
+  return {
+    oldFailed,
+    oldTotal,
+    newFailed,
+    newTotal,
+    oldSideFailed,
+    newSideFailed,
+    escalate: oldSideFailed || newSideFailed,
+  }
+}
+
+export const diffFailureWarning = (status: DiffFailureStatus): string | undefined => {
+  if (!status.escalate) return undefined
+  const parts: readonly string[] = [
+    ...(status.oldSideFailed
+      ? [`old side: ${String(status.oldFailed)}/${String(status.oldTotal)} run(s) failed (worktree broken)`]
+      : []),
+    ...(status.newSideFailed
+      ? [`new side: ${String(status.newFailed)}/${String(status.newTotal)} run(s) failed (worktree broken)`]
+      : []),
+  ]
+  return `diff unavailable — ${parts.join('; ')}. The metrics above do not include these runs' code changes.`
+}
+
+export const redactRunInput = (runInput: RunInput): RunInput => ({
+  ...runInput,
+  repoUrl: redactUrlCredentials(runInput.repoUrl),
+  ...(runInput.packRef === undefined
+    ? {}
+    : { packRef: safeRefDisplay(redactUrlCredentials(runInput.packRef)) }),
+})
+
+export const warnFsFailure = (what: string, e: FsError): string =>
+  `warning: failed to write ${what}: ${e.operation} on ${e.path}: ${String(e.cause)}`
 
 const timedPhase = <A>(
   index: number,
@@ -132,11 +219,10 @@ const runOneSide = (
       const homeEnv = envs[idx]
       if (homeEnv === undefined) {
         return Effect.fail(
-          runSideError(
-            `missing HOME env for ${side} run ${String(runIndex)}`,
-            'E_RUN_CRASH',
-            { side, runIndex },
-          ),
+          runSideError(`missing HOME env for ${side} run ${String(runIndex)}`, 'E_RUN_CRASH', {
+            side,
+            runIndex,
+          }),
         )
       }
       return runSide({
@@ -168,9 +254,7 @@ const detailForPack = (p: PackInstallOutcome): string => {
   return `${p.detectedType}: ${name === undefined ? 'pack' : name.name}`
 }
 
-export const runPipeline = (
-  opts: PipelineOptions,
-): Effect.Effect<PipelineOutcome, PhaseError> =>
+export const runPipeline = (opts: PipelineOptions): Effect.Effect<PipelineOutcome, PhaseError> =>
   Effect.gen(function* () {
     const rawReporter = opts.reporter
 
@@ -193,6 +277,9 @@ export const runPipeline = (
     const dockerWarning = dockerDowngradeWarning(parsed.flagDefaults)
     if (dockerWarning !== undefined) reporter.log(dockerWarning)
 
+    const protectGitWarning = protectGitHomeWarning(baseRunInput)
+    if (protectGitWarning !== undefined) reporter.log(protectGitWarning)
+
     const runId = yield* generateRunId()
     reporter.header(runId)
 
@@ -207,211 +294,284 @@ export const runPipeline = (
           ...parsed.flagDefaults,
           reviewRun: opts.reviewRun,
           ide: opts.ide,
+          protectGit: baseRunInput.protectGit,
         },
+        ...(parsed.dockerImage === undefined ? {} : { dockerImage: parsed.dockerImage }),
       }),
       reporter,
       (r) => r.rootPath,
     )
     const { manifest, treePaths } = ws
 
-    // --output: when the user gave an explicit output dir (cli or config),
-    // report artifacts (report.*, metrics.json, timeline.*, diff/, judge.json,
-    // review.code-workspace, preflight.log, install.log, gc.log) land there.
-    // Manifest + workspace structure (apps, home, raw, pack, config) stay under
-    // <workspace>/<run-id>. Without --output the run tree's results/ is used.
-    const customOutput = parsed.outputPathProvided
-      ? path.resolve(opts.cwd, baseRunInput.outputPath)
-      : undefined
-    const resultsDir = customOutput ?? treePaths.results
-    const runInput: RunInput = { ...baseRunInput, outputPath: resultsDir }
-    const treePathsUsed: WorkspaceTree = customOutput
-      ? { ...treePaths, results: customOutput, diff: path.join(customOutput, 'diff') }
-      : treePaths
+    // Everything below this point has a run root to write into (`ws.rootPath`,
+    // where manifest.json already lives), so a fatal error from here on is
+    // captured to `error.json` before it propagates — the pipeline can die at
+    // any later phase and still leave a readable record of why, next to
+    // whatever partial results already made it to disk.
+    return yield* Effect.gen(function* () {
+      // --output: when the user gave an explicit output dir (cli or config),
+      // report artifacts (report.*, metrics.json, timeline.*, diff/, judge.json,
+      // review.code-workspace, preflight.log, install.log, gc.log) land there.
+      // Manifest + workspace structure (apps, home, raw, pack, config) stay under
+      // <workspace>/<run-id>. Without --output the run tree's results/ is used.
+      const customOutput = parsed.outputPathProvided
+        ? path.resolve(opts.cwd, baseRunInput.outputPath)
+        : undefined
+      const resultsDir = customOutput ?? treePaths.results
+      const runInput: RunInput = { ...baseRunInput, outputPath: resultsDir }
+      const treePathsUsed: WorkspaceTree = customOutput
+        ? { ...treePaths, results: customOutput, diff: path.join(customOutput, 'diff') }
+        : treePaths
 
-    // 02 repo-clone
-    yield* timedPhase(
-      2,
-      'repo-clone',
-      repoClone({ runInput, manifest, workspace: treePathsUsed }),
-      reporter,
-      () => runInput.repoUrl,
-    )
+      // run-input.json: the resolved RunInput next to manifest.json, so a
+      // post-mortem or a future `report --rebuild` can recover the exact input
+      // without re-parsing CLI/config. Redacted, best-effort, never fails the run.
+      yield* writeJson(path.join(ws.rootPath, 'run-input.json'), redactRunInput(runInput)).pipe(
+        Effect.catchAll((e) =>
+          Effect.sync(() => {
+            reporter.log(warnFsFailure('run-input.json', e))
+          }),
+        ),
+      )
 
-    // 03 pack-install
-    const pack = yield* timedPhase(
-      3,
-      'pack-install',
-      packInstall({ runInput, manifest, workspace: treePathsUsed }),
-      reporter,
-      detailForPack,
-    )
+      // 02 repo-clone
+      yield* timedPhase(
+        2,
+        'repo-clone',
+        repoClone({ runInput, manifest, workspace: treePathsUsed }),
+        reporter,
+        () => runInput.repoUrl,
+      )
 
-    // 04 home-isolation
-    const home = yield* timedPhase(
-      4,
-      'home-isolation',
-      homeIsolation({
+      // 03 pack-install
+      const pack = yield* timedPhase(
+        3,
+        'pack-install',
+        packInstall({ runInput, manifest, workspace: treePathsUsed }),
+        reporter,
+        detailForPack,
+      )
+
+      // 04 home-isolation
+      const home = yield* timedPhase(
+        4,
+        'home-isolation',
+        homeIsolation({
+          runInput,
+          manifest,
+          workspace: treePathsUsed,
+          packInstall: pack,
+          ...(parsed.dockerImage === undefined ? {} : { dockerImage: parsed.dockerImage }),
+        }),
+        reporter,
+        () => `${String(runInput.runs * 2)} HOME trees`,
+      )
+
+      // 05 preflight
+      const homePaths = {
+        old: treePaths.homeOld[0] ?? '',
+        new: treePaths.homeNew[0] ?? '',
+      }
+      const preflightResult = yield* timedPhase(
+        5,
+        'preflight',
+        preflight({
+          runInput,
+          manifest,
+          homePaths,
+          packInstall: pack,
+          configs: { old: home.generatedConfigs.baseline, new: home.generatedConfigs.new },
+          ...(home.dockerImage === undefined ? {} : { dockerImage: home.dockerImage }),
+        }),
+        reporter,
+        (r) =>
+          runInput.preflightEnabled
+            ? `${String(r.checks.length)} checks passed`
+            : 'skipped (--no-preflight)',
+      )
+      void preflightResult
+
+      // 06 run-side (old || new, sequential within side)
+      reporter.sub(`run-side: ${String(runInput.runs)} run(s) per side`)
+      const oldEnvs = home.envVars[0] ?? []
+      const newEnvs = home.envVars[1] ?? []
+      const start06 = Date.now()
+      const both = yield* Effect.all(
+        {
+          old: runOneSide(
+            'old',
+            runInput,
+            manifest,
+            treePathsUsed,
+            oldEnvs,
+            home.dockerImage,
+            reporter,
+          ),
+          new: runOneSide(
+            'new',
+            runInput,
+            manifest,
+            treePathsUsed,
+            newEnvs,
+            home.dockerImage,
+            reporter,
+          ),
+        },
+        { concurrency: 2 },
+      )
+      reporter.phaseDone({
+        index: 6,
+        total: PHASE_COUNT,
+        label: 'run-side',
+        durationMs: Date.now() - start06,
+        detail: `${String(runInput.runs)} run(s) \u00d7 2 sides`,
+      })
+      const sideResults = {
+        old: [...both.old],
+        new: [...both.new],
+      }
+
+      // opencode config capture (sibling of 06, not a numbered phase): best-effort,
+      // must never fail an otherwise-finished N×2 run.
+      yield* captureOpencodeConfig({
+        workspace: treePathsUsed,
+        runs: runInput.runs,
+        generatedConfigs: home.generatedConfigs,
+      }).pipe(
+        Effect.catchAll((e) =>
+          Effect.sync(() => {
+            reporter.log(`warning: opencode config capture failed: ${e.message}`)
+          }),
+        ),
+      )
+
+      // 07 aggregate
+      const agg = yield* timedPhase(
+        7,
+        'aggregate',
+        aggregate({ runInput, manifest, workspace: treePathsUsed, sideResults }),
+        reporter,
+        (r) => (r.metricsDiff.bothFailed ? 'both sides failed' : 'metricsDiff computed'),
+      )
+
+      // 08 diff
+      const diffOut = yield* timedPhase(
+        8,
+        'diff',
+        diff({ runInput, manifest, workspace: treePathsUsed }),
+        reporter,
+        (r) => {
+          const all = [...r.diff.old.runs, ...r.diff.new.runs]
+          const failed = all.filter((x) => x.state === 'failed').length
+          return failed === 0
+            ? `${String(all.length)} run patch(es)`
+            : `${String(all.length - failed)} run patch(es), ${String(failed)} failed`
+        },
+      )
+
+      const diffStatus = diffFailureStatus(diffOut.diff)
+      const diffWarning = diffFailureWarning(diffStatus)
+      if (diffWarning !== undefined) reporter.log(`warning: ${diffWarning}`)
+
+      // 09 judge (optional)
+      const judgeOut = yield* timedPhase(
+        9,
+        'judge',
+        judge({ runInput, manifest, diff: diffOut.diff }),
+        reporter,
+        (r) => (r.judge === null ? 'skipped (no --judge)' : 'verdict recorded'),
+      )
+      const judgeResult = resolveJudge(judgeOut.judge)
+
+      // 10 timeline
+      const tl = yield* timedPhase(
+        10,
+        'timeline',
+        timeline({ runInput, manifest, workspace: treePathsUsed, sideResults }),
+        reporter,
+        (r) => `${String(r.timeline.old.length + r.timeline.new.length)} events`,
+      )
+
+      // summary (built from the diff, not a separate phase). A whole-side
+      // diff failure is folded into the headline here — `buildReportSummary`
+      // only sees `agg.metricsDiff` (phase 07, computed before diff ever
+      // runs), so it has no way to know phase 08 came back empty for a side.
+      const rawSummary = buildReportSummary(agg.metricsDiff)
+      const summary: ReportSummary =
+        diffWarning === undefined
+          ? rawSummary
+          : { ...rawSummary, headlineResult: `${diffWarning} ${rawSummary.headlineResult}` }
+
+      // 11 report-render
+      const reportInput: ReportRenderInput = {
         runInput,
+        manifest,
+        metricsDiff: agg.metricsDiff,
+        timeline: tl.timeline,
+        diff: diffOut.diff,
+        summary,
+        ...(judgeResult === undefined ? {} : { judge: judgeResult }),
+      }
+      const report = yield* timedPhase(
+        11,
+        'report-render',
+        reportRender(reportInput),
+        reporter,
+        (r) => Object.keys(r.paths).join(', '),
+      )
+      // Spec invariant: the report is always printed to stdout, in whichever
+      // format the user actually requested (md by default, or when both were
+      // requested; json only when the user asked for json without md).
+      if (report.stdoutMd !== undefined) {
+        const stdoutMd = report.stdoutMd
+        yield* Effect.sync(() => process.stdout.write(`${stdoutMd}\n`))
+      } else if (report.stdoutJson !== undefined) {
+        const stdoutJson = report.stdoutJson
+        yield* Effect.sync(() => process.stdout.write(stdoutJson))
+      }
+
+      // 12 review-workspace
+      const review = yield* timedPhase(
+        12,
+        'review-workspace',
+        reviewWorkspace({ runInput, manifest, workspace: treePathsUsed }),
+        reporter,
+      )
+
+      // 13 cleanup (optional)
+      yield* timedPhase(
+        13,
+        'cleanup',
+        cleanup({
+          runInput,
+          manifest,
+          workspace: treePathsUsed,
+          ephemeral: opts.ephemeral,
+        }),
+        reporter,
+        (r) => (r.deleted.length === 0 ? 'retained' : `deleted ${String(r.deleted.length)} dir(s)`),
+      )
+
+      const improvements = summary.improvements.length
+      const regressions = summary.regressions.length
+      reporter.done(
+        `${String(improvements)} improvement(s), ${String(regressions)} regression(s). Report: ${report.paths.md ?? '<none>'}`,
+      )
+
+      return {
+        runId,
         manifest,
         workspace: treePathsUsed,
-        packInstall: pack,
-        ...(parsed.dockerImage === undefined ? {} : { dockerImage: parsed.dockerImage }),
-      }),
-      reporter,
-      () => `${String(runInput.runs * 2)} HOME trees`,
+        rootPath: ws.rootPath,
+        metricsDiff: agg.metricsDiff,
+        reportPaths: report.paths,
+        reviewCommand: review.command,
+        summary: summary.headlineResult,
+        diffEscalated: diffStatus.escalate,
+      }
+    }).pipe(
+      Effect.tapError((e) =>
+        writeJson(path.join(ws.rootPath, 'error.json'), serializePhaseError(e)).pipe(Effect.ignore),
+      ),
     )
-
-    // 05 preflight
-    const homePaths = {
-      old: treePaths.homeOld[0] ?? '',
-      new: treePaths.homeNew[0] ?? '',
-    }
-    const preflightResult = yield* timedPhase(
-      5,
-      'preflight',
-      preflight({
-        runInput,
-        manifest,
-        homePaths,
-        packInstall: pack,
-        configs: { old: home.generatedConfigs.baseline, new: home.generatedConfigs.new },
-        ...(home.dockerImage === undefined ? {} : { dockerImage: home.dockerImage }),
-      }),
-      reporter,
-      (r) => (runInput.preflightEnabled ? `${String(r.checks.length)} checks passed` : 'skipped (--no-preflight)'),
-    )
-    void preflightResult
-
-    // 06 run-side (old || new, sequential within side)
-    reporter.sub(`run-side: ${String(runInput.runs)} run(s) per side`)
-    const oldEnvs = home.envVars[0] ?? []
-    const newEnvs = home.envVars[1] ?? []
-    const start06 = Date.now()
-    const both = yield* Effect.all(
-      {
-        old: runOneSide('old', runInput, manifest, treePathsUsed, oldEnvs, home.dockerImage, reporter),
-        new: runOneSide('new', runInput, manifest, treePathsUsed, newEnvs, home.dockerImage, reporter),
-      },
-      { concurrency: 2 },
-    )
-    reporter.phaseDone({
-      index: 6,
-      total: PHASE_COUNT,
-      label: 'run-side',
-      durationMs: Date.now() - start06,
-      detail: `${String(runInput.runs)} run(s) \u00d7 2 sides`,
-    })
-    const sideResults = {
-      old: [...both.old],
-      new: [...both.new],
-    }
-
-    // 07 aggregate
-    const agg = yield* timedPhase(
-      7,
-      'aggregate',
-      aggregate({ runInput, manifest, workspace: treePathsUsed, sideResults }),
-      reporter,
-      (r) =>
-        r.metricsDiff.bothFailed ? 'both sides failed' : 'metricsDiff computed',
-    )
-
-    // 08 diff
-    const diffOut = yield* timedPhase(
-      8,
-      'diff',
-      diff({ runInput, manifest, workspace: treePathsUsed }),
-      reporter,
-      (r) =>
-        `${String(r.diff.old.runs.length + r.diff.new.runs.length)} run patch(es)`,
-    )
-
-    // 09 judge (optional)
-    const judgeOut = yield* timedPhase(
-      9,
-      'judge',
-      judge({ runInput, manifest, diff: diffOut.diff }),
-      reporter,
-      (r) => (r.judge === null ? 'skipped (no --judge)' : 'verdict recorded'),
-    )
-    const judgeResult = resolveJudge(judgeOut.judge)
-
-    // 10 timeline
-    const tl = yield* timedPhase(
-      10,
-      'timeline',
-      timeline({ runInput, manifest, workspace: treePathsUsed, sideResults }),
-      reporter,
-      (r) => `${String(r.timeline.old.length + r.timeline.new.length)} events`,
-    )
-
-    // summary (built from the diff, not a separate phase)
-    const summary = buildReportSummary(agg.metricsDiff)
-
-    // 11 report-render
-    const reportInput: ReportRenderInput = {
-      runInput,
-      manifest,
-      metricsDiff: agg.metricsDiff,
-      timeline: tl.timeline,
-      diff: diffOut.diff,
-      summary,
-      ...(judgeResult === undefined ? {} : { judge: judgeResult }),
-    }
-    const report = yield* timedPhase(
-      11,
-      'report-render',
-      reportRender(reportInput),
-      reporter,
-      (r) => Object.keys(r.paths).join(', '),
-    )
-    // Spec invariant: the report is always printed to stdout, in whichever
-    // format the user actually requested (md by default, or when both were
-    // requested; json only when the user asked for json without md).
-    if (report.stdoutMd !== undefined) {
-      const stdoutMd = report.stdoutMd
-      yield* Effect.sync(() => process.stdout.write(`${stdoutMd}\n`))
-    } else if (report.stdoutJson !== undefined) {
-      const stdoutJson = report.stdoutJson
-      yield* Effect.sync(() => process.stdout.write(stdoutJson))
-    }
-
-    // 12 review-workspace
-    const review = yield* timedPhase(
-      12,
-      'review-workspace',
-      reviewWorkspace({ runInput, manifest, workspace: treePathsUsed }),
-      reporter,
-    )
-
-    // 13 cleanup (optional)
-    yield* timedPhase(
-      13,
-      'cleanup',
-      cleanup({
-        runInput,
-        manifest,
-        workspace: treePathsUsed,
-        ephemeral: opts.ephemeral,
-      }),
-      reporter,
-      (r) => (r.deleted.length === 0 ? 'retained' : `deleted ${String(r.deleted.length)} dir(s)`),
-    )
-
-    const improvements = summary.improvements.length
-    const regressions = summary.regressions.length
-    reporter.done(
-      `${String(improvements)} improvement(s), ${String(regressions)} regression(s). Report: ${report.paths.md ?? '<none>'}`,
-    )
-
-    return {
-      runId,
-      manifest,
-      workspace: treePathsUsed,
-      rootPath: ws.rootPath,
-      metricsDiff: agg.metricsDiff,
-      reportPaths: report.paths,
-      reviewCommand: review.command,
-      summary: summary.headlineResult,
-    }
   })

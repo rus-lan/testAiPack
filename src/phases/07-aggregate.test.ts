@@ -35,6 +35,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
   formats: ['md'],
   outputPath: './results',
   diffHtml: false,
+  protectGit: false,
   collapseRepeats: true,
   timelineMode: 'side-by-side',
   timeouts: {
@@ -68,6 +69,8 @@ const makeWorkspace = async (runs: number): Promise<WorkspaceTree> => {
     pack: path.join(root, 'pack'),
     homeOld: [],
     homeNew: [],
+    gitDirsOld: [],
+    gitDirsNew: [],
     config: path.join(root, 'config'),
     results: path.join(root, 'results'),
     raw: path.join(root, 'results', 'raw'),
@@ -82,19 +85,46 @@ const sideResult = (
   side: 'old' | 'new',
   runIndex: number,
   successRank: number,
-  opts: { readonly finishCause?: RunSideResult['finishCause']; readonly exitCode?: number; readonly watchdog?: boolean; readonly errorCode?: ErrorCode } = {},
+  opts: {
+    readonly finishCause?: RunSideResult['finishCause']
+    readonly exitCode?: number
+    readonly watchdog?: boolean
+    readonly errorCode?: ErrorCode
+    readonly verifyExitCode?: number
+    readonly eventsLogPath?: string
+  } = {},
 ): RunSideResultExt => ({
   side,
   runIndex,
   exportPath: '',
-  eventsLogPath: '',
+  eventsLogPath: opts.eventsLogPath ?? '',
   successRank,
   finishCause: opts.finishCause ?? 'stop',
   exitCode: opts.exitCode ?? 0,
   durationMs: '0',
   watchdogTriggered: opts.watchdog ?? false,
   ...(opts.errorCode === undefined ? {} : { errorCode: opts.errorCode }),
+  ...(opts.verifyExitCode === undefined ? {} : { verifyExitCode: opts.verifyExitCode }),
 })
+
+const skillPart = (packName: string, status: 'completed' | 'error' = 'completed', id = 'skill') => ({
+  type: 'tool',
+  tool: 'skill',
+  callID: `c-${id}`,
+  state: { status, input: { name: packName }, time: { start: 0, end: 1 } },
+  id,
+})
+
+const writeEvents = async (
+  tree: WorkspaceTree,
+  side: 'old' | 'new',
+  runIndex: number,
+  lines: readonly string[],
+): Promise<string> => {
+  const file = path.join(tree.raw, side, `run-${String(runIndex)}.events.ndjson`)
+  await runP(writeFile(file, lines.join('\n')))
+  return file
+}
 
 interface ExportOpts {
   readonly id?: string
@@ -454,5 +484,230 @@ describe('aggregate — secondary aggregation', () => {
     const parsed: unknown = JSON.parse(raw)
     expect(parsed).toHaveProperty('metricsDiff')
     expect(parsed).toHaveProperty('rawAggregates')
+  })
+})
+
+describe('aggregate — pack usage', () => {
+  it('packName resolved from a skill packRef and threaded to extraction', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1, packRef: 'https://github.com/Graphify-Labs/graphify' })
+    await writeRaw(tree, 'old', 1, exportJson({ messages: [{ info: { role: 'assistant', time: { created: 0 } }, parts: [skillPart('graphify')] }] }))
+    await writeRaw(tree, 'new', 1, exportJson({ messages: [] }))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.old.packUse?.calls).toBe(1)
+    expect(result.rawAggregates.old.packUse?.canDetect).toBe(true)
+  })
+
+  it('plugin packRef -> packUse.canDetect false, calls 0 (invisible in exports)', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1, packRef: 'npm:some-plugin' })
+    await writeRaw(tree, 'old', 1, exportJson({ messages: [] }))
+    await writeRaw(tree, 'new', 1, exportJson({ messages: [] }))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.old.packUse?.canDetect).toBe(false)
+    expect(result.rawAggregates.old.packUse?.calls).toBe(0)
+  })
+
+  it('no packRef -> packUse absent entirely', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1 })
+    await writeRaw(tree, 'old', 1, exportJson({ messages: [] }))
+    await writeRaw(tree, 'new', 1, exportJson({ messages: [] }))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.old.packUse).toBeUndefined()
+  })
+})
+
+describe('aggregate — verify stats (P10)', () => {
+  it('exit 0 -> passed, non-zero -> failed, E_VERIFY_TIMEOUT -> timedOut', async () => {
+    const tree = await makeWorkspace(3)
+    const runInput = makeRunInput({ runs: 3 })
+    await writeRaw(tree, 'old', 1, exportJson({}))
+    await writeRaw(tree, 'old', 2, exportJson({}))
+    await writeRaw(tree, 'new', 1, exportJson({}))
+    await writeRaw(tree, 'new', 2, exportJson({}))
+    await writeRaw(tree, 'new', 3, exportJson({}))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: {
+        old: [
+          sideResult('old', 1, 4, { verifyExitCode: 0 }),
+          sideResult('old', 2, 4, { verifyExitCode: 1 }),
+          sideResult('old', 3, 0, { errorCode: 'E_VERIFY_TIMEOUT' }),
+        ],
+        new: [1, 2, 3].map((i) => sideResult('new', i, 4, { verifyExitCode: 0 })),
+      },
+    }))
+    expect(result.rawAggregates.old.verifyStats).toEqual({ passed: 1, failed: 1, timedOut: 1, runCount: 3 })
+    expect(result.rawAggregates.new.verifyStats).toEqual({ passed: 3, failed: 0, timedOut: 0, runCount: 3 })
+  })
+
+  it('no run has verify data -> verifyStats absent', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1 })
+    await writeRaw(tree, 'old', 1, exportJson({}))
+    await writeRaw(tree, 'new', 1, exportJson({}))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: { old: [sideResult('old', 1, 4)], new: [sideResult('new', 1, 4)] },
+    }))
+    expect(result.rawAggregates.old.verifyStats).toBeUndefined()
+  })
+})
+
+describe('aggregate — events profile (P5)', () => {
+  it('events file read per run and profiled into the P5 secondary fields', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1 })
+    await writeRaw(tree, 'old', 1, exportJson({}))
+    await writeRaw(tree, 'new', 1, exportJson({}))
+    const eventsLogPath = await writeEvents(tree, 'old', 1, [
+      JSON.stringify({ type: 'text', timestamp: 1000, part: { type: 'text', text: 'hi' } }),
+      JSON.stringify({ type: 'tool_use', timestamp: 1200, part: { type: 'tool', tool: 'bash' } }),
+    ])
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: {
+        old: [sideResult('old', 1, 4, { eventsLogPath })],
+        new: [sideResult('new', 1, 4)],
+      },
+    }))
+    expect(result.rawAggregates.old.secondary.timeToFirstToolMs).toBe('200')
+  })
+
+  it('missing events file -> P5 fields omitted, no error', async () => {
+    const tree = await makeWorkspace(1)
+    const runInput = makeRunInput({ runs: 1 })
+    await writeRaw(tree, 'old', 1, exportJson({}))
+    await writeRaw(tree, 'new', 1, exportJson({}))
+    const result = await runP(aggregate({
+      runInput, manifest: makeManifest(runInput), workspace: tree,
+      sideResults: {
+        old: [sideResult('old', 1, 4, { eventsLogPath: path.join(tree.raw, 'old', 'missing.ndjson') })],
+        new: [sideResult('new', 1, 4)],
+      },
+    }))
+    expect(result.rawAggregates.old.secondary.timeToFirstToolMs).toBeUndefined()
+    expect(result.rawAggregates.old.secondary.maxEventGapMs).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Real ground truth — .research/metrics-expansion/golden-values.md. Reads the
+// actual raw exports + events.ndjson from the sample workspace this data was
+// hand-computed from. That workspace lives outside the repo (a real testaipack
+// run under the user's home, not a checked-in fixture), so this block skips
+// cleanly when absent — same pattern as src/metrics/events-profile.test.ts.
+// ---------------------------------------------------------------------------
+
+const GOLDEN_ROOT = '/home/ruslan/.testaipack/2026-07-29_20-44-07_ed1eeb'
+const hasGoldenWorkspace = existsSync(GOLDEN_ROOT)
+
+describe.skipIf(!hasGoldenWorkspace)('aggregate — real ground truth (golden-values.md)', () => {
+  it('side aggregates match the hand-computed golden table for both sides', async () => {
+    const rawDir = path.join(GOLDEN_ROOT, 'results', 'raw')
+    const tempResults = makeTempDir()
+    const tree: WorkspaceTree = {
+      root: GOLDEN_ROOT,
+      appsSource: path.join(GOLDEN_ROOT, 'apps', 'source'),
+      appsOld: [],
+      appsNew: [],
+      pack: path.join(GOLDEN_ROOT, 'pack'),
+      homeOld: [],
+      homeNew: [],
+      gitDirsOld: [],
+      gitDirsNew: [],
+      config: path.join(GOLDEN_ROOT, 'config'),
+      results: tempResults,
+      raw: rawDir,
+      diff: path.join(tempResults, 'diff'),
+    }
+    const runInput = makeRunInput({ runs: 5, packRef: 'https://github.com/Graphify-Labs/graphify' })
+    const manifest = makeManifest(runInput)
+    const runsFor = (side: 'old' | 'new'): RunSideResultExt[] =>
+      [1, 2, 3, 4, 5].map((i) =>
+        sideResult(side, i, 4, {
+          eventsLogPath: path.join(rawDir, side, `run-${String(i)}.events.ndjson`),
+        }),
+      )
+    const result = await runP(aggregate({
+      runInput,
+      manifest,
+      workspace: tree,
+      sideResults: { old: runsFor('old'), new: runsFor('new') },
+    }))
+
+    const old = result.rawAggregates.old
+    const nw = result.rawAggregates.new
+
+    // packUse
+    expect(old.packUse).toEqual({ calls: 1, errors: 1, runsWithCall: 1, runCount: 5, firstCallMsMedian: '64043', canDetect: true })
+    expect(nw.packUse).toEqual({ calls: 0, errors: 0, runsWithCall: 0, runCount: 5, canDetect: true })
+
+    // riskyCommands
+    expect(old.riskyCommands).toEqual([
+      { runIndex: 1, command: 'rm -rf /workspace/.git && echo "Removed git repo" && ls -la /workspace/', completed: true, exitCode: 0 },
+    ])
+    expect(nw.riskyCommands).toEqual([])
+
+    // wave-1 counters
+    expect(old.secondary.bashFailCount).toBe(5)
+    expect(nw.secondary.bashFailCount).toBe(0)
+    expect(old.secondary.invalidToolCalls).toBe(1)
+    expect(nw.secondary.invalidToolCalls).toBe(0)
+    expect(old.secondary.duplicateToolCalls).toBe(5)
+    expect(nw.secondary.duplicateToolCalls).toBe(1)
+
+    // P5 latency
+    expect(old.secondary.timeToFirstToolMs).toBe('2165')
+    expect(nw.secondary.timeToFirstToolMs).toBe('7518')
+    expect(old.secondary.timeToFirstEditMs).toBe('90986') // 90985.5 rounded
+    expect(nw.secondary.timeToFirstEditMs).toBe('117736')
+    expect(old.secondary.maxEventGapMs).toBe('252915')
+    expect(nw.secondary.maxEventGapMs).toBe('240663')
+    // stall count (>60s threshold): golden per-run maxGap table has exactly
+    // one run over 60s on each side (old/run-1 252915ms, new/run-2 240663ms)
+    expect(old.secondary.stalledRunCount).toBe(1)
+    expect(nw.secondary.stalledRunCount).toBe(1)
+    expect(old.secondary.stallCount).toBeGreaterThanOrEqual(1)
+    expect(nw.secondary.stallCount).toBeGreaterThanOrEqual(1)
+
+    // P11 context growth
+    expect(old.secondary.firstStepInputTokens).toBe('5491')
+    expect(nw.secondary.firstStepInputTokens).toBe('5491')
+    expect(old.secondary.lastStepInputTokens).toBe('18184')
+    expect(nw.secondary.lastStepInputTokens).toBe('12485') // fallback rule, not the literal-last 10905
+
+    // P12 output volume
+    expect(old.secondary.textChars).toBe('1003')
+    expect(nw.secondary.textChars).toBe('972')
+    expect(old.secondary.reasoningChars).toBe('4107')
+    // golden-values.md says 3364 (Python len(), counts Unicode codepoints);
+    // new/run-4's reasoning text ends in a literal emoji (U+1F389 🎉), which
+    // JS .length counts as a 2-unit UTF-16 surrogate pair — 3365 is correct
+    // for this codebase (every other char count here is plain .length, no
+    // codepoint-aware counting exists anywhere else in the repo).
+    expect(nw.secondary.reasoningChars).toBe('3365')
+
+    // cache write + versions + verify
+    expect(old.secondary.cacheWriteTokens).toBe('0')
+    expect(nw.secondary.cacheWriteTokens).toBe('0')
+    expect(old.opencodeVersions).toEqual(['1.18.4'])
+    expect(nw.opencodeVersions).toEqual(['1.18.4'])
+    expect(old.verifyStats).toBeUndefined()
+    expect(nw.verifyStats).toBeUndefined()
+
+    // existing field, newly rendered
+    expect(old.secondary.maxConsecutiveSameTool).toBe(4)
+    expect(nw.secondary.maxConsecutiveSameTool).toBe(4)
   })
 })

@@ -787,3 +787,51 @@ describe('cliParse — auth whitelist', () => {
     expect(err.code).toBe('E_CONFIG_INVALID')
   })
 })
+
+describe('cliParse — protectGit', () => {
+  it('defaults to false', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(cliParse({ argv: ['run', REPO, '--prompt', 'x'], cwd }))
+    expect(result.runInput.protectGit).toBe(false)
+  })
+
+  it('--protect-git sets it to true', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--protect-git'], cwd }),
+    )
+    expect(result.runInput.protectGit).toBe(true)
+  })
+
+  it('--no-protect-git sets it to false explicitly', async () => {
+    const cwd = makeTempDir()
+    const result = await runP(
+      cliParse({ argv: ['run', REPO, '--prompt', 'x', '--no-protect-git'], cwd }),
+    )
+    expect(result.runInput.protectGit).toBe(false)
+  })
+
+  it('config file protectGit:true is honored', async () => {
+    const cwd = makeTempDir()
+    await ensureDirP(path.join(cwd, '.testaipack'))
+    await writeFileP(
+      path.join(cwd, '.testaipack', 'config.json'),
+      JSON.stringify({ repoUrl: REPO, prompt: 'x', protectGit: true }),
+    )
+    const result = await runP(cliParse({ argv: ['run'], cwd }))
+    expect(result.runInput.protectGit).toBe(true)
+  })
+
+  it('CLI --no-protect-git overrides a config protectGit:true', async () => {
+    const cwd = makeTempDir()
+    await ensureDirP(path.join(cwd, '.testaipack'))
+    await writeFileP(
+      path.join(cwd, '.testaipack', 'config.json'),
+      JSON.stringify({ repoUrl: REPO, prompt: 'x', protectGit: true }),
+    )
+    const result = await runP(
+      cliParse({ argv: ['run', '--no-protect-git'], cwd }),
+    )
+    expect(result.runInput.protectGit).toBe(false)
+  })
+})

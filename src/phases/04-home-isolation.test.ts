@@ -69,6 +69,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
     git: false,
   },
   pureBaseline: true,
+  protectGit: false,
   preflightEnabled: true,
   formats: ['md'],
   outputPath: '/out',
@@ -116,6 +117,8 @@ const buildWorkspace = (runs: number): BuiltWorkspace => {
     pack: path.join(root, 'pack'),
     homeOld,
     homeNew,
+    gitDirsOld: [],
+    gitDirsNew: [],
     config: path.join(root, 'config'),
     results: path.join(root, 'results'),
     raw: path.join(root, 'raw'),
@@ -658,6 +661,114 @@ describe('phase 04 — homeIsolation', () => {
     expect(baselineOnDisk['testaipack']).toBeUndefined()
     expect(newOnDisk['testaipack']).toBeUndefined()
     expect(newOnDisk['agent']).toBeDefined()
+  })
+
+  it('redacts a provider apiKey on disk, but the in-memory generatedConfigs (fed to OPENCODE_CONFIG_CONTENT) keeps the real value', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+      await runP(ensureDir(path.join(h, '.config', 'opencode')))
+      await runP(
+        writeFile(
+          path.join(h, '.config', 'opencode', 'opencode.json'),
+          JSON.stringify({
+            provider: {
+              anthropic: { npm: '@ai-sdk/anthropic', options: { apiKey: 'sk-ant-REAL-SECRET' } },
+            },
+          }),
+        ),
+      )
+    })
+    const input = buildInput({}, undefined)
+    const result = await runP(homeIsolation(input))
+
+    // execution path: unredacted, real credential
+    const baselineCfg = JSON.parse(result.generatedConfigs.baseline) as { provider: { anthropic: { options: { apiKey: string } } } }
+    expect(baselineCfg.provider.anthropic.options.apiKey).toBe('sk-ant-REAL-SECRET')
+
+    // disk artifact: redacted
+    const baselinePath = path.join(input.workspace.config, 'baseline.json')
+    const onDiskText = await runP(readFile(baselinePath))
+    expect(onDiskText).not.toContain('sk-ant-REAL-SECRET')
+    const onDisk = JSON.parse(onDiskText) as { provider: { anthropic: { npm: string; options: { apiKey: string } } } }
+    expect(onDisk.provider.anthropic.options.apiKey).toBe('[REDACTED]')
+    expect(onDisk.provider.anthropic.npm).toBe('@ai-sdk/anthropic')
+  })
+
+  it('redacts an mcp server env secret on disk, keeps it real in generatedConfigs.new', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const outcome: PackInstallOutcome = {
+      packPath: '',
+      detectedType: 'mcp',
+      installLogPath: '/tmp/install.log',
+      registeredIn: ['mcp'],
+      instructions: [
+        {
+          kind: 'config',
+          section: 'mcp',
+          name: 'myserver',
+          json: { command: 'npx', args: ['-y', 'myserver'], env: { API_TOKEN: 'sk-mcp-REAL-SECRET' } },
+        },
+      ],
+    }
+    const input = buildInput({}, outcome)
+    const result = await runP(homeIsolation(input))
+
+    const newCfg = JSON.parse(result.generatedConfigs.new) as {
+      mcp: { myserver: { env: { API_TOKEN: string } } }
+    }
+    expect(newCfg.mcp.myserver.env.API_TOKEN).toBe('sk-mcp-REAL-SECRET')
+
+    const newPath = path.join(input.workspace.config, 'new.json')
+    const onDiskText = await runP(readFile(newPath))
+    expect(onDiskText).not.toContain('sk-mcp-REAL-SECRET')
+    const onDisk = JSON.parse(onDiskText) as { mcp: { myserver: { env: { API_TOKEN: string } } } }
+    expect(onDisk.mcp.myserver.env.API_TOKEN).toBe('[REDACTED]')
+  })
+
+  it('re-verify: a bare <VENDOR>_KEY and a URL with embedded userinfo stay real in generatedConfigs.new (the OPENCODE_CONFIG_CONTENT source), redacted only on disk', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const outcome: PackInstallOutcome = {
+      packPath: '',
+      detectedType: 'mcp',
+      installLogPath: '/tmp/install.log',
+      registeredIn: ['mcp'],
+      instructions: [
+        {
+          kind: 'config',
+          section: 'mcp',
+          name: 'myserver',
+          json: {
+            command: 'npx',
+            env: { GEMINI_KEY: 'sk-gemini-REAL-SECRET' },
+            url: 'https://svcuser:svcpass@remote.example/sse',
+          },
+        },
+      ],
+    }
+    const input = buildInput({}, outcome)
+    const result = await runP(homeIsolation(input))
+
+    // runtime path: real values, exactly what OPENCODE_CONFIG_CONTENT carries
+    const newCfg = JSON.parse(result.generatedConfigs.new) as {
+      mcp: { myserver: { env: { GEMINI_KEY: string }; url: string } }
+    }
+    expect(newCfg.mcp.myserver.env.GEMINI_KEY).toBe('sk-gemini-REAL-SECRET')
+    expect(newCfg.mcp.myserver.url).toBe('https://svcuser:svcpass@remote.example/sse')
+
+    // disk artifact: both shapes redacted
+    const newPath = path.join(input.workspace.config, 'new.json')
+    const onDiskText = await runP(readFile(newPath))
+    expect(onDiskText).not.toContain('sk-gemini-REAL-SECRET')
+    expect(onDiskText).not.toContain('svcuser:svcpass')
+    const onDisk = JSON.parse(onDiskText) as {
+      mcp: { myserver: { env: { GEMINI_KEY: string }; url: string } }
+    }
+    expect(onDisk.mcp.myserver.env.GEMINI_KEY).toBe('[REDACTED]')
+    expect(onDisk.mcp.myserver.url).toBe('https://remote.example/sse')
   })
 
   it('smoke-test writes identical baseline.json and new.json (no pack metadata)', async () => {

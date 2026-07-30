@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { Effect } from 'effect'
 import path from 'node:path'
+import { existsSync } from 'node:fs'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, writeJson, writeFile } from '../util/fs.js'
 import {
@@ -136,13 +137,17 @@ describe('cli/workspace-runs', () => {
     expect(plan.keep[0]?.runId).toBe('r3')
   })
 
-  it('planGc --aggressive prunes home/ and apps/ from kept runs', async () => {
+  it('planGc --aggressive prunes home/, apps/ and gitdirs/ from kept runs', async () => {
     const ws = makeTempDir()
     await seedRun(ws, 'r1', '2025-01-01T00:00:00.000Z')
     const plan = await runP(planGc(ws, { aggressive: true }))
     expect(plan.delete).toEqual([])
     expect(plan.pruneHome.some((p) => p.endsWith('home'))).toBe(true)
     expect(plan.pruneHome.some((p) => p.endsWith('apps'))).toBe(true)
+    // --protect-git relocates each run's git dir into gitdirs/, outside apps/
+    // and home/ — aggressive gc must reclaim it too, or a full clone per run
+    // survives forever, which is most of what --aggressive exists to free.
+    expect(plan.pruneHome.some((p) => p.endsWith('gitdirs'))).toBe(true)
   })
 
   it('executeGc deletes targeted dirs', async () => {
@@ -165,6 +170,20 @@ describe('cli/workspace-runs', () => {
     const plan = await runP(planGc(ws, { aggressive: true }))
     await runP(executeGc(plan))
     // home dir pruned, manifest still present
+    const runs = await runP(listRuns(ws))
+    expect(runs.length).toBe(1)
+  })
+
+  it('executeGc prunes gitdirs/ (the --protect-git relocated clones) in aggressive mode', async () => {
+    const ws = makeTempDir()
+    await seedRun(ws, 'r1', '2025-01-01T00:00:00.000Z')
+    const runDir = path.join(ws, 'r1')
+    const gitDirMarker = path.join(runDir, 'gitdirs', 'old', 'run-1', 'HEAD')
+    await runP(ensureDir(path.join(runDir, 'gitdirs', 'old', 'run-1')))
+    await runP(writeFile(gitDirMarker, 'ref: refs/heads/main\n'))
+    const plan = await runP(planGc(ws, { aggressive: true }))
+    await runP(executeGc(plan))
+    expect(existsSync(gitDirMarker)).toBe(false)
     const runs = await runP(listRuns(ws))
     expect(runs.length).toBe(1)
   })

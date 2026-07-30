@@ -22,6 +22,7 @@ import type { FsError } from '../util/fs.js'
 const ephemeralTargets = (workspace: WorkspaceTree): readonly string[] => [
   path.join(workspace.root, 'apps'),
   path.join(workspace.root, 'home'),
+  path.join(workspace.root, 'gitdirs'),
   workspace.pack,
 ]
 
@@ -33,6 +34,8 @@ const allWorkspacePaths = (workspace: WorkspaceTree): readonly string[] => [
   workspace.pack,
   ...workspace.homeOld,
   ...workspace.homeNew,
+  ...workspace.gitDirsOld,
+  ...workspace.gitDirsNew,
   workspace.config,
   workspace.results,
   workspace.raw,

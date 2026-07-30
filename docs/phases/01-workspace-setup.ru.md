@@ -24,7 +24,11 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
   - `rootPath` — абсолютный путь к `.testaipack/<run-id>/`.
   - `treePaths` — объект `WorkspaceTree` с абсолютными путями ко всем
     поддиректориям скелета: `root`, `appsSource`, `appsOld[]`, `appsNew[]`,
-    `pack`, `homeOld[]`, `homeNew[]`, `config`, `results`, `raw`, `diff`.
+    `pack`, `homeOld[]`, `homeNew[]`, `gitDirsOld[]`, `gitDirsNew[]`, `config`,
+    `results`, `raw`, `diff`. `gitDirsOld`/`gitDirsNew` — пути под `gitdirs/`,
+    заполняются всегда (как планируемые пути run-N), но каталоги на диске
+    появляются только при `--protect-git` (фаза 02 переносит туда `.git`,
+    см. `docs/phases/02-repo-clone.ru.md`).
 - Ошибки: `@error WorkspaceSetupError` — `{ code, message, reason?, path?,
   context? }`, где `code` всегда `"E_HOME_SETUP_FAILED"` (других кодов фаза не
   имеет). `reason` ∈ `{ "already-exists", "not-a-directory", "mkdir-failed",
@@ -52,6 +56,15 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
 }
 ```
 
+`opencodeVersion` — либо `runInput.opencodeVersion` (флаг `--opencode-version`, чистая
+метка прогона, ничего не переключает), либо результат пробы `opencode --version`. При
+`runInput.isolation === "docker"` проба выполняется **внутри того же docker-образа**,
+который фаза 04 использует для самих прогонов (`input.dockerImage ?? DEFAULT_OPENCODE_IMAGE`)
+— иначе в манифест попадает версия хостового бинаря, которая может не совпадать с версией,
+реально закреплённой в образе (`Dockerfile.opencode` `ARG OPENCODE_VERSION`). Проба
+best-effort с таймаутом 5s: недоступный образ или ошибка пробы → `opencodeVersion =
+"unknown"`, фаза не падает.
+
 ## 3. Шаги алгоритма
 
 1. `runId` приходит на вход уже сформированным (`WorkspaceSetupInput.runId`).
@@ -70,6 +83,8 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
    ├── pack/
    ├── home/old/
    ├── home/new/
+   ├── gitdirs/old/
+   ├── gitdirs/new/
    ├── config/
    └── results/raw/old/
        results/raw/new/
@@ -79,6 +94,15 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
    На этом этапе `apps/*/run-N/` и `home/*/run-N/` **не** создаются — их
    создают фазы 02 (repo-clone) и 04 (home-isolation) соответственно.
    Любой сбой `mkdir` → throw `E_HOME_SETUP_FAILED` с `reason: "mkdir-failed"`.
+
+   Побочный эффект пробы версии (следующий шаг): сам бинарь opencode при
+   `opencode --version` создаёт под переданным `HOME=<config>` свой XDG-скелет
+   (`config/.config/opencode/`, `.cache/opencode/`, `.local/share/opencode/`) —
+   пустой, потому что `--version` завершается раньше, чем opencode доходит до
+   загрузки конфига. Это не мёртвый код и не бага — `config/.config/opencode/`
+   позже заполняется фазой 06 (`captureOpencodeConfig`, см.
+   `docs/phases/06-run-side.ru.md`, раздел 9), которая переиспользует этот же
+   путь как место снимка эффективного конфига и зависимостей.
 5. Сериализовать `Manifest` в `<rootPath>/manifest.json` (pretty-print,
    stable key order). Сбой записи → `E_HOME_SETUP_FAILED` с `reason:
    "write-failed"`. Если `rootPath` оказался файлом, а не каталогом → `reason:
@@ -95,11 +119,29 @@ Namespace: `TestAiPack.WorkspaceSetup` (см.
    (workspace уже работает).
 8. Вернуть `WorkspaceSetupResult { manifest, rootPath, treePaths }`.
 
+**Дополнительные артефакты рядом с `manifest.json`, не принадлежащие этой
+фазе.** Оркестратор (`runPipeline`, `src/cli/pipeline.ts`) — не сама фаза 01
+— пишет в `rootPath` ещё два файла post-mortem/rebuild-назначения, оба
+best-effort (сбой записи — warning, прогон не падает):
+- `run-input.json` — итоговый (resolved) `RunInput`, каким его реально
+  использует прогон (`outputPath` уже разрешён относительно `--output`),
+  записывается сразу после того, как этот `RunInput` собран, перед фазой 02.
+  Редактируются те же два поля, что и в `Manifest` (`repoUrl`, `packRef`) —
+  см. `redactRunInput` в `src/cli/pipeline.ts`.
+- `error.json` — сериализованный `PhaseError` (`serializePhaseError`,
+  `src/errors.ts`), пишется, если прогон падает на любой фазе ≥ 02 (через
+  `Effect.tapError` вокруг всего, что идёт после фазы 01). Падение самих фаз
+  00/01 — записывать `error.json` некуда (`rootPath` ещё не создан или
+  вызывающая сторона о нём не знает), поведение как раньше: только
+  scrollback.
+
 ## 4. Входные/выходные файлы
 
 | Файл                       | Чтение/Запись | Схема (TypeSpec/Zod) |
 | -------------------------- | ------------- | -------------------- |
 | `<workspaceRoot>/manifest.json` | Запись   | `Manifest`           |
+| `<workspaceRoot>/run-input.json` | Запись (оркестратором, не фазой 01) | `RunInput` |
+| `<workspaceRoot>/error.json` | Запись (оркестратором, при падении фазы ≥ 02) | `PhaseError` (`SerializedPhaseError`) |
 | `.gitignore` (в корне cwd) | Чтение+Запись | текст, `<basename workspaceDir>/` добавляется один раз |
 
 ## 5. Edge-cases и ошибки

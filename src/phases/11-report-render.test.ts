@@ -185,7 +185,7 @@ describe('reportRender — markdown content', () => {
     })
     await runP(reportRender(input))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).toContain('| Total tokens | 12345 | 10987 | -1358 | -11.0% | ✓ significant | ✓ better |')
+    expect(md).toContain('| Total tokens | 12345 | 100–100 | 10987 | 100–100 | -1358 | -11.0% | ✓ significant | ✓ better |')
   })
 
   it('headline result appears near the top of Summary', async () => {

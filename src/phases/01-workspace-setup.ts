@@ -20,11 +20,19 @@ import { ensureDir, pathKind, readDir, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
 import { updateGitignore } from '../util/gitignore.js'
 import { version as opencodeVersionProbe } from '../opencode/cli.js'
+import type { DockerExec } from '../opencode/cli.js'
+import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import { redactUrlCredentials } from '../util/redact.js'
 import { safeRefDisplay } from '../pack/detector.js'
 
+/**
+ * Local input extension: carries the docker image (resolved from `--docker-image` /
+ * config at phase 00, before phase 04 confirms it) so the version probe below runs
+ * against the binary the run will actually use in docker isolation, not the host one.
+ */
 export type WorkspaceSetupInputExt = WorkspaceSetupInput & {
   readonly flagDefaults?: Readonly<Record<string, unknown>>
+  readonly dockerImage?: string
 }
 
 const VERSION_PROBE_TIMEOUT_MS = 5000
@@ -45,9 +53,16 @@ const mapFsTo = (
   (e: FsError) =>
     workspaceSetupError(`${reason}: ${p}`, 'E_HOME_SETUP_FAILED', { reason, path: p, cause: String(e) })
 
-const probeOpencodeVersion = (probeHome: string): Effect.Effect<string> =>
+/**
+ * `--isolation docker` runs opencode inside a container pinned to its own
+ * version (`Dockerfile.opencode` `ARG OPENCODE_VERSION`), which can differ
+ * from whatever `opencode` resolves to on the host `PATH`. Probing without
+ * `docker` here recorded the host binary's version in the manifest even
+ * though the run never touches it.
+ */
+const probeOpencodeVersion = (probeHome: string, docker?: DockerExec): Effect.Effect<string> =>
   Effect.gen(function* () {
-    const either = yield* opencodeVersionProbe(probeHome).pipe(
+    const either = yield* opencodeVersionProbe(probeHome, docker).pipe(
       Effect.timeoutOption(VERSION_PROBE_TIMEOUT_MS),
       Effect.either,
     )
@@ -82,6 +97,44 @@ const buildManifest = (
   ...(runInput.init !== undefined ? { init: runInput.init } : {}),
   ...(runInput.verify !== undefined ? { verify: runInput.verify } : {}),
 })
+
+/**
+ * Pure function of `(rootPath, runs)` — the same `WorkspaceTree` this phase
+ * derives while setting up a run, rederivable at any later point (e.g. `report
+ * --rebuild`) without touching disk. Kept in lockstep with the directory
+ * layout `workspaceSetup` creates below.
+ */
+export const buildTreePaths = (rootPath: string, runs: number): WorkspaceTree => {
+  const appsSource = path.join(rootPath, 'apps', 'source')
+  const appsOldBase = path.join(rootPath, 'apps', 'oldVersion')
+  const appsNewBase = path.join(rootPath, 'apps', 'newVersion')
+  const pack = path.join(rootPath, 'pack')
+  const homeOldBase = path.join(rootPath, 'home', 'old')
+  const homeNewBase = path.join(rootPath, 'home', 'new')
+  const gitDirsOldBase = path.join(rootPath, 'gitdirs', 'old')
+  const gitDirsNewBase = path.join(rootPath, 'gitdirs', 'new')
+  const config = path.join(rootPath, 'config')
+  const results = path.join(rootPath, 'results')
+  const raw = path.join(rootPath, 'results', 'raw')
+  const diff = path.join(rootPath, 'results', 'diff')
+  const runPaths = (base: string) => range(runs).map((n) => path.join(base, `run-${n.toString()}`))
+
+  return {
+    root: rootPath,
+    appsSource,
+    appsOld: runPaths(appsOldBase),
+    appsNew: runPaths(appsNewBase),
+    pack,
+    homeOld: runPaths(homeOldBase),
+    homeNew: runPaths(homeNewBase),
+    gitDirsOld: runPaths(gitDirsOldBase),
+    gitDirsNew: runPaths(gitDirsNewBase),
+    config,
+    results,
+    raw,
+    diff,
+  }
+}
 
 export const workspaceSetup = (
   input: WorkspaceSetupInputExt,
@@ -119,8 +172,9 @@ export const workspaceSetup = (
     const pack = path.join(rootPath, 'pack')
     const homeOldBase = path.join(rootPath, 'home', 'old')
     const homeNewBase = path.join(rootPath, 'home', 'new')
+    const gitDirsOldBase = path.join(rootPath, 'gitdirs', 'old')
+    const gitDirsNewBase = path.join(rootPath, 'gitdirs', 'new')
     const config = path.join(rootPath, 'config')
-    const results = path.join(rootPath, 'results')
     const raw = path.join(rootPath, 'results', 'raw')
     const rawOld = path.join(raw, 'old')
     const rawNew = path.join(raw, 'new')
@@ -128,14 +182,25 @@ export const workspaceSetup = (
     const diffOld = path.join(diff, 'old')
     const diffNew = path.join(diff, 'new')
 
+    // gitdirs/{old,new} are created unconditionally (like home/{old,new}) so the
+    // skeleton stays flag-free — they stay empty unless --protect-git moves a
+    // run's .git into them (phase 02); per-run subdirs are created by that move.
     const skeleton: readonly string[] = [
-      appsSource, appsOldBase, appsNewBase, pack, homeOldBase, homeNewBase, config, rawOld, rawNew, diffOld, diffNew,
+      appsSource, appsOldBase, appsNewBase, pack, homeOldBase, homeNewBase,
+      gitDirsOldBase, gitDirsNewBase, config, rawOld, rawNew, diffOld, diffNew,
     ]
     for (const p of skeleton) {
       yield* ensureDir(p).pipe(Effect.mapError(mapFsTo('mkdir-failed', p)))
     }
 
-    const opencodeVersion = runInput.opencodeVersion ?? (yield* probeOpencodeVersion(config))
+    const docker: DockerExec | undefined =
+      runInput.isolation === 'docker'
+        ? {
+            image: input.dockerImage ?? DEFAULT_OPENCODE_IMAGE,
+            ...(runInput.dockerNetwork === undefined ? {} : { network: runInput.dockerNetwork }),
+          }
+        : undefined
+    const opencodeVersion = runInput.opencodeVersion ?? (yield* probeOpencodeVersion(config, docker))
     const flagDefaults: Record<string, unknown> = input.flagDefaults
       ? { ...input.flagDefaults }
       : { dockerDowngraded: false }
@@ -154,22 +219,7 @@ export const workspaceSetup = (
 
     yield* updateGitignore(path.join(projectRoot, '.gitignore'), `${path.basename(workspaceDir)}/`)
 
-    const runs = runInput.runs
-    const runPaths = (base: string) => range(runs).map((n) => path.join(base, `run-${n.toString()}`))
-
-    const treePaths: WorkspaceTree = {
-      root: rootPath,
-      appsSource,
-      appsOld: runPaths(appsOldBase),
-      appsNew: runPaths(appsNewBase),
-      pack,
-      homeOld: runPaths(homeOldBase),
-      homeNew: runPaths(homeNewBase),
-      config,
-      results,
-      raw,
-      diff,
-    }
+    const treePaths = buildTreePaths(rootPath, runInput.runs)
 
     return { manifest, rootPath, treePaths }
   })

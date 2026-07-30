@@ -55,12 +55,40 @@ Namespace: `TestAiPack.RepoClone` (см. `contract/phases/02-repo-clone.tsp`).
    (или платформенно-эквивалентный рекурсивный copy с сохранением прав и
    `.git/`). На `ENOSPC` → throw `E_REPO_CLONE_FAILED` с `context.reason =
    "disk full"`.
-7. Детерминизм-проверка (baseline identical): для всех `destPath` посчитать
-   `git -C <destPath> rev-parse HEAD` и хэш `git -C <destPath> ls-files -s`.
-   Все значения должны совпадать между собой и с `sourcePath`. Если есть
-   расхождение → throw `E_REPO_CLONE_FAILED` с `context.reason =
-   "non-deterministic copy"` (это сигнал о повреждении при копировании).
-8. `cloneDurationMs` = измеренное время clone-шага. Вернуть `RepoCloneResult`.
+7. Если `runInput.protectGit === true`: для каждого `destPath` перенести
+   `destPath/.git` в `<root>/gitdirs/<side>/run-N/` (позиционно из
+   `workspace.gitDirsOld[i]` / `gitDirsNew[i]`) через `rename` (одна файловая
+   система, без copy+delete fallback). Сбой переноса → throw
+   `E_REPO_CLONE_FAILED` с `context.reason = "protect-git-move"`. Шаг
+   выполняется **до** детерминизм-проверки, чтобы она проверяла именно
+   финальный (перенесённый) layout, а не промежуточное состояние.
+8. Детерминизм-проверка (baseline identical): для всех `destPath` посчитать
+   `git rev-parse HEAD` и хэш `git ls-files -s`. Без `--protect-git` — обычным
+   `git -C <destPath>`. С `--protect-git` — через two-path форму
+   `git --git-dir=<gitDirsOld[i]|gitDirsNew[i]> --work-tree=<destPath>`, потому
+   что `.git` уже перенесён шагом 7 и внутри `destPath` его больше нет.
+   `sourcePath` (`apps/source/`) всегда однопутевой — его `.git` никуда не
+   переносится ни при каких флагах. Все значения должны совпадать между собой
+   и с `sourcePath`. Если есть расхождение → throw `E_REPO_CLONE_FAILED` с
+   `context.reason = "non-deterministic copy"` (сигнал о повреждении при
+   копировании).
+9. `cloneDurationMs` = измеренное время clone-шага. Вернуть `RepoCloneResult`.
+
+### 7.1 `--protect-git`: `gitdirs/` layout
+
+```
+<root>/
+├── apps/{old,new}Version/run-N/     # рабочее дерево БЕЗ .git при protectGit
+└── gitdirs/{old,new}/run-N/         # перенесённый .git (HEAD, objects/, …)
+```
+
+`gitdirs/{old,new}` (пустые базовые каталоги) создаются фазой 01 безусловно
+(как `home/{old,new}`), чтобы skeleton не зависел от флага; конкретные
+`run-N/` внутри них создаёт сам `rename` в шаге 7 — только для защищённых
+прогонов. Каталог не примонтирован в docker (`docker-runner.ts` монтирует
+только `apps/<side>Version/run-N` и HOME-дерево) — агент внутри контейнера
+физически не видит `gitdirs/`; под `--isolation home` защита слабее (см.
+`docs/phases/00-cli-parse.ru.md`, поле `protectGit`).
 
 ## 4. Входные/выходные файлы
 
@@ -69,6 +97,7 @@ Namespace: `TestAiPack.RepoClone` (см. `contract/phases/02-repo-clone.tsp`).
 | `apps/source/`                              | Запись        | git working tree     |
 | `apps/{old,new}Version/run-{1..N}/`         | Запись        | копия `apps/source/` |
 | `apps/source/.git`                          | Чтение        | валидный git-репо    |
+| `gitdirs/{old,new}/run-{1..N}/` (только `--protect-git`) | Запись | перенесённый `.git` |
 
 Фаза не читает метаданных из `raw/` или `results/`.
 
@@ -82,6 +111,7 @@ Namespace: `TestAiPack.RepoClone` (см. `contract/phases/02-repo-clone.tsp`).
 | `cp -r` падает на `ENOSPC`                           | fail с `context.reason = "disk full"`          | `E_REPO_CLONE_FAILED`  |
 | `source/.git` отсутствует после clone                | fail                                           | `E_REPO_CLONE_FAILED`  |
 | копии разошлись по HEAD или ls-files                 | fail (non-deterministic copy)                  | `E_REPO_CLONE_FAILED`  |
+| `--protect-git`: перенос `.git` в `gitdirs/` упал     | fail, `context.reason = "protect-git-move"`    | `E_REPO_CLONE_FAILED`  |
 | `runs = 0` (теоретически, клирится в фазе 00)        | считаем ошибкой контракта                      | `E_REPO_CLONE_FAILED`  |
 | shallow-clone привёл к detached HEAD без ветки       | нормально, `rev-parse HEAD` всё равно работает | —                      |
 

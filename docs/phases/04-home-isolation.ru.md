@@ -168,6 +168,11 @@ Namespace: `TestAiPack.HomeIsolation` (см.
 `OPENCODE_CONFIG_CONTENT`), они же пишутся как `config/baseline.json` и
 `config/new.json` для отладки и для review-workspace.
 
+Снимок того, что стороны реально использовали **после** запуска (эффективный конфиг,
+установленные skills/agents/plugins/mcp/npm-зависимости, факт вызова) сохраняется позже,
+фазой 06, в `config/.config/opencode/<side>/` — см. `docs/phases/06-run-side.ru.md`,
+раздел 9.
+
 ## 5. Edge-cases и ошибки
 
 | Кейс                                                       | Поведение                                       | Код                       |

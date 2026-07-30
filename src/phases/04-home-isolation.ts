@@ -29,6 +29,7 @@ import { copyDir, copyFile, ensureDir, exists, isPathWithin, pathKind, readFile,
 import type { FsError } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
+import { redactConfigSecrets } from '../util/redact.js'
 import type { PhaseError } from '../errors.js'
 import { homeIsolationError } from '../errors.js'
 
@@ -501,10 +502,14 @@ export const homeIsolation = (
     yield* ensureDir(configDir).pipe(
       Effect.mapError((e: FsError) => setupFail(`cannot create config dir: ${e.path}`, { path: e.path })),
     )
-    yield* writeJson(path.join(configDir, 'baseline.json'), baselineObj).pipe(
+    // `baselineObj`/`newObj` themselves stay unredacted — they still feed
+    // `baselineCfg`/`newCfg` below, which becomes OPENCODE_CONFIG_CONTENT and
+    // must carry real credentials for the run to authenticate. Only these
+    // disk copies, written for a human to read, are redacted.
+    yield* writeJson(path.join(configDir, 'baseline.json'), redactConfigSecrets(baselineObj)).pipe(
       Effect.mapError((e: FsError) => setupFail(`cannot write baseline.json: ${e.path}`, { path: e.path })),
     )
-    yield* writeJson(path.join(configDir, 'new.json'), newObj).pipe(
+    yield* writeJson(path.join(configDir, 'new.json'), redactConfigSecrets(newObj)).pipe(
       Effect.mapError((e: FsError) => setupFail(`cannot write new.json: ${e.path}`, { path: e.path })),
     )
 

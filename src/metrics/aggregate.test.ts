@@ -10,8 +10,14 @@ import {
   buildSideAggregates,
   computeDelta,
   computeMetricDelta,
+  countStalls,
+  STALL_THRESHOLD_MS,
 } from './aggregate.js'
-import type { ExtractedMetrics } from './extract.js'
+import type { EventsProfile } from './events-profile.js'
+import type { ExtractedExtras, ExtractedMetrics } from './extract.js'
+import { profileEvents } from './events-profile.js'
+import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
 
 const primary = (over: Partial<PrimaryMetrics>): PrimaryMetrics => ({
   totalTokens: '0',
@@ -36,6 +42,32 @@ const emptySecondary = (): SecondaryMetrics => ({
   toolLatencyAvgMs: '0',
   finishCauseDistribution: {},
   maxConsecutiveSameTool: 0,
+})
+
+const extras = (over: Partial<ExtractedExtras> = {}): ExtractedExtras => ({
+  packCalls: 0,
+  packErrors: 0,
+  firstPackCallMs: undefined,
+  invalidToolCalls: 0,
+  duplicateToolCalls: 0,
+  bashFailCount: 0,
+  toolErrorTexts: [],
+  riskyCommands: [],
+  opencodeVersion: '1.18.4',
+  firstStepInputTokens: undefined,
+  lastStepInputTokens: undefined,
+  textChars: 0,
+  reasoningChars: 0,
+  cacheWriteTokens: 0,
+  ...over,
+})
+
+const profile = (over: Partial<EventsProfile> = {}): EventsProfile => ({
+  timeToFirstToolMs: undefined,
+  timeToFirstEditMs: undefined,
+  maxEventGapMs: 0,
+  gapsMs: [],
+  ...over,
 })
 
 const sideFromPrimary = (side: 'old' | 'new', list: readonly PrimaryMetrics[]): SideAggregates => {
@@ -138,7 +170,7 @@ describe('aggregateSecondary', () => {
       },
       finishCauseDistribution: { 'tool-calls': 1 },
     }
-    const out = aggregateSecondary([a, b])
+    const out = aggregateSecondary([a, b], [])
     // bash: count 4, errors 1, durSum 200*3 + 400*1 = 1000 -> avg 250
     expect(out.perTool['bash']?.count).toBe(4)
     expect(out.perTool['bash']?.errorRate).toBeCloseTo(0.25, 3)
@@ -149,7 +181,7 @@ describe('aggregateSecondary', () => {
   })
 
   it('empty input -> zero secondary', () => {
-    const out = aggregateSecondary([])
+    const out = aggregateSecondary([], [])
     expect(out.perTool).toEqual({})
     expect(out.maxConsecutiveSameTool).toBe(0)
   })
@@ -167,7 +199,7 @@ describe('aggregateSecondary', () => {
       ...emptySecondary(),
       perTool: { zeta: { count: 3, errorRate: 1 / 3, avgDurationMs: '300' } },
     }
-    const out = aggregateSecondary([a, b, c])
+    const out = aggregateSecondary([a, b, c], [])
     // zeta: count 1+3=4, durSum 100*1 + 300*3 = 1000 -> avg 250
     expect(out.perTool['zeta']?.count).toBe(4)
     expect(out.perTool['zeta']?.avgDurationMs).toBe('250')
@@ -179,7 +211,15 @@ describe('buildSideAggregates', () => {
   const extracted = (over: Partial<PrimaryMetrics>): ExtractedMetrics => ({
     primary: primary(over),
     secondary: emptySecondary(),
+    extras: extras(),
   })
+
+  const baseInput = {
+    extras: [] as readonly ExtractedExtras[],
+    runIndexes: [] as readonly number[],
+    eventsProfiles: [] as readonly EventsProfile[],
+    canDetect: false,
+  }
 
   it('aggregates successful runs and carries failedRuns', () => {
     const agg = buildSideAggregates({
@@ -187,6 +227,10 @@ describe('buildSideAggregates', () => {
       extracted: [extracted({ totalTokens: '10' }), extracted({ totalTokens: '30' })],
       failedRuns: [{ runIndex: 2, errorCode: 'E_RUN_CRASH', errorMessage: 'boom', timestamp: 't' }],
       rawRunIds: ['s1', 's3'],
+      extras: [extras(), extras()],
+      runIndexes: [1, 3],
+      eventsProfiles: [],
+      canDetect: false,
     })
     expect(agg.side).toBe('new')
     expect(agg.primary.totalTokens).toBe('20') // median of [10,30]
@@ -201,11 +245,283 @@ describe('buildSideAggregates', () => {
       extracted: [],
       failedRuns: [],
       rawRunIds: [],
+      ...baseInput,
     })
     expect(agg.primary).toEqual({
       totalTokens: '0', wallClockMs: '0', costUsd: 0, stepCount: 0, toolCallCount: 0, successRank: 0, maxParallelism: 0,
     })
     expect(agg.stats.totalTokens.samples).toEqual([])
+    expect(agg.riskyCommands).toBeUndefined()
+    expect(agg.opencodeVersions).toBeUndefined()
+  })
+})
+
+describe('aggregateSecondary — wave-1 rare-event sums', () => {
+  const list3 = [emptySecondary(), emptySecondary(), emptySecondary()]
+
+  it('sums invalid/duplicate/bashFail across runs, not median — (0,0,3) -> 3', () => {
+    const out = aggregateSecondary(list3, [
+      extras({ bashFailCount: 0 }),
+      extras({ bashFailCount: 0 }),
+      extras({ bashFailCount: 3 }),
+    ])
+    expect(out.bashFailCount).toBe(3)
+  })
+
+  it('invalidToolCalls and duplicateToolCalls also sum, present even when 0', () => {
+    const out = aggregateSecondary(list3, [
+      extras({ invalidToolCalls: 1, duplicateToolCalls: 2 }),
+      extras({ invalidToolCalls: 0, duplicateToolCalls: 0 }),
+      extras({ invalidToolCalls: 0, duplicateToolCalls: 1 }),
+    ])
+    expect(out.invalidToolCalls).toBe(1)
+    expect(out.duplicateToolCalls).toBe(3)
+  })
+
+  it('toolErrorTexts: top-5 by frequency, deduped', () => {
+    const out = aggregateSecondary(list3, [
+      extras({ toolErrorTexts: ['a', 'a', 'b'] }),
+      extras({ toolErrorTexts: ['a'] }),
+      extras({ toolErrorTexts: ['c'] }),
+    ])
+    // a x3, b x1, c x1 -> a first, all 3 distinct texts fit in top 5
+    expect(out.toolErrorTexts).toEqual(['a', 'b', 'c'])
+  })
+
+  it('wave-2 medians: firstStep/lastStep/textChars/reasoningChars/cacheWrite median across runs', () => {
+    const out = aggregateSecondary(list3, [
+      extras({ firstStepInputTokens: 100, lastStepInputTokens: 200, textChars: 10, reasoningChars: 20, cacheWriteTokens: 1 }),
+      extras({ firstStepInputTokens: 100, lastStepInputTokens: 300, textChars: 20, reasoningChars: 30, cacheWriteTokens: 2 }),
+      extras({ firstStepInputTokens: 100, lastStepInputTokens: 400, textChars: 30, reasoningChars: 40, cacheWriteTokens: 3 }),
+    ])
+    expect(out.firstStepInputTokens).toBe('100')
+    expect(out.lastStepInputTokens).toBe('300')
+    expect(out.textChars).toBe('20')
+    expect(out.reasoningChars).toBe('30')
+    expect(out.cacheWriteTokens).toBe('2')
+  })
+
+  it('step-token medians over defined values only, omitted when none defined', () => {
+    const definedOnly = aggregateSecondary(list3, [
+      extras({ lastStepInputTokens: undefined }),
+      extras({ lastStepInputTokens: 100 }),
+      extras({ lastStepInputTokens: 300 }),
+    ])
+    expect(definedOnly.lastStepInputTokens).toBe('200') // median of [100, 300]
+
+    const noneDefined = aggregateSecondary(list3, [
+      extras({ lastStepInputTokens: undefined }),
+      extras({ lastStepInputTokens: undefined }),
+      extras({ lastStepInputTokens: undefined }),
+    ])
+    expect(noneDefined.lastStepInputTokens).toBeUndefined()
+  })
+
+  it('timeToFirstToolMs median over defined values', () => {
+    const out = aggregateSecondary(list3, [extras(), extras(), extras()], [
+      profile({ timeToFirstToolMs: 100 }),
+      profile({ timeToFirstToolMs: 200 }),
+      profile({ timeToFirstToolMs: 300 }),
+    ])
+    expect(out.timeToFirstToolMs).toBe('200')
+  })
+
+  it('timeToFirstEditMs median over runs-that-edited, omitted when none edited', () => {
+    const out = aggregateSecondary(list3, [extras(), extras(), extras()], [
+      profile({ timeToFirstEditMs: undefined }),
+      profile({ timeToFirstEditMs: 500 }),
+      profile({ timeToFirstEditMs: undefined }),
+    ])
+    expect(out.timeToFirstEditMs).toBe('500')
+
+    const noEdits = aggregateSecondary(list3, [extras(), extras(), extras()], [
+      profile({ timeToFirstEditMs: undefined }),
+      profile({ timeToFirstEditMs: undefined }),
+      profile({ timeToFirstEditMs: undefined }),
+    ])
+    expect(noEdits.timeToFirstEditMs).toBeUndefined()
+  })
+
+  it('maxEventGapMs is MAX across runs, not median — (10s, 10s, 240s) -> 240s', () => {
+    const out = aggregateSecondary(list3, [extras(), extras(), extras()], [
+      profile({ maxEventGapMs: 10000 }),
+      profile({ maxEventGapMs: 10000 }),
+      profile({ maxEventGapMs: 240000 }),
+    ])
+    expect(out.maxEventGapMs).toBe('240000')
+  })
+
+  it('aggregateSecondary wires stallCount/stalledRunCount from countStalls (default 60s threshold)', () => {
+    const out = aggregateSecondary(list3, [extras(), extras(), extras()], [
+      profile({ gapsMs: [70000, 10000] }), // 1 stall
+      profile({ gapsMs: [5000] }), // 0 stalls
+      profile({ gapsMs: [90000, 65000] }), // 2 stalls
+    ])
+    expect(out.stallCount).toBe(3)
+    expect(out.stalledRunCount).toBe(2)
+  })
+
+  it('stallCount/stalledRunCount omitted when there are no eventsProfiles at all', () => {
+    const out = aggregateSecondary(list3, [extras(), extras(), extras()], [])
+    expect(out.stallCount).toBeUndefined()
+    expect(out.stalledRunCount).toBeUndefined()
+  })
+
+  it('explicitly empty extras/eventsProfiles -> wave-1/2 fields omitted (base secondary still built from list)', () => {
+    // extras is required (no default) precisely so a caller with a non-empty
+    // `list` cannot omit it by accident and get these fields fabricated as 0.
+    const out = aggregateSecondary(list3, [])
+    expect(out.invalidToolCalls).toBe(0)
+    expect(out.toolErrorTexts).toEqual([])
+    expect(out.timeToFirstToolMs).toBeUndefined()
+    expect(out.maxEventGapMs).toBeUndefined()
+  })
+})
+
+describe('countStalls — threshold is a caller choice, not baked into the parser', () => {
+  it('one run stalled once vs four runs stalled repeatedly render differently', () => {
+    const oneRunOnce = countStalls([
+      profile({ gapsMs: [1000, 65000, 2000] }),
+      profile({ gapsMs: [500, 800] }),
+    ])
+    expect(oneRunOnce).toEqual({ stallCount: 1, runsWithStall: 1 })
+
+    const fourRunsRepeatedly = countStalls([
+      profile({ gapsMs: [70000, 61000] }),
+      profile({ gapsMs: [90000] }),
+      profile({ gapsMs: [200000, 61000, 61000] }),
+      profile({ gapsMs: [61000] }),
+    ])
+    expect(fourRunsRepeatedly).toEqual({ stallCount: 7, runsWithStall: 4 })
+  })
+
+  it('gaps exactly at the threshold do not count (strictly greater than)', () => {
+    expect(countStalls([profile({ gapsMs: [STALL_THRESHOLD_MS] })])).toEqual({
+      stallCount: 0,
+      runsWithStall: 0,
+    })
+    expect(countStalls([profile({ gapsMs: [STALL_THRESHOLD_MS + 1] })])).toEqual({
+      stallCount: 1,
+      runsWithStall: 1,
+    })
+  })
+
+  it('no gaps anywhere -> zero, not undefined', () => {
+    expect(countStalls([profile(), profile()])).toEqual({ stallCount: 0, runsWithStall: 0 })
+  })
+
+  it('empty profiles list -> zero', () => {
+    expect(countStalls([])).toEqual({ stallCount: 0, runsWithStall: 0 })
+  })
+
+  it('custom threshold overrides the default', () => {
+    const out = countStalls([profile({ gapsMs: [5000] })], 1000)
+    expect(out).toEqual({ stallCount: 1, runsWithStall: 1 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Real ground truth — same sample workspace as events-profile.test.ts. Pins
+// countStalls' default 60s threshold against the actual incident run.
+// ---------------------------------------------------------------------------
+
+const GOLDEN_ROOT = '/home/ruslan/.testaipack/2026-07-29_20-44-07_ed1eeb/results/raw'
+const hasGoldenWorkspace = existsSync(GOLDEN_ROOT)
+
+describe.skipIf(!hasGoldenWorkspace)('countStalls — real ground truth (golden-values.md)', () => {
+  it('old side: run-1 (252915ms) and run-2 (50733ms, below 60s) — only run-1 stalls', () => {
+    const profiles = [1, 2, 3, 4, 5].map((n) =>
+      profileEvents(readFileSync(path.join(GOLDEN_ROOT, 'old', `run-${String(n)}.events.ndjson`), 'utf8')),
+    )
+    const out = countStalls(profiles)
+    expect(out.runsWithStall).toBe(1)
+    expect(out.stallCount).toBeGreaterThanOrEqual(1)
+  })
+
+  it('new side: run-2 (240663ms) is the only run over 60s', () => {
+    const profiles = [1, 2, 3, 4, 5].map((n) =>
+      profileEvents(readFileSync(path.join(GOLDEN_ROOT, 'new', `run-${String(n)}.events.ndjson`), 'utf8')),
+    )
+    const out = countStalls(profiles)
+    expect(out.runsWithStall).toBe(1)
+    expect(out.stallCount).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', () => {
+  it('packUse omitted without packName', () => {
+    const agg = buildSideAggregates({
+      side: 'old',
+      extracted: [{ primary: primary({}), secondary: emptySecondary(), extras: extras({ packCalls: 1 }) }],
+      failedRuns: [],
+      rawRunIds: ['s1'],
+      extras: [extras({ packCalls: 1 })],
+      runIndexes: [1],
+      eventsProfiles: [],
+      canDetect: true,
+    })
+    expect(agg.packUse).toBeUndefined()
+  })
+
+  it('packUse: sums, runsWithCall, runCount, median firstCall over defined values only', () => {
+    const agg = buildSideAggregates({
+      side: 'old',
+      extracted: [1, 2, 3].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras() })),
+      failedRuns: [],
+      rawRunIds: ['s1', 's2', 's3'],
+      extras: [
+        extras({ packCalls: 1, packErrors: 0, firstPackCallMs: 100 }),
+        extras({ packCalls: 0 }),
+        extras({ packCalls: 2, packErrors: 1, firstPackCallMs: 300 }),
+      ],
+      runIndexes: [1, 2, 3],
+      eventsProfiles: [],
+      packName: 'graphify',
+      canDetect: true,
+    })
+    expect(agg.packUse).toEqual({
+      calls: 3,
+      errors: 1,
+      runsWithCall: 2,
+      runCount: 3,
+      firstCallMsMedian: '200',
+      canDetect: true,
+    })
+  })
+
+  it('riskyCommands concatenated with runIndex attached', () => {
+    const agg = buildSideAggregates({
+      side: 'old',
+      extracted: [1, 2].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras() })),
+      failedRuns: [],
+      rawRunIds: ['s1', 's2'],
+      extras: [
+        extras({ riskyCommands: [{ command: 'rm -rf x', completed: true, exitCode: 0 }] }),
+        extras({ riskyCommands: [] }),
+      ],
+      runIndexes: [1, 2],
+      eventsProfiles: [],
+      canDetect: false,
+    })
+    expect(agg.riskyCommands).toEqual([{ command: 'rm -rf x', completed: true, exitCode: 0, runIndex: 1 }])
+  })
+
+  it('opencodeVersions distinct + sorted', () => {
+    const agg = buildSideAggregates({
+      side: 'old',
+      extracted: [1, 2, 3].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras() })),
+      failedRuns: [],
+      rawRunIds: ['s1', 's2', 's3'],
+      extras: [
+        extras({ opencodeVersion: '1.18.4' }),
+        extras({ opencodeVersion: '1.18.3' }),
+        extras({ opencodeVersion: '1.18.4' }),
+      ],
+      runIndexes: [1, 2, 3],
+      eventsProfiles: [],
+      canDetect: false,
+    })
+    expect(agg.opencodeVersions).toEqual(['1.18.3', '1.18.4'])
   })
 })
 
@@ -223,7 +539,10 @@ describe('computeDelta', () => {
 
   it('one side empty -> neutral deltas, bothFailed false', () => {
     const oldAgg = sideFromPrimary('old', [primary({ totalTokens: '100' })])
-    const newAgg = buildSideAggregates({ side: 'new', extracted: [], failedRuns: [], rawRunIds: [] })
+    const newAgg = buildSideAggregates({
+      side: 'new', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false,
+    })
     const diff = computeDelta(oldAgg, newAgg)
     expect(diff.bothFailed).toBe(false)
     expect(diff.deltas.totalTokens.better).toBe('neutral')
@@ -231,15 +550,24 @@ describe('computeDelta', () => {
   })
 
   it('both sides empty -> bothFailed true, all neutral', () => {
-    const oldAgg = buildSideAggregates({ side: 'old', extracted: [], failedRuns: [], rawRunIds: [] })
-    const newAgg = buildSideAggregates({ side: 'new', extracted: [], failedRuns: [], rawRunIds: [] })
+    const oldAgg = buildSideAggregates({
+      side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false,
+    })
+    const newAgg = buildSideAggregates({
+      side: 'new', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false,
+    })
     const diff = computeDelta(oldAgg, newAgg)
     expect(diff.bothFailed).toBe(true)
     expect(diff.deltas.maxParallelism.better).toBe('neutral')
   })
 
   it('old side empty (0 tokens) vs a new side with tokens -> percent omitted, not 0', () => {
-    const oldAgg = buildSideAggregates({ side: 'old', extracted: [], failedRuns: [], rawRunIds: [] })
+    const oldAgg = buildSideAggregates({
+      side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], canDetect: false,
+    })
     const newAgg = sideFromPrimary('new', [primary({ totalTokens: '100' })])
     const diff = computeDelta(oldAgg, newAgg)
     expect(diff.deltas.totalTokens.absolute).toBe(100)

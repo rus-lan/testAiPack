@@ -22,7 +22,10 @@ import {
   addAll,
   diffCached,
   diffStat,
+  diffStatFull,
+  headState,
   init,
+  lsFilesStage,
   revParseHead,
 } from './git.js'
 
@@ -95,6 +98,20 @@ describe('git utils', () => {
     expect(err.stderr.length).toBeGreaterThan(0)
   })
 
+  it('forces the C locale so git error text is stable regardless of the host locale', async () => {
+    const repo = await buildSourceRepo()
+    const { writeFile } = await import('./fs.js')
+    // A garbled HEAD makes git report "not a git repository" for the exact
+    // condition this sandbox's host locale renders as "fatal: не найден git
+    // репозиторий..." (verified manually) — a classifier expecting English
+    // text would silently miss it without the locale forced.
+    await run(writeFile(path.join(repo, '.git', 'HEAD'), 'garbage not a ref\n'))
+    const err = await runFlip(headState(repo))
+    expect(err).toBeInstanceOf(GitError)
+    expect(err.stderr.toLowerCase()).toContain('not a git repository')
+    expect(err.stderr).not.toMatch(/[Ѐ-ӿ]/)
+  })
+
   it('redacts a credentialed URL echoed in git stderr from the resulting GitError', async () => {
     const leakyStderr =
       "fatal: unable to access 'https://user:sk-fake-token@example.invalid/repo.git/': The requested URL returned error: 403"
@@ -117,5 +134,73 @@ describe('git utils', () => {
     expect(err.stderr).not.toContain('sk-fake-token')
     expect(err.stderr).not.toContain('user:')
     expect(err.stderr).toContain('https://example.invalid/repo.git')
+  })
+})
+
+describe('git utils — two-path (--git-dir/--work-tree) form', () => {
+  it('single-path calls (no gitDir) are unaffected: addAll/diffCached/diffStatFull/revParseHead/lsFilesStage still work exactly as before', async () => {
+    const repo = await buildSourceRepo()
+    const { writeFile } = await import('./fs.js')
+    await run(writeFile(path.join(repo, 'plain.txt'), 'x\n'))
+    await run(addAll(repo))
+    expect(await run(diffCached(repo))).toContain('plain.txt')
+    expect((await run(diffStatFull(repo))).filesChanged).toBe(1)
+    expect(await run(revParseHead(repo))).toMatch(/^[0-9a-f]{40}$/)
+    expect(await run(lsFilesStage(repo))).toContain('plain.txt')
+  })
+
+  it('after moving .git out, the two-path form reproduces every value the in-tree form produced on the same repo', async () => {
+    const repo = await buildSourceRepo()
+    const { writeFile, moveDir } = await import('./fs.js')
+    await run(writeFile(path.join(repo, 'new.txt'), 'fresh\n'))
+    await run(addAll(repo))
+
+    const beforeDiff = await run(diffCached(repo))
+    const beforeStat = await run(diffStatFull(repo))
+    const beforeHead = await run(revParseHead(repo))
+    const beforeLsFiles = await run(lsFilesStage(repo))
+
+    const gitDir = makeTempDir('git-dir-')
+    await run(moveDir(path.join(repo, '.git'), gitDir))
+    expect(existsSync(path.join(repo, '.git'))).toBe(false)
+
+    expect(await run(diffCached(repo, gitDir))).toBe(beforeDiff)
+    expect(await run(diffStatFull(repo, gitDir))).toEqual(beforeStat)
+    expect(await run(revParseHead(repo, gitDir))).toBe(beforeHead)
+    expect(await run(lsFilesStage(repo, gitDir))).toBe(beforeLsFiles)
+  })
+
+  it('addAll with a gitDir stages a working-tree change made after the move', async () => {
+    const repo = await buildSourceRepo()
+    const { writeFile, moveDir } = await import('./fs.js')
+    const gitDir = makeTempDir('git-dir-')
+    await run(moveDir(path.join(repo, '.git'), gitDir))
+    await run(writeFile(path.join(repo, 'after-move.txt'), 'x\n'))
+    await run(addAll(repo, gitDir))
+    const diff = await run(diffCached(repo, gitDir))
+    expect(diff).toContain('after-move.txt')
+    expect(diff).toContain('+x')
+  })
+
+  it('revParseHead succeeds against a moved gitDir even though cwd/.git no longer exists', async () => {
+    const repo = await buildSourceRepo()
+    const { moveDir } = await import('./fs.js')
+    const gitDir = makeTempDir('git-dir-')
+    await run(moveDir(path.join(repo, '.git'), gitDir))
+    expect(await run(revParseHead(repo, gitDir))).toMatch(/^[0-9a-f]{40}$/)
+  })
+
+  it('revParseHead fails when the given gitDir does not exist (guard checks gitDir, not cwd/.git)', async () => {
+    const repo = await buildSourceRepo()
+    const bogusGitDir = path.join(makeTempDir(), 'nope')
+    const err = await runFlip(revParseHead(repo, bogusGitDir))
+    expect(err).toBeInstanceOf(GitError)
+  })
+
+  it('lsFilesStage fails when the given gitDir does not exist', async () => {
+    const repo = await buildSourceRepo()
+    const bogusGitDir = path.join(makeTempDir(), 'nope')
+    const err = await runFlip(lsFilesStage(repo, bogusGitDir))
+    expect(err).toBeInstanceOf(GitError)
   })
 })

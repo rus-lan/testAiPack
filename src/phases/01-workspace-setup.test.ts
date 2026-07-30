@@ -3,7 +3,7 @@ import { Effect } from 'effect'
 import path from 'node:path'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, writeFile, readFile, exists } from '../util/fs.js'
-import { workspaceSetup } from './01-workspace-setup.js'
+import { workspaceSetup, buildTreePaths } from './01-workspace-setup.js'
 import { PhaseError } from '../errors.js'
 import type { RunInput, WorkspaceTree } from '@generated/types'
 import { manifestSchema } from '@generated/schemas'
@@ -35,6 +35,7 @@ const makeRunInput = (overrides: Partial<RunInput> & { workspacePath: string }):
     gemini: false, aws: false, ssh: false, git: false,
   },
   pureBaseline: true,
+  protectGit: false,
   preflightEnabled: true,
   formats: ['md'],
   outputPath: './results',
@@ -70,6 +71,8 @@ describe('workspaceSetup — happy path', () => {
       path.join(result.rootPath, 'pack'),
       path.join(result.rootPath, 'home', 'old'),
       path.join(result.rootPath, 'home', 'new'),
+      path.join(result.rootPath, 'gitdirs', 'old'),
+      path.join(result.rootPath, 'gitdirs', 'new'),
       path.join(result.rootPath, 'config'),
       path.join(result.rootPath, 'results'),
       path.join(result.rootPath, 'results', 'raw', 'old'),
@@ -104,6 +107,12 @@ describe('workspaceSetup — happy path', () => {
       path.join(result.rootPath, 'home', 'old', 'run-3'),
     ])
     expect(tree.homeNew).toHaveLength(3)
+    expect(tree.gitDirsOld).toEqual([
+      path.join(result.rootPath, 'gitdirs', 'old', 'run-1'),
+      path.join(result.rootPath, 'gitdirs', 'old', 'run-2'),
+      path.join(result.rootPath, 'gitdirs', 'old', 'run-3'),
+    ])
+    expect(tree.gitDirsNew).toHaveLength(3)
     expect(tree.pack).toBe(path.join(result.rootPath, 'pack'))
     expect(tree.config).toBe(path.join(result.rootPath, 'config'))
     expect(tree.results).toBe(path.join(result.rootPath, 'results'))
@@ -120,6 +129,14 @@ describe('workspaceSetup — happy path', () => {
     expect(result.treePaths.appsNew).toEqual([path.join(result.rootPath, 'apps', 'newVersion', 'run-1')])
     expect(result.treePaths.homeOld).toHaveLength(1)
     expect(result.treePaths.homeNew).toHaveLength(1)
+  })
+
+  it('buildTreePaths(root, n) equals the treePaths workspaceSetup returns for the same inputs (pins the refactor)', async () => {
+    const { workspacePath } = await freshProject()
+    const result = await runP(
+      workspaceSetup({ runInput: makeRunInput({ workspacePath, runs: 4 }), runId: 'pin-check' }),
+    )
+    expect(buildTreePaths(result.rootPath, 4)).toEqual(result.treePaths)
   })
 })
 

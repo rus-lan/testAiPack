@@ -186,6 +186,7 @@ describe('cli/index — run wiring (splitRunFlags -> executeRun -> runPipeline)'
     reportPaths: {},
     reviewCommand: 'code /fake/review.code-workspace',
     summary: 'ok',
+    diffEscalated: false,
   }
 
   beforeEach(() => {
@@ -241,6 +242,12 @@ describe('cli/index — run wiring (splitRunFlags -> executeRun -> runPipeline)'
     expect(code).toBe(2)
     expect(runPipelineMock).not.toHaveBeenCalled()
     expect(errSpy).toHaveBeenCalledWith('--config requires a value')
+  })
+
+  it('a completed run with diffEscalated=true exits non-zero even though nothing threw', async () => {
+    runPipelineMock.mockReturnValue(Effect.succeed({ ...fakeOutcome, diffEscalated: true }))
+    const code = await runCli(['run', 'https://example.com/repo.git', '--prompt', 'x'])
+    expect(code).not.toBe(0)
   })
 })
 

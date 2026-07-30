@@ -10,6 +10,7 @@ import {
   ensureDir,
   removeDir,
   copyDir,
+  moveDir,
   writeFile,
   appendFile,
   readFile,
@@ -54,6 +55,33 @@ describe('fs utils', () => {
     await run(copyDir(src, dst))
     expect(await run(readFile(path.join(dst, 'root.txt')))).toBe('root')
     expect(await run(readFile(path.join(dst, 'sub', 'child.txt')))).toBe('child')
+  })
+
+  it('moveDir relocates a directory: source gone, contents present at the destination', async () => {
+    const src = await freshDir()
+    await run(ensureDir(path.join(src, 'sub')))
+    await run(writeFile(path.join(src, 'root.txt'), 'root'))
+    await run(writeFile(path.join(src, 'sub', 'child.txt'), 'child'))
+    const dst = path.join(await freshDir(), 'moved')
+    await run(moveDir(src, dst))
+    expect(await run(exists(src))).toBe(false)
+    expect(await run(readFile(path.join(dst, 'root.txt')))).toBe('root')
+    expect(await run(readFile(path.join(dst, 'sub', 'child.txt')))).toBe('child')
+  })
+
+  it('moveDir returns FsError when the source is missing', async () => {
+    const missing = path.join(makeTempDir(), 'nope')
+    const err = await runFlip(moveDir(missing, path.join(makeTempDir(), 'dst')))
+    expect(err).toBeInstanceOf(FsError)
+    expect(err.operation).toBe('moveDir')
+  })
+
+  it('moveDir returns FsError when the destination parent does not exist', async () => {
+    const src = await freshDir()
+    const dst = path.join(makeTempDir(), 'no', 'such', 'parent', 'dst')
+    const err = await runFlip(moveDir(src, dst))
+    expect(err).toBeInstanceOf(FsError)
+    expect(err.operation).toBe('moveDir')
   })
 
   it('writeFile + readFile round-trip a string', async () => {

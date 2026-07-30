@@ -19,6 +19,7 @@ import type {
   OpencodeExport,
   Side,
   SideAggregates,
+  VerifyStats,
 } from '@generated/types'
 import { opencodeExportSchema } from '@generated/schemas'
 import { aggregateError } from '../errors.js'
@@ -29,7 +30,10 @@ import type { PricingTable } from '../pricing/lookup.js'
 import { loadPricing } from '../pricing/lookup.js'
 import { extractMetricsFromTree } from '../metrics/extract.js'
 import type { ExtractedMetrics } from '../metrics/extract.js'
+import { profileEvents } from '../metrics/events-profile.js'
+import type { EventsProfile } from '../metrics/events-profile.js'
 import { buildSideAggregates, computeDelta } from '../metrics/aggregate.js'
+import { detectPack } from '../pack/detector.js'
 import { loadTreeForRun } from './10-timeline.js'
 import type { SessionTreeLoader } from './10-timeline.js'
 import type { RunSideResultExt } from './06-run-side.js'
@@ -40,7 +44,17 @@ export interface AggregateDeps {
 }
 
 type ProcessedRun =
-  | { readonly kind: 'ok'; readonly metrics: ExtractedMetrics; readonly id: string }
+  | {
+      readonly kind: 'ok'
+      readonly metrics: ExtractedMetrics
+      readonly id: string
+      readonly runIndex: number
+      // undefined when events.ndjson could not be read at all (older
+      // workspace, ephemeral cleanup) — distinct from a file that exists and
+      // profiles to zero gaps; the run then contributes no P5 data point at
+      // all instead of a fabricated "0".
+      readonly eventsProfile: EventsProfile | undefined
+    }
   | { readonly kind: 'failed'; readonly failedRun: FailedRun }
 
 const errorCodeFor = (r: RunSideResultExt): ErrorCode => r.errorCode ?? 'E_RUN_CRASH'
@@ -64,15 +78,29 @@ const toExportInvalid = (side: Side, runIndex: number, cause: unknown): PhaseErr
     },
   )
 
+/** A missing/unreadable events.ndjson (older workspace) yields no profile, not a fabricated one. */
+const readEventsProfile = (eventsLogPath: string): Effect.Effect<EventsProfile | undefined> =>
+  readFile(eventsLogPath).pipe(
+    Effect.map(profileEvents),
+    Effect.catchAll(() => Effect.succeed(undefined)),
+  )
+
 const readAndExtract = (
   r: RunSideResultExt,
   side: Side,
   rawDir: string,
   homeDirs: readonly string[],
   pricing: PricingTable | null,
+  packName: string | undefined,
   loader?: SessionTreeLoader,
 ): Effect.Effect<
-  { readonly kind: 'ok'; readonly metrics: ExtractedMetrics; readonly id: string },
+  {
+    readonly kind: 'ok'
+    readonly metrics: ExtractedMetrics
+    readonly id: string
+    readonly runIndex: number
+    readonly eventsProfile: EventsProfile | undefined
+  },
   PhaseError
 > =>
   Effect.gen(function* () {
@@ -94,12 +122,25 @@ const readAndExtract = (
     const data = result.data as OpencodeExport
     const homeDir = homeDirs[r.runIndex - 1] ?? ''
     const tree = yield* loadTreeForRun(homeDir, data, loader)
+    const eventsProfile = yield* readEventsProfile(r.eventsLogPath)
     return {
       kind: 'ok' as const,
-      metrics: extractMetricsFromTree(tree, pricing, r.successRank),
+      metrics: extractMetricsFromTree(tree, pricing, r.successRank, {
+        ...(packName === undefined ? {} : { packName }),
+      }),
       id: data.info.id,
+      runIndex: r.runIndex,
+      eventsProfile,
     }
   })
+
+const buildVerifyStats = (results: readonly RunSideResultExt[]): VerifyStats | undefined => {
+  const passed = results.filter((r) => r.verifyExitCode === 0).length
+  const failed = results.filter((r) => r.verifyExitCode !== undefined && r.verifyExitCode !== 0).length
+  const timedOut = results.filter((r) => r.errorCode === 'E_VERIFY_TIMEOUT').length
+  const runCount = passed + failed + timedOut
+  return runCount === 0 ? undefined : { passed, failed, timedOut, runCount }
+}
 
 const aggregateSide = (
   side: Side,
@@ -108,6 +149,8 @@ const aggregateSide = (
   homeDirs: readonly string[],
   pricing: PricingTable | null,
   timestamp: string,
+  packName: string | undefined,
+  canDetect: boolean,
   loader?: SessionTreeLoader,
 ): Effect.Effect<SideAggregates, PhaseError> =>
   Effect.gen(function* () {
@@ -119,13 +162,30 @@ const aggregateSide = (
               kind: 'failed' as const,
               failedRun: toFailedRun(r, timestamp),
             })
-          : readAndExtract(r, side, rawDir, homeDirs, pricing, loader),
+          : readAndExtract(r, side, rawDir, homeDirs, pricing, packName, loader),
       { concurrency: 1 },
     )
     const extracted = processed.flatMap((p) => (p.kind === 'ok' ? [p.metrics] : []))
+    const extras = processed.flatMap((p) => (p.kind === 'ok' ? [p.metrics.extras] : []))
+    const runIndexes = processed.flatMap((p) => (p.kind === 'ok' ? [p.runIndex] : []))
+    const eventsProfiles = processed.flatMap((p) =>
+      p.kind === 'ok' && p.eventsProfile !== undefined ? [p.eventsProfile] : [],
+    )
     const rawRunIds = processed.flatMap((p) => (p.kind === 'ok' ? [p.id] : []))
     const failedRuns = processed.flatMap((p) => (p.kind === 'failed' ? [p.failedRun] : []))
-    return buildSideAggregates({ side, extracted, failedRuns, rawRunIds })
+    const verifyStats = buildVerifyStats(results)
+    return buildSideAggregates({
+      side,
+      extracted,
+      failedRuns,
+      rawRunIds,
+      extras,
+      runIndexes,
+      eventsProfiles,
+      canDetect,
+      ...(packName === undefined ? {} : { packName }),
+      ...(verifyStats === undefined ? {} : { verifyStats }),
+    })
   })
 
 const ignorePricingError = (): Effect.Effect<null> => Effect.succeed(null)
@@ -141,9 +201,43 @@ export const aggregate = (
       ? yield* loadPricing(runInput.pricingPath).pipe(Effect.catchAll(ignorePricingError))
       : null
 
+    // Wave 1: only a skill pack shows up as tool parts in exports — plugin/mcp/
+    // agent/command usage is invisible there, so canDetect is false for them.
+    // packName still resolves for every pack type (not just skill) so packUse
+    // stays present with canDetect: false instead of being omitted — an
+    // omitted section would look identical to "no --pack at all", the exact
+    // confusion canDetect exists to prevent.
+    const packRef = runInput.packRef
+    const pack =
+      packRef === undefined
+        ? null
+        : yield* detectPack(packRef).pipe(Effect.catchAll(() => Effect.succeed(null)))
+    const packName = pack?.name
+    const canDetect = pack !== null && pack.type === 'skill'
+
     const timestamp = manifest.timestamp
-    const oldAgg = yield* aggregateSide('old', sideResults.old, workspace.raw, workspace.homeOld, pricing, timestamp, loader)
-    const newAgg = yield* aggregateSide('new', sideResults.new, workspace.raw, workspace.homeNew, pricing, timestamp, loader)
+    const oldAgg = yield* aggregateSide(
+      'old',
+      sideResults.old,
+      workspace.raw,
+      workspace.homeOld,
+      pricing,
+      timestamp,
+      packName,
+      canDetect,
+      loader,
+    )
+    const newAgg = yield* aggregateSide(
+      'new',
+      sideResults.new,
+      workspace.raw,
+      workspace.homeNew,
+      pricing,
+      timestamp,
+      packName,
+      canDetect,
+      loader,
+    )
     const metricsDiff = computeDelta(oldAgg, newAgg)
     const result: AggregateResult = {
       metricsDiff,

@@ -49,6 +49,22 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
   - `E_TOTAL_TIMEOUT` — исчерпан `runInput.timeouts.totalSeconds` (если задан)
     для всего run-N.
 
+  **Какие коды реально фейлят фазу.** Контракт декларирует все коды выше как
+  legal errors, но по факту большинство из них никогда не всплывает как
+  `Effect.fail` — они лишь оседают в `RunSideResult.errorCode` при
+  `successRank = 0` (прогон при этом валиден, фаза продолжается). Это касается
+  и export-шага: `E_RUN_CRASH` (export ничего не вернул), `E_RUN_TIMEOUT`
+  (export не уложился в таймаут) и `E_EXPORT_INVALID` (export невалиден после
+  исчерпания retry) больше не прерывают фазу — один сломанный export не должен
+  убивать все N×2 прогонов, включая уже завершённые и параллельно идущие на
+  другой стороне. Фазу реально фейлит только:
+  - `E_DISK_FULL` — запись `events.ndjson`, `ensureDir` рабочей директории или
+    запись самого export-файла упёрлись в ENOSPC. Это машинно-глобальная
+    проблема, а не свойство конкретного прогона.
+  - `E_RUN_CRASH` из guard-а «нет рабочей директории приложения для этого
+    `runIndex`» — это баг обвязки (фаза 02 не создала worktree), а не итог
+    прогона, поэтому он остаётся жёстким fail.
+
 `successRank` (0–4):
 - `4` — finish-stop (нормальное завершение).
 - `3` — finish-tool-calls → stop (закончил тул-колами, потом остановился).
@@ -94,9 +110,15 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
       **ограниченный retry** свежего `opencode export` с экспоненциальным
       backoff (до 3 попыток, старт 200ms, потолок ожидания 3s). Если сам
       `opencode export` падает как процесс (ошибка запуска) или не
-      укладывается в таймаут — retry **не** делается, сразу `E_RUN_CRASH` /
-      `E_RUN_TIMEOUT` соответственно. Если после исчерпания retry export
-      всё ещё невалиден по схеме → `E_EXPORT_INVALID` (см. фазу 07).
+      укладывается в таймаут — retry **не** делается. В любом из трёх
+      исходов (`E_RUN_CRASH` / `E_RUN_TIMEOUT` / `E_EXPORT_INVALID` после
+      исчерпания retry) фаза **не падает**: прогон принудительно понижается до
+      `successRank = 0` с этим `errorCode`, `--verify` для него пропускается
+      (rank всё равно будет обнулён), `export.json` на диске может отсутствовать
+      или быть невалидным — фаза 07 уже умеет заводить такой прогон в
+      `FailedRun`, фаза 10 читает его как пустой список events. Настоящий
+      `ENOSPC` при записи самого export-файла — исключение, он всё ещё валит
+      фазу с `E_DISK_FULL` (см. таблицу выше).
    g. Определить `finishCause` из последнего `step-finish` event-а:
       `stop` / `tool-calls` / `length` / `error`. Определить `successRank` по
       правилам выше. Итоговый `exitCode` в `RunSideResult` — «combined»: если
@@ -128,7 +150,14 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
         результате.
       - таймаут → `E_VERIFY_TIMEOUT`, `verifyExitCode` не задаётся,
         `successRank = 0` (verify-таймаут считаем провалом прогона).
-3. Собрать `RunSideResult` для прогона и вернуть.
+3. Собрать `RunSideResult` для прогона. Записать его как есть (включая
+   локальное расширение `errorCode`, если оно задано) в
+   `raw/<side>/run-<n>.result.json` — best-effort (сбой записи логируется в
+   `run-<n>.log` и не фейлит прогон): это единственный на диске снимок
+   *результата* прогона (rank, finishCause, exitCode, errorCode…), который
+   иначе существует только в памяти оркестратора и как plain-text `[STOP]`
+   строка в логе — нужен для post-mortem и будущего `report --rebuild`.
+   Вернуть `RunSideResult`.
 
 ## 4. Входные/выходные файлы
 
@@ -136,7 +165,12 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
 | --------------------------------------- | ------------- | -------------------- |
 | `raw/<side>/run-<n>.events.ndjson`      | Запись        | поток JSONL событий  |
 | `raw/<side>/run-<n>.json`               | Запись        | `OpencodeExport`     |
+| `raw/<side>/run-<n>.result.json`        | Запись (best-effort) | `RunSideResult` (+ локальный `errorCode`) |
 | `apps/<side>Version/run-<n>/`           | Чтение+Запись | рабочее дерево агента |
+| `config/.config/opencode/<side>/opencode.json`  | Запись | строка `OPENCODE_CONFIG_CONTENT` + `\n` |
+| `config/.config/opencode/<side>/installed.json` | Запись | внутренний JSON (не в контракте) |
+| `config/.config/opencode/<side>/usage.json`     | Запись | внутренний JSON (не в контракте) |
+| `config/.config/opencode/<side>/home/*`         | Запись | байт-копии из `home/<side>/run-1/.config/opencode/` |
 
 ## 5. Edge-cases и ошибки
 
@@ -153,8 +187,8 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
 | `--verify` таймаут                                  | `successRank = 0`, failed                         | `E_VERIFY_TIMEOUT`         |
 | `--init` без `--prompt` (невозможно, клирится в 00) | ошибка контракта                                  | — (через 00)               |
 | `opencode export` вернул невалидный по схеме JSON (первые попытки) | ограниченный retry с backoff (до 3 раз) | —              |
-| `opencode export` невалиден и после исчерпания retry | прогон failed, данные в `.events.ndjson` живут   | `E_EXPORT_INVALID`         |
-| `opencode export` падает как процесс / таймаут       | retry не делается, сразу fail                     | `E_RUN_CRASH` / `E_RUN_TIMEOUT` |
+| `opencode export` невалиден и после исчерпания retry | фаза ОК, `successRank = 0`, `--verify` пропущен, данные в `.events.ndjson` живут | `E_EXPORT_INVALID` |
+| `opencode export` падает как процесс / таймаут       | retry не делается; фаза ОК, `successRank = 0`, `--verify` пропущен | `E_RUN_CRASH` / `E_RUN_TIMEOUT` |
 | «429» встретился в успешном выводе tool (не в тексте/ошибке) | НЕ засчитывается как rate-limit           | —                          |
 | `--init` упал (non-zero), `--prompt` после него завершился нулём | итоговый `exitCode` = код `--init` (первый non-zero) | `E_RUN_CRASH` |
 | Процесс убит по OOM                                 | `successRank = 0`                                 | `E_OOM`                    |
@@ -182,11 +216,17 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
 - ✅ disk full: `ENOSPC` при записи лога → `E_DISK_FULL`.
 - ✅ port conflict: plugin требует занятый порт → `E_PORT_CONFLICT`.
 - ✅ export invalid, retry exhausted: `opencode export` возвращает невалидный
-  JSON на всех попытках → retry с backoff исчерпан → `E_EXPORT_INVALID`.
+  JSON на всех попытках → retry с backoff исчерпан → фаза ОК, `successRank = 0`,
+  `errorCode = E_EXPORT_INVALID`, невалидный файл остаётся на диске.
 - ✅ export invalid, retry recovers: первая попытка невалидна, повторная —
   валидна → прогон не падает, export принят со второй попытки.
-- ✅ export process failure: сам `opencode export` падает как процесс →
-  `E_RUN_CRASH` немедленно, без retry.
+- ✅ export produced no data: сам `opencode export` падает как процесс →
+  фаза ОК, `successRank = 0`, `errorCode = E_RUN_CRASH`, без retry,
+  `events.ndjson` записан, `--verify` пропущен.
+- ✅ export timeout: `opencode export` не укладывается в таймаут → фаза ОК,
+  `successRank = 0`, `errorCode = E_RUN_TIMEOUT`.
+- ✅ events.ndjson write failure (ENOSPC): фаза всё ещё падает с
+  `E_DISK_FULL` — это машинно-глобальная проблема, не свойство прогона.
 - ✅ combined exit code: `--init` падает (non-zero), `--prompt` после него
   завершается нулём → `RunSideResult.exitCode` = код `--init`.
 - ✅ `--init` then `--prompt`: два вызова opencode с одним `--session`,
@@ -198,14 +238,18 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
   `successRank = 0`.
 - ✅ 2-way parallelism: old и new стартуют одновременно (проверка по timestamp
   запуска), внутри стороны N прогонов идут последовательно.
+- ✅ run-N.result.json: пишется после прогона, парсится по `RunSideResult`
+  (плюс локальный `errorCode`), совпадает с возвращённым результатом.
+- ✅ run-N.result.json write failure: сбой записи (fs) не фейлит прогон.
 - ❌ НЕ покрыто (ticket): повторяемая инвалидация export при несовместимой
   версии opencode (отдельный ticket по версионированию).
 
 ## 7. Инварианты
 
-- Для каждой пары `(side, n)` существует либо валидный `raw/<side>/run-N.json`
-  (по схеме `OpencodeExport`), либо `RunSideResult` с кодом `E_*` — но не
-  оба и не ни одного.
+- Для каждой пары `(side, n)` фаза всегда возвращает `RunSideResult`; если
+  export провалился (`E_RUN_CRASH` / `E_RUN_TIMEOUT` / `E_EXPORT_INVALID`),
+  `raw/<side>/run-N.json` на диске может отсутствовать или быть невалидным —
+  это не мешает фазе продолжить остальные прогоны и стороны.
 - `successRank ∈ {0,1,2,3,4}` определён для **каждого** прогона (даже failed
   получает 0).
 - Стороны old и new стартуют в пределах ≤ 1s друг от друга (параллельный старт
@@ -224,3 +268,36 @@ Namespace: `TestAiPack.RunSide` (см. `contract/phases/06-run-side.tsp`).
   **08 diff** (git diff в рабочих деревьях после прогона),
   **10 timeline** (читает `raw/<side>/run-N.json`).
 - Параллелизуется с: сама с собой по оси `side` (`old ‖ new`).
+
+## 9. Снимок конфигурации opencode
+
+После того как обе стороны отработали N×2 прогонов, `src/phases/06-config-capture.ts`
+(соседний helper фазы 06, не отдельная нумерованная фаза — как `08-diff-css.ts` при
+`08-diff.ts`) сохраняет в `config/.config/opencode/<side>/` картину того, какой конфиг и
+какие зависимости реально использовала каждая сторона:
+
+- `opencode.json` — точное содержимое `OPENCODE_CONFIG_CONTENT`, полученное этой стороной
+  (последний и приоритетный слой merge opencode; сам opencode никогда не материализует
+  единый эффективный конфиг, поэтому testaipack его не синтезирует, а сохраняет слои
+  рядом).
+- `home/` — байт-копии `opencode.jsonc`, `opencode.json`, `package.json`,
+  `package-lock.json` из `home/<side>/run-1/.config/opencode/` (каждый — только если
+  существует). `node_modules/` не копируется никогда (размер; `package-lock.json`
+  фиксирует дерево целиком).
+- `installed.json` — что реально установлено: skills (имя + цель symlink-а), agents,
+  commands, plugin-файлы и plugin-config-спеки, имена mcp-серверов, npm-зависимости
+  (`package.json`), `configMergeOrder` (порядок слоёв merge — `home/opencode.json` →
+  `home/opencode.jsonc` → `opencode.json`, последний побеждает), и
+  `identicalAcrossRuns`/`driftFiles` — сверка отслеживаемых файлов run-1 с run-2..run-N.
+- `usage.json` — что реально вызывалось, по данным `results/raw/<side>/run-N.events.ndjson`:
+  счётчики `toolCalls` по именам инструментов и список вызовов `skill`
+  (`run`, `name`, `status`, `error`). Использование skill (и, ожидаемо, mcp) видно в
+  событиях; использование plugin-хуков и npm-пакетов **не наблюдаемо** — это явно
+  перечислено в `notKnowable`, а не домысливается.
+
+Захват идёт **один раз на сторону**, из `run-1` (отслеживаемые файлы одной стороны у всех
+прогонов байт-в-байт идентичны — гарантия фазы 04, но `driftFiles` всё равно её
+перепроверяет, а не предполагает вслепую). Захват — best-effort: ошибка не валит уже
+завершённый прогон, а пишет предупреждение в лог оркестратора (`src/cli/pipeline.ts`).
+Выполняется после прогонов (внутри фазы 06) и до `--ephemeral`-очистки (фаза 13, которая
+иначе удалила бы единственную копию этой картины вместе с `home/`).

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   fmtCost,
+  fmtDurationMs,
   fmtInt,
   fmtPct,
   fmtSigned,
@@ -84,6 +85,20 @@ describe('format — signed deltas and percent', () => {
     [4, 'rank', '4'],
   ])('fmtValue(%j, %s) === %s', (value, kind, expected) => {
     expect(fmtValue(value, kind)).toBe(expected)
+  })
+})
+
+describe('format — fmtDurationMs (readability: raw ms does not read as minutes)', () => {
+  it.each<[string | number, string]>([
+    [0, '0ms'],
+    [500, '500ms'],
+    [59999, '59999ms'],
+    [60000, '60000ms (~1.0min)'],
+    [252915, '252915ms (~4.2min)'],
+    ['252915', '252915ms (~4.2min)'],
+    [240663, '240663ms (~4.0min)'],
+  ])('fmtDurationMs(%j) === %s', (value, expected) => {
+    expect(fmtDurationMs(value)).toBe(expected)
   })
 })
 

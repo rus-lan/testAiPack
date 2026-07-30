@@ -18,21 +18,30 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
   отсутствует → фаза возвращает `JudgeResultOutput { judge: null }` (no-op).
 - Выход: `JudgeResultOutput` — `{ judge: JudgeResult | null }`. `JudgeResult =
   { verdict: JudgeVerdict, oldQuality: int32, newQuality: int32, explanation:
-  string, rawResponse?: string, modelUsed: string, timestamp: utcDateTime }`.
-  `JudgeVerdict ∈ { "ok", "fail", "unclear" }` (значения enum: `"ok"`, `"fail"`,
-  `"unclear"`). `judge = null` — когда судья не запрашивалась (`runInput.judge`
-  отсутствует).
-- Ошибки: `@error JudgeError` — `{ code, message, context? }`, где `code`
-  принимает только одно значение:
-  - `E_MODEL_UNAVAILABLE` — модель судьи недоступна у провайдера auth.
+  string, rawResponse?: string, modelUsed: string, timestamp: utcDateTime,
+  ran?: boolean }`. `JudgeVerdict ∈ { "ok", "fail", "unclear" }` (значения enum:
+  `"ok"`, `"fail"`, `"unclear"`). `judge = null` — когда судья не запрашивалась
+  (`runInput.judge` отсутствует).
+- `ran` различает «судья не смогла запуститься» от «судья запустилась и не
+  определилась»: `ran: true` — модель судьи была вызвана и вернула ответ (даже
+  мусорный — тогда `rawResponse` его хранит, а `verdict = "unclear"`);
+  `ran: false` — ответа модели вообще нет (недоступна модель, crash opencode,
+  таймаут, не удалось создать scratch-директорию, либо оба патча пусты).
+  Отсутствие поля (старый `report.json`, записанный до появления `ran`)
+  читается как `true` — поле опционально специально ради обратной
+  совместимости.
+- Ошибки: фаза **никогда не падает**. `@error JudgeError` — `{ code: "E_MODEL_UNAVAILABLE",
+  message, context? }` — модель остаётся в `contract/phases/09-judge.tsp`
+  (легальна для схемы), но фаза 09 её больше не бросает: недоступность модели
+  судьи теперь деградирует так же, как таймаут/crash/rate-limit — `verdict:
+  "unclear"`, `ran: false`, `explanation` с деталями сбоя. Раньше это было
+  единственной фатальной веткой фазы и валило весь пайплайн после того, как
+  все прогоны и диффы уже посчитаны — опечатка в имени модели судьи или
+  протухший ключ больше не уничтожают весь эксперимент.
 
-  Таймаут, crash, rate-limit и т.п. здесь **не** выделены в отдельные кода;
-  контракт 09 имеет только `E_MODEL_UNAVAILABLE`. На практике таймаут/crash
-  возвращают `JudgeResult` с `verdict: "unclear"` и `explanation`, содержащим
-  описание сбоя; жёсткая недоступность модели — `E_MODEL_UNAVAILABLE`.
-
-  Неверный JSON-ответ **не** ошибка — `verdict = "unclear"`,
-  `explanation = rawResponse`.
+  Неверный JSON-ответ **не** ошибка и не «не запустилась» — `verdict =
+  "unclear"`, `ran = true`, `explanation = rawResponse` (ответ был получен,
+  просто не распарсился).
 
 `judge.json` (сериализованный `JudgeResult`):
 ```jsonc
@@ -43,7 +52,8 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
   "explanation": "new добавляет валидацию ...",
   "rawResponse": "...",       // полный сырой ответ модели (optional)
   "modelUsed": "anthropic/...",  // какая модель судила
-  "timestamp": "2026-07-21T17:06:00+03:00"
+  "timestamp": "2026-07-21T17:06:00+03:00",
+  "ran": true                 // false = модель не ответила (см. §2)
 }
 ```
 
@@ -77,16 +87,22 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
    Таймаут `runInput.timeouts.runSeconds`, watchdog
    `runInput.timeouts.watchdogSeconds`.
 5. Собрать assistant-message из стрима.
-   - Модель недоступна у провайдера auth → throw
-     `JudgeError({ code: "E_MODEL_UNAVAILABLE", context: { model } })`.
-   - Иные сбои (таймаут/crash/429) — **не** throw; возвращаем
-     `JudgeResult.verdict = "unclear"`, `explanation` содержит описание сбоя
-     (контракт 09 не выделяет для них кода).
+   - Модель недоступна у провайдера auth — **не** throw (было: throw
+     `JudgeError({ code: "E_MODEL_UNAVAILABLE" })`, валило весь пайплайн после
+     того, как все прогоны и диффы уже посчитаны); возвращаем
+     `JudgeResult.verdict = "unclear"`, `ran = false`, `explanation` содержит
+     модель и хвост stderr.
+   - Иные сбои (таймаут/crash/429, не удалось создать scratch-директорию) —
+     тоже **не** throw; `JudgeResult.verdict = "unclear"`, `ran = false`,
+     `explanation` содержит описание сбоя (контракт 09 не выделяет для них
+     кода). После этого шага в `computeJudge` не остаётся ни одной ветки
+     `throw`/`Effect.fail` — фаза 09 гарантированно не абортит пайплайн.
 6. Попытаться распарсить ответ как JSON `{ verdict, oldQuality, newQuality,
    explanation }` (допускается JSON в markdown code-fence — извлекаем).
-   - Успех → использовать распарсенные поля.
+   - Успех → использовать распарсенные поля, `ran = true`.
    - Провал парсинга → `verdict = "unclear"`, `oldQuality = 0`, `newQuality = 0`,
-     `explanation = rawResponse`.
+     `explanation = rawResponse`, **`ran = true`** — ответ от модели пришёл,
+     просто не распарсился; это не то же самое, что «судья не запустилась».
 7. Валидация диапазонов: `oldQuality`, `newQuality` — любое конечное число
    (модель может вернуть дробное значение, например `8.5`), клампится в
    [0,10] и округляется до целого (контракт хранит `int32`). Если вне
@@ -109,14 +125,15 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
 | --------------------------------------------------- | ----------------------------------------------- | -------------------------- |
 | `--judge` не задан                                   | no-op, `JudgeResultOutput.judge = null`         | —                          |
 | run-1 патч пустой с обеих сторон                     | fallback на первый непустой, или `unclear`      | —                          |
-| Все патчи пустые                                     | `verdict = "unclear"`, `explanation = "no diffs"` | —                        |
+| Все патчи пустые                                     | `verdict = "unclear"`, `ran = false`            | —                          |
 | Ответ модели — невалидный JSON                       | `verdict = "unclear"`, `explanation = raw`      | —                          |
 | Ответ — JSON в code-fence                            | извлекаем и парсим                              | —                          |
 | `oldQuality = 15` (вне диапазона)                    | clamp до 10, warning                            | —                          |
 | `oldQuality = 8.5` (дробное)                          | принимается, округляется до 8 или 9             | —                          |
-| `oldQuality = "8"` (не число)                         | весь ответ невалиден → `verdict = "unclear"`    | —                          |
-| Модель недоступна у провайдера auth                  | throw                                           | `E_MODEL_UNAVAILABLE`      |
-| Таймаут / crash / 429 у судьи                        | `verdict = "unclear"` с описанием сбоя (не throw) | —                        |
+| `oldQuality = "8"` (не число)                         | весь ответ невалиден → `verdict = "unclear"`, `ran = true` | —                  |
+| Модель недоступна у провайдера auth                  | `verdict = "unclear"`, `ran = false` (не throw) | —                          |
+| Таймаут / crash / 429 у судьи                        | `verdict = "unclear"`, `ran = false` с описанием сбоя (не throw) | —          |
+| Не удалось создать scratch-директорию                | `verdict = "unclear"`, `ran = false`, opencode не вызывается | —              |
 | Оба патча очень большие (>100KB)                    | truncate до 50KB каждый, warning                | —                          |
 | `judge` ссылается на `@file`, которого нет           | клирится ещё в фазе 00 → сюда не доходит        | — (через 00)               |
 
@@ -124,7 +141,7 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
 
 - ✅ happy-path: judge задан, оба патча есть, ответ валидный JSON →
   `verdict = "ok"`, `oldQuality: 7`, `newQuality: 8`, explanation непустой,
-  `modelUsed` и `timestamp` заполнены.
+  `modelUsed` и `timestamp` заполнены, `ran = true`.
 - ✅ skipped: judge не задан → `JudgeResultOutput.judge = null`, файл
   `results/judge.json` содержит `{ judge: null }`.
 - ✅ run-1 empty fallback: old/run-1 патч пустой, old/run-2 непустой →
@@ -145,12 +162,22 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
   `$HOME`.
 - ✅ scratch cleanup: scratch-директория `cwd` удаляется после завершения
   вызова судьи.
-- ✅ model unavailable: модель судьи недоступна → throw `E_MODEL_UNAVAILABLE`.
+- ✅ model unavailable: модель судьи недоступна → фаза успешна,
+  `verdict = "unclear"`, `ran = false` (было: throw `E_MODEL_UNAVAILABLE`,
+  валило пайплайн после того, как все прогоны и диффы уже посчитаны).
 - ✅ judge timeout: судья висит > `timeouts.runSeconds` → НЕ throw,
-  `verdict = "unclear"` с описанием.
-- ✅ judge crash: opencode exit 1 → НЕ throw, `verdict = "unclear"`.
-- ✅ judge rate-limit: серия 429 → НЕ throw, `verdict = "unclear"`.
+  `verdict = "unclear"`, `ran = false`, с описанием.
+- ✅ judge crash: opencode exit 1 → НЕ throw, `verdict = "unclear"`,
+  `ran = false`.
+- ✅ judge rate-limit: серия 429 → НЕ throw, `verdict = "unclear"`,
+  `ran = false`.
+- ✅ parse failure keeps ran true: невалидный JSON-ответ → `verdict =
+  "unclear"`, но `ran = true` и `rawResponse` хранит сырой ответ — судья
+  запустилась, просто не определилась.
 - ✅ large diffs: оба патча > 100KB → обрезаны до 50KB, warning в логе.
+- ✅ report renderer: `judge.ran === false` → md/html рендерят «Judge did not
+  run: <explanation>» без блока verdict/quality; `ran` отсутствует (старый
+  `report.json`) → рендерится как раньше.
 - ❌ НЕ покрыто (ticket): multi-run judge (оценка по всем N прогонам с
   усреднением) — ticket про v0.2.
 
@@ -164,6 +191,11 @@ Namespace: `TestAiPack.Judge` (см. `contract/phases/09-judge.tsp`).
 - Если `verdict ≠ "unclear"`, то `oldQuality` и `newQuality` ∈ [0, 10].
 - `modelUsed` фиксирует, какая модель судила; `timestamp` — момент вердикта.
 - `rawResponse` сохраняется (optional) для отладки и аудита.
+- `ran` (optional, отсутствие = `true`) отличает «нет ответа модели» (`false`
+  — недоступна модель, таймаут, crash, сбой scratch-директории, оба патча
+  пусты) от «ответ получен» (`true` — валидный вердикт или невалидный JSON,
+  который всё равно является ответом). Фаза 09 никогда не завершается ошибкой:
+  `computeJudge` не содержит ни одной ветки `throw`/`Effect.fail`.
 - Судья всегда запускается с read-only агентом `plan` и `auto: false` — она
   получает в промпт непроверенный diff-контент агента под тестом, и не
   должна иметь возможность что-то менять. `cwd` — одноразовая

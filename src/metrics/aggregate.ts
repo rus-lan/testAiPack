@@ -11,13 +11,17 @@ import type {
   MetricDelta,
   MetricDistribution,
   MetricsDiff,
+  PackUse,
   PrimaryMetrics,
+  RiskyCommand,
   SecondaryMetrics,
   Side,
   SideAggregates,
   ToolStat,
+  VerifyStats,
 } from '@generated/types'
-import type { ExtractedMetrics } from './extract.js'
+import type { EventsProfile } from './events-profile.js'
+import type { ExtractedExtras, ExtractedMetrics } from './extract.js'
 import { interquartileRange, maximum, median, minimum, percentile, toNum } from './stats.js'
 import { isSignificant } from './significance.js'
 
@@ -145,10 +149,76 @@ const mergeFinishCause = (records: readonly Record<string, number>[]): Record<st
     }), out)
   }, {})
 
-export const aggregateSecondary = (list: readonly SecondaryMetrics[]): SecondaryMetrics => {
+/** Top distinct texts by frequency (ties keep first-seen order — `Array.sort` is stable). */
+const topByFrequency = (texts: readonly string[], limit: number): readonly string[] => {
+  const counts = texts.reduce<Readonly<Record<string, number>>>(
+    (m, t) => ({ ...m, [t]: (m[t] ?? 0) + 1 }),
+    {},
+  )
+  return Object.entries(counts)
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, limit)
+    .map(([t]) => t)
+}
+
+const TOOL_ERROR_TEXTS_LIMIT = 5
+
+/**
+ * A gap this long between two consecutive streamed events (text/tool/
+ * reasoning/step) is not normal per-step latency — every per-tool duration
+ * observed in real runs is single-digit to low-triple-digit milliseconds —
+ * it reads as the agent or model being stuck, not thinking. The threshold is
+ * a caller-side choice (see `EventsProfile.gapsMs` doc); `events-profile.ts`
+ * itself stays threshold-agnostic.
+ */
+export const STALL_THRESHOLD_MS = 60_000
+
+export interface StallStats {
+  /** Sum across runs of gaps exceeding the threshold. */
+  readonly stallCount: number
+  /** Number of runs with at least one such gap. */
+  readonly runsWithStall: number
+}
+
+/** Counts gaps over `thresholdMs` across runs, and how many runs had at least one. */
+export const countStalls = (
+  profiles: readonly EventsProfile[],
+  thresholdMs: number = STALL_THRESHOLD_MS,
+): StallStats =>
+  profiles.reduce<StallStats>(
+    (acc, p) => {
+      const hits = p.gapsMs.filter((g) => g > thresholdMs).length
+      return {
+        stallCount: acc.stallCount + hits,
+        runsWithStall: acc.runsWithStall + (hits > 0 ? 1 : 0),
+      }
+    },
+    { stallCount: 0, runsWithStall: 0 },
+  )
+
+/** Median over the defined values only; `undefined` when none are defined. */
+const definedMedian64 = (vals: readonly (number | undefined)[]): string | undefined => {
+  const defined = vals.filter((v): v is number => v !== undefined)
+  return defined.length === 0 ? undefined : String(round(median(defined)))
+}
+
+export const aggregateSecondary = (
+  list: readonly SecondaryMetrics[],
+  extras: readonly ExtractedExtras[],
+  eventsProfiles: readonly EventsProfile[] = [],
+): SecondaryMetrics => {
   if (list.length === 0) return emptySecondary()
   const numMedian = (vals: readonly string[]): string =>
     String(round(median(vals.map(toNum))))
+  const timeToFirstToolMs = definedMedian64(eventsProfiles.map((p) => p.timeToFirstToolMs))
+  const timeToFirstEditMs = definedMedian64(eventsProfiles.map((p) => p.timeToFirstEditMs))
+  const maxEventGapMs =
+    eventsProfiles.length === 0
+      ? undefined
+      : String(Math.round(Math.max(...eventsProfiles.map((p) => p.maxEventGapMs))))
+  const stalls = eventsProfiles.length === 0 ? undefined : countStalls(eventsProfiles)
+  const firstStepInputTokens = definedMedian64(extras.map((e) => e.firstStepInputTokens))
+  const lastStepInputTokens = definedMedian64(extras.map((e) => e.lastStepInputTokens))
   return {
     inputTokens: numMedian(list.map((m) => m.inputTokens)),
     outputTokens: numMedian(list.map((m) => m.outputTokens)),
@@ -161,8 +231,54 @@ export const aggregateSecondary = (list: readonly SecondaryMetrics[]): Secondary
     toolLatencyAvgMs: numMedian(list.map((m) => m.toolLatencyAvgMs)),
     finishCauseDistribution: mergeFinishCause(list.map((m) => m.finishCauseDistribution)),
     maxConsecutiveSameTool: round(median(list.map((m) => m.maxConsecutiveSameTool))),
+    // Rare-event counters SUM across runs — a median would hide (0,0,0,0,3) as 0.
+    invalidToolCalls: extras.reduce((a, e) => a + e.invalidToolCalls, 0),
+    duplicateToolCalls: extras.reduce((a, e) => a + e.duplicateToolCalls, 0),
+    bashFailCount: extras.reduce((a, e) => a + e.bashFailCount, 0),
+    toolErrorTexts: [
+      ...topByFrequency(
+        extras.flatMap((e) => e.toolErrorTexts),
+        TOOL_ERROR_TEXTS_LIMIT,
+      ),
+    ],
+    ...(timeToFirstToolMs === undefined ? {} : { timeToFirstToolMs }),
+    ...(timeToFirstEditMs === undefined ? {} : { timeToFirstEditMs }),
+    ...(maxEventGapMs === undefined ? {} : { maxEventGapMs }),
+    ...(stalls === undefined ? {} : { stallCount: stalls.stallCount, stalledRunCount: stalls.runsWithStall }),
+    ...(firstStepInputTokens === undefined ? {} : { firstStepInputTokens }),
+    ...(lastStepInputTokens === undefined ? {} : { lastStepInputTokens }),
+    textChars: numMedian(extras.map((e) => String(e.textChars))),
+    reasoningChars: numMedian(extras.map((e) => String(e.reasoningChars))),
+    cacheWriteTokens: numMedian(extras.map((e) => String(e.cacheWriteTokens))),
   }
 }
+
+const buildPackUse = (
+  extras: readonly ExtractedExtras[],
+  packName: string | undefined,
+  canDetect: boolean,
+): PackUse | undefined => {
+  if (packName === undefined) return undefined
+  const firstTimes = extras.flatMap((e) => (e.firstPackCallMs === undefined ? [] : [e.firstPackCallMs]))
+  const firstCallMsMedian = firstTimes.length === 0 ? undefined : String(round(median(firstTimes)))
+  return {
+    calls: extras.reduce((a, e) => a + e.packCalls, 0),
+    errors: extras.reduce((a, e) => a + e.packErrors, 0),
+    runsWithCall: extras.filter((e) => e.packCalls > 0).length,
+    runCount: extras.length,
+    canDetect,
+    ...(firstCallMsMedian === undefined ? {} : { firstCallMsMedian }),
+  }
+}
+
+const buildRiskyCommands = (
+  extras: readonly ExtractedExtras[],
+  runIndexes: readonly number[],
+): readonly RiskyCommand[] =>
+  extras.flatMap((e, i) => e.riskyCommands.map((r) => ({ ...r, runIndex: runIndexes[i] ?? 0 })))
+
+const buildOpencodeVersions = (extras: readonly ExtractedExtras[]): readonly string[] =>
+  [...new Set(extras.map((e) => e.opencodeVersion).filter((v) => v !== ''))].sort()
 
 const emptyPrimary = (): PrimaryMetrics => ({
   totalTokens: '0',
@@ -188,9 +304,22 @@ export interface SideAggregationInput {
   readonly extracted: readonly ExtractedMetrics[]
   readonly failedRuns: readonly FailedRun[]
   readonly rawRunIds: readonly string[]
+  /** Parallel to `extracted` — one entry per successfully-extracted run. */
+  readonly extras: readonly ExtractedExtras[]
+  /** Parallel to `extracted` — the run index each entry came from. */
+  readonly runIndexes: readonly number[]
+  /** Parallel to `extracted` — P5 latency profile of the run's events.ndjson. */
+  readonly eventsProfiles: readonly EventsProfile[]
+  /** The skill pack name to match, when `--pack` resolved to a skill. Absent -> packUse omitted. */
+  readonly packName?: string
+  /** Whether the pack type can be seen in exports at all (false for plugin/mcp/agent/command). */
+  readonly canDetect: boolean
+  /** Computed by phase 07 from side results (§1.6); passed through unchanged. */
+  readonly verifyStats?: VerifyStats
 }
 
 export const buildSideAggregates = (input: SideAggregationInput): SideAggregates => {
+  const packUse = buildPackUse(input.extras, input.packName, input.canDetect)
   if (input.extracted.length === 0) {
     return {
       side: input.side,
@@ -199,10 +328,13 @@ export const buildSideAggregates = (input: SideAggregationInput): SideAggregates
       stats: emptyStats(),
       failedRuns: [...input.failedRuns],
       rawRunIds: [...input.rawRunIds],
+      ...(packUse === undefined ? {} : { packUse }),
+      ...(input.verifyStats === undefined ? {} : { verifyStats: input.verifyStats }),
+      // riskyCommands / opencodeVersions omitted — no successful run was ever inspected.
     }
   }
   const { median: primary, stats } = aggregatePrimary(input.extracted.map((e) => e.primary))
-  const secondary = aggregateSecondary(input.extracted.map((e) => e.secondary))
+  const secondary = aggregateSecondary(input.extracted.map((e) => e.secondary), input.extras, input.eventsProfiles)
   return {
     side: input.side,
     primary,
@@ -210,6 +342,10 @@ export const buildSideAggregates = (input: SideAggregationInput): SideAggregates
     stats,
     failedRuns: [...input.failedRuns],
     rawRunIds: [...input.rawRunIds],
+    ...(packUse === undefined ? {} : { packUse }),
+    riskyCommands: [...buildRiskyCommands(input.extras, input.runIndexes)],
+    opencodeVersions: [...buildOpencodeVersions(input.extras)],
+    ...(input.verifyStats === undefined ? {} : { verifyStats: input.verifyStats }),
   }
 }
 

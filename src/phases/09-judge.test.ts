@@ -6,6 +6,7 @@ import os from 'node:os'
 import { judge, parseJudgeResponse, buildJudgePrompt } from './09-judge.js'
 import { makeTempDir } from '../../tests/setup.js'
 import { readFile, writeFile, ensureDir, removeDir } from '../util/fs.js'
+import { judgeResultSchema } from '@generated/schemas'
 import type {
   DiffResult,
   DiffRunResult,
@@ -30,7 +31,6 @@ const { run } = await import('../opencode/cli.js')
 const runMock = vi.mocked(run)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
-const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -46,6 +46,7 @@ const makeRunInput = (over: Partial<RunInput>): RunInput => ({
     gemini: false, aws: false, ssh: false, git: false,
   },
   pureBaseline: true,
+  protectGit: false,
   preflightEnabled: true,
   formats: ['md'],
   outputPath: makeTempDir(),
@@ -299,6 +300,7 @@ describe('judge — happy path', () => {
     expect(j.explanation).toBe('new adds validation')
     expect(j.modelUsed).toBe('cheap/judge-model')
     expect(j.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+    expect(j.ran).toBe(true)
   })
 
   it('response inside assistant message event → parsed', async () => {
@@ -344,6 +346,7 @@ describe('judge — happy path', () => {
       const result = await runP(judge(input))
       const j = result.judge as JudgeResult
       expect(j.verdict).toBe('unclear')
+      expect(j.ran).toBe(false)
       expect(j.explanation).toContain('scratch directory')
       expect(runMock).not.toHaveBeenCalled()
     } finally {
@@ -423,12 +426,13 @@ describe('judge — both empty', () => {
     expect(j.newQuality).toBe(0)
     expect(j.explanation).toContain('no changes')
     expect(j.modelUsed).toBe('')
+    expect(j.ran).toBe(false)
     expect(runMock).not.toHaveBeenCalled()
   })
 })
 
 describe('judge — unparseable response', () => {
-  it('LLM returns prose → verdict unclear, rawResponse preserved', async () => {
+  it('LLM returns prose → verdict unclear, ran true, rawResponse preserved', async () => {
     runMock.mockImplementation(succeedWith(textEvent('I really cannot decide this one.')))
     const result = await runP(judge(buildInput({})))
     const j = result.judge as JudgeResult
@@ -437,46 +441,54 @@ describe('judge — unparseable response', () => {
     expect(j.newQuality).toBe(0)
     expect(j.explanation).toContain('parse')
     expect(j.rawResponse).toBe('I really cannot decide this one.')
+    expect(j.ran).toBe(true)
   })
 })
 
-describe('judge — LLM failures (non-fatal → unclear)', () => {
-  it('timeout → verdict unclear, explanation mentions timeout', async () => {
+describe('judge — LLM failures (non-fatal → unclear, ran false)', () => {
+  it('timeout → verdict unclear, ran false, explanation mentions timeout', async () => {
     runMock.mockImplementation(failWith({ exitCode: null, stderr: '', timedOut: true }))
     const result = await runP(judge(buildInput({})))
     const j = result.judge as JudgeResult
     expect(j.verdict).toBe('unclear')
+    expect(j.ran).toBe(false)
     expect(j.explanation.toLowerCase()).toContain('timeout')
   })
 
-  it('crash (exit 1) → verdict unclear, explanation mentions crash', async () => {
+  it('crash (exit 1) → verdict unclear, ran false, explanation mentions crash', async () => {
     runMock.mockImplementation(failWith({ exitCode: 1, stderr: 'boom', timedOut: false }))
     const result = await runP(judge(buildInput({})))
     const j = result.judge as JudgeResult
     expect(j.verdict).toBe('unclear')
+    expect(j.ran).toBe(false)
     expect(j.explanation.toLowerCase()).toContain('crash')
   })
 
-  it('rate-limit (429 stderr, not auth) → verdict unclear', async () => {
+  it('rate-limit (429 stderr, not auth) → verdict unclear, ran false', async () => {
     runMock.mockImplementation(failWith({ exitCode: 1, stderr: 'HTTP 429 too many requests', timedOut: false }))
     const result = await runP(judge(buildInput({})))
     const j = result.judge as JudgeResult
     expect(j.verdict).toBe('unclear')
+    expect(j.ran).toBe(false)
   })
 })
 
-describe('judge — model unavailable (fatal → E_MODEL_UNAVAILABLE)', () => {
-  it('auth failure (401 unauthorized) → phase fails', async () => {
+describe('judge — model unavailable (non-fatal → unclear, ran false)', () => {
+  it('auth failure (401 unauthorized) → phase succeeds, verdict unclear, ran false', async () => {
     runMock.mockImplementation(failWith({ exitCode: 1, stderr: '401 Unauthorized invalid api key', timedOut: false }))
-    const err = await runFlip(judge(buildInput({})))
-    expect(err.code).toBe('E_MODEL_UNAVAILABLE')
-    expect(err.phase).toBe('judge')
+    const result = await runP(judge(buildInput({})))
+    const j = result.judge as JudgeResult
+    expect(j.verdict).toBe('unclear')
+    expect(j.ran).toBe(false)
+    expect(j.explanation).toContain('model unavailable')
   })
 
-  it('model not found → phase fails', async () => {
+  it('model not found → phase succeeds, verdict unclear, ran false', async () => {
     runMock.mockImplementation(failWith({ exitCode: 1, stderr: 'model not found: cheap/judge-model', timedOut: false }))
-    const err = await runFlip(judge(buildInput({})))
-    expect(err.code).toBe('E_MODEL_UNAVAILABLE')
+    const result = await runP(judge(buildInput({})))
+    const j = result.judge as JudgeResult
+    expect(j.verdict).toBe('unclear')
+    expect(j.ran).toBe(false)
   })
 })
 
@@ -515,5 +527,34 @@ describe('judge — results/judge.json artifact', () => {
       judge: JudgeResult | null
     }
     expect((onDisk.judge as JudgeResult).verdict).toBe('unclear')
+  })
+})
+
+describe('judgeResultSchema — back-compat round-trip', () => {
+  it('parses an old judge.json shape that has no ran field', () => {
+    const old = {
+      verdict: 'ok',
+      oldQuality: 7,
+      newQuality: 8,
+      explanation: 'new is better',
+      modelUsed: 'gpt-test',
+      timestamp: '2025-01-01T00:00:00.000Z',
+    }
+    const parsed = judgeResultSchema.safeParse(old)
+    expect(parsed.success).toBe(true)
+  })
+
+  it('parses a new judge.json shape that has ran: false', () => {
+    const fresh = {
+      verdict: 'unclear',
+      oldQuality: 0,
+      newQuality: 0,
+      explanation: 'judge model unavailable',
+      modelUsed: '',
+      timestamp: '2025-01-01T00:00:00.000Z',
+      ran: false,
+    }
+    const parsed = judgeResultSchema.safeParse(fresh)
+    expect(parsed.success).toBe(true)
   })
 })

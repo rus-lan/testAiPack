@@ -90,6 +90,7 @@ enum ErrorCode {
   ETotalTimeout: "E_TOTAL_TIMEOUT";
   EOom: "E_OOM";
   EDiskFull: "E_DISK_FULL";
+  EWorktreeBroken: "E_WORKTREE_BROKEN";
   EPortConflict: "E_PORT_CONFLICT";
   EDockerFailed: "E_DOCKER_FAILED";
   EExportInvalid: "E_EXPORT_INVALID";
@@ -136,6 +137,7 @@ model RunInput {
   formats: OutputFormat[];
   outputPath: string;
   diffHtml: boolean;
+  protectGit: boolean;
   collapseRepeats: boolean;
   timelineMode: TimelineMode;
   timeouts: TimeoutConfig;
@@ -298,6 +300,8 @@ model ExportToolState {
   status: "pending" | "running" | "completed" | "error";
   input: unknown;
   output?: string;
+  /** Error text opencode attaches to a failed tool call. */
+  error?: string;
   metadata?: Record<unknown>;
   title?: string;
   time?: { start: safeint; end: safeint };
@@ -356,12 +360,89 @@ model SecondaryMetrics {
   toolLatencyAvgMs: int64;
   finishCauseDistribution: Record<int32>;
   maxConsecutiveSameTool: int32;
+
+  // -- wave 1: sums across runs (rare events; a median would hide (0,0,0,0,3) as 0) --
+  /** Sum across runs of tool parts with tool === "invalid" (hallucinated tool names). */
+  invalidToolCalls?: int32;
+  /** Sum across runs of exact repeat tool calls (same tool + identical input JSON), counting repeats beyond the first. */
+  duplicateToolCalls?: int32;
+  /** Sum across runs of bash calls with state.metadata.exit !== 0. */
+  bashFailCount?: int32;
+  /** Top-5 distinct tool state.error texts by frequency, each truncated to 200 chars. */
+  toolErrorTexts?: string[];
+
+  // -- wave 2 / P5: latency profile from the streamed events (medians unless noted) --
+  /** Median across runs of (first tool_use event timestamp − first event timestamp). */
+  timeToFirstToolMs?: int64;
+  /** Median over runs-that-edited of (first edit/write tool_use timestamp − first event timestamp). */
+  timeToFirstEditMs?: int64;
+  /** MAX across runs of the largest gap between consecutive event timestamps (worst silent stall). */
+  maxEventGapMs?: int64;
+  /** Sum across runs of event gaps exceeding the stall threshold (see stalledRunCount). */
+  stallCount?: int32;
+  /** Number of runs with at least one gap exceeding the stall threshold. */
+  stalledRunCount?: int32;
+
+  // -- wave 2 / P11: context growth from step-finish token counts (medians) --
+  /** Median across runs of the FIRST step-finish tokens.input (baseline context: system prompt + tools + task). */
+  firstStepInputTokens?: int64;
+  /** Median across runs of the LAST step-finish tokens.input (final context size). */
+  lastStepInputTokens?: int64;
+
+  // -- wave 2 / P12: output volume (medians) --
+  /** Median across runs of total text-part characters. */
+  textChars?: int64;
+  /** Median across runs of total reasoning-part characters. */
+  reasoningChars?: int64;
+
+  // -- promoted from anti-recommendations: recorded, never scored (median) --
+  /** Median across runs of info.tokens.cache.write. */
+  cacheWriteTokens?: int64;
 }
 
 model ToolStat {
   count: int32;
   errorRate: float64;
   avgDurationMs: int64;
+}
+
+/** Pack invocations seen in the exports of one side (wave 1: skill packs only). */
+model PackUse {
+  /** Sum of matching skill tool calls across the side's successful runs. */
+  calls: int32;
+  /** Of those, calls whose tool state.status === "error". */
+  errors: int32;
+  /** Number of runs with at least one matching call. */
+  runsWithCall: int32;
+  /** Number of successful runs inspected. */
+  runCount: int32;
+  /** Median over runs-with-call of (first call state.time.start − root info.time.created). */
+  firstCallMsMedian?: int64;
+  /** false when the pack type cannot be seen in exports (plugin, mcp, agent, command). */
+  canDetect: boolean;
+}
+
+/** One dangerous shell command found in a run's exports. */
+model RiskyCommand {
+  runIndex: int32;
+  /** The bash tool input.command, truncated to 300 chars. */
+  command: string;
+  /** true when state.status === "completed". */
+  completed: boolean;
+  /** state.metadata.exit when present. */
+  exitCode?: int32;
+}
+
+/** Outcome of the --verify command across one side's runs. Omitted when --verify is unset. */
+model VerifyStats {
+  /** Runs whose verify command exited 0. */
+  passed: int32;
+  /** Runs whose verify command exited non-zero. */
+  failed: int32;
+  /** Runs whose verify command hit the verify timeout. */
+  timedOut: int32;
+  /** Runs where verify was attempted. */
+  runCount: int32;
 }
 
 model FileChange {
@@ -379,6 +460,11 @@ model SideAggregates {
   stats: AggregateStats;
   failedRuns: FailedRun[];
   rawRunIds: string[];
+  packUse?: PackUse;
+  riskyCommands?: RiskyCommand[];
+  /** Distinct export info.version values seen across the side's runs. */
+  opencodeVersions?: string[];
+  verifyStats?: VerifyStats;
 }
 
 model AggregateStats {
@@ -476,6 +562,21 @@ model DiffRunResult {
   summary: DiffSummary;
   htmlPath?: string;
   noChanges: boolean;
+  // absent = "ok" — report.json written before this field existed must still parse
+  state?: DiffRunState;
+  error?: DiffRunError;
+}
+
+enum DiffRunState {
+  Ok: "ok";
+  GitRestored: "git-restored";
+  GitReplaced: "git-replaced";
+  Failed: "failed";
+}
+
+model DiffRunError {
+  code: "E_WORKTREE_BROKEN";
+  message: string;
 }
 
 model DiffSummary {
@@ -497,6 +598,8 @@ model JudgeResult {
   rawResponse?: string;
   modelUsed: string;
   timestamp: utcDateTime;
+  // absent = true (reports written before this field existed)
+  ran?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +636,8 @@ model WorkspaceTree {
   pack: string;
   homeOld: string[];
   homeNew: string[];
+  gitDirsOld: string[];
+  gitDirsNew: string[];
   config: string;
   results: string;
   raw: string;
@@ -565,4 +670,5 @@ model RunSideResult {
   durationMs: int64;
   verifyExitCode?: int32;
   watchdogTriggered: boolean;
+  errorCode?: ErrorCode;
 }

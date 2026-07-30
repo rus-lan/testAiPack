@@ -69,6 +69,7 @@ export type RunInput = {
   formats: Array<OutputFormat>
   outputPath: string
   diffHtml: boolean
+  protectGit: boolean
   collapseRepeats: boolean
   timelineMode: TimelineMode
   timeouts: TimeoutConfig
@@ -100,6 +101,8 @@ export type WorkspaceTree = {
   pack: string
   homeOld: Array<string>
   homeNew: Array<string>
+  gitDirsOld: Array<string>
+  gitDirsNew: Array<string>
   config: string
   results: string
   raw: string
@@ -109,6 +112,36 @@ export type WorkspaceTree = {
 export type SuccessRank = number
 
 export type FinishCause = 'stop' | 'tool-calls' | 'length' | 'error' | 'other' | 'unknown'
+
+export type ErrorCode =
+  | 'E_REPO_TIMEOUT'
+  | 'E_REPO_CLONE_FAILED'
+  | 'E_PACK_INVALID_REF'
+  | 'E_PACK_UNKNOWN_TYPE'
+  | 'E_PACK_INSTALL_TIMEOUT'
+  | 'E_PACK_INSTALL_FAILED'
+  | 'E_HOME_SETUP_FAILED'
+  | 'E_PREFLIGHT_TIMEOUT'
+  | 'E_PREFLIGHT_FAILED'
+  | 'E_PREFLIGHT_PACK_INVISIBLE'
+  | 'E_RUN_TIMEOUT'
+  | 'E_RUN_HANG_WATCHDOG'
+  | 'E_RUN_CRASH'
+  | 'E_VERIFY_TIMEOUT'
+  | 'E_VERIFY_FAILED'
+  | 'E_INSTALL_TIMEOUT'
+  | 'E_INSTALL_FAILED'
+  | 'E_TOTAL_TIMEOUT'
+  | 'E_OOM'
+  | 'E_DISK_FULL'
+  | 'E_WORKTREE_BROKEN'
+  | 'E_PORT_CONFLICT'
+  | 'E_DOCKER_FAILED'
+  | 'E_EXPORT_INVALID'
+  | 'E_CONFIG_INVALID'
+  | 'E_AUTH_MISSING'
+  | 'E_MODEL_UNAVAILABLE'
+  | 'E_RATE_LIMIT_EXHAUSTED'
 
 export type RunSideResult = {
   side: Side
@@ -121,6 +154,7 @@ export type RunSideResult = {
   durationMs: string
   verifyExitCode?: number
   watchdogTriggered: boolean
+  errorCode?: ErrorCode
 }
 
 export type AggregateInput = {
@@ -165,6 +199,20 @@ export type SecondaryMetrics = {
   toolLatencyAvgMs: string
   finishCauseDistribution: RecordInt32
   maxConsecutiveSameTool: number
+  invalidToolCalls?: number
+  duplicateToolCalls?: number
+  bashFailCount?: number
+  toolErrorTexts?: Array<string>
+  timeToFirstToolMs?: string
+  timeToFirstEditMs?: string
+  maxEventGapMs?: string
+  stallCount?: number
+  stalledRunCount?: number
+  firstStepInputTokens?: string
+  lastStepInputTokens?: string
+  textChars?: string
+  reasoningChars?: string
+  cacheWriteTokens?: string
 }
 
 export type MetricDistribution = {
@@ -184,40 +232,34 @@ export type AggregateStats = {
   successRank: MetricDistribution
 }
 
-export type ErrorCode =
-  | 'E_REPO_TIMEOUT'
-  | 'E_REPO_CLONE_FAILED'
-  | 'E_PACK_INVALID_REF'
-  | 'E_PACK_UNKNOWN_TYPE'
-  | 'E_PACK_INSTALL_TIMEOUT'
-  | 'E_PACK_INSTALL_FAILED'
-  | 'E_HOME_SETUP_FAILED'
-  | 'E_PREFLIGHT_TIMEOUT'
-  | 'E_PREFLIGHT_FAILED'
-  | 'E_PREFLIGHT_PACK_INVISIBLE'
-  | 'E_RUN_TIMEOUT'
-  | 'E_RUN_HANG_WATCHDOG'
-  | 'E_RUN_CRASH'
-  | 'E_VERIFY_TIMEOUT'
-  | 'E_VERIFY_FAILED'
-  | 'E_INSTALL_TIMEOUT'
-  | 'E_INSTALL_FAILED'
-  | 'E_TOTAL_TIMEOUT'
-  | 'E_OOM'
-  | 'E_DISK_FULL'
-  | 'E_PORT_CONFLICT'
-  | 'E_DOCKER_FAILED'
-  | 'E_EXPORT_INVALID'
-  | 'E_CONFIG_INVALID'
-  | 'E_AUTH_MISSING'
-  | 'E_MODEL_UNAVAILABLE'
-  | 'E_RATE_LIMIT_EXHAUSTED'
-
 export type FailedRun = {
   runIndex: number
   errorCode: ErrorCode
   errorMessage: string
   timestamp: string
+}
+
+export type PackUse = {
+  calls: number
+  errors: number
+  runsWithCall: number
+  runCount: number
+  firstCallMsMedian?: string
+  canDetect: boolean
+}
+
+export type RiskyCommand = {
+  runIndex: number
+  command: string
+  completed: boolean
+  exitCode?: number
+}
+
+export type VerifyStats = {
+  passed: number
+  failed: number
+  timedOut: number
+  runCount: number
 }
 
 export type SideAggregates = {
@@ -227,6 +269,10 @@ export type SideAggregates = {
   stats: AggregateStats
   failedRuns: Array<FailedRun>
   rawRunIds: Array<string>
+  packUse?: PackUse
+  riskyCommands?: Array<RiskyCommand>
+  opencodeVersions?: Array<string>
+  verifyStats?: VerifyStats
 }
 
 export type MetricDelta = {
@@ -292,7 +338,7 @@ export type CliParseResult = {
 }
 
 export type DiffError = {
-  code: 'E_DISK_FULL'
+  code: 'E_DISK_FULL' | 'E_WORKTREE_BROKEN'
   message: string
   side: Side
   runIndex?: number
@@ -318,12 +364,21 @@ export type DiffSummary = {
   perFile: Array<FileChange>
 }
 
+export type DiffRunState = 'ok' | 'git-restored' | 'git-replaced' | 'failed'
+
+export type DiffRunError = {
+  code: 'E_WORKTREE_BROKEN'
+  message: string
+}
+
 export type DiffRunResult = {
   runIndex: number
   fullPatch: string
   summary: DiffSummary
   htmlPath?: string
   noChanges: boolean
+  state?: DiffRunState
+  error?: DiffRunError
 }
 
 export type DiffResult = {
@@ -438,6 +493,7 @@ export type ExportToolState = {
   status: 'pending' | 'running' | 'completed' | 'error'
   input: unknown
   output?: string
+  error?: string
   metadata?: RecordUnknown
   title?: string
   time?: {
@@ -569,6 +625,7 @@ export type JudgeResult = {
   rawResponse?: string
   modelUsed: string
   timestamp: string
+  ran?: boolean
 }
 
 export type JudgeResultOutput = {

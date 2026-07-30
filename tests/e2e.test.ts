@@ -16,6 +16,8 @@ import {
   reportSchema,
   timelineSchema,
   opencodeExportSchema,
+  runInputSchema,
+  phaseErrorSchema,
 } from '@generated/schemas'
 
 // ---------------------------------------------------------------------------
@@ -244,6 +246,12 @@ describe('e2e: full A/B pipeline via runCli', () => {
 
       // manifest
       expect(existsSync(path.join(runDir, 'manifest.json'))).toBe(true)
+
+      // run-input.json: resolved RunInput persisted next to manifest.json
+      expect(existsSync(path.join(runDir, 'run-input.json'))).toBe(true)
+      const runInputRaw = await runP(readFile(path.join(runDir, 'run-input.json')))
+      const runInputCheck = runInputSchema.safeParse(JSON.parse(runInputRaw))
+      expect(runInputCheck.success).toBe(true)
 
       // raw exports
       expect(existsSync(path.join(results, 'raw', 'old', 'run-1.json'))).toBe(true)
@@ -573,7 +581,7 @@ describe('e2e: full A/B pipeline via runCli', () => {
     })
   }, 60_000)
 
-  it('preflight failure (opencode launch fails) exits with code 2', async () => {
+  it('preflight failure (opencode launch fails) exits with code 2 and leaves error.json', async () => {
     // version() fails on every call: phase 01 probe swallows it ('unknown'),
     // phase 05 gate 1 (opencode-launch) surfaces it as exit 2.
     mockedVersion.mockImplementation(() =>
@@ -603,8 +611,27 @@ describe('e2e: full A/B pipeline via runCli', () => {
         workspace,
       ])
       expect(code).toBe(2)
+
+      // the pipeline died after phase 01 (workspace exists), so the fatal
+      // PhaseError is captured to error.json instead of only reaching scrollback
+      const runDir = await findRunDir(workspace)
+      expect(existsSync(path.join(runDir, 'error.json'))).toBe(true)
+      const errorRaw = await runP(readFile(path.join(runDir, 'error.json')))
+      const parsed = JSON.parse(errorRaw) as { readonly phase: string; readonly code: string }
+      expect(phaseErrorSchema.safeParse(parsed).success).toBe(true)
+      expect(parsed.phase).toBe('preflight')
+      expect(parsed.code).toBe('E_PREFLIGHT_FAILED')
     })
     mockedVersion.mockReset()
     mockedVersion.mockImplementation(() => Effect.succeed('1.0.0'))
   }, 60_000)
+
+  it('a phase 00 failure (before any workspace exists) does not crash and writes no error.json', async () => {
+    const workspace = path.join(makeTempDir(), '.testaipack')
+    const code = await runCli(['run', '--workspace', workspace])
+    expect(code).not.toBe(0)
+    // cli-parse failed before workspace-setup ever ran: no run dir, nothing to
+    // write error.json into, and the CLI call above completed without throwing.
+    expect(existsSync(workspace)).toBe(false)
+  }, 30_000)
 })
