@@ -29,6 +29,16 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.6.5 (installer atomic rename, binary permissions, signal cleanup)
+
+- **The download temp file now lives inside `INSTALL_DIR`** instead of `${TMPDIR:-/tmp}`, so the final `mv` into place is an atomic same-filesystem rename instead of a cross-filesystem copy — previously, running out of space mid-copy could leave a truncated file sitting on top of a working install (reproduced: 1024 bytes of a 5 MB file). Verified side benefit: the rename now also succeeds over a currently-running binary, where the old cross-filesystem copy failed with `ETXTBSY` — self-upgrading `testaipack` while it's running now works.
+- The installed binary is now `chmod 755` explicitly, instead of relying on `chmod +x` over whatever mode `mktemp` + cross-filesystem `mv` happened to carry over (0600, minus umask) — harmless for a personal `~/.local/bin`, but `sudo INSTALL_DIR=/usr/local/bin` under a restrictive umask could produce 0700, unusable by anyone else.
+- `HUP`/`INT`/`QUIT`/`TERM` are now trapped alongside `EXIT` (dash/ash don't run the `EXIT` trap on a signal), so an interrupted download — closing the terminal, an SSH drop during the ~96 MB transfer — no longer strands a temp file. This matters more now that the temp file lives inside `INSTALL_DIR` (see above): a stray file would land in a directory on the user's `PATH` instead of `/tmp`.
+- A non-writable `INSTALL_DIR` now fails before downloading anything, with a message naming the directory and suggesting `sudo` or a different `INSTALL_DIR`, instead of a raw `mktemp: Permission denied` naming a hidden temp path after the fact.
+- Corrected a stale header comment claiming the binary is always fetched from `releases/latest/download/<asset>` — no longer true since 0.6.4's tag-resolution rework.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.6.4...v0.6.5
+
 ## v0.6.4 (installer release-resolution race, mandatory checksum)
 
 - **`install.sh` could download one release's binary and verify it against another release's checksums**: the base URL resolved to `releases/latest/download`, and the binary and `checksums-sha256.txt` were fetched via two independent HTTP requests, each re-resolving "latest" server-side — during a release publish window they could land on different releases. A user hit this right after v0.6.3 shipped: they got v0.6.2's binary checked against v0.6.3's checksums, a mismatch, and an aborted install, even though both releases were individually correct. The race has existed since v0.4.0. Fixed: "latest" is now resolved to one concrete tag with a single `curl --no-location` redirect probe against `checksums-sha256.txt` (works even when `~/.curlrc` sets `location`), and every asset is downloaded from that same `releases/download/<tag>/` path — the same path pinned `TESTAIPACK_VERSION` installs already used.
