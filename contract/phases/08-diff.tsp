@@ -8,7 +8,7 @@ namespace TestAiPack.Diff;
 model DiffError {
   code: "E_DISK_FULL" | "E_WORKTREE_BROKEN";
   message: string;
-  side: Side;
+  variant: string;
   runIndex?: int32;
   context?: Record<unknown>;
 }
@@ -20,5 +20,5 @@ model DiffInput {
 }
 
 model DiffResultOutput {
-  diff: { old: DiffResult; new: DiffResult };
+  diffs: DiffResult[];
 }

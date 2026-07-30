@@ -8,11 +8,6 @@ namespace TestAiPack;
 // Enumerations
 // ---------------------------------------------------------------------------
 
-enum Side {
-  Old: "old";
-  New: "new";
-}
-
 enum IsolationMode {
   Home: "home";
   Docker: "docker";
@@ -31,16 +26,6 @@ enum TimelineMode {
   SideBySide: "side-by-side";
   TreeDiff: "tree-diff";
   Merged: "merged";
-}
-
-// Which side(s) receive `init` text. `Both` is the historical default:
-// correct for environment prep (dependency installs) both sides need for a
-// fair comparison, but wrong for a pack TRIGGER (e.g. a slash command),
-// which only the pack-under-test side should ever see.
-enum InitSide {
-  Both: "both";
-  New: "new";
-  Old: "old";
 }
 
 enum LogLevel {
@@ -126,30 +111,85 @@ model PhaseError {
 }
 
 // ---------------------------------------------------------------------------
+// Variants & packs (v2)
+// ---------------------------------------------------------------------------
+
+/** Wire-format version. 2 = n-way variants. Artifacts without the field are v1. */
+scalar SchemaVersion extends int32;
+
+/**
+ * One pack in the experiment's registry. `setup`/`check` belong to the PACK
+ * (they install/verify the pack's own runtime); `exercise` belongs to the
+ * VARIANT (see VariantSpec.exercise).
+ */
+model PackSpec {
+  /** Registry key, referenced by VariantSpec.packs. Same charset as variant names. */
+  name: string;
+  /** git URL, npm package, local path, or mcp:<name>:<config> — the old RunInput.packRef. */
+  ref: string;
+  /** Override the auto-detected pack type. */
+  type?: PackType;
+  /** Shell command that installs the pack's runtime into $HOME. Runs once per declaring variant (in its run-1 HOME, then copied out). */
+  setup?: string;
+  /** Shell command that exits 0 iff the pack's runtime is functional. Preflight gate 6 runs it in EVERY HOME of every variant: must pass where the pack is declared, must fail elsewhere (unless allowPacks). */
+  check?: string;
+}
+
+/**
+ * One experiment arm. Fields prompt/init/model/hint/verify fall back to the
+ * same-named global RunInput field when absent; an explicit empty string
+ * disables the inherited global (decision D7).
+ */
+model VariantSpec {
+  /** ^[a-z0-9][a-z0-9-]{0,31}$, unique across the run, `source` reserved. Lands in paths and sessionIds. */
+  name: string;
+  /** PackSpec.name references. Stage 1 enforces length <= 1 at parse time. */
+  packs: string[];
+  prompt?: string;
+  "init"?: string;
+  "model"?: string;
+  /** Appended to this variant's task prompt (successor of the global-only packHint). */
+  hint?: string;
+  /** Drives OPENCODE_PURE / OPENCODE_DISABLE_DEFAULT_PLUGINS / OPENCODE_DISABLE_EXTERNAL_SKILLS. Default: packs.length === 0. */
+  pure?: boolean;
+  verify?: string;
+  /** Shell command run once per run of THIS variant, before the agent session (successor of --pack-exercise). */
+  exercise?: string;
+  /** Pack names whose `check` may pass in this variant's HOMEs without failing gate 6 — the per-(variant,pack) successor of --allow-baseline-tool. */
+  allowPacks?: string[];
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline input
 // ---------------------------------------------------------------------------
 
 model RunInput {
+  schemaVersion: SchemaVersion;
   repoUrl: string;
-  packRef?: string;
-  packType?: PackType;
-  prompt: string;
+  /** Global default prompt. Optional in v2 — every variant must have an effective prompt (own or this). */
+  prompt?: string;
   promptFiles?: string[];
   "init"?: string;
   initFiles?: string[];
-  initSide: InitSide;
+  /** Global default (old packHint). */
+  hint?: string;
   verify?: string;
+  "model"?: string;
   runs: int32;
+  /** Max variants executed concurrently in phase 06. Default 2. */
+  parallel: int32;
+  /** Name of the baseline variant. Defaults to variants[0].name. */
+  baseline: string;
+  packs: PackSpec[];
+  variants: VariantSpec[];
   isolation: IsolationMode;
   dockerNetwork?: string;
   opencodeVersion?: string;
   auth: AuthWhitelist;
-  pureBaseline: boolean;
   judge?: string;
   judgeFiles?: string[];
   preflightEnabled: boolean;
   preflightModel?: string;
-  "model"?: string;
   formats: OutputFormat[];
   outputPath: string;
   diffHtml: boolean;
@@ -160,16 +200,6 @@ model RunInput {
   workspacePath: string;
   logLevel: LogLevel;
   pricingPath?: string;
-  /** Shell command that installs the pack's runtime into $HOME. Runs once for the whole experiment. */
-  packSetup?: string;
-  /** Shell command that exits 0 iff the pack's runtime is functional. Runs in every new HOME (must pass) and every old HOME (must fail unless allowBaselineTool). */
-  packCheck?: string;
-  /** Shell command that runs the pack's own pipeline, once per new-side run, before the agent session starts. */
-  packExercise?: string;
-  /** Override for gate 6: do not hard-fail when packCheck already passes on the old (baseline) side. Absent = false (reports/run-input.json written before this field existed). */
-  allowBaselineTool?: boolean;
-  /** Text appended to the task prompt for BOTH sides, identically — never one-sided, that would make the comparison meaningless. Meant to tell the agent about tool output that may already sit in the workspace (e.g. from packExercise) without biasing which side looks for it. Must be phrased conditionally ("if X is present, use it; if not, work as usual") so its absence on the baseline side costs at most a couple of tool calls. */
-  packHint?: string;
 }
 
 model AuthWhitelist {
@@ -197,26 +227,24 @@ model TimeoutConfig {
 // ---------------------------------------------------------------------------
 
 model Manifest {
+  schemaVersion: SchemaVersion;
   runId: string;
   timestamp: utcDateTime;
   repoUrl: string;
-  packRef?: string;
-  packType?: PackType;
-  prompt: string;
+  /** Optional (global default only). */
+  prompt?: string;
   "init"?: string;
+  hint?: string;
   verify?: string;
   runs: int32;
+  parallel: int32;
+  baseline: string;
+  /** Provenance copies — refs redacted like repoUrl (01-workspace-setup.ts:79-103). */
+  packs: PackSpec[];
+  variants: VariantSpec[];
   isolation: IsolationMode;
   opencodeVersion: string;
   flagDefaults: Record<unknown>;
-  /** Provenance copy of RunInput.packSetup. */
-  packSetup?: string;
-  /** Provenance copy of RunInput.packCheck. */
-  packCheck?: string;
-  /** Provenance copy of RunInput.packExercise. */
-  packExercise?: string;
-  /** Provenance copy of RunInput.packHint — sent identically to both sides; see RunInput.packHint. */
-  packHint?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -437,7 +465,7 @@ model SecondaryMetrics {
   cacheWriteTokens?: int64;
 }
 
-/** One phase's share of the splittable primary metrics (init or task). See SidePhaseSplit. */
+/** One phase's share of the splittable primary metrics (init or task). See PhaseSplit. */
 model PhaseSlice {
   totalTokens: int64;
   wallClockMs: int64;
@@ -460,7 +488,7 @@ model PhaseSliceStats {
  * model call, so no tokens/steps/cost — wall-clock is the ONLY metric that
  * exists for it. A separate model (not a PhaseSlice) so the absence of agent
  * metrics is structural, not a fabricated zero. Aggregated from
- * RunSideResult.setupWallMs (written by the pack-setup pipeline — see its
+ * RunResult.setupWallMs (written by the pack-setup pipeline — see its
  * doc there for exactly what that per-run figure covers).
  */
 model SetupSegment {
@@ -468,14 +496,14 @@ model SetupSegment {
 }
 
 /**
- * Per-side split of the primary metrics between the `--init` invocation and
+ * Per-variant split of the primary metrics between the `--init` invocation and
  * the `--prompt` (task) invocation, derived from the export by cutting the
  * message list at the second user-role message. Absent on reports written
  * before the split existed. `task` covers every successful run (for a run
  * with no init the whole run IS the task); `init` covers only runs whose
  * export contains an init turn.
  */
-model SidePhaseSplit {
+model PhaseSplit {
   /** Successful runs whose export contains an init turn (2 user messages). */
   runsWithInit: int32;
   /** Successful runs where phase 06 ran an init but the export lost it (session continuation failed) — init cost unmeasured, not zero. */
@@ -488,7 +516,7 @@ model SidePhaseSplit {
   taskStats: PhaseSliceStats;
   /** True when at least one contributing run's phase cost was prorated from the session cost (per-message costs absent) — render as derived, never as measured. */
   costProrated?: boolean;
-  /** Harness-run pack setup before the agent phases (see RunSideResult.setupWallMs): wall-clock only — median over runs that had one. Absent when no setup segment ran on this side. */
+  /** Harness-run pack setup before the agent phases (see RunResult.setupWallMs): wall-clock only — median over runs that had one. Absent when no setup segment ran on this variant. */
   setup?: SetupSegment;
   setupStats?: MetricDistribution;
 }
@@ -508,9 +536,10 @@ model ToolStat {
   avgDurationMs: int64;
 }
 
-/** Pack invocations seen in the exports of one side (wave 1: skill packs only). */
+/** Pack invocations seen in one variant's exports, for ONE pack. */
 model PackUse {
-  /** Sum of matching skill tool calls across the side's successful runs. */
+  pack: string;
+  /** Sum of matching skill tool calls across the variant's successful runs. */
   calls: int32;
   /** Of those, calls whose tool state.status === "error". */
   errors: int32;
@@ -524,13 +553,13 @@ model PackUse {
   canDetect: boolean;
   /**
    * True when preflight's pack-visibility gate proved the pack was present in
-   * the new-side HOME before any run started. Only meaningful together with
-   * `calls === 0`: with this true, zero calls means the model chose not to
-   * use the pack; with this false or absent, zero calls could also mean the
-   * pack was never reachable (preflight skipped, disabled, or ran before
-   * this field existed). Optional so a `report.json` written before this
-   * field existed still parses — render sites must treat absent the same as
-   * `false`.
+   * the declaring variant's HOME before any run started. Only meaningful
+   * together with `calls === 0`: with this true, zero calls means the model
+   * chose not to use the pack; with this false or absent, zero calls could
+   * also mean the pack was never reachable (preflight skipped, disabled, or
+   * ran before this field existed). Optional so a `report.json` written
+   * before this field existed still parses — render sites must treat absent
+   * the same as `false`.
    */
   visibilityConfirmed?: boolean;
   /** Run indexes with a successful extraction but zero pack calls — the pack was available and inspected, the agent just never called it. Observational, not a success criterion. */
@@ -540,15 +569,17 @@ model PackUse {
 enum PackSetupMode {
   /** setup + check + exercise all declared and all succeeded — the intended default. */
   Exercised: "exercised";
-  /** No packExercise declared (the pack has nothing runnable, e.g. a pure instruction skill). Not a failure. */
+  /** No exercise declared (the pack has nothing runnable, e.g. a pure instruction skill). Not a failure. */
   InstalledOnly: "installed-only";
   /** No setup/check/exercise declared at all — legacy behavior, weakest evidence class. */
   DeliveredOnly: "delivered-only";
 }
 
-/** Result of one harness-run pack command (setup / check / exercise) — no model, no opencode session. */
+/** Harness command evidence — carries variant AND pack attribution now. */
 model PackCmdResult {
-  side: Side;
+  variant: string;
+  /** Pack the command belongs to; absent for a variant-owned exercise. */
+  pack?: string;
   /** 0 for the one-shot setup. */
   runIndex: int32;
   exitCode: int32;
@@ -559,19 +590,34 @@ model PackCmdResult {
   artifactHash?: string;
 }
 
-/** Harness-side pack preparation record for the whole experiment — see RunInput.packSetup/packCheck/packExercise. */
-model PackSetupReport {
+/** Pack-owned prep evidence (setup + checks) — one per registry pack. */
+model PackPrep {
+  pack: string;
   mode: PackSetupMode;
   setupDeclared: boolean;
   checkDeclared: boolean;
+  /** Any declaring variant has an exercise. */
   exerciseDeclared: boolean;
   /** Dependency markers (pyproject.toml, package.json with bin, pip/uv/npm install text, ...) found in the pack while nothing was declared. */
   undeclaredDepWarning?: string;
-  setup?: PackCmdResult;
-  /** One per new HOME (must pass) + one per old HOME (must fail unless allowBaselineTool). */
+  /** One per declaring variant. */
+  setups: PackCmdResult[];
+  /** Every HOME of every variant (declared: must pass; foreign: must fail). */
   checks: PackCmdResult[];
-  /** One per new-side run, only when exerciseDeclared. */
+}
+
+/** Variant-owned prep evidence (the per-run exercise). */
+model VariantPrep {
+  variant: string;
+  exerciseDeclared: boolean;
+  /** One per variant-side run, only when exerciseDeclared. */
   exercises: PackCmdResult[];
+}
+
+/** Harness-side pack preparation record for the whole experiment. */
+model PrepReport {
+  packs: PackPrep[];
+  variants: VariantPrep[];
 }
 
 /** One dangerous shell command found in a run's exports. */
@@ -586,19 +632,20 @@ model RiskyCommand {
 }
 
 /**
- * One observed sign that the baseline (`old`) side acquired or used the
- * pack under test — a heuristic tripwire, not proof. See
- * `src/metrics/baseline-contamination.ts`.
+ * One observed sign that a variant acquired or used a FOREIGN pack — a
+ * heuristic tripwire, not proof. See `src/metrics/baseline-contamination.ts`.
  */
 model ContaminationSignal {
   kind: "skill-call" | "bash-install" | "install-drift";
+  /** Which FOREIGN pack the signal points at. */
+  pack: string;
   /** Free text — agent-authored (a quoted command, or a drift summary), truncated for display. Render as untrusted content. */
   detail: string;
-  /** Absent for `install-drift`, which is side-level, not tied to one run. */
+  /** Absent for `install-drift`, which is variant-level, not tied to one run. */
   runIndex?: int32;
 }
 
-/** Outcome of the --verify command across one side's runs. Omitted when --verify is unset. */
+/** Outcome of the --verify command across one variant's runs. Omitted when --verify is unset. */
 model VerifyStats {
   /** Runs whose verify command exited 0. */
   passed: int32;
@@ -616,8 +663,8 @@ model FileChange {
   deletions: int32;
 }
 
-model SideAggregates {
-  side: Side;
+model VariantAggregates {
+  variant: string;
   /** primary: median-снимок первичных метрик по N прогонам — используется в дельте и рендере */
   primary: PrimaryMetrics;
   secondary: SecondaryMetrics;
@@ -625,15 +672,16 @@ model SideAggregates {
   stats: AggregateStats;
   failedRuns: FailedRun[];
   rawRunIds: string[];
-  packUse?: PackUse;
+  /** One entry per pack in this variant's declared set. */
+  packUses?: PackUse[];
   riskyCommands?: RiskyCommand[];
-  /** Distinct export info.version values seen across the side's runs. */
+  /** Distinct export info.version values seen across the variant's runs. */
   opencodeVersions?: string[];
   verifyStats?: VerifyStats;
-  /** Only ever populated for `side: "old"` — see `ContaminationSignal`. */
+  /** Signals that THIS variant acquired/used a FOREIGN pack (another variant's set). */
   contaminationSignals?: ContaminationSignal[];
-  /** Split of the primary metrics between the --init and --prompt invocations — see SidePhaseSplit. */
-  phaseSplit?: SidePhaseSplit;
+  /** Split of the primary metrics between the --init and --prompt invocations — see PhaseSplit. */
+  phaseSplit?: PhaseSplit;
 }
 
 model AggregateStats {
@@ -654,21 +702,33 @@ model MetricDistribution {
 }
 
 model FailedRun {
+  variant: string;
   runIndex: int32;
   errorCode: ErrorCode;
   errorMessage: string;
   timestamp: utcDateTime;
 }
 
-model MetricsDiff {
-  old: SideAggregates;
-  new: SideAggregates;
+/** One non-baseline variant's deltas vs the baseline. */
+model VariantDelta {
+  variant: string;
   deltas: PrimaryDeltas;
-  bothFailed: boolean;
-  /** Task-phase-only deltas (new task vs old task) — the like-for-like basis when init runs on one side. Present iff both sides carry phaseSplit. */
+  /** Present iff both this variant and the baseline carry phaseSplit. */
   taskDeltas?: PhaseDeltas;
-  /** Init-vs-init deltas. Present iff BOTH sides have runsWithInit > 0 (i.e. --init-side both). */
+  /** Present iff both carry runsWithInit > 0. */
   initDeltas?: PhaseDeltas;
+  /** True when baseline or this variant produced zero samples — deltas then non-significant/neutral (same containment as computeDelta's anyFailed, src/metrics/aggregate.ts:568-588). */
+  pairIncomplete: boolean;
+}
+
+model MetricsReport {
+  baseline: string;
+  /** Config order, baseline included. */
+  variants: VariantAggregates[];
+  /** N-1 entries, config order minus baseline. */
+  deltas: VariantDelta[];
+  /** Every variant produced zero samples (replaces bothFailed). */
+  allFailed: boolean;
 }
 
 model PrimaryDeltas {
@@ -703,7 +763,7 @@ enum TimelineEventType {
 model TimelineEvent {
   tStart: int64;
   tEnd: int64;
-  side: Side;
+  variant: string;
   runIndex: int32;
   sessionId: string;
   parentSessionId?: string;
@@ -714,9 +774,13 @@ model TimelineEvent {
   status?: "pending" | "running" | "completed" | "error";
 }
 
+model VariantTimeline {
+  variant: string;
+  events: TimelineEvent[];
+}
+
 model Timeline {
-  old: TimelineEvent[];
-  new: TimelineEvent[];
+  lanes: VariantTimeline[];
   mode: TimelineMode;
 }
 
@@ -725,7 +789,7 @@ model Timeline {
 // ---------------------------------------------------------------------------
 
 model DiffResult {
-  side: Side;
+  variant: string;
   runs: DiffRunResult[];
 }
 
@@ -763,16 +827,25 @@ model DiffSummary {
 // Judge
 // ---------------------------------------------------------------------------
 
+model VariantScore {
+  variant: string;
+  /** 0-10, clamped — same scale as today (09-judge.ts:217). */
+  quality: int32;
+}
+
 model JudgeResult {
   verdict: JudgeVerdict;
-  oldQuality: int32;
-  newQuality: int32;
+  scores: VariantScore[];
+  /** Variant names, best first. Derived from scores when the model omits or contradicts it. */
+  ranking: string[];
   explanation: string;
   rawResponse?: string;
   modelUsed: string;
   timestamp: utcDateTime;
   // absent = true (reports written before this field existed)
   ran?: boolean;
+  /** True when the single call would exceed the prompt budget and per-variant scores came from pairwise-vs-baseline calls (03-hard-problems.md §2). */
+  pairwiseFallback?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -780,20 +853,27 @@ model JudgeResult {
 // ---------------------------------------------------------------------------
 
 model Report {
+  schemaVersion: SchemaVersion;
   manifest: Manifest;
-  metricsDiff: MetricsDiff;
+  metrics: MetricsReport;
   timeline: Timeline;
-  diff: { old: DiffResult; new: DiffResult };
+  diffs: DiffResult[];
   judge?: JudgeResult;
   summary: ReportSummary;
-  packSetup?: PackSetupReport;
+  prep?: PrepReport;
+}
+
+model VariantSummary {
+  variant: string;
+  improvements: MetricDelta[];
+  regressions: MetricDelta[];
+  neutral: MetricDelta[];
 }
 
 model ReportSummary {
   headlineResult: string;
-  improvements: MetricDelta[];
-  regressions: MetricDelta[];
-  neutral: MetricDelta[];
+  /** N-1 entries (non-baseline variants, config order). */
+  perVariant: VariantSummary[];
   failures: FailedRun[];
   /** Which deltas fed headlineResult and the buckets: "task" (init/setup excluded) or "total". Absent = "total" (older reports). */
   basis?: "task" | "total";
@@ -804,16 +884,20 @@ model ReportSummary {
 // Referenced by 2+ phases, defined once here so phase files only import main.tsp.
 // ---------------------------------------------------------------------------
 
+/** Per-variant slice of the workspace layout (one path per run). */
+model VariantTree {
+  name: string;
+  apps: string[];
+  homes: string[];
+  gitDirs: string[];
+}
+
 model WorkspaceTree {
   root: string;
   appsSource: string;
-  appsOld: string[];
-  appsNew: string[];
+  /** Root of pack deliveries: pack/<packName>/. */
   pack: string;
-  homeOld: string[];
-  homeNew: string[];
-  gitDirsOld: string[];
-  gitDirsNew: string[];
+  variantTrees: VariantTree[];
   config: string;
   results: string;
   raw: string;
@@ -833,12 +917,18 @@ model EnvVarSet {
   OPENCODE_DISABLE_EXTERNAL_SKILLS: boolean;
   OPENCODE_PURE: boolean;
   OPENCODE_CONFIG_CONTENT?: string;
-  /** Set only when RunInput.packSetup is declared: <homeDir>/.local/bin prepended, identical shape on both sides. */
+  /** Set only when the variant's pack declares PackSpec.setup: <homeDir>/.local/bin prepended; identical shape for every variant. */
   PATH?: string;
 }
 
-model RunSideResult {
-  side: Side;
+/** Env sets for one variant, one entry per run. Replaces EnvVarSet[][] magic indexing. */
+model VariantEnv {
+  name: string;
+  envs: EnvVarSet[];
+}
+
+model RunResult {
+  variant: string;
   runIndex: int32;
   exportPath: string;
   eventsLogPath: string;
@@ -852,10 +942,10 @@ model RunSideResult {
   /**
    * Wall-clock consumed by harness pack-exercise work for THIS run, before
    * the agent session started — no model, no tokens, no opencode session.
-   * Absent (not zero) when no exercise ran for this run: the old side never
-   * exercises, and a zero here would read as "measured none" rather than
-   * "not applicable". One-time setup/check wall-clock is experiment-level,
-   * not per-run — see PackSetupReport.setup / PackSetupReport.checks.
+   * Absent (not zero) when no exercise ran for this run: a zero here would
+   * read as "measured none" rather than "not applicable". One-time
+   * setup/check wall-clock is experiment-level, not per-run — see
+   * PackPrep.setups / PackPrep.checks.
    */
   setupWallMs?: int64;
   /** True when this run actually executed an --init invocation. */

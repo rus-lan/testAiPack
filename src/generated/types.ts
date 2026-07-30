@@ -4,21 +4,40 @@
  * Re-run `npm run contract:codegen` after changing contract/*.tsp.
  */
 
-export type Side = 'old' | 'new'
-
 export type RecordUnknown = Record<string, unknown>
 
 export type AggregateError = {
   code: 'E_EXPORT_INVALID'
   message: string
-  side: Side
+  variant: string
   runIndex?: number
   context?: RecordUnknown
 }
 
+export type SchemaVersion = number
+
 export type PackType = 'skill' | 'plugin' | 'agent' | 'command' | 'mcp' | 'all'
 
-export type InitSide = 'both' | 'new' | 'old'
+export type PackSpec = {
+  name: string
+  ref: string
+  type?: PackType
+  setup?: string
+  check?: string
+}
+
+export type VariantSpec = {
+  name: string
+  packs: Array<string>
+  prompt?: string
+  init?: string
+  model?: string
+  hint?: string
+  pure?: boolean
+  verify?: string
+  exercise?: string
+  allowPacks?: Array<string>
+}
 
 export type IsolationMode = 'home' | 'docker'
 
@@ -49,26 +68,28 @@ export type TimeoutConfig = {
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 export type RunInput = {
+  schemaVersion: SchemaVersion
   repoUrl: string
-  packRef?: string
-  packType?: PackType
-  prompt: string
+  prompt?: string
   promptFiles?: Array<string>
   init?: string
   initFiles?: Array<string>
-  initSide: InitSide
+  hint?: string
   verify?: string
+  model?: string
   runs: number
+  parallel: number
+  baseline: string
+  packs: Array<PackSpec>
+  variants: Array<VariantSpec>
   isolation: IsolationMode
   dockerNetwork?: string
   opencodeVersion?: string
   auth: AuthWhitelist
-  pureBaseline: boolean
   judge?: string
   judgeFiles?: Array<string>
   preflightEnabled: boolean
   preflightModel?: string
-  model?: string
   formats: Array<OutputFormat>
   outputPath: string
   diffHtml: boolean
@@ -79,42 +100,39 @@ export type RunInput = {
   workspacePath: string
   logLevel: LogLevel
   pricingPath?: string
-  packSetup?: string
-  packCheck?: string
-  packExercise?: string
-  allowBaselineTool?: boolean
-  packHint?: string
 }
 
 export type Manifest = {
+  schemaVersion: SchemaVersion
   runId: string
   timestamp: string
   repoUrl: string
-  packRef?: string
-  packType?: PackType
-  prompt: string
+  prompt?: string
   init?: string
+  hint?: string
   verify?: string
   runs: number
+  parallel: number
+  baseline: string
+  packs: Array<PackSpec>
+  variants: Array<VariantSpec>
   isolation: IsolationMode
   opencodeVersion: string
   flagDefaults: RecordUnknown
-  packSetup?: string
-  packCheck?: string
-  packExercise?: string
-  packHint?: string
+}
+
+export type VariantTree = {
+  name: string
+  apps: Array<string>
+  homes: Array<string>
+  gitDirs: Array<string>
 }
 
 export type WorkspaceTree = {
   root: string
   appsSource: string
-  appsOld: Array<string>
-  appsNew: Array<string>
   pack: string
-  homeOld: Array<string>
-  homeNew: Array<string>
-  gitDirsOld: Array<string>
-  gitDirsNew: Array<string>
+  variantTrees: Array<VariantTree>
   config: string
   results: string
   raw: string
@@ -160,8 +178,8 @@ export type ErrorCode =
   | 'E_PACK_EXERCISE_FAILED'
   | 'E_PACK_EXERCISE_DIRTY'
 
-export type RunSideResult = {
-  side: Side
+export type RunResult = {
+  variant: string
   runIndex: number
   exportPath: string
   eventsLogPath: string
@@ -178,14 +196,16 @@ export type RunSideResult = {
   promptWallMs?: string
 }
 
+export type VariantRunResults = {
+  name: string
+  runs: Array<RunResult>
+}
+
 export type AggregateInput = {
   runInput: RunInput
   manifest: Manifest
   workspace: WorkspaceTree
-  sideResults: {
-    old: Array<RunSideResult>
-    new: Array<RunSideResult>
-  }
+  results: Array<VariantRunResults>
 }
 
 export type PrimaryMetrics = {
@@ -254,6 +274,7 @@ export type AggregateStats = {
 }
 
 export type FailedRun = {
+  variant: string
   runIndex: number
   errorCode: ErrorCode
   errorMessage: string
@@ -261,6 +282,7 @@ export type FailedRun = {
 }
 
 export type PackUse = {
+  pack: string
   calls: number
   errors: number
   runsWithCall: number
@@ -287,6 +309,7 @@ export type VerifyStats = {
 
 export type ContaminationSignal = {
   kind: 'skill-call' | 'bash-install' | 'install-drift'
+  pack: string
   detail: string
   runIndex?: number
 }
@@ -311,7 +334,7 @@ export type SetupSegment = {
   wallClockMs: string
 }
 
-export type SidePhaseSplit = {
+export type PhaseSplit = {
   runsWithInit: number
   runsWithLostInit: number
   init?: PhaseSlice
@@ -323,19 +346,19 @@ export type SidePhaseSplit = {
   setupStats?: MetricDistribution
 }
 
-export type SideAggregates = {
-  side: Side
+export type VariantAggregates = {
+  variant: string
   primary: PrimaryMetrics
   secondary: SecondaryMetrics
   stats: AggregateStats
   failedRuns: Array<FailedRun>
   rawRunIds: Array<string>
-  packUse?: PackUse
+  packUses?: Array<PackUse>
   riskyCommands?: Array<RiskyCommand>
   opencodeVersions?: Array<string>
   verifyStats?: VerifyStats
   contaminationSignals?: Array<ContaminationSignal>
-  phaseSplit?: SidePhaseSplit
+  phaseSplit?: PhaseSplit
 }
 
 export type MetricDelta = {
@@ -363,21 +386,23 @@ export type PhaseDeltas = {
   toolCallCount: MetricDelta
 }
 
-export type MetricsDiff = {
-  old: SideAggregates
-  new: SideAggregates
+export type VariantDelta = {
+  variant: string
   deltas: PrimaryDeltas
-  bothFailed: boolean
   taskDeltas?: PhaseDeltas
   initDeltas?: PhaseDeltas
+  pairIncomplete: boolean
+}
+
+export type MetricsReport = {
+  baseline: string
+  variants: Array<VariantAggregates>
+  deltas: Array<VariantDelta>
+  allFailed: boolean
 }
 
 export type AggregateResult = {
-  metricsDiff: MetricsDiff
-  rawAggregates: {
-    old: SideAggregates
-    new: SideAggregates
-  }
+  metrics: MetricsReport
 }
 
 export type CleanupInput = {
@@ -413,7 +438,7 @@ export type CliParseResult = {
 export type DiffError = {
   code: 'E_DISK_FULL' | 'E_WORKTREE_BROKEN'
   message: string
-  side: Side
+  variant: string
   runIndex?: number
   context?: RecordUnknown
 }
@@ -455,15 +480,12 @@ export type DiffRunResult = {
 }
 
 export type DiffResult = {
-  side: Side
+  variant: string
   runs: Array<DiffRunResult>
 }
 
 export type DiffResultOutput = {
-  diff: {
-    old: DiffResult
-    new: DiffResult
-  }
+  diffs: Array<DiffResult>
 }
 
 export type EnvVarSet = {
@@ -631,6 +653,11 @@ export type ExportMessage = {
   parts: Array<ExportPart>
 }
 
+export type HomeCheckTarget = {
+  homeDir: string
+  pathOverride?: string
+}
+
 export type HomeIsolationError = {
   code:
     | 'E_HOME_SETUP_FAILED'
@@ -642,11 +669,16 @@ export type HomeIsolationError = {
   context?: RecordUnknown
 }
 
-export type PackInstallResult = {
+export type PackDelivery = {
+  pack: string
   packPath: string
   detectedType: PackType | unknown
-  installLogPath: string
   registeredIn: Array<string>
+}
+
+export type PackInstallResult = {
+  deliveries: Array<PackDelivery>
+  installLogPath: string
 }
 
 export type HomeIsolationInput = {
@@ -662,16 +694,25 @@ export type HomeTree = {
   copiedAuth: Array<string>
 }
 
+export type VariantHomes = {
+  name: string
+  trees: Array<HomeTree>
+}
+
+export type VariantEnv = {
+  name: string
+  envs: Array<EnvVarSet>
+}
+
+export type VariantConfig = {
+  name: string
+  config: string
+}
+
 export type HomeIsolationResult = {
-  homeTrees: {
-    old: Array<HomeTree>
-    new: Array<HomeTree>
-  }
-  envVars: Array<Array<EnvVarSet>>
-  generatedConfigs: {
-    baseline: string
-    new: string
-  }
+  homeTrees: Array<VariantHomes>
+  envVars: Array<VariantEnv>
+  generatedConfigs: Array<VariantConfig>
 }
 
 export type JudgeError = {
@@ -683,23 +724,26 @@ export type JudgeError = {
 export type JudgeInput = {
   runInput: RunInput
   manifest: Manifest
-  diff: {
-    old: DiffResult
-    new: DiffResult
-  }
+  diffs: Array<DiffResult>
 }
 
 export type JudgeVerdict = 'ok' | 'fail' | 'unclear'
 
+export type VariantScore = {
+  variant: string
+  quality: number
+}
+
 export type JudgeResult = {
   verdict: JudgeVerdict
-  oldQuality: number
-  newQuality: number
+  scores: Array<VariantScore>
+  ranking: Array<string>
   explanation: string
   rawResponse?: string
   modelUsed: string
   timestamp: string
   ran?: boolean
+  pairwiseFallback?: boolean
 }
 
 export type JudgeResultOutput = {
@@ -712,7 +756,8 @@ export type OpencodeExport = {
 }
 
 export type PackCmdResult = {
-  side: Side
+  variant: string
+  pack?: string
   runIndex: number
   exitCode: number
   durationMs: string
@@ -733,6 +778,19 @@ export type PackInstallInput = {
   workspace: WorkspaceTree
 }
 
+export type PackSetupMode = 'exercised' | 'installed-only' | 'delivered-only'
+
+export type PackPrep = {
+  pack: string
+  mode: PackSetupMode
+  setupDeclared: boolean
+  checkDeclared: boolean
+  exerciseDeclared: boolean
+  undeclaredDepWarning?: string
+  setups: Array<PackCmdResult>
+  checks: Array<PackCmdResult>
+}
+
 export type PackSetupError = {
   code: 'E_PACK_SETUP_FAILED' | 'E_PACK_SETUP_TIMEOUT'
   message: string
@@ -746,21 +804,19 @@ export type PackSetupInput = {
   packInstall?: PackInstallResult
 }
 
-export type PackSetupMode = 'exercised' | 'installed-only' | 'delivered-only'
-
-export type PackSetupReport = {
-  mode: PackSetupMode
-  setupDeclared: boolean
-  checkDeclared: boolean
+export type VariantPrep = {
+  variant: string
   exerciseDeclared: boolean
-  undeclaredDepWarning?: string
-  setup?: PackCmdResult
-  checks: Array<PackCmdResult>
   exercises: Array<PackCmdResult>
 }
 
+export type PrepReport = {
+  packs: Array<PackPrep>
+  variants: Array<VariantPrep>
+}
+
 export type PackSetupResult = {
-  report: PackSetupReport
+  report: PrepReport
   logPath: string
 }
 
@@ -775,7 +831,7 @@ export type PhaseError = {
 
 export type PreflightCheck = {
   name: string
-  side: Side
+  variant: string
   passed: boolean
   durationMs: string
   details?: string
@@ -794,20 +850,22 @@ export type PreflightError = {
     | 'auth-ping'
     | 'build-agent'
     | 'pack-visibility'
-    | 'baseline-identical'
+    | 'foreign-pack-absent'
     | 'pack-functional'
-  side: Side
+  variant: string
   message: string
   context?: RecordUnknown
+}
+
+export type VariantHomesForCheck = {
+  name: string
+  homes: Array<HomeCheckTarget>
 }
 
 export type PreflightInput = {
   runInput: RunInput
   manifest: Manifest
-  homePaths: {
-    old: string
-    new: string
-  }
+  homesForCheck: Array<VariantHomesForCheck>
 }
 
 export type PreflightResult = {
@@ -830,12 +888,14 @@ export type RepoCloneInput = {
   workspace: WorkspaceTree
 }
 
+export type VariantCopyPaths = {
+  name: string
+  paths: Array<string>
+}
+
 export type RepoCloneResult = {
   sourcePath: string
-  copyPaths: {
-    old: Array<string>
-    new: Array<string>
-  }
+  copyPaths: Array<VariantCopyPaths>
   cloneDurationMs: string
 }
 
@@ -844,7 +904,7 @@ export type TimelineEventType = 'reasoning' | 'tool-call' | 'tool-result' | 'ste
 export type TimelineEvent = {
   tStart: string
   tEnd: string
-  side: Side
+  variant: string
   runIndex: number
   sessionId: string
   parentSessionId?: string
@@ -855,32 +915,39 @@ export type TimelineEvent = {
   status?: 'pending' | 'running' | 'completed' | 'error'
 }
 
+export type VariantTimeline = {
+  variant: string
+  events: Array<TimelineEvent>
+}
+
 export type Timeline = {
-  old: Array<TimelineEvent>
-  new: Array<TimelineEvent>
+  lanes: Array<VariantTimeline>
   mode: TimelineMode
+}
+
+export type VariantSummary = {
+  variant: string
+  improvements: Array<MetricDelta>
+  regressions: Array<MetricDelta>
+  neutral: Array<MetricDelta>
 }
 
 export type ReportSummary = {
   headlineResult: string
-  improvements: Array<MetricDelta>
-  regressions: Array<MetricDelta>
-  neutral: Array<MetricDelta>
+  perVariant: Array<VariantSummary>
   failures: Array<FailedRun>
   basis?: 'task' | 'total'
 }
 
 export type Report = {
+  schemaVersion: SchemaVersion
   manifest: Manifest
-  metricsDiff: MetricsDiff
+  metrics: MetricsReport
   timeline: Timeline
-  diff: {
-    old: DiffResult
-    new: DiffResult
-  }
+  diffs: Array<DiffResult>
   judge?: JudgeResult
   summary: ReportSummary
-  packSetup?: PackSetupReport
+  prep?: PrepReport
 }
 
 export type ReportRenderError = {
@@ -892,15 +959,12 @@ export type ReportRenderError = {
 export type ReportRenderInput = {
   runInput: RunInput
   manifest: Manifest
-  metricsDiff: MetricsDiff
+  metrics: MetricsReport
   timeline: Timeline
-  diff: {
-    old: DiffResult
-    new: DiffResult
-  }
+  diffs: Array<DiffResult>
   judge?: JudgeResult
   summary: ReportSummary
-  packSetup?: PackSetupReport
+  prep?: PrepReport
 }
 
 export type ReportRenderResult = {
@@ -940,7 +1004,7 @@ export type RunSideError = {
     | 'E_EXPORT_INVALID'
     | 'E_TOTAL_TIMEOUT'
   message: string
-  side: Side
+  variant: string
   runIndex: number
   context?: RecordUnknown
 }
@@ -950,7 +1014,7 @@ export type RunSideInput = {
   manifest: Manifest
   workspace: WorkspaceTree
   homeEnv: EnvVarSet
-  side: Side
+  variant: string
   runIndex: number
   sessionId: string
 }
@@ -958,7 +1022,7 @@ export type RunSideInput = {
 export type TimelineError = {
   code: 'E_EXPORT_INVALID'
   message: string
-  side?: Side
+  variant?: string
   runIndex?: number
   context?: RecordUnknown
 }
@@ -967,10 +1031,7 @@ export type TimelineInput = {
   runInput: RunInput
   manifest: Manifest
   workspace: WorkspaceTree
-  sideResults: {
-    old: Array<RunSideResult>
-    new: Array<RunSideResult>
-  }
+  results: Array<VariantRunResults>
 }
 
 export type TimelineResult = {

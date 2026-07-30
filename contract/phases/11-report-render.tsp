@@ -14,12 +14,12 @@ model ReportRenderError {
 model ReportRenderInput {
   runInput: RunInput;
   manifest: Manifest;
-  metricsDiff: MetricsDiff;
+  metrics: MetricsReport;
   timeline: Timeline;
-  diff: { old: DiffResult; new: DiffResult };
+  diffs: DiffResult[];
   judge?: JudgeResult;
   summary: ReportSummary;
-  packSetup?: PackSetupReport;
+  prep?: PrepReport;
 }
 
 model ReportRenderResult {

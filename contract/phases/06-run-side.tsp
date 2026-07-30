@@ -18,7 +18,7 @@ model RunSideError {
     | "E_EXPORT_INVALID"
     | "E_TOTAL_TIMEOUT";
   message: string;
-  side: Side;
+  variant: string;
   runIndex: int32;
   context?: Record<unknown>;
 }
@@ -28,7 +28,7 @@ model RunSideInput {
   manifest: Manifest;
   workspace: WorkspaceTree;
   homeEnv: EnvVarSet;
-  side: Side;
+  variant: string;
   runIndex: int32;
   sessionId: string;
 }

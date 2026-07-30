@@ -4,25 +4,35 @@ using TestAiPack;
 
 namespace TestAiPack.Preflight;
 
+model HomeCheckTarget {
+  homeDir: string;
+  pathOverride?: string;
+}
+
+model VariantHomesForCheck {
+  name: string;
+  homes: HomeCheckTarget[];
+}
+
 model PreflightInput {
   runInput: RunInput;
   manifest: Manifest;
-  homePaths: { old: string; new: string };
+  homesForCheck: VariantHomesForCheck[];
 }
 
 @error
 model PreflightError {
   code: "E_PREFLIGHT_TIMEOUT" | "E_PREFLIGHT_FAILED" | "E_PREFLIGHT_PACK_INVISIBLE" | "E_AUTH_MISSING" | "E_PACK_CHECK_FAILED";
   phase: "preflight";
-  check: "opencode-launch" | "auth-ping" | "build-agent" | "pack-visibility" | "baseline-identical" | "pack-functional";
-  side: Side;
+  check: "opencode-launch" | "auth-ping" | "build-agent" | "pack-visibility" | "foreign-pack-absent" | "pack-functional";
+  variant: string;
   message: string;
   context?: Record<unknown>;
 }
 
 model PreflightCheck {
   name: string;
-  side: Side;
+  variant: string;
   passed: boolean;
   durationMs: int64;
   details?: string;

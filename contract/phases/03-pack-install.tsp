@@ -18,9 +18,14 @@ model PackInstallInput {
   workspace: WorkspaceTree;
 }
 
-model PackInstallResult {
+model PackDelivery {
+  pack: string;
   packPath: string;
   detectedType: PackType | null;
-  installLogPath: string;
   registeredIn: string[];
+}
+
+model PackInstallResult {
+  deliveries: PackDelivery[];
+  installLogPath: string;
 }

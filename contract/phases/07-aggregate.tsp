@@ -8,19 +8,23 @@ namespace TestAiPack.Aggregate;
 model AggregateError {
   code: "E_EXPORT_INVALID";
   message: string;
-  side: Side;
+  variant: string;
   runIndex?: int32;
   context?: Record<unknown>;
+}
+
+model VariantRunResults {
+  name: string;
+  runs: RunResult[];
 }
 
 model AggregateInput {
   runInput: RunInput;
   manifest: Manifest;
   workspace: WorkspaceTree;
-  sideResults: { old: RunSideResult[]; new: RunSideResult[] };
+  results: VariantRunResults[];
 }
 
 model AggregateResult {
-  metricsDiff: MetricsDiff;
-  rawAggregates: { old: SideAggregates; new: SideAggregates };
+  metrics: MetricsReport;
 }

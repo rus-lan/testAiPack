@@ -6,21 +6,40 @@
 
 import { z } from 'zod'
 
-export const sideSchema = z.enum(['old', 'new'])
-
 export const recordUnknownSchema = z.record(z.string(), z.unknown())
 
 export const aggregateErrorSchema = z.object({
   code: z.literal('E_EXPORT_INVALID'),
   message: z.string(),
-  side: sideSchema,
+  variant: z.string(),
   runIndex: z.number().int().optional(),
   context: recordUnknownSchema.optional(),
 })
 
+export const schemaVersionSchema = z.number().int()
+
 export const packTypeSchema = z.enum(['skill', 'plugin', 'agent', 'command', 'mcp', 'all'])
 
-export const initSideSchema = z.enum(['both', 'new', 'old'])
+export const packSpecSchema = z.object({
+  name: z.string(),
+  ref: z.string(),
+  type: packTypeSchema.optional(),
+  setup: z.string().optional(),
+  check: z.string().optional(),
+})
+
+export const variantSpecSchema = z.object({
+  name: z.string(),
+  packs: z.array(z.string()),
+  prompt: z.string().optional(),
+  init: z.string().optional(),
+  model: z.string().optional(),
+  hint: z.string().optional(),
+  pure: z.boolean().optional(),
+  verify: z.string().optional(),
+  exercise: z.string().optional(),
+  allowPacks: z.array(z.string()).optional(),
+})
 
 export const isolationModeSchema = z.enum(['home', 'docker'])
 
@@ -51,26 +70,28 @@ export const timeoutConfigSchema = z.object({
 export const logLevelSchema = z.enum(['debug', 'info', 'warn', 'error'])
 
 export const runInputSchema = z.object({
+  schemaVersion: schemaVersionSchema,
   repoUrl: z.string(),
-  packRef: z.string().optional(),
-  packType: packTypeSchema.optional(),
-  prompt: z.string(),
+  prompt: z.string().optional(),
   promptFiles: z.array(z.string()).optional(),
   init: z.string().optional(),
   initFiles: z.array(z.string()).optional(),
-  initSide: initSideSchema,
+  hint: z.string().optional(),
   verify: z.string().optional(),
+  model: z.string().optional(),
   runs: z.number().int(),
+  parallel: z.number().int(),
+  baseline: z.string(),
+  packs: z.array(packSpecSchema),
+  variants: z.array(variantSpecSchema),
   isolation: isolationModeSchema,
   dockerNetwork: z.string().optional(),
   opencodeVersion: z.string().optional(),
   auth: authWhitelistSchema,
-  pureBaseline: z.boolean(),
   judge: z.string().optional(),
   judgeFiles: z.array(z.string()).optional(),
   preflightEnabled: z.boolean(),
   preflightModel: z.string().optional(),
-  model: z.string().optional(),
   formats: z.array(outputFormatSchema),
   outputPath: z.string(),
   diffHtml: z.boolean(),
@@ -81,42 +102,39 @@ export const runInputSchema = z.object({
   workspacePath: z.string(),
   logLevel: logLevelSchema,
   pricingPath: z.string().optional(),
-  packSetup: z.string().optional(),
-  packCheck: z.string().optional(),
-  packExercise: z.string().optional(),
-  allowBaselineTool: z.boolean().optional(),
-  packHint: z.string().optional(),
 })
 
 export const manifestSchema = z.object({
+  schemaVersion: schemaVersionSchema,
   runId: z.string(),
   timestamp: z.string(),
   repoUrl: z.string(),
-  packRef: z.string().optional(),
-  packType: packTypeSchema.optional(),
-  prompt: z.string(),
+  prompt: z.string().optional(),
   init: z.string().optional(),
+  hint: z.string().optional(),
   verify: z.string().optional(),
   runs: z.number().int(),
+  parallel: z.number().int(),
+  baseline: z.string(),
+  packs: z.array(packSpecSchema),
+  variants: z.array(variantSpecSchema),
   isolation: isolationModeSchema,
   opencodeVersion: z.string(),
   flagDefaults: recordUnknownSchema,
-  packSetup: z.string().optional(),
-  packCheck: z.string().optional(),
-  packExercise: z.string().optional(),
-  packHint: z.string().optional(),
+})
+
+export const variantTreeSchema = z.object({
+  name: z.string(),
+  apps: z.array(z.string()),
+  homes: z.array(z.string()),
+  gitDirs: z.array(z.string()),
 })
 
 export const workspaceTreeSchema = z.object({
   root: z.string(),
   appsSource: z.string(),
-  appsOld: z.array(z.string()),
-  appsNew: z.array(z.string()),
   pack: z.string(),
-  homeOld: z.array(z.string()),
-  homeNew: z.array(z.string()),
-  gitDirsOld: z.array(z.string()),
-  gitDirsNew: z.array(z.string()),
+  variantTrees: z.array(variantTreeSchema),
   config: z.string(),
   results: z.string(),
   raw: z.string(),
@@ -170,8 +188,8 @@ export const errorCodeSchema = z.enum([
   'E_PACK_EXERCISE_DIRTY',
 ])
 
-export const runSideResultSchema = z.object({
-  side: sideSchema,
+export const runResultSchema = z.object({
+  variant: z.string(),
   runIndex: z.number().int(),
   exportPath: z.string(),
   eventsLogPath: z.string(),
@@ -188,14 +206,16 @@ export const runSideResultSchema = z.object({
   promptWallMs: z.string().optional(),
 })
 
+export const variantRunResultsSchema = z.object({
+  name: z.string(),
+  runs: z.array(runResultSchema),
+})
+
 export const aggregateInputSchema = z.object({
   runInput: runInputSchema,
   manifest: manifestSchema,
   workspace: workspaceTreeSchema,
-  sideResults: z.object({
-    old: z.array(runSideResultSchema),
-    new: z.array(runSideResultSchema),
-  }),
+  results: z.array(variantRunResultsSchema),
 })
 
 export const primaryMetricsSchema = z.object({
@@ -264,6 +284,7 @@ export const aggregateStatsSchema = z.object({
 })
 
 export const failedRunSchema = z.object({
+  variant: z.string(),
   runIndex: z.number().int(),
   errorCode: errorCodeSchema,
   errorMessage: z.string(),
@@ -271,6 +292,7 @@ export const failedRunSchema = z.object({
 })
 
 export const packUseSchema = z.object({
+  pack: z.string(),
   calls: z.number().int(),
   errors: z.number().int(),
   runsWithCall: z.number().int(),
@@ -297,6 +319,7 @@ export const verifyStatsSchema = z.object({
 
 export const contaminationSignalSchema = z.object({
   kind: z.union([z.literal('skill-call'), z.literal('bash-install'), z.literal('install-drift')]),
+  pack: z.string(),
   detail: z.string(),
   runIndex: z.number().int().optional(),
 })
@@ -321,7 +344,7 @@ export const setupSegmentSchema = z.object({
   wallClockMs: z.string(),
 })
 
-export const sidePhaseSplitSchema = z.object({
+export const phaseSplitSchema = z.object({
   runsWithInit: z.number().int(),
   runsWithLostInit: z.number().int(),
   init: phaseSliceSchema.optional(),
@@ -333,19 +356,19 @@ export const sidePhaseSplitSchema = z.object({
   setupStats: metricDistributionSchema.optional(),
 })
 
-export const sideAggregatesSchema = z.object({
-  side: sideSchema,
+export const variantAggregatesSchema = z.object({
+  variant: z.string(),
   primary: primaryMetricsSchema,
   secondary: secondaryMetricsSchema,
   stats: aggregateStatsSchema,
   failedRuns: z.array(failedRunSchema),
   rawRunIds: z.array(z.string()),
-  packUse: packUseSchema.optional(),
+  packUses: z.array(packUseSchema).optional(),
   riskyCommands: z.array(riskyCommandSchema).optional(),
   opencodeVersions: z.array(z.string()).optional(),
   verifyStats: verifyStatsSchema.optional(),
   contaminationSignals: z.array(contaminationSignalSchema).optional(),
-  phaseSplit: sidePhaseSplitSchema.optional(),
+  phaseSplit: phaseSplitSchema.optional(),
 })
 
 export const metricDeltaSchema = z.object({
@@ -378,21 +401,23 @@ export const phaseDeltasSchema = z.object({
   toolCallCount: metricDeltaSchema,
 })
 
-export const metricsDiffSchema = z.object({
-  old: sideAggregatesSchema,
-  new: sideAggregatesSchema,
+export const variantDeltaSchema = z.object({
+  variant: z.string(),
   deltas: primaryDeltasSchema,
-  bothFailed: z.boolean(),
   taskDeltas: phaseDeltasSchema.optional(),
   initDeltas: phaseDeltasSchema.optional(),
+  pairIncomplete: z.boolean(),
+})
+
+export const metricsReportSchema = z.object({
+  baseline: z.string(),
+  variants: z.array(variantAggregatesSchema),
+  deltas: z.array(variantDeltaSchema),
+  allFailed: z.boolean(),
 })
 
 export const aggregateResultSchema = z.object({
-  metricsDiff: metricsDiffSchema,
-  rawAggregates: z.object({
-    old: sideAggregatesSchema,
-    new: sideAggregatesSchema,
-  }),
+  metrics: metricsReportSchema,
 })
 
 export const cleanupInputSchema = z.object({
@@ -428,7 +453,7 @@ export const cliParseResultSchema = z.object({
 export const diffErrorSchema = z.object({
   code: z.union([z.literal('E_DISK_FULL'), z.literal('E_WORKTREE_BROKEN')]),
   message: z.string(),
-  side: sideSchema,
+  variant: z.string(),
   runIndex: z.number().int().optional(),
   context: recordUnknownSchema.optional(),
 })
@@ -470,15 +495,12 @@ export const diffRunResultSchema = z.object({
 })
 
 export const diffResultSchema = z.object({
-  side: sideSchema,
+  variant: z.string(),
   runs: z.array(diffRunResultSchema),
 })
 
 export const diffResultOutputSchema = z.object({
-  diff: z.object({
-    old: diffResultSchema,
-    new: diffResultSchema,
-  }),
+  diffs: z.array(diffResultSchema),
 })
 
 export const envVarSetSchema = z.object({
@@ -662,6 +684,11 @@ export const exportMessageSchema = z.object({
   parts: z.array(exportPartSchema),
 })
 
+export const homeCheckTargetSchema = z.object({
+  homeDir: z.string(),
+  pathOverride: z.string().optional(),
+})
+
 export const homeIsolationErrorSchema = z.object({
   code: z.union([
     z.literal('E_HOME_SETUP_FAILED'),
@@ -674,11 +701,16 @@ export const homeIsolationErrorSchema = z.object({
   context: recordUnknownSchema.optional(),
 })
 
-export const packInstallResultSchema = z.object({
+export const packDeliverySchema = z.object({
+  pack: z.string(),
   packPath: z.string(),
   detectedType: z.union([packTypeSchema, z.unknown()]),
-  installLogPath: z.string(),
   registeredIn: z.array(z.string()),
+})
+
+export const packInstallResultSchema = z.object({
+  deliveries: z.array(packDeliverySchema),
+  installLogPath: z.string(),
 })
 
 export const homeIsolationInputSchema = z.object({
@@ -694,16 +726,25 @@ export const homeTreeSchema = z.object({
   copiedAuth: z.array(z.string()),
 })
 
+export const variantHomesSchema = z.object({
+  name: z.string(),
+  trees: z.array(homeTreeSchema),
+})
+
+export const variantEnvSchema = z.object({
+  name: z.string(),
+  envs: z.array(envVarSetSchema),
+})
+
+export const variantConfigSchema = z.object({
+  name: z.string(),
+  config: z.string(),
+})
+
 export const homeIsolationResultSchema = z.object({
-  homeTrees: z.object({
-    old: z.array(homeTreeSchema),
-    new: z.array(homeTreeSchema),
-  }),
-  envVars: z.array(z.array(envVarSetSchema)),
-  generatedConfigs: z.object({
-    baseline: z.string(),
-    new: z.string(),
-  }),
+  homeTrees: z.array(variantHomesSchema),
+  envVars: z.array(variantEnvSchema),
+  generatedConfigs: z.array(variantConfigSchema),
 })
 
 export const judgeErrorSchema = z.object({
@@ -715,23 +756,26 @@ export const judgeErrorSchema = z.object({
 export const judgeInputSchema = z.object({
   runInput: runInputSchema,
   manifest: manifestSchema,
-  diff: z.object({
-    old: diffResultSchema,
-    new: diffResultSchema,
-  }),
+  diffs: z.array(diffResultSchema),
 })
 
 export const judgeVerdictSchema = z.enum(['ok', 'fail', 'unclear'])
 
+export const variantScoreSchema = z.object({
+  variant: z.string(),
+  quality: z.number().int(),
+})
+
 export const judgeResultSchema = z.object({
   verdict: judgeVerdictSchema,
-  oldQuality: z.number().int(),
-  newQuality: z.number().int(),
+  scores: z.array(variantScoreSchema),
+  ranking: z.array(z.string()),
   explanation: z.string(),
   rawResponse: z.string().optional(),
   modelUsed: z.string(),
   timestamp: z.string(),
   ran: z.boolean().optional(),
+  pairwiseFallback: z.boolean().optional(),
 })
 
 export const judgeResultOutputSchema = z.object({
@@ -744,7 +788,8 @@ export const opencodeExportSchema = z.object({
 })
 
 export const packCmdResultSchema = z.object({
-  side: sideSchema,
+  variant: z.string(),
+  pack: z.string().optional(),
   runIndex: z.number().int(),
   exitCode: z.number().int(),
   durationMs: z.string(),
@@ -770,6 +815,19 @@ export const packInstallInputSchema = z.object({
   workspace: workspaceTreeSchema,
 })
 
+export const packSetupModeSchema = z.enum(['exercised', 'installed-only', 'delivered-only'])
+
+export const packPrepSchema = z.object({
+  pack: z.string(),
+  mode: packSetupModeSchema,
+  setupDeclared: z.boolean(),
+  checkDeclared: z.boolean(),
+  exerciseDeclared: z.boolean(),
+  undeclaredDepWarning: z.string().optional(),
+  setups: z.array(packCmdResultSchema),
+  checks: z.array(packCmdResultSchema),
+})
+
 export const packSetupErrorSchema = z.object({
   code: z.union([z.literal('E_PACK_SETUP_FAILED'), z.literal('E_PACK_SETUP_TIMEOUT')]),
   message: z.string(),
@@ -783,21 +841,19 @@ export const packSetupInputSchema = z.object({
   packInstall: packInstallResultSchema.optional(),
 })
 
-export const packSetupModeSchema = z.enum(['exercised', 'installed-only', 'delivered-only'])
-
-export const packSetupReportSchema = z.object({
-  mode: packSetupModeSchema,
-  setupDeclared: z.boolean(),
-  checkDeclared: z.boolean(),
+export const variantPrepSchema = z.object({
+  variant: z.string(),
   exerciseDeclared: z.boolean(),
-  undeclaredDepWarning: z.string().optional(),
-  setup: packCmdResultSchema.optional(),
-  checks: z.array(packCmdResultSchema),
   exercises: z.array(packCmdResultSchema),
 })
 
+export const prepReportSchema = z.object({
+  packs: z.array(packPrepSchema),
+  variants: z.array(variantPrepSchema),
+})
+
 export const packSetupResultSchema = z.object({
-  report: packSetupReportSchema,
+  report: prepReportSchema,
   logPath: z.string(),
 })
 
@@ -812,7 +868,7 @@ export const phaseErrorSchema = z.object({
 
 export const preflightCheckSchema = z.object({
   name: z.string(),
-  side: sideSchema,
+  variant: z.string(),
   passed: z.boolean(),
   durationMs: z.string(),
   details: z.string().optional(),
@@ -832,21 +888,23 @@ export const preflightErrorSchema = z.object({
     z.literal('auth-ping'),
     z.literal('build-agent'),
     z.literal('pack-visibility'),
-    z.literal('baseline-identical'),
+    z.literal('foreign-pack-absent'),
     z.literal('pack-functional'),
   ]),
-  side: sideSchema,
+  variant: z.string(),
   message: z.string(),
   context: recordUnknownSchema.optional(),
+})
+
+export const variantHomesForCheckSchema = z.object({
+  name: z.string(),
+  homes: z.array(homeCheckTargetSchema),
 })
 
 export const preflightInputSchema = z.object({
   runInput: runInputSchema,
   manifest: manifestSchema,
-  homePaths: z.object({
-    old: z.string(),
-    new: z.string(),
-  }),
+  homesForCheck: z.array(variantHomesForCheckSchema),
 })
 
 export const preflightResultSchema = z.object({
@@ -869,12 +927,14 @@ export const repoCloneInputSchema = z.object({
   workspace: workspaceTreeSchema,
 })
 
+export const variantCopyPathsSchema = z.object({
+  name: z.string(),
+  paths: z.array(z.string()),
+})
+
 export const repoCloneResultSchema = z.object({
   sourcePath: z.string(),
-  copyPaths: z.object({
-    old: z.array(z.string()),
-    new: z.array(z.string()),
-  }),
+  copyPaths: z.array(variantCopyPathsSchema),
   cloneDurationMs: z.string(),
 })
 
@@ -889,7 +949,7 @@ export const timelineEventTypeSchema = z.enum([
 export const timelineEventSchema = z.object({
   tStart: z.string(),
   tEnd: z.string(),
-  side: sideSchema,
+  variant: z.string(),
   runIndex: z.number().int(),
   sessionId: z.string(),
   parentSessionId: z.string().optional(),
@@ -902,32 +962,39 @@ export const timelineEventSchema = z.object({
     .optional(),
 })
 
+export const variantTimelineSchema = z.object({
+  variant: z.string(),
+  events: z.array(timelineEventSchema),
+})
+
 export const timelineSchema = z.object({
-  old: z.array(timelineEventSchema),
-  new: z.array(timelineEventSchema),
+  lanes: z.array(variantTimelineSchema),
   mode: timelineModeSchema,
+})
+
+export const variantSummarySchema = z.object({
+  variant: z.string(),
+  improvements: z.array(metricDeltaSchema),
+  regressions: z.array(metricDeltaSchema),
+  neutral: z.array(metricDeltaSchema),
 })
 
 export const reportSummarySchema = z.object({
   headlineResult: z.string(),
-  improvements: z.array(metricDeltaSchema),
-  regressions: z.array(metricDeltaSchema),
-  neutral: z.array(metricDeltaSchema),
+  perVariant: z.array(variantSummarySchema),
   failures: z.array(failedRunSchema),
   basis: z.union([z.literal('task'), z.literal('total')]).optional(),
 })
 
 export const reportSchema = z.object({
+  schemaVersion: schemaVersionSchema,
   manifest: manifestSchema,
-  metricsDiff: metricsDiffSchema,
+  metrics: metricsReportSchema,
   timeline: timelineSchema,
-  diff: z.object({
-    old: diffResultSchema,
-    new: diffResultSchema,
-  }),
+  diffs: z.array(diffResultSchema),
   judge: judgeResultSchema.optional(),
   summary: reportSummarySchema,
-  packSetup: packSetupReportSchema.optional(),
+  prep: prepReportSchema.optional(),
 })
 
 export const reportRenderErrorSchema = z.object({
@@ -939,15 +1006,12 @@ export const reportRenderErrorSchema = z.object({
 export const reportRenderInputSchema = z.object({
   runInput: runInputSchema,
   manifest: manifestSchema,
-  metricsDiff: metricsDiffSchema,
+  metrics: metricsReportSchema,
   timeline: timelineSchema,
-  diff: z.object({
-    old: diffResultSchema,
-    new: diffResultSchema,
-  }),
+  diffs: z.array(diffResultSchema),
   judge: judgeResultSchema.optional(),
   summary: reportSummarySchema,
-  packSetup: packSetupReportSchema.optional(),
+  prep: prepReportSchema.optional(),
 })
 
 export const reportRenderResultSchema = z.object({
@@ -988,7 +1052,7 @@ export const runSideErrorSchema = z.object({
     z.literal('E_TOTAL_TIMEOUT'),
   ]),
   message: z.string(),
-  side: sideSchema,
+  variant: z.string(),
   runIndex: z.number().int(),
   context: recordUnknownSchema.optional(),
 })
@@ -998,7 +1062,7 @@ export const runSideInputSchema = z.object({
   manifest: manifestSchema,
   workspace: workspaceTreeSchema,
   homeEnv: envVarSetSchema,
-  side: sideSchema,
+  variant: z.string(),
   runIndex: z.number().int(),
   sessionId: z.string(),
 })
@@ -1006,7 +1070,7 @@ export const runSideInputSchema = z.object({
 export const timelineErrorSchema = z.object({
   code: z.literal('E_EXPORT_INVALID'),
   message: z.string(),
-  side: sideSchema.optional(),
+  variant: z.string().optional(),
   runIndex: z.number().int().optional(),
   context: recordUnknownSchema.optional(),
 })
@@ -1015,10 +1079,7 @@ export const timelineInputSchema = z.object({
   runInput: runInputSchema,
   manifest: manifestSchema,
   workspace: workspaceTreeSchema,
-  sideResults: z.object({
-    old: z.array(runSideResultSchema),
-    new: z.array(runSideResultSchema),
-  }),
+  results: z.array(variantRunResultsSchema),
 })
 
 export const timelineResultSchema = z.object({

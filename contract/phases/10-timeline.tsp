@@ -8,7 +8,7 @@ namespace TestAiPack.TimelineBuild;
 model TimelineError {
   code: "E_EXPORT_INVALID";
   message: string;
-  side?: Side;
+  variant?: string;
   runIndex?: int32;
   context?: Record<unknown>;
 }
@@ -17,7 +17,7 @@ model TimelineInput {
   runInput: RunInput;
   manifest: Manifest;
   workspace: WorkspaceTree;
-  sideResults: { old: RunSideResult[]; new: RunSideResult[] };
+  results: TestAiPack.Aggregate.VariantRunResults[];
 }
 
 model TimelineResult {

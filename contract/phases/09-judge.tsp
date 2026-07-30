@@ -14,7 +14,7 @@ model JudgeError {
 model JudgeInput {
   runInput: RunInput;
   manifest: Manifest;
-  diff: { old: DiffResult; new: DiffResult };
+  diffs: DiffResult[];
 }
 
 model JudgeResultOutput {

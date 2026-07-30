@@ -18,8 +18,13 @@ model RepoCloneInput {
   workspace: WorkspaceTree;
 }
 
+model VariantCopyPaths {
+  name: string;
+  paths: string[];
+}
+
 model RepoCloneResult {
   sourcePath: string;
-  copyPaths: { old: string[]; new: string[] };
+  copyPaths: VariantCopyPaths[];
   cloneDurationMs: int64;
 }

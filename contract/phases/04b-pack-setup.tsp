@@ -15,11 +15,11 @@ model PackSetupInput {
   runInput: RunInput;
   manifest: Manifest;
   workspace: WorkspaceTree;
-  /** Результат фазы 03 — есть только когда packRef задан (smoke-test режим отсутствует). */
+  /** Результат фазы 03 — есть только когда задан хотя бы один пакет. */
   packInstall?: TestAiPack.PackInstall.PackInstallResult;
 }
 
 model PackSetupResult {
-  report: PackSetupReport;
+  report: PrepReport;
   logPath: string;
 }
