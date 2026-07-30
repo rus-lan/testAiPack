@@ -29,6 +29,15 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.6.4 (installer release-resolution race, mandatory checksum)
+
+- **`install.sh` could download one release's binary and verify it against another release's checksums**: the base URL resolved to `releases/latest/download`, and the binary and `checksums-sha256.txt` were fetched via two independent HTTP requests, each re-resolving "latest" server-side — during a release publish window they could land on different releases. A user hit this right after v0.6.3 shipped: they got v0.6.2's binary checked against v0.6.3's checksums, a mismatch, and an aborted install, even though both releases were individually correct. The race has existed since v0.4.0. Fixed: "latest" is now resolved to one concrete tag with a single `curl --no-location` redirect probe against `checksums-sha256.txt` (works even when `~/.curlrc` sets `location`), and every asset is downloaded from that same `releases/download/<tag>/` path — the same path pinned `TESTAIPACK_VERSION` installs already used.
+- **Checksum verification is now mandatory**: previously a missing `sha256sum`/`shasum`, a failed checksums download, or no matching line in the checksums file all degraded to a warning and installed anyway. Now each of those aborts the install; `TESTAIPACK_SKIP_CHECKSUM=1` restores the old warn-and-continue behavior for minimal environments. A genuine checksum mismatch remains fatal regardless of that flag.
+- `TESTAIPACK_VERSION` now accepts both `0.6.2` and `v0.6.2` (the latter previously produced a `vv0.6.2` tag and a 404).
+- The installer now prints which release it resolved.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.6.3...v0.6.4
+
 ## v0.6.3 (export part validation crash fix)
 
 - **A run killed by the watchdog could crash the timeline phase**: `exportPartSchema` is a `z.union` whose last member is a catch-all `z.object({type, id})` — zod 4 strips undeclared keys, so a part that failed its real variant silently degraded to `{type, id}` while keeping its original `type` tag, defeating every guard that checked `type` alone and then crashing on a field it assumed was there (`part.time.start`). The real trigger: an interrupted reasoning part left behind by a watchdog-killed run, with `time.start` and no `time.end`. `time.end` on the reasoning part and on tool state, and `ExportToolState.input`, are now optional in the contract — an interrupted part now validates as its real variant instead of degrading.
