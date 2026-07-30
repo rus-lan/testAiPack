@@ -29,6 +29,17 @@ testaipack doctor
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
 
+## v0.6.0 (protect-git, offline rebuild, config capture, ~13 new metrics)
+
+- **`--protect-git`** (opt-in, off by default) — keeps each run's `.git` outside the tree the agent works in, so a run can no longer delete or rewrite its own git history. Costs opencode's snapshot/patch export, which needs `.git` in place, so it stays off by default; mainly useful under `--isolation docker`.
+- **`testaipack report --rebuild <run-id>`** — recomputes the report entirely offline from artifacts already on disk (aggregate/diff/timeline/report), no agent, LLM, or docker call by default. `--force` overwrites an existing report; `--rejudge` is the one opt-in exception, permitting a single fresh judge call. Works even on workspaces predating `run-input.json`, via best-effort recovery with every recovered/defaulted field disclosed in the rebuilt report.
+- Per-side capture of the actual opencode config used by each run — merge layers, installed skills/agents/commands/plugins/mcp servers, npm deps, and observed pack usage — written (with credentials redacted) under `config/.config/opencode/<side>/`.
+- Every run now persists `run-input.json` and a per-run `result.json`, closing the data gap that made `--rebuild` and post-hoc recovery possible in the first place.
+- ~13 new metrics and a regrouped report (Behavior / Latency / Tokens & context / Output volume, plus Safety, Pack signal, and Stability sections): a pack-never-invoked alert, a destructive-command tripwire (`rm -rf`, force-push, `chmod`, `dd`, `DROP TABLE`, and their common disguises), stability/spread multipliers, real shell-failure counts, hallucinated/duplicate tool calls, tokens and cost per changed line, per-file diff overlap, an opencode version-drift warning, a latency/stall profile, verify pass rate, context growth, and output volume.
+- **Fixed**: an agent deleting or replacing its own `.git` no longer aborts the whole run (now recovered/contained, reported as `E_WORKTREE_BROKEN`); one bad run can no longer take down the rest of a side; a judge failure no longer destroys an otherwise-complete report; the manifest now records the opencode version actually used under docker isolation, not the host's; config-capture artifacts no longer write credentials in clear; the success-rate and diff-efficiency numbers in the report no longer drift from crashed or diff-failed runs; git output is now parsed locale-independently (`LC_ALL=C`).
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.5.5...v0.6.0
+
 ## v0.5.5 (docker export validation fix)
 
 - **Anyone on `--isolation docker` is currently losing every run**: opencode 1.18.4 (baked into the docker image) writes `finish: "unknown"` into a session, and our export validation — built against 1.18.3 — rejected it outright. `unknown` is now an accepted, valid outcome (treated the same as `other`: not a clean success, not a crash).
