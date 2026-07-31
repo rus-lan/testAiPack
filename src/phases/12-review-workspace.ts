@@ -2,8 +2,9 @@
  * Phase 12: review-workspace
  *
  * Generates a VSCode multi-root `review.code-workspace` so the user can open
- * OLD, NEW and PACK side by side. Soft phase: never fails — file-write errors
- * are logged as warnings and the phase still returns a result.
+ * every variant's run side by side, plus one read-only folder per registry
+ * pack. Soft phase: never fails — file-write errors are logged as warnings
+ * and the phase still returns a result.
  *
  * @see docs/phases/12-review-workspace.ru.md
  * @see contract/phases/12-review-workspace.tsp
@@ -38,27 +39,35 @@ export const mapIdeToBinary = (ide: string): string => {
   return 'code'
 }
 
-const fallbackRunDir = (workspace: WorkspaceTree, side: 'old' | 'new', reviewRun: number): string =>
-  path.join(workspace.root, 'apps', `${side}Version`, `run-${String(reviewRun)}`)
+const fallbackRunDir = (workspace: WorkspaceTree, variantName: string, reviewRun: number): string =>
+  path.join(workspace.root, 'apps', variantName, `run-${String(reviewRun)}`)
 
 /**
  * Pure builder for the workspace JSON. Paths are relative to `locationDir`
  * (the directory that will hold `review.code-workspace`, normally `results/`).
+ * One folder per variant (`<NAME> run-K`, baseline suffixed `(baseline)`),
+ * then one folder per registry pack (`PACK <name> (read-only)` under
+ * `workspace.pack/<name>` — see `03-pack-install.ts`'s `packDir` layout).
  */
 export const buildWorkspaceJson = (
   reviewRun: number,
+  manifest: Manifest,
   workspace: WorkspaceTree,
   locationDir: string,
 ): ReviewWorkspaceFile => {
-  const oldAbs = workspace.appsOld[reviewRun - 1] ?? fallbackRunDir(workspace, 'old', reviewRun)
-  const newAbs = workspace.appsNew[reviewRun - 1] ?? fallbackRunDir(workspace, 'new', reviewRun)
   const rel = (abs: string): string => path.relative(locationDir, abs)
+  const variantFolders: readonly WorkspaceFolder[] = manifest.variants.map((v) => {
+    const tree = workspace.variantTrees.find((t) => t.name === v.name)
+    const abs = tree?.apps[reviewRun - 1] ?? fallbackRunDir(workspace, v.name, reviewRun)
+    const baselineSuffix = v.name === manifest.baseline ? ' (baseline)' : ''
+    return { path: rel(abs), name: `${v.name} run-${String(reviewRun)}${baselineSuffix}` }
+  })
+  const packFolders: readonly WorkspaceFolder[] = manifest.packs.map((p) => ({
+    path: rel(path.join(workspace.pack, p.name)),
+    name: `PACK ${p.name} (read-only)`,
+  }))
   return {
-    folders: [
-      { path: rel(oldAbs), name: `OLD (baseline) run-${String(reviewRun)}` },
-      { path: rel(newAbs), name: `NEW (with pack) run-${String(reviewRun)}` },
-      { path: rel(workspace.pack), name: 'PACK source (read-only)' },
-    ],
+    folders: [...variantFolders, ...packFolders],
     settings: { 'workbench.colorCustomizations': {} },
   }
 }
@@ -95,7 +104,7 @@ export const reviewWorkspace = (
     const reviewRun = resolveReviewRun(manifest)
     const ide = resolveIde(manifest)
     const locationDir = workspace.results
-    const file = buildWorkspaceJson(reviewRun, workspace, locationDir)
+    const file = buildWorkspaceJson(reviewRun, manifest, workspace, locationDir)
     const workspacePath = path.join(locationDir, 'review.code-workspace')
 
     yield* ensureDir(locationDir).pipe(Effect.catchAll(soft('ensureDir')))

@@ -9,13 +9,8 @@ import { FsError } from '../util/fs.js'
 import { PhaseError } from '../errors.js'
 import { reportRender, buildReport } from './11-report-render.js'
 import { renderJson } from '../report/json.js'
-import {
-  makeReportRenderInput,
-  makeRunInput,
-  makeReport,
-  makeSummary,
-} from '../../tests/report-fixture.js'
-import type { ReportSummary } from '@generated/types'
+import { makeReportV2, threeVariants } from '../../tests/helpers/variants.js'
+import type { Report, ReportRenderInput, ReportSummary, RunInput } from '@generated/types'
 
 vi.mock('../util/fs.js', async () => {
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -34,10 +29,36 @@ beforeEach(async () => {
   writeFileMock.mockImplementation(actual.writeFile)
 })
 
+const baseReport = (): Report => makeReportV2()
+
+/** Report without `judge` — built by omitting the key, not setting it to `undefined` (exactOptionalPropertyTypes). */
+const withoutJudge = (report: Report): Report => {
+  const { judge: _judge, ...rest } = report
+  return rest
+}
+
+const runInputFor = (over: Partial<RunInput> = {}): RunInput => ({
+  ...threeVariants().runInput,
+  outputPath: './results',
+  ...over,
+})
+
+/** `ReportRenderInput` mirrors `Report` minus `schemaVersion` — built from the same fixture so md/json/yaml all see consistent data. */
+const inputFrom = (report: Report, runInputOver: Partial<RunInput> = {}): ReportRenderInput => ({
+  runInput: runInputFor(runInputOver),
+  manifest: report.manifest,
+  metrics: report.metrics,
+  timeline: report.timeline,
+  diffs: report.diffs,
+  summary: report.summary,
+  ...(report.judge === undefined ? {} : { judge: report.judge }),
+  ...(report.prep === undefined ? {} : { prep: report.prep }),
+})
+
 describe('reportRender — format selection', () => {
   it('formats=["md"] writes report.md + report.json (canonical), no yaml/html', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({ runInput: makeRunInput({ formats: ['md'], outputPath: out }) })
+    const input = inputFrom(baseReport(), { formats: ['md'], outputPath: out })
     const result = await runP(reportRender(input))
 
     expect(existsSync(`${out}/report.md`)).toBe(true)
@@ -54,9 +75,7 @@ describe('reportRender — format selection', () => {
 
   it('formats=["md","json"] writes md and json files', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md', 'json'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['md', 'json'], outputPath: out })
     const result = await runP(reportRender(input))
     expect(existsSync(`${out}/report.md`)).toBe(true)
     expect(existsSync(`${out}/report.json`)).toBe(true)
@@ -65,9 +84,7 @@ describe('reportRender — format selection', () => {
 
   it('formats=["md","html","json","yaml"] writes all four files', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md', 'html', 'json', 'yaml'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['md', 'html', 'json', 'yaml'], outputPath: out })
     const result = await runP(reportRender(input))
     expect(existsSync(`${out}/report.md`)).toBe(true)
     expect(existsSync(`${out}/report.json`)).toBe(true)
@@ -80,14 +97,10 @@ describe('reportRender — format selection', () => {
 
   it('md is always written even when not requested, but stdout follows the user\'s actual request', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['json'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['json'], outputPath: out })
     const result = await runP(reportRender(input))
     expect(existsSync(`${out}/report.md`)).toBe(true)
     expect(result.formats).toContain('md')
-    // md is force-added to `formats` (file output), but the user only asked
-    // for json — stdout must reflect that, not the force-added md.
     expect(result.stdoutFormat).toBe('json')
     expect(result.stdoutMd).toBeUndefined()
   })
@@ -96,34 +109,27 @@ describe('reportRender — format selection', () => {
 describe('reportRender — stdout Markdown', () => {
   it('result carries stdoutMd when md is in requested formats', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-    })
+    const report = baseReport()
+    const input = inputFrom(report, { formats: ['md'], outputPath: out })
     const result = await runP(reportRender(input))
     expect(result.stdoutMd).toBeDefined()
     expect(typeof result.stdoutMd).toBe('string')
-    expect(result.stdoutMd).toContain('# testaipack report: run-abc-001')
-    // stdoutMd matches the file written to disk
+    expect(result.stdoutMd).toContain(`# testaipack report: ${report.manifest.runId}`)
     const onDisk = await runP(readFile(`${out}/report.md`))
     expect(result.stdoutMd).toBe(onDisk)
   })
 
   it('result omits stdoutMd when only json is requested', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['json'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['json'], outputPath: out })
     const result = await runP(reportRender(input))
     expect(result.stdoutMd).toBeUndefined()
-    // report.md is still written to disk (always), just not surfaced to stdout
     expect(existsSync(`${out}/report.md`)).toBe(true)
   })
 
   it('stdoutMd is present when formats include md alongside others', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md', 'yaml'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['md', 'yaml'], outputPath: out })
     const result = await runP(reportRender(input))
     expect(result.stdoutMd).toBeDefined()
   })
@@ -132,9 +138,7 @@ describe('reportRender — stdout Markdown', () => {
 describe('reportRender — stdout JSON', () => {
   it('result carries stdoutJson (matching report.json on disk) when only json is requested', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['json'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['json'], outputPath: out })
     const result = await runP(reportRender(input))
     expect(result.stdoutJson).toBeDefined()
     expect(result.stdoutMd).toBeUndefined()
@@ -144,32 +148,23 @@ describe('reportRender — stdout JSON', () => {
 
   it('result omits stdoutJson when md is requested (alone or alongside json)', async () => {
     const out1 = makeTempDir()
-    const mdOnly = await runP(
-      reportRender(makeReportRenderInput({ runInput: makeRunInput({ formats: ['md'], outputPath: out1 }) })),
-    )
+    const mdOnly = await runP(reportRender(inputFrom(baseReport(), { formats: ['md'], outputPath: out1 })))
     expect(mdOnly.stdoutJson).toBeUndefined()
 
     const out2 = makeTempDir()
-    const mdAndJson = await runP(
-      reportRender(
-        makeReportRenderInput({ runInput: makeRunInput({ formats: ['md', 'json'], outputPath: out2 }) }),
-      ),
-    )
+    const mdAndJson = await runP(reportRender(inputFrom(baseReport(), { formats: ['md', 'json'], outputPath: out2 })))
     expect(mdAndJson.stdoutJson).toBeUndefined()
     expect(mdAndJson.stdoutMd).toBeDefined()
   })
 })
 
-describe('reportRender — markdown content', () => {
+describe('reportRender — markdown content (3-variant N-way report)', () => {
   it('written report.md contains all mandatory sections', async () => {
     const out = makeTempDir()
     await runP(ensureDir(out))
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['md'], outputPath: out })
     await runP(reportRender(input))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).toContain('# testaipack report: run-abc-001')
     expect(md).toContain('## Summary')
     expect(md).toContain('## Primary metrics — total (init + task)')
     expect(md).toContain('## Secondary metrics')
@@ -178,123 +173,37 @@ describe('reportRender — markdown content', () => {
     expect(md).toContain('## Diff summary')
   })
 
-  it('primary metrics table is correctly formatted in the written file', async () => {
+  it('primary metrics table shows the metric-major header and baseline row', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['md'], outputPath: out })
     await runP(reportRender(input))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).toContain('| Total tokens | 12345 | 100–100 | 10987 | 100–100 | -1358 | -11.0% | ✓ significant | ✓ better |')
+    expect(md).toContain('| Metric | Variant | Median | [min–max] | Δ vs base | Δ% | Significant | Verdict |')
+    expect(md).toContain('| Total tokens | base* |')
   })
 
   it('headline result appears near the top of Summary', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-    })
+    const report = baseReport()
+    const input = inputFrom(report, { formats: ['md'], outputPath: out })
     await runP(reportRender(input))
     const md = await runP(readFile(`${out}/report.md`))
     const summaryIdx = md.indexOf('## Summary')
-    const headlineIdx = md.indexOf('Pack improved token efficiency')
+    const headlineIdx = md.indexOf(report.summary.headlineResult)
     expect(headlineIdx).toBeGreaterThan(summaryIdx)
   })
 
-  it('failed runs section appears when failures exist', async () => {
+  it('failed runs section appears when the summary carries failures', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-      metricsDiff: {
-        old: {
-          side: 'old',
-          primary: {
-            totalTokens: '12345',
-            wallClockMs: '45000',
-            costUsd: 0.045,
-            stepCount: 12,
-            toolCallCount: 25,
-            successRank: 4,
-            maxParallelism: 1,
-          },
-          secondary: {
-            inputTokens: '6000',
-            outputTokens: '4000',
-            reasoningTokens: '1500',
-            cacheReadTokens: '845',
-            perTool: {},
-            reasoningTimeMs: '6000',
-            stepLatencyP50Ms: '2000',
-            stepLatencyP95Ms: '5000',
-            toolLatencyAvgMs: '200',
-            finishCauseDistribution: {},
-            maxConsecutiveSameTool: 0,
-          },
-          stats: {
-            totalTokens: { median: 12345, min: 12345, max: 12345, samples: [12345] },
-            wallClockMs: { median: 45000, min: 45000, max: 45000, samples: [45000] },
-            costUsd: { median: 0.045, min: 0.045, max: 0.045, samples: [0.045] },
-            stepCount: { median: 12, min: 12, max: 12, samples: [12] },
-            toolCallCount: { median: 25, min: 25, max: 25, samples: [25] },
-            successRank: { median: 4, min: 4, max: 4, samples: [4] },
-          },
-          failedRuns: [
-            {
-              runIndex: 1,
-              errorCode: 'E_RUN_CRASH',
-              errorMessage: 'boom',
-              timestamp: '2025-01-01T00:02:00.000Z',
-            },
-          ],
-          rawRunIds: ['s-old-1'],
-        },
-        new: {
-          side: 'new',
-          primary: {
-            totalTokens: '10987',
-            wallClockMs: '52000',
-            costUsd: 0.041,
-            stepCount: 14,
-            toolCallCount: 30,
-            successRank: 4,
-            maxParallelism: 1,
-          },
-          secondary: {
-            inputTokens: '6000',
-            outputTokens: '4000',
-            reasoningTokens: '1500',
-            cacheReadTokens: '845',
-            perTool: {},
-            reasoningTimeMs: '6000',
-            stepLatencyP50Ms: '2000',
-            stepLatencyP95Ms: '5000',
-            toolLatencyAvgMs: '200',
-            finishCauseDistribution: {},
-            maxConsecutiveSameTool: 0,
-          },
-          stats: {
-            totalTokens: { median: 10987, min: 10987, max: 10987, samples: [10987] },
-            wallClockMs: { median: 52000, min: 52000, max: 52000, samples: [52000] },
-            costUsd: { median: 0.041, min: 0.041, max: 0.041, samples: [0.041] },
-            stepCount: { median: 14, min: 14, max: 14, samples: [14] },
-            toolCallCount: { median: 30, min: 30, max: 30, samples: [30] },
-            successRank: { median: 4, min: 4, max: 4, samples: [4] },
-          },
-          failedRuns: [],
-          rawRunIds: ['s-new-1'],
-        },
-        deltas: {
-          totalTokens: { absolute: -1358, percent: -11.0, significant: true, better: 'better' },
-          wallClockMs: { absolute: 7000, percent: 15.6, significant: false, better: 'worse' },
-          costUsd: { absolute: -0.004, percent: -8.9, significant: false, better: 'better' },
-          stepCount: { absolute: 2, percent: 16.7, significant: false, better: 'worse' },
-          toolCallCount: { absolute: 5, percent: 20.0, significant: true, better: 'worse' },
-          successRank: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
-          maxParallelism: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
-        },
-        bothFailed: false,
+    const report = baseReport()
+    const withFailure: Report = {
+      ...report,
+      summary: {
+        ...report.summary,
+        failures: [{ variant: 'graphify', runIndex: 1, errorCode: 'E_RUN_CRASH', errorMessage: 'boom', timestamp: '2025-01-01T00:02:00.000Z' }],
       },
-    })
-    await runP(reportRender(input))
+    }
+    await runP(reportRender(inputFrom(withFailure, { formats: ['md'], outputPath: out })))
     const md = await runP(readFile(`${out}/report.md`))
     expect(md).toContain('## Failed runs')
     expect(md).toContain('E_RUN_CRASH')
@@ -302,9 +211,7 @@ describe('reportRender — markdown content', () => {
 
   it('failed runs section is skipped when there are none', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['md'], outputPath: out })
     await runP(reportRender(input))
     const md = await runP(readFile(`${out}/report.md`))
     expect(md).not.toContain('## Failed runs')
@@ -312,49 +219,40 @@ describe('reportRender — markdown content', () => {
 
   it('judge section shows "not requested" when judge omitted', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-      judge: null,
-    })
-    await runP(reportRender(input))
+    const report = withoutJudge(baseReport())
+    await runP(reportRender(inputFrom(report, { formats: ['md'], outputPath: out })))
     const md = await runP(readFile(`${out}/report.md`))
     expect(md).toContain('_Judge was not requested (--judge not set)_')
   })
 
-  it('bothFailed emits the comparison-unreliable warning', async () => {
+  it('allFailed emits the comparison-unreliable warning', async () => {
     const out = makeTempDir()
-    const report = makeReport()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-      metricsDiff: { ...report.metricsDiff, bothFailed: true },
-    })
-    await runP(reportRender(input))
+    const report = baseReport()
+    const failed: Report = { ...report, metrics: { ...report.metrics, allFailed: true } }
+    await runP(reportRender(inputFrom(failed, { formats: ['md'], outputPath: out })))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).toContain('Both sides failed — comparison unreliable')
+    expect(md).toContain('All variants failed — comparison unreliable')
   })
 })
 
 describe('reportRender — json canonical', () => {
-  it('report.json validates against reportSchema and contains metricsDiff + runId', async () => {
+  it('report.json validates against reportSchema and contains metrics + runId', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-    })
-    await runP(reportRender(input))
+    const report = baseReport()
+    await runP(reportRender(inputFrom(report, { formats: ['md'], outputPath: out })))
     const raw = await runP(readFile(`${out}/report.json`))
     const parsed = JSON.parse(raw) as unknown
     expect(reportSchema.safeParse(parsed).success).toBe(true)
-    expect((parsed as { manifest: { runId: string } }).manifest.runId).toBe('run-abc-001')
-    expect((parsed as { metricsDiff: unknown }).metricsDiff).toBeDefined()
+    expect((parsed as { manifest: { runId: string } }).manifest.runId).toBe(report.manifest.runId)
+    expect((parsed as { metrics: unknown }).metrics).toBeDefined()
+    expect((parsed as { schemaVersion: number }).schemaVersion).toBe(2)
   })
 })
 
 describe('reportRender — yaml round-trip', () => {
   it('report.yaml parses back into a schema-valid report', async () => {
     const out = makeTempDir()
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md', 'yaml'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['md', 'yaml'], outputPath: out })
     await runP(reportRender(input))
     const raw = await runP(readFile(`${out}/report.yaml`))
     const parsed = parseYaml(raw) as unknown
@@ -366,17 +264,9 @@ describe('reportRender — disk full', () => {
   it('ENOSPC on write → E_DISK_FULL', async () => {
     const out = makeTempDir()
     writeFileMock.mockImplementation(() =>
-      Effect.fail(
-        new FsError({
-          path: 'report.md',
-          operation: 'writeFile',
-          cause: new Error('ENOSPC: no space left on device'),
-        }),
-      ),
+      Effect.fail(new FsError({ path: 'report.md', operation: 'writeFile', cause: new Error('ENOSPC: no space left on device') })),
     )
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['md'], outputPath: out })
     const err = await runFlip(reportRender(input))
     expect(err).toBeInstanceOf(PhaseError)
     expect(err.code).toBe('E_DISK_FULL')
@@ -388,9 +278,7 @@ describe('reportRender — disk full', () => {
     writeFileMock.mockImplementation(() =>
       Effect.fail(new FsError({ path: 'report.md', operation: 'writeFile', cause: new Error('EACCES') })),
     )
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-    })
+    const input = inputFrom(baseReport(), { formats: ['md'], outputPath: out })
     const err = await runFlip(reportRender(input))
     expect(err.code).toBe('E_DISK_FULL')
     expect(err.context?.['reason']).toBe('write-failure')
@@ -400,11 +288,9 @@ describe('reportRender — disk full', () => {
 describe('reportRender — invalid report schema', () => {
   it('a Report that fails its own schema fails the phase with E_EXPORT_INVALID, not an uncaught defect', async () => {
     const out = makeTempDir()
-    const badSummary = { ...makeSummary(), headlineResult: 123 } as unknown as ReportSummary
-    const input = makeReportRenderInput({
-      runInput: makeRunInput({ formats: ['md'], outputPath: out }),
-      summary: badSummary,
-    })
+    const report = baseReport()
+    const badSummary = { ...report.summary, headlineResult: 123 } as unknown as ReportSummary
+    const input = inputFrom({ ...report, summary: badSummary }, { formats: ['md'], outputPath: out })
     const err = await runFlip(reportRender(input))
     expect(err.code).toBe('E_EXPORT_INVALID')
     expect(err.phase).toBe('report-render')
@@ -413,19 +299,23 @@ describe('reportRender — invalid report schema', () => {
 
 describe('renderJson — pure round-trip', () => {
   it('renderJson output parses back into the same report', async () => {
-    const report = makeReport()
+    const report = baseReport()
     const text = await runP(renderJson(report))
     const parsed = JSON.parse(text) as unknown
     expect(reportSchema.safeParse(parsed).success).toBe(true)
     expect((parsed as { manifest: { runId: string } }).manifest.runId).toBe(report.manifest.runId)
   })
 
-  it('buildReport omits judge when undefined and includes it when present', () => {
-    const withJudge = makeReportRenderInput()
+  it('buildReport omits judge/prep when undefined and includes them when present', () => {
+    const report = baseReport()
+    const withJudge = inputFrom(report)
     const r1 = buildReport(withJudge)
     expect(r1.judge).toBeDefined()
-    const withoutJudge = makeReportRenderInput({ judge: null })
-    const r2 = buildReport(withoutJudge)
+    expect(r1.schemaVersion).toBe(2)
+
+    const withoutJudgeInput = inputFrom(withoutJudge(report))
+    const r2 = buildReport(withoutJudgeInput)
     expect(r2.judge).toBeUndefined()
+    expect(r2.prep).toBeUndefined()
   })
 })
