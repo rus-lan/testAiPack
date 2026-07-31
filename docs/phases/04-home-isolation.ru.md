@@ -5,10 +5,11 @@
 
 ## 1. Назначение
 
-Собрать для каждой пары `(side, n)` изолированный HOME (`home/<side>/run-N/`)
-с минимальным opencode-конфигом, скопировать auth по whitelist, применить pack
-(симлинки/файлы/plugin/mcp-блок) на стороне **new** и сгенерировать два блока
-`OPENCODE_CONFIG_CONTENT` — `baseline` для old и `new` для new.
+Собрать для **каждой пары `(variant, n)`** изолированный HOME
+(`home/<variant>/run-N/`) с минимальным opencode-конфигом, скопировать auth по
+whitelist, применить на HOME все паки, объявленные этим вариантом
+(`variant.packs`), и сгенерировать по одному блоку `OPENCODE_CONFIG_CONTENT`
+**на каждый вариант** (было: два фиксированных блока `baseline`/`new`).
 
 ## 2. Контракт (TypeSpec)
 
@@ -17,161 +18,160 @@ Namespace: `TestAiPack.HomeIsolation` (см.
 
 - Вход: `HomeIsolationInput` — `{ runInput: RunInput, manifest: Manifest,
   workspace: WorkspaceTree, packInstall?: PackInstallResult }`. Опциональное
-  поле `packInstall` — результат фазы 03 (явная связь pack-install →
-  home-isolation); фаза 04 применяет pack на стороне **new** по
-  `packInstall.detectedType` и `packInstall.registeredIn`. Поле отсутствует в
-  smoke-test режиме (`packRef` не задан) — тогда фаза генерирует идентичные
-  конфиги для обеих сторон.
-- Выход: `HomeIsolationResult` — `{ homeTrees: { old: HomeTree[]; new:
-  HomeTree[] }, envVars: EnvVarSet[][], generatedConfigs: { baseline: string;
-  new: string } }`:
-  - `homeTrees` — по одному `HomeTree` (поля `basePath`, `structure[]`,
-    `copiedAuth[]`) на каждый run-N, отдельно для `old` и `new`.
-  - `envVars` — двумерный массив `EnvVarSet` с осями
-    `[side: 0=old, 1=new][runIndex-1]`, один набор переменных окружения на
-    каждую пару `(side, n)`. `EnvVarSet`: `HOME`,
-    `OPENCODE_DISABLE_PROJECT_CONFIG`, `OPENCODE_DISABLE_DEFAULT_PLUGINS`,
-    `OPENCODE_DISABLE_EXTERNAL_SKILLS`, `OPENCODE_PURE`, опциональный
-    `OPENCODE_CONFIG_CONTENT`.
-  - `generatedConfigs.baseline` — строка с `OPENCODE_CONFIG_CONTENT` для old
-    (pure-baseline).
-  - `generatedConfigs.new` — строка с `OPENCODE_CONFIG_CONTENT` для new
-    (включает mcp-блок, если pack — mcp).
-  - Оба блока содержат поле `model`, если модель прогона определена (см. шаг 3
-    ниже) — идентичное на обеих сторонах.
-  - Оба блока содержат поля `provider`, `small_model`, `enabled_providers`,
-    `disabled_providers`, если они заданы у пользователя в реальном
-    `~/.config/opencode/opencode.json` (например, кастомный provider для
-    локального ollama-сервера, свой allow/deny-список провайдеров) —
-    копируются как есть, без фильтрации, и идентично на обеих сторонах (см.
-    шаг 3).
+  поле `packInstall` — результат фазы 03 (по одной `PackDelivery` на каждый
+  пак реестра); отсутствует только когда фаза 03 вообще не вызывалась (тесты)
+  или реестр пуст — тогда все варианты получают идентичные конфиги без
+  паковых инструкций.
+- Выход: `HomeIsolationResult` — `{ homeTrees: VariantHomes[], envVars:
+  VariantEnv[], generatedConfigs: VariantConfig[] }`:
+  - `homeTrees` / `envVars` / `generatedConfigs` — по одной записи **на
+    каждый вариант**, в порядке `runInput.variants`. `VariantHomes = { name,
+    trees: HomeTree[] }`, `VariantEnv = { name, envs: EnvVarSet[] }`,
+    `VariantConfig = { name, config: string }`. Внутри `trees`/`envs` — по
+    `runs` элементов (один на прогон), в порядке run-1..run-N. Это заменяет
+    прежний `envVars[side: 0|1][runIndex-1]` — никакой позиционной индексации
+    по стороне больше нет нигде в пайплайне.
+  - `EnvVarSet`: `HOME`, `OPENCODE_DISABLE_PROJECT_CONFIG`,
+    `OPENCODE_DISABLE_DEFAULT_PLUGINS`, `OPENCODE_DISABLE_EXTERNAL_SKILLS`,
+    `OPENCODE_PURE`, опциональный `OPENCODE_CONFIG_CONTENT`, опциональный
+    `PATH` (см. §3, шаг 6).
+  - Каждый `VariantConfig.config` содержит поле `model`, если модель прогона
+    определена (см. шаг 3 ниже), и поля `provider`/`small_model`/
+    `enabled_providers`/`disabled_providers`, если они заданы у пользователя
+    в реальном `~/.config/opencode/opencode.json` — копируются как есть, без
+    фильтрации, и **идентично на КАЖДОМ варианте**.
 - Ошибки: `@error HomeIsolationError` — `{ code, message, context? }`, где
   `code` принимает только значения:
   - `E_HOME_SETUP_FAILED` — нельзя создать структуру HOME, нет прав на
-    symlink/запись, ROFS, либо pack ссылается на `pack/<name>/`, которого нет.
+    symlink/запись, ROFS, либо пак ссылается на `pack/<name>/`, которого нет,
+    либо у переданного `WorkspaceTree` нет пути для варианта/прогона.
   - `E_AUTH_MISSING` — нет вообще никакого auth (ни `~/.opencode/`, ни
-    provider-конфигов), preflight auth-ping всё равно упадёт.
+    provider-конфигов) для конкретного `(variant, run)` — preflight
+    auth-ping всё равно упадёт.
   - `E_DOCKER_FAILED` — `runInput.isolation === "docker"` и подготовка
-    docker-контейнера завершилась ошибкой (v0.3; в v0.1 фаза работает только в
-    home-mode).
-  - `E_PACK_INSTALL_TIMEOUT` — `opencode plugin <name>` превысил
+    docker-контейнера завершилась ошибкой.
+  - `E_PACK_INSTALL_TIMEOUT` — `opencode plugin <ref>` превысил
     `runInput.timeouts.installSeconds` (только для `detectedType = "plugin"`).
-  - `E_PACK_INSTALL_FAILED` — `opencode plugin <name>` упал с non-zero exit
-    или иной ошибкой установки (только для `detectedType = "plugin"`).
+  - `E_PACK_INSTALL_FAILED` — `opencode plugin <ref>` упал с non-zero exit,
+    либо объявленный пак не нашёлся в `packInstall.deliveries` (внутренняя
+    рассинхронизация 03↔04 — реальный баг, а не пользовательская ошибка).
 
-`EnvVarSet` для `old` дополнительно выставляет
-`OPENCODE_DISABLE_DEFAULT_PLUGINS=1`, `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`,
-`OPENCODE_PURE=1`; для `new` эти pure-baseline флаги сняты.
+`EnvVarSet.OPENCODE_PURE`/`OPENCODE_DISABLE_DEFAULT_PLUGINS`/
+`OPENCODE_DISABLE_EXTERNAL_SKILLS` выставляются в значение `pure` варианта —
+**не** «`true` для old, `false` для new», как раньше. `pure` вычисляется как
+`variant.pure ?? declaredPacks.length === 0` (решение D1,
+`.research/n-way-variants/00-overview.md §5`): явный `variant.pure`
+побеждает всегда; при отсутствии — вариант без объявленных паков чист по
+умолчанию, вариант с паком(-ами) — нет. Для legacy-шима это воспроизводит
+сегодняшнее хардкод-поведение байт-в-байт (`old.pure` не задан явно, значит
+`true`, потому что `old.packs === []`; `new.pure === false` явно).
 
 ## 3. Шаги алгоритма
 
-1. Для каждой пары `(side, n)`, `side ∈ {old, new}`, `n ∈ 1..runs`:
-   a. Вычислить `homeDir = workspace.homeOld[n-1]` (или `homeNew[n-1]`) и
-      создать структуру:
-      ```
-      <homeDir>/
-      ├── .config/opencode/{skills,agents,plugins,command}/   # пустые
-      ├── .opencode/                                           # auth
-      ├── .cache/opencode/
-      └── .local/share/opencode/
-      ```
-      Сбой `mkdir` → throw
-      `HomeIsolationError({ code: "E_HOME_SETUP_FAILED", context: { side, n, reason: "mkdir-failed" } })`.
-   b. Скопировать auth по whitelist. **Базовый whitelist** (всегда, если
-      источник существует), согласно `runInput.auth` (`AuthWhitelist`):
-      - `opencode` → `~/.opencode/` → `<homeDir>/.opencode/` (opencode auth).
-      - `npmrc` → `~/.npmrc` → `<homeDir>/.npmrc` (для npm-based pack-ов).
-      - `anthropic` → `~/.config/anthropic/`, `openai` → `~/.config/openai/`,
-        `gemini` → `~/.config/gemini/` → аналогично в
-        `<homeDir>/.config/<provider>/`.
-      **Расширяемый whitelist** (дополнительные флаги):
-      - `aws` → `~/.aws/` → `<homeDir>/.aws/`
-      - `ssh` → `~/.ssh/` → `<homeDir>/.ssh/`
-      - `git` → `~/.gitconfig` → `<homeDir>/.gitconfig`
-      Если запрошенный в whitelist ресурс отсутствует на хосте → warning в
-      лог, продолжаем без него. Но если **все** auth-источники отсутствуют
-      (нет `~/.opencode/`, нет provider-конфигов) → throw
-      `HomeIsolationError({ code: "E_AUTH_MISSING", context: { side, n } })`,
-      потому что preflight auth-ping всё равно упадёт.
-2. Применить **pack** (только для `side = new`, читая `input.packInstall` —
-   `PackInstallResult` из контрактного Input; в smoke-test режиме поле
-   отсутствует и шаг пропускается):
-   - `detectedType = "skill"` → создать
-     `<homeDir>/.config/opencode/skills/<name>` → `pack/<name>/`.
-   - `detectedType = "agent" | "command"` → скопировать файл в
-     `<homeDir>/.config/opencode/<agents|command>/<name>.md`.
-    - `detectedType = "plugin"` → запустить
-      `HOME=<homeDir> opencode plugin <name>` с таймаутом
-      `runInput.timeouts.installSeconds`. Команда ставит пакет в
-      `<homeDir>/.config/opencode/plugins/`. Таймаут → throw
-      `E_PACK_INSTALL_TIMEOUT`; non-zero exit / иной сбой → throw
-      `E_PACK_INSTALL_FAILED`. Результат (exit code, длительность) дописать в
-      `results/install.log`.
-   - `detectedType = "mcp"` → сохранить блок для вставки в `generatedConfigs.new`.
-   Существующий symlink/файл перезаписывается. Сбой symlink (ROFS) →
-   `E_HOME_SETUP_FAILED`.
-   Для `side = old` pack **не применяется** — pack там отсутствует.
-3. Определить модель и connectivity-настройки прогона одним чтением реального
+1. Определить модель и connectivity-настройки прогона одним чтением реального
    `~/.config/opencode/opencode.json` (`readSourceConnectivity`, читается один
-   раз на весь прогон, не зависит от `side`/`n`; отсутствие файла, пустой файл
-   или битый JSON — не ошибка фазы, просто все поля ниже остаются
-   неопределены):
-   - `runModel = runInput.model ?? sourceConnectivity.model`. `runInput.model`
-     приходит из фазы 00 (`--model` / config-file / не задан — см.
-     `docs/phases/00-cli-parse.ru.md`). Если он не задан, `runModel =
-     sourceConnectivity.model`, то есть поведение полностью совпадает с
-     состоянием до появления флага `--model`.
-   - `provider`, `small_model`, `enabled_providers`, `disabled_providers` — те
-     же поля из исходного конфига, но **без** CLI-переопределения: каждое
-     либо есть в исходном конфиге целиком (`provider` — без фильтрации полей,
-     `enabled_providers`/`disabled_providers` — как массив строк, иначе
-     считается отсутствующим), либо отсутствует. Изолированный `opencode.json`
-     строится с нуля, поэтому без этого шага кастомный provider (например,
-     локальный ollama-сервер) или собственный allow/deny-список провайдеров
-     пользователя невидимы внутри HOME вообще — даже если `model` указывает
-     именно на такой provider.
-4. Сгенерировать `generatedConfigs.baseline` — `OPENCODE_CONFIG_CONTENT` для
-   old:
-   - минимальный `opencode.json` с одним агентом `build` по стандартному
-     шаблону оркестратора;
-   - поле `model: runModel`, если `runModel` определён (иначе поле
-     отсутствует);
-   - поля `provider`, `small_model`, `enabled_providers`, `disabled_providers`
-     из шага 3 — каждое только если определено (иначе поле отсутствует);
-   - пустые секции `skills`, `agents`, `plugins`, `command`, `mcp`.
-   Сериализация через `JSON.stringify` (stable keys).
-5. Сгенерировать `generatedConfigs.new` — то же, что baseline (те же самые
-   значения `runModel` и connectivity-полей), плюс:
-   - для plugin: ничего дополнительно (pack уже установлен в
-     `home/new/run-N/.config/opencode/plugins/`);
-   - для mcp: вставить блок из инструкции в секцию `mcp`;
-   - для skill/agent/command: ничего дополнительно в конфиге не нужно
-     (видимость через файлы/симлинки).
-   Поскольку `runModel` и все connectivity-поля — одни и те же значения для
-   обеих сторон, единственная разница baseline/new остаётся в pack-секции —
-   ничто из них её не расширяет и не ломает `--pure-baseline`.
-6. Собрать `EnvVarSet` для каждой пары (см. секцию 2). На каждую пару — один
-   `EnvVarSet`; все наборы собираются в двумерный массив `envVars[side][run]`.
-7. Вернуть `HomeIsolationResult { homeTrees, envVars, generatedConfigs }`.
+   раз на весь прогон, не зависит от варианта/прогона; отсутствие файла,
+   пустой файл или битый JSON — не ошибка фазы, просто все поля ниже остаются
+   неопределены).
+2. Для **каждого варианта** `v` из `runInput.variants` (`processVariant`,
+   последовательно, `{ concurrency: 1 }`):
+   a. `declaredPacks = packsOf(runInput, v)` — паки, которые этот вариант
+      объявил (Stage 1: 0 или 1 запись). Для каждого объявленного пака найти
+      его `PackDelivery` в `packInstall.deliveries` по имени; отсутствие
+      делавери у объявленного пака (когда `packInstall` вообще задан) —
+      `E_PACK_INSTALL_FAILED` (внутренний баг связки 03↔04, не должно
+      случаться на здоровом прогоне). Собрать объединённые `instructions`
+      этого варианта (**Stage 1**: объединение тривиально, ≤1 пак; **Stage 2**
+      добавит сюда коллизионную проверку — два пака, регистрирующие один и тот
+      же `(kind, name)`, дадут `E_PACK_INSTALL_FAILED`) и `mcpServers`.
+   b. `pure = v.pure ?? declaredPacks.length === 0` (см. §2 выше).
+   c. Модель варианта: `ownModel = effectiveOf(v, runInput.model, 'model')`;
+      если `ownModel` не задан или явно пустая строка — падение на
+      `sourceConnectivity.model` (та же ambient-модель, что и раньше).
+      `provider`/`small_model`/`enabled_providers`/`disabled_providers` — те
+      же поля из шага 1, **без** per-variant переопределения: либо есть в
+      исходном конфиге целиком, либо отсутствуют — идентичны на всех
+      вариантах.
+   d. Собрать `configObj` (`buildConfigObject`): `$schema`, опциональные
+      `model`/`provider`/`small_model`/`enabled_providers`/
+      `disabled_providers`, единый агент `build` по стандартному шаблону
+      оркестратора, и (только если у варианта есть объявленные паки и
+      найденные `mcpServers` непусты) секция `mcp`. Сериализовать в `configStr`
+      (`JSON.stringify`, stable keys) — это и есть `OPENCODE_CONFIG_CONTENT`
+      этого варианта. Записать редактированную (secrets вычищены) копию в
+      `config/<name>.json` для отладки/review-workspace (сам `configStr`,
+      идущий в env, остаётся НЕ редактированным — иначе прогон не смог бы
+      аутентифицироваться).
+   e. Для **каждого прогона** `n ∈ 1..runs` этого варианта (`{ concurrency: 1
+      }`):
+      - вычислить `homeDir` из `workspace.variantTrees.find(t => t.name ===
+        v.name).homes[n-1]`. Отсутствие пути (рассинхрон с фазой 01) →
+        `E_HOME_SETUP_FAILED`.
+      - создать структуру HOME:
+        ```
+        <homeDir>/
+        ├── .config/opencode/{skills,agents,plugins,command}/   # пустые
+        ├── .opencode/                                           # auth
+        ├── .cache/opencode/
+        ├── .local/share/opencode/
+        └── .local/bin/            # только если ≥1 пак реестра объявляет setup (см. шаг 6)
+        ```
+        Сбой `mkdir` → `E_HOME_SETUP_FAILED`.
+      - скопировать auth по whitelist (`runInput.auth`, `AuthWhitelist`).
+        **Базовый whitelist** (всегда, если источник существует): `opencode`
+        → `~/.opencode/`, `npmrc` → `~/.npmrc`, `anthropic`/`openai`/`gemini`
+        → `~/.config/<provider>/`. **Расширяемый whitelist**: `aws` →
+        `~/.aws/`, `ssh` → `~/.ssh/`, `git` → `~/.gitconfig`. Запрошенный, но
+        отсутствующий на хосте ресурс → warning, продолжаем без него; если
+        **ни один** источник auth не скопировался → `E_AUTH_MISSING`
+        (`variant`, `runIndex`).
+      - применить `instructions` этого варианта на `homeDir` (симлинк для
+        skill, копия файла для agent/command, `opencode plugin <ref>` для
+        plugin — таймаут `installSeconds`, non-zero exit / таймаут →
+        `E_PACK_INSTALL_FAILED` / `E_PACK_INSTALL_TIMEOUT`, mcp-блок уже
+        свёрнут в `configObj` на шаге d). Вариант, не объявивший ни одного
+        пака, не получает НИ ОДНОЙ инструкции — на диске никакого следа
+        чужого пака быть не должно (проверяется гейтом
+        `foreign-pack-absent`, фаза 05).
+      - собрать `HomeTree { basePath: homeDir, structure, copiedAuth }` и
+        `EnvVarSet` через `buildEnvVars(homeDir, pure, configStr, pathValue)`
+        (см. шаг 6 про `pathValue`).
+   f. Вернуть `VariantResult { name: v.name, trees, envs, config: configStr }`.
+3. Собрать `homeTrees: VariantHomes[]`, `envVars: VariantEnv[]`,
+   `generatedConfigs: VariantConfig[]` — по одной записи на вариант,
+   `map(r => ({ name: r.name, ...}))`, в порядке `runInput.variants`.
+4. Вернуть `HomeIsolationResult { homeTrees, envVars, generatedConfigs }`.
+
+### 6. PATH и `--pack-setup`: одинаковая видимость для всех вариантов
+
+Если **хотя бы один** пак реестра объявляет `setup` — `.local/bin` попадает в
+`PATH` **каждого** варианта (`anyPackDeclaresSetup`), независимо от того,
+объявил ли конкретный вариант этот пак. Это сознательное решение симметрии
+(`.research/n-way-variants/02-phases.md`, фаза 04): HOME-установленный бинарник
+должен быть одинаково *достижим* везде, и только его *присутствие*
+различается — иначе гейт 6 (`pack-functional`, фаза 05) не мог бы отличить
+«бинарника нет» от «PATH его прячет» на вариантах, где пак не установлен.
+`setupPathFor(homeDir, isolation, imagePath)` в docker-режиме использует
+in-container путь (`/home/opencode/.local/bin:<imagePath>`), в host-режиме —
+реальный путь на хосте (`<homeDir>/.local/bin:<текущий PATH процесса>`).
 
 ## 4. Входные/выходные файлы
 
 | Файл / каталог                                    | Чтение/Запись | Схема (TypeSpec/Zod) |
 | ------------------------------------------------- | ------------- | -------------------- |
-| `home/<side>/run-<n>/`                            | Запись        | структура HOME       |
-| `home/<side>/run-<n>/.config/opencode/{...}/`     | Запись        | пустые + pack на new |
-| `home/<side>/run-<n>/.opencode/`                  | Запись        | копия `~/.opencode/` |
-| `config/baseline.json`                            | Запись        | `OpenCodeConfig`     |
-| `config/new.json`                                 | Запись        | `OpenCodeConfig`     |
+| `home/<variant>/run-<n>/`                         | Запись        | структура HOME       |
+| `home/<variant>/run-<n>/.config/opencode/{...}/`  | Запись        | пустые + инструкции объявленных этим вариантом паков |
+| `home/<variant>/run-<n>/.opencode/`               | Запись        | копия `~/.opencode/` |
+| `config/<variant>.json`                           | Запись        | `OpenCodeConfig` (редактированная копия) |
 
-`generatedConfigs.baseline` и `generatedConfigs.new` — это **строки** (содержимое
-`OPENCODE_CONFIG_CONTENT`), они же пишутся как `config/baseline.json` и
-`config/new.json` для отладки и для review-workspace.
+`generatedConfigs[*].config` — это **строки** (содержимое
+`OPENCODE_CONFIG_CONTENT`), они же пишутся (редактированными) как
+`config/<variant>.json` для отладки и для review-workspace.
 
-Снимок того, что стороны реально использовали **после** запуска (эффективный конфиг,
-установленные skills/agents/plugins/mcp/npm-зависимости, факт вызова) сохраняется позже,
-фазой 06, в `config/.config/opencode/<side>/` — см. `docs/phases/06-run-side.ru.md`,
-раздел 9.
+Снимок того, что варианты реально использовали **после** запуска (эффективный
+конфиг, установленные skills/agents/plugins/mcp/npm-зависимости, факт вызова)
+сохраняется позже, фазой 06, в `config/.config/opencode/<variant>/` — см.
+`docs/phases/06-run-side.ru.md`, раздел 9.
 
 ## 5. Edge-cases и ошибки
 
@@ -179,101 +179,101 @@ Namespace: `TestAiPack.HomeIsolation` (см.
 | ---------------------------------------------------------- | ----------------------------------------------- | ------------------------- |
 | `~/.opencode/` существует, но пустой                       | Копируем как есть, не fail                      | —                         |
 | Запрошен `--aws`, но `~/.aws` нет                          | warning, продолжаем без него                    | —                         |
-| Нет вообще никакого auth (ни opencode, ни provider)        | fail (preflight всё равно упадёт)               | `E_AUTH_MISSING`          |
-| `--ssh` и приватный pack, но ключ не подходит              | не падает здесь — упадёт в фазе 03 clone        | — (через 03)              |
+| Нет вообще никакого auth (ни opencode, ни provider)        | fail для этого `(variant, run)` (preflight всё равно упадёт) | `E_AUTH_MISSING`   |
 | symlink создать нельзя (ROFS / нет прав)                   | fail                                            | `E_HOME_SETUP_FAILED`     |
-| pack ссылается на `pack/<name>/`, которого нет             | fail                                            | `E_HOME_SETUP_FAILED`     |
-| plugin install (kind: plugin) превысил таймаут             | fail прогона                                    | `E_PACK_INSTALL_TIMEOUT`  |
-| plugin install (kind: plugin) упал с non-zero exit         | fail прогона                                    | `E_PACK_INSTALL_FAILED`   |
-| `isolation = "docker"`, подготовка контейнера упала (v0.3) | fail прогона                                    | `E_DOCKER_FAILED`         |
-| smoke-test: pack отсутствует                               | new-сторона получает ту же конфигурацию, что old| —                         |
-| Повторный запуск с тем же runId (idempotent)               | пересоздаём структуру, перезаписываем           | —                         |
+| пак ссылается на `pack/<name>/`, которого нет               | fail                                            | `E_HOME_SETUP_FAILED`     |
+| объявленный пак отсутствует в `packInstall.deliveries`      | fail (рассинхрон 03↔04)                        | `E_PACK_INSTALL_FAILED`   |
+| plugin install превысил таймаут                            | fail прогона                                    | `E_PACK_INSTALL_TIMEOUT`  |
+| plugin install упал с non-zero exit                        | fail прогона                                    | `E_PACK_INSTALL_FAILED`   |
+| `isolation = "docker"`, подготовка контейнера упала          | fail прогона                                    | `E_DOCKER_FAILED`         |
+| smoke-test / вариант без паков                              | вариант получает конфигурацию без паковых инструкций | —                    |
+| Ни один пак реестра не объявляет `setup`                    | `.local/bin` не создаётся, `PATH` не переопределяется | —                    |
+| Повторный запуск с тем же runId (idempotent)                | пересоздаём структуру, перезаписываем           | —                         |
 
 ## 6. Тест-кейсы (по одному на ветку контракта)
 
-- ✅ happy-path: `runs = 2`, есть `~/.opencode/` → 4 HOME-каталога, в каждом
-  `.opencode/` скопирован; `generatedConfigs.baseline` и
-  `generatedConfigs.new` валидны как JSON.
+- ✅ happy-path: legacy-шим (2 варианта), `runs = 2`, есть `~/.opencode/` →
+  4 HOME-каталога, в каждом `.opencode/` скопирован; `generatedConfigs`
+  содержит 2 валидных JSON-строки.
+- ✅ N-way: 3 варианта (один чистый смоук, один с паком A, один с паком B) →
+  purity выставлена только на смоук-варианте; инструкции пака A попадают
+  только в HOME варианта A, пака B — только в HOME варианта B; `envVars`
+  несёт имена вариантов без позиционной индексации (grep `envVars[0]`
+  ничего не находит вне тестов).
 - ✅ pack symlink (`detectedType = "skill"`): создан
-  `home/new/run-1/.config/opencode/skills/<name>` → `pack/<name>/`, symlink
-  разыменовывается.
+  `home/<variant>/run-1/.config/opencode/skills/<name>` → `pack/<name>/`,
+  symlink разыменовывается.
 - ✅ pack file (`detectedType = "agent"`): файл скопирован в
-  `home/new/run-1/.config/opencode/agents/<name>.md`.
+  `home/<variant>/run-1/.config/opencode/agents/<name>.md`.
 - ✅ pack plugin (`detectedType = "plugin"`): запускается
-  `HOME=home/new/run-1 opencode plugin <name>`, в
-  `home/new/run-1/.config/opencode/plugins/` появляется модуль, в
+  `HOME=home/<variant>/run-1 opencode plugin <ref>`, в
+  `home/<variant>/run-1/.config/opencode/plugins/` появляется модуль, в
   `results/install.log` — запись об успехе.
 - ✅ plugin install failure: муляж `opencode plugin` exit 1 → throw
   `E_PACK_INSTALL_FAILED`.
-- ✅ docker isolation failure (v0.3): `isolation = "docker"`, подготовка
+- ✅ docker isolation failure: `isolation = "docker"`, подготовка
   контейнера упала → throw `E_DOCKER_FAILED`.
-- ✅ old не имеет pack: после фазы в `home/old/run-*/.config/opencode/`
-  нет pack-файлов, `skills/` пустой.
-- ✅ env composition: для old `EnvVarSet` содержит `OPENCODE_PURE=1`,
-  `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`; для new они сняты.
+- ✅ вариант без объявленного пака не получает pack-файлы: после фазы в
+  `home/<без-пака>/run-*/.config/opencode/` нет pack-файлов, `skills/`
+  пустой.
+- ✅ env composition: для варианта без паков (`pure` по умолчанию)
+  `EnvVarSet` содержит `OPENCODE_PURE=1`, `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`;
+  для варианта с явным `pure: false` они сняты, даже если у него есть паки.
 - ✅ whitelist aws missing: `--aws`, но `~/.aws` нет → warning в логах, HOME
   создан без `.aws`, не fail.
 - ✅ no auth at all: отсутствуют `~/.opencode/` и все provider-конфиги →
   throw `E_AUTH_MISSING`.
-- ✅ smoke-test: pack отсутствует → new-сторона получает структуру,
-  идентичную old (кроме pure-baseline флагов).
 - ✅ symlink failure ROFS: целевая FS read-only → throw `E_HOME_SETUP_FAILED`.
-- ✅ `runInput.model` override: задан `runInput.model` → и `generatedConfigs.baseline`,
-  и `generatedConfigs.new` содержат это значение в поле `model`, даже если
-  ambient-модель в `~/.config/opencode/opencode.json` другая.
-- ✅ `runInput.model` не задан: оба конфига берут `model` из ambient
-  `~/.config/opencode/opencode.json` (или не содержат поля `model` вовсе, если
-  ambient-конфига тоже нет) — поведение как до появления флага.
-- ✅ `runInput.model` + mcp-pack (`--pure-baseline`): `baseline` и `new`
-  по-прежнему совпадают во всём, кроме секции `mcp` — модель не создаёт новой
-  разницы между сторонами.
+- ✅ `variant.model` override: у одного варианта задан свой `model` → его
+  конфиг содержит это значение, у остальных — глобальный/ambient.
+- ✅ `runInput.model` не задан ни на одном варианте: все конфиги берут
+  `model` из ambient `~/.config/opencode/opencode.json` (или не содержат поля
+  `model` вовсе, если ambient-конфига тоже нет).
 - ✅ custom provider: в реальном `~/.config/opencode/opencode.json` заданы
-  `provider`, `small_model`, `enabled_providers`, `disabled_providers`
-  (например, кастомный ollama + свой allow/deny-список) → оба
-  `generatedConfigs.baseline` и `generatedConfigs.new` содержат все четыре
-  поля целиком и идентично.
-- ✅ custom provider не задан: оба конфига не содержат ни одного из четырёх
-  полей вовсе — поведение совпадает с состоянием до появления этого шага.
+  `provider`/`small_model`/`enabled_providers`/`disabled_providers` →
+  КАЖДЫЙ `generatedConfigs[*].config` содержит все четыре поля целиком и
+  идентично.
+- ✅ custom provider не задан: ни один конфиг не содержит ни одного из
+  четырёх полей вовсе.
 - ✅ `enabled_providers`/`disabled_providers`/`small_model` неожиданной формы
-  (не массив строк / не строка) → поле трактуется как отсутствующее, так же
-  как если бы его не было в исходном конфиге вовсе — не throw.
-- ✅ custom provider + mcp-pack: `baseline` и `new` по-прежнему совпадают во
-  всём, кроме секции `mcp` — ни одно из четырёх connectivity-полей не создаёт
-  новой разницы между сторонами.
-- ❌ НЕ покрыто (ticket): изоляция под macOS с sandbox-exec (v0.3).
-- ❌ НЕ покрыто (ticket): docker-isolation happy-path (v0.3) — здесь только
-  home-mode.
+  → поле трактуется как отсутствующее, не throw.
+- ✅ PATH fairness: пак реестра объявляет `setup`, но объявлен только на
+  варианте A → `PATH` варианта B (не объявившего его) ВСЁ РАВНО содержит
+  `.local/bin` (симметрия видимости — только бинарника там нет).
+- ❌ НЕ покрыто (ticket): изоляция под macOS с sandbox-exec.
+- ❌ НЕ покрыто (ticket): Stage 2 — коллизия инструкций двух паков одного
+  варианта (`(kind, name)` collision → `E_PACK_INSTALL_FAILED`).
 
 ## 7. Инварианты
 
-- После фазы для **каждой** пары `(side, n)` существует полный HOME-скелет с
-  пустыми `.config/opencode/{skills,agents,plugins,command}/`.
-- Для `side = old`: pack **отсутствует** в любых подкаталогах
-  `home/old/run-N/.config/opencode/` (проверяется фазой 05).
-- Для `side = new`: pack **виден** — либо symlink/файл в
-  `.config/opencode/...`, либо установлен в `plugins/` (plugin-тип), либо
-  зарегистрирован в `generatedConfigs.new` (mcp).
-- `envVars[side][n-1]` (`EnvVarSet`) содержит `HOME`,
-  `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_CONFIG_CONTENT`. Для old
-  добавлены pure-baseline флаги.
-- Whitelist копируется идентично во все `home/<side>/run-N/` (детерминизм
+- После фазы для **каждой** пары `(variant, n)` существует полный
+  HOME-скелет с пустыми `.config/opencode/{skills,agents,plugins,command}/`.
+- Вариант, не объявивший пак, **не имеет** его в любых подкаталогах своего
+  `.config/opencode/` (проверяется фазой 05, гейт `foreign-pack-absent`).
+- Вариант, объявивший пак, **имеет** его видимым — либо symlink/файл в
+  `.config/opencode/...`, либо установлен в `plugins/`, либо зарегистрирован
+  в его `generatedConfigs` (mcp).
+- `envVars[i].envs[n-1]` (`EnvVarSet`) содержит `HOME`,
+  `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `OPENCODE_CONFIG_CONTENT`.
+  `OPENCODE_PURE`/`OPENCODE_DISABLE_DEFAULT_PLUGINS`/
+  `OPENCODE_DISABLE_EXTERNAL_SKILLS` = `pure` этого варианта.
+- Whitelist копируется идентично во все `home/<variant>/run-N/` (детерминизм
   auth-состояния между прогонами).
-- Модель прогона (`runInput.model ?? sourceConnectivity.model`) и все
-  connectivity-поля (`provider`, `small_model`, `enabled_providers`,
-  `disabled_providers` — копируются как есть, без CLI-переопределения)
-  применяются **идентично** к обеим сторонам: `generatedConfigs.baseline` и
-  `.new` могут отличаться только pack-секцией (`mcp` и т.п.), никогда этими
-  полями. Это гарантирует, что `--pure-baseline` / gate 5
-  (`baseline-identical`, см. `docs/phases/05-preflight.ru.md`) не ломается на
-  несовпадении модели или connectivity-настроек между сторонами.
+- Модель прогона и все connectivity-поля применяются **идентично на КАЖДОМ
+  варианте**, если только вариант не переопределил их явно
+  (`effectiveOf(v, ..., 'model')`) — расхождение между двумя генерируемыми
+  конфигами, вызванное чем-то, кроме секции паков/явного оверрайда, было бы
+  багом: оно незаметно ломало бы честность сравнения так же, как в v1
+  ломало бы `--pure-baseline` (см. гейт 5/6 preflight,
+  `docs/phases/05-preflight.ru.md`).
 
 ## 8. Зависимости от других фаз
 
-- Зависит от: **01 workspace-setup** (`Manifest`, `WorkspaceTree.homeOld`,
-  `WorkspaceTree.homeNew`), **03 pack-install** (`PackInstallResult` для
-  применения pack — передаётся через опциональное поле `packInstall` в
-  контрактном `HomeIsolationInput`; без него это smoke-test).
+- Зависит от: **01 workspace-setup** (`Manifest`, `WorkspaceTree.variantTrees`),
+  **03 pack-install** (`PackInstallResult.deliveries` для применения паков —
+  передаётся через опциональное поле `packInstall` в контрактном
+  `HomeIsolationInput`; без него — все варианты без паковых инструкций).
 - Блокирует: **05 preflight** (preflight проверяет HOME-структуру и
-  pack-visibility), **06 run-side** (нужны `envVars` и пути для запуска
-  агента).
+  pack-visibility/foreign-pack-absent per variant), **06 run-side** (нужны
+  `envVars` и пути для запуска агента).
 - Параллелизуется с: — (исполняется после 02+03, точка схода перед preflight).

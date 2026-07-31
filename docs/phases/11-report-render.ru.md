@@ -5,10 +5,13 @@
 
 ## 1. Назначение
 
-Собрать из `metrics.json`, диффов, `judge.json` и `timeline.html` итоговый
-отчёт во всех запрошенных форматах (`--format`): обязательные `report.md` (в
-stdout + файл) и `report.json` (файл), опциональные `report.html` и
-`report.yaml`.
+Собрать из `metrics.json`, диффов всех вариантов, `judge.json` и
+`timeline.html` итоговый отчёт во всех запрошенных форматах (`--format`):
+обязательные `report.md` (в stdout + файл) и `report.json` (файл),
+опциональные `report.html` и `report.yaml`. Для N вариантов таблицы стали
+**metric-major** (одна строка на пару метрика×вариант) вместо
+фиксированных 2-колоночных пар old/new — раскладка нормативно описана в
+`.research/n-way-variants/03-hard-problems.md §4`.
 
 ## 2. Контракт (TypeSpec)
 
@@ -16,258 +19,273 @@ Namespace: `TestAiPack.ReportRender` (см.
 `contract/phases/11-report-render.tsp`).
 
 - Вход: `ReportRenderInput` — `{ runInput: RunInput, manifest: Manifest,
-  metricsDiff: MetricsDiff, timeline: Timeline, diff: { old: DiffResult; new:
-  DiffResult }, judge?: JudgeResult, summary: ReportSummary }`:
-  - `metricsDiff` (`MetricsDiff`) — результат фазы 07.
-  - `timeline` (`Timeline`) — результат фазы 10 (значение поля `timeline` из
-    `TimelineResult`, не сам `TimelineResult`).
-  - `diff` — две `DiffResult` (old/new) из фазы 08.
-  - `judge?` — опциональный `JudgeResult` из фазы 09; отсутствует, если судья
-    не запрашивалась (`JudgeResultOutput.judge = null`).
+  metrics: MetricsReport, timeline: Timeline, diffs: DiffResult[], judge?:
+  JudgeResult, summary: ReportSummary }` (было `metricsDiff`/`diff: {old,new}`):
+  - `metrics` (`MetricsReport`) — результат фазы 07: `{ baseline, variants:
+    VariantAggregates[], deltas: VariantDelta[], allFailed }`.
+  - `timeline` (`Timeline`) — результат фазы 10 (`{ lanes: VariantTimeline[],
+    mode }`).
+  - `diffs: DiffResult[]` — по одной записи на каждый вариант, из фазы 08.
+  - `judge?` — опциональный `JudgeResult` (N-way, `scores: VariantScore[]`) из
+    фазы 09; отсутствует, если судья не запрашивалась.
   - `summary` (`ReportSummary`) — собранная оркестратором сводка:
-    `headlineResult: string`, `improvements: MetricDelta[]`,
-    `regressions: MetricDelta[]`, `neutral: MetricDelta[]`,
-    `failures: FailedRun[]`.
+    `headlineResult: string`, `perVariant: VariantSummary[]` (было плоские
+    `improvements`/`regressions`/`neutral` — теперь по записи `{ variant,
+    improvements, regressions, neutral }` **на каждый не-baseline вариант**),
+    `failures: FailedRun[]`, `basis?: "task" | "total"`.
 - Выход: `ReportRenderResult` — `{ formats: OutputFormat[], paths: { md?:
   string; json?: string; yaml?: string; html?: string }, stdoutFormat: "md" |
-  "json" }`. `OutputFormat ∈ { "md", "html", "json", "yaml" }`.
-  - `formats` — фактически сгенерированные форматы (подмножество из
-    `runInput.formats`, всегда включает `"md"`).
-  - `paths` — пути к записанным файлам; обязательных нет, все опциональные.
-  - `stdoutFormat` — что печатается в stdout (`"md"` всегда; `"json"` — если
-    пользователь явно попросил JSON-вывод через CLI флаг).
+  "json" }` — без изменений структуры.
 - Ошибки: `@error ReportRenderError` — `{ code, message, context? }`, где
   `code`:
   - `E_DISK_FULL` — нет места писать отчёт (`ENOSPC`).
   - `E_EXPORT_INVALID` — собранный `Report` не прошёл собственную
-    `reportSchema` перед сериализацией в JSON/YAML (внутреннее рассогласование
-    контракта выше по цепочке фаз, а не ошибка пользователя). Раньше это было
-    непойманным `throw` внутри `Effect.gen` — теперь корректный
-    `Effect.fail(reportRenderError(..., "E_EXPORT_INVALID"))`.
+    `reportSchema` перед сериализацией в JSON/YAML.
 
-  Неверное значение в `formats` или пустой `formats` здесь **не** выделены в
-  отдельный код — они клирятся в фазе 00 (`runInput.formats: OutputFormat[]`
-  уже отвалидирован).
+## 3. Секции `report.md`, в порядке рендера (`renderMd`)
 
-## 3. Шаги алгоритма
+Порядок: `Header → Summary → Primary metrics → Phase split → Harness
+preparation → Pack signal → Safety → Contamination → Secondary → Failed runs
+→ LLM Judge → Timeline summary → Diff summary`. Каждая секция — свой чистый
+рендерер (`src/report/md.ts`), пропускается (пустая строка, отфильтровывается)
+при отсутствии релевантных данных.
 
-1. Прочитать `runInput.formats` (уже отвалидированный массив `OutputFormat`).
-   Должно быть непустое подмножество `{md, html, json, yaml}` — пустой массив
-   клирится в фазе 00.
-2. **report.md** — рендерим всегда (даже если `"md"` не в `formats`, он нужен
-   в stdout). Секции идут в порядке headline → detail (см.
-   `.research/metrics-expansion/spec.md` §2.0) — заголовок держит только
-   вердикт-несущие/интерпретирующие факты, детали идут ниже:
-   a. **Header** — run-id, repo, pack (или `smoke-test`), timestamp; + строка
-      предупреждения о рассинхроне версии opencode (P13, см. §2 ниже).
-   b. **Summary** — существующие бакеты Improvements/Regressions/Neutral, плюс
-      до двух alert-строк наверху: pack-noop (P1) и «⚠ N risky command(s)
-      detected — see Safety» (P2).
-   c. **Primary metrics — total (init + task)** (заголовок так называется с
-      metric-split, см. ниже — таблица суммирует ВЕСЬ прогон, включая init,
-      если он был) — таблица по 7 первичным метрикам (`totalTokens`,
-      `wallClockMs`, `costUsd`, `stepCount`, `toolCallCount`, `successRank`,
-      `maxParallelism`) + новые колонки `[min–max]` (и `IQR=`, если есть) на
-      каждую сторону (P3); плюс блок **Stability** — success rate,
-      гистограмма рангов, флаг `unstable`, и строка `verify: X/Y passed`,
-      если есть `verifyStats` (P10).
-      | Метрика | old median | old [min–max] | new median | new [min–max] | Δ | Δ% | Significant | Вердикт |
-      Вердикт = ✓ (улучшение), ⚠ (значимо хуже,
-      `MetricDelta.significant === true` и `better === "worse"`), — (в шуме).
-      Новые метрики waves 1+2 **не входят** в эту таблицу и не имеют вердикта.
-   c′. **Phase split (init vs task)** (metric-split, см. `docs/phases/07-aggregate.ru.md` §9)
-      — присутствует только если хотя бы одна сторона несёт `phaseSplit`.
-      Между Primary metrics и Pack signal: task-таблица (те же 9 колонок, что
-      у Primary metrics, но только по 5 расщепляемым метрикам, всегда
-      task-vs-task); строка(и) pack-setup (только wall-clock, никогда не
-      внутри дельты); блок Init cost — median/[min–max] БЕЗ дельты при
-      одностороннем init, полноценная 9-колоночная дельта-таблица только
-      когда `initDeltas` присутствует (обе стороны гоняли init);
-      предупреждение про `runsWithLostInit`, если есть. `## Summary`
-      получает строку `_Basis: task phase only..._` под заголовком, когда
-      `summary.basis === "task"`; заголовок и бакеты в этом случае считаются
-      от `taskDeltas` (+ `successRank`/`maxParallelism` из whole-run дельт),
-      не от `PrimaryDeltas`.
-   d. **Pack signal** (P1) — per-side calls/errors/runs-with-call/first-call
-      median; `_pack use is not visible for this pack type_`, если
-      `canDetect === false`. Секция отсутствует, если `packUse` нет ни на
-      одной стороне (смоук-ран или старый report.json).
-   e. **Safety** (P2) — таблица опасных bash-команд (`riskyCommands`) по
-      сторонам; отсутствует, если оба списка пусты/не заданы.
-   f. **Secondary metrics** — заголовок получает пометку
-      `_Whole-run (init + task) — not split_`, когда у стороны есть
-      `phaseSplit` (эти метрики remain нерасщеплёнными — см.
-      `docs/phases/07-aggregate.ru.md` §9). По сторонам, перегруппировано в
-      4 именованных блока (в md — вложенные списки, в html — `<details>`,
-      первый открыт):
-      **Behavior** (finish causes, max same-tool streak, invalid/duplicate/
-      bashFail-счётчики, топ error-текстов, per-tool breakdown), **Latency**
-      (step p50/p95, reasoning time + доля от wall-clock, P5-строка «first
-      tool/first edit/worst stall»), **Tokens & context** (token breakdown +
-      cacheWrite, P11-контекст first/last step tokens), **Output volume**
-      (File diff totals + P12 text/reasoning char counts).
-   g. **Failed runs** — секция присутствует только если `summary.failures`
-      непустой: таблица `(side, runIndex, errorCode, errorMessage)`.
-   h. **LLM-судья** — секция присутствует только если `judge !== undefined`:
-      вердикт, баллы, explanation (или «did not run», см.
-      `docs/phases/09-judge.ru.md`).
-   i. **Timeline summary** — топ-N долгих событий.
-   j. **Diff summary** — существующие ссылки на патчи + P8 (median tokens per
-      changed line, cost per file) + P9 (per-file overlap: both/only-old/
-      only-new, до 15 путей).
-   k. Футер: пути к `report.json`, `timeline.html`, `review.code-workspace`.
+**Header** (`renderHeader`): run-id, repo,
+`**Variants:** <descriptor каждого варианта>` (было `pack | smoke-test`) —
+`variantDescriptor` перечисляет паки и pure-статус каждого варианта, например
+`base* (no packs, pure), graphify (packs: graphify), ast-grep (packs:
+ast-grep)`, звёздочка помечает baseline; `**Runs:** N per variant`;
+timestamp; версия opencode + warning о рассинхроне; опциональные
+disclosure-строки **Prompt**/**Init**/**Hint** — печатаются, только если
+эффективные значения расходятся между вариантами (группируют варианты по
+источнику: «унаследовал глобальный» / «свой текст» / «явно отключён»,
+например `base, graphify — global init; ast-grep — own init ("...")`).
+Раньше был единственный факт «сторонам ушёл идентичный текст»; теперь per-
+variant текст — законная возможность, и заголовок обязан явно это раскрыть,
+а не молчать.
 
-   Каждая новая строка/секция пропускается, если соответствующее поле
-   `undefined` — старый `report.json` (без waves 1+2 полей) рендерится ровно
-   как раньше, без новых секций и строк.
+**Summary** (`renderSummary`): до трёх видов alert-строк наверху —
+`allFailed`-баннер («All variants failed — comparison unavailable»),
+`pairIncomplete`-предупреждение на каждый неполный не-baseline вариант, pack-
+noop alert, «⚠ N risky command(s) detected», contamination-alert (называет
+все затронутые варианты и суммарное число сигналов). Заголовок-summary
+(`headlineResult`) — по одной клаузе **на каждый не-baseline вариант**, в
+порядке конфига:
+```
+vs base: graphify — 2 significant improvement(s): Total tokens, Steps; ast-grep — no significant differences (3 better, 1 worse, all within noise).
+```
+Ниже — блок `### vs base: <variant>` на каждый не-baseline вариант с
+бакетами Improvements/Regressions/Neutral (было — единственный плоский блок
+new-vs-old).
+
+**Primary metrics — total (init + task)** (`renderPrimary`): metric-major
+длинная таблица — одна строка на каждую (метрика, вариант) пару, строка
+baseline идёт первой в каждой группе метрики, колонки дельт пустые на
+строке baseline:
+
+```md
+| Metric | Variant | Median | [min–max] | Δ vs base | Δ% | Significant | Verdict |
+|---|---|---|---|---|---|---|---|
+| Total tokens | base* | 120000 | 100000–130000 (IQR=9000) | — | — | — | — |
+| Total tokens | graphify | 90000 | 85000–99000 (IQR=5000) | -30000 | -25.0% | ✓ significant | ✓ better |
+| Total tokens | ast-grep | 118000 | 90000–160000 (IQR=30000) | -2000 | -1.7% | in noise | ✓ better |
+```
+
+Футер (`primaryFootnote`): `_* baseline._`, и если `deltas.length > 1` —
+однострочная оговорка о множественных сравнениях: `N−1 = {k} comparisons
+share one baseline; at this sample size expect occasional spurious
+"significant" flags — treat cross-variant differences in flag count, not any
+single flag, as the signal.` Прежние per-pair 2-колоночные таблицы (old/new)
+физически не масштабировались бы за N=4 (>80 колонок) — metric-major long
+table и есть единственное решение, читаемое построчно.
+
+**Stability** (`renderStability`, вложена в конец Primary metrics): одна
+строка на КАЖДЫЙ вариант (было — 2 строки, old/new):
+```md
+- **base***: success rate 3/3 (100%); rank 4 ×3
+- **graphify**: success rate 2/3 (67%); rank 4 ×2, rank 0 ×1; unstable: Wall-clock (2.1×); verify: 2/3 passed
+```
+
+**Phase split (init vs task)** (`renderPhaseSplit`, только если хотя бы один
+вариант несёт `phaseSplit`): та же metric-major раскладка для 5
+расщепляемых метрик, отдельно task-таблица и init cost (init-таблица
+показывает полноценную дельту только когда `initDeltas` присутствует у пары
+(baseline, вариант) — иначе medaan/[min–max] без дельты, никогда не
+подставляется вычтенное значение у стороны без init); строки pack-setup (
+только wall-clock) и предупреждение про `runsWithLostInit` — по каждому
+варианту, у которого они есть.
+
+**Harness preparation** (`renderHarnessPrep`): один блок на каждый пак
+(баннер по режиму `PackPrep.mode`), таблица evidence с колонкой `Pack`
+добавленной к прежним `Variant`/`Run`:
+```md
+| Step | Pack | Variant | Run | Result | Wall-clock | Artifact hash |
+|---|---|---|---|---|---|---|
+| setup | graphify | graphify | — | ✓ | 12000ms | — |
+| check | graphify | graphify | 1 | ✓ | 300ms | — |
+| check | graphify | base | 1 | ✓ | 150ms | — |   <- ✓ здесь значит "корректно отсутствует"
+| exercise | — | graphify | 1 | ✓ | 8000ms | ab12cd34ef56 |
+```
+`cmdStatus` теперь решает «declared-vs-foreign» вместо «new-vs-old».
+
+**Pack signal** (`renderPackSignal`): вложено по варианту, по паку:
+```md
+- **graphify** (variant graphify): 3 call(s), 0 error(s), 3/3 runs...
+- **graphify** (variant base): 0 call(s) — foreign; any call would be contamination
+```
+Строки с нулевым **чужим** сигналом молчат (дублировали бы секцию
+Contamination) — ненулевое там уже сигнал сам по себе.
+
+**Safety** (`renderSafety`): таблица опасных bash-команд по всем вариантам
+(колонка `Variant`); отсутствует, если списки пусты во всех вариантах.
+
+**Contamination** (`renderContamination`, новая секция относительно v1):
+таблица с колонками `Variant`/`Pack`; alert-баннер в Summary называет
+затронутые варианты. Была невозможна в v1 — там contamination проверялась
+только для одной стороны против одного `--pack`.
+
+**Secondary metrics**: без изменений семантики полей, теперь по варианту (не
+по стороне) — 4 именованных блока (Behavior / Latency / Tokens & context /
+Output volume) на каждый вариант.
+
+**Failed runs** (`renderFailures`): таблица `(Variant, Run, Code, Message)` —
+колонка `Side` переименована в `Variant`; строки со всех вариантов вперемешку
+(`summary.failures` — плоский список, каждая запись уже несёт `variant`).
+
+**LLM Judge** (`renderJudge`, N-way):
+```md
+## LLM Judge
+- Verdict: **ok**
+- Ranking: graphify > base > ast-grep
+- Quality: base=6, graphify=8, ast-grep=5
+- Model: `ollama/qwen3.5:9b`
+- Explanation: ...
+```
+Плюс `_Scores derived from pairwise-vs-baseline calls (prompt exceeded the
+single-call budget)._`, когда `judge.pairwiseFallback === true`.
+`judge.ran === false` → `_Judge did not run: <explanation>_` без блока
+verdict/quality, как раньше.
+
+**Timeline summary** (`renderTimeline`): топ-N долгих событий по всем
+lane'ам, без изменений.
+
+**Diff summary** (`renderDiff`): существующие ссылки на патчи + tokens-per-
+line/cost-per-file + per-file overlap. Overlap раньше был `both/only-old/
+only-new`; теперь на каждый не-baseline вариант — `Both`/`Only base`/`Only
+{variant}` (пары «этот вариант против baseline», не N×N).
+
+## 4. Шаги алгоритма
+
+1. Прочитать `runInput.formats`. Непустое подмножество `{md, html, json,
+   yaml}` — гарантировано фазой 00.
+2. Собрать `report.md` секциями из §3 выше (`joinBlocks` с разделителем
+   `\n\n---\n\n`, пустые секции отфильтровываются перед join).
 3. Печать `report.md` в **stdout** (`stdoutFormat = "md"` по умолчанию) +
    запись в `results/report.md`.
-4. **report.json** — canonical: сериализация `metricsDiff` + `timeline` +
-   `diff` + `judge` + `summary` + метаданные (`runId`, `generatedAt`,
-   `formats`, `testaipackVersion`). Запись в `results/report.json`.
-5. Если `"yaml" ∈ formats`: сериализация той же структуры в
-   `results/report.yaml`.
-6. Если `"html" ∈ formats`: рендер `results/report.html` — полный
-   интерактивный отчёт, встраивающий `timeline.html` (через iframe на
-   file://-путь или inline). Главная таблица дельт с теми же ✓/⚠/—, блоки
-   Failed runs, Карта, LLM-судья. Self-contained, vanilla JS.
-7. `ENOSPC` на любой записи → `ReportRenderError({ code: "E_DISK_FULL" })`.
-   `Report` не проходит `reportSchema` перед сериализацией (json/yaml) →
-   `ReportRenderError({ code: "E_EXPORT_INVALID" })`.
+4. **report.json** — canonical: сериализация `Report { schemaVersion: 2,
+   manifest, metrics, timeline, diffs, judge?, summary, prep? }` (было
+   `metricsDiff`/`diff`/без `prep`). Запись в `results/report.json`.
+5. Если `"yaml" ∈ formats`: та же структура в `results/report.yaml`.
+6. Если `"html" ∈ formats`: рендер `results/report.html` — те же секции
+   1:1 с md (`src/report/html.ts`), metric-major таблицы, `.baseline-row`
+   фон вместо прежних `.old`/`.new` CSS-классов; per-variant `<details>` для
+   Secondary (первый открыт).
+7. `ENOSPC` на любой записи → `E_DISK_FULL`. `Report` не проходит
+   `reportSchema` перед сериализацией → `E_EXPORT_INVALID`.
 8. Вернуть `ReportRenderResult { formats, paths, stdoutFormat }`.
 
-## 4. Входные/выходные файлы
+## 5. Входные/выходные файлы
 
 | Файл                       | Чтение/Запись | Схема (TypeSpec/Zod) |
 | -------------------------- | ------------- | -------------------- |
-| `results/metrics.json`     | Чтение        | `Metrics`            |
-| `diff/<side>/run-N/summary.json` | Чтение   | `DiffSummary`        |
+| `results/metrics.json`     | Чтение        | `MetricsReport`      |
+| `diff/<variant>/run-N/summary.json` | Чтение | `DiffSummary`        |
 | `results/judge.json`       | Чтение        | `JudgeResult`        |
+| `results/prep.json`        | Чтение (opt)  | `PrepReport`         |
 | `results/timeline.html`    | Чтение (html) | HTML                 |
 | `results/report.md`        | Запись        | Markdown             |
-| `results/report.json`      | Запись        | canonical report     |
+| `results/report.json`      | Запись        | canonical report (v2) |
 | `results/report.yaml`      | Запись (opt)  | YAML                 |
 | `results/report.html`      | Запись (opt)  | self-contained HTML  |
 
-## 5. Edge-cases и ошибки
+## 6. Edge-cases и ошибки
 
 | Кейс                                                | Поведение                                          | Код                  |
 | --------------------------------------------------- | -------------------------------------------------- | -------------------- |
-| `formats = []`                                      | невозможный случай — фаза 00 кидает `E_CONFIG_INVALID` | — (через 00)    |
 | `formats = ["md"]` (default)                        | пишем только `report.md` + `report.json`           | —                    |
 | `formats = ["all"]`                                 | раскрыто в фазе 00 → все 4 формата                 | —                    |
 | `summary.failures` пустой                           | секция Failed runs не показывается                 | —                    |
-| `judge === undefined` (судья не запрашивалась)      | секция LLM-судья не показывается                   | —                    |
+| `judge === undefined`                               | секция LLM-судья не показывается                   | —                    |
 | `judge.verdict = "unclear"`                          | секция показывается с пометкой unclear             | —                    |
-| `metricsDiff.bothFailed = true`                     | в таблице Δ показываем 0/null, вердикт «—»         | —                    |
+| `metrics.allFailed = true`                           | баннер «All variants failed», в таблицах Δ — «—»   | —                    |
+| `deltas[i].pairIncomplete = true` (не все failed)    | предупреждение в Summary именно на этот вариант    | —                    |
+| `deltas.length > 1` (3+ варианта)                    | primary-таблица получает multiple-comparisons сноску | —                  |
 | Нет места писать отчёт                              | fail                                               | `E_DISK_FULL`        |
 | Собранный `Report` не проходит `reportSchema`       | fail (до записи файла)                             | `E_EXPORT_INVALID`   |
 | `timeline.html` отсутствует (фаза 10 упала)         | `report.html` без timeline-блока, warning          | —                    |
-| Очень большая `perTool` (>50 tool-ов)                | показываем топ-20, остальные в раскрытии           | —                    |
-| `packUse` нет ни на одной стороне                    | секция Pack signal отсутствует                     | —                    |
-| `packUse.canDetect === false`                        | строка «pack use is not visible for this pack type» вместо чисел | — |
-| `packUse.calls === 0` на NEW и `canDetect === true`  | alert в Summary: «pack was never invoked...»        | —                    |
-| `riskyCommands` пусты/не заданы с обеих сторон       | секция Safety отсутствует                          | —                    |
-| `verifyStats` не задан                                | строка verify в Stability отсутствует              | —                    |
-| Старый `report.json` (waves 1+2 полей нет)           | рендер идентичен дорелизному — без новых секций/строк | —                 |
-| `wallClockMs = 0` (пустой прогон)                     | строка доли reasoning от wall-clock пропускается (деление на 0) | — |
-| Ни у одной стороны нет `phaseSplit` (старый report.json)| секция Phase split отсутствует; Primary metrics всё равно называется «total (init + task)» | — |
-| `phaseSplit` есть, `runsWithInit === 0` на стороне    | Init cost для неё — «no init phase», без дельты          | — |
-| `initDeltas` отсутствует (init односторонний)         | Init cost — median/[min–max] на сторону с init, НИКОГДА не рендерится как дельта | — |
-| `costProrated === true`                                | значение стоимости с префиксом `~` + сноска «derived, not measured» | — |
-| `runsWithLostInit > 0`                                 | предупреждение «⚠ N run(s) ran --init but the export lost the init session» | — |
-| `phaseSplit.setup` отсутствует                          | строка pack-setup для этой стороны не рендерится (не `0ms`) | — |
+| Prompt/Init/Hint совпадают у всех вариантов          | disclosure-строка не печатается (нечего раскрывать) | —                   |
+| Prompt/Init/Hint расходятся между вариантами         | disclosure-строка группирует варианты по источнику  | —                   |
+| `packUses` нет ни на одном варианте                  | секция Pack signal отсутствует                     | —                    |
+| Contamination-сигналов нет ни на одном варианте      | секция Contamination отсутствует, alert в Summary не печатается | —      |
+| Старый `report.json` (v1, без waves 1+2 полей)       | читается через compat-слой, рендерится как v1-совместимый вид (2 варианта `old`/`new`) | — |
 
-## 6. Тест-кейсы (по одному на ветку контракта)
+## 7. Тест-кейсы (по одному на ветку контракта)
 
-- ✅ happy-path md: `formats = ["md"]` → `report.md` в stdout и файле, есть
-  главная таблица дельт с ✓/⚠/—, футер с путями; `ReportRenderResult.formats
-  = ["md"]`.
-- ✅ md with failed runs: `summary.failures` непустой → секция Failed runs
-  показана с кодом ошибки.
-- ✅ md without failed runs: `summary.failures = []` → секция отсутствует.
-- ✅ md with judge: `judge.verdict = "ok"` → секция LLM-судья с баллами.
-- ✅ md judge missing: `judge === undefined` → секция отсутствует.
-- ✅ md judge unclear: `judge.verdict = "unclear"` → секция с пометкой.
-- ✅ md bothFailed: `metricsDiff.bothFailed = true` → в таблице Δ = 0/null,
-  вердикт «—».
-- ✅ json canonical: `report.json` валиден, содержит `metricsDiff` +
-  метаданные.
-- ✅ yaml output: `formats = ["yaml"]` → `report.yaml` существует, парсится
-  обратно в ту же структуру.
-- ✅ html output: `formats = ["html"]` → `report.html` self-contained,
-  встраивает timeline.
-- ✅ html timeline missing: фаза 10 упала → `report.html` без timeline-блока,
-  warning.
-- ✅ formats all: `["md","html","json","yaml"]` → все 4 файла существуют,
-  `ReportRenderResult.paths` заполнен полностью.
-- ✅ disk full: `ENOSPC` → fail `E_DISK_FULL`.
-- ✅ invalid report schema: собранный `Report` не проходит `reportSchema` →
-  fail `E_EXPORT_INVALID` (проверено на уровне `renderJson`/`renderYaml` и на
-  уровне всей фазы `reportRender`, до записи файла).
-- ❌ НЕ покрыто (ticket): PDF-экспорт отчёта — ticket про v0.3.
-- ✅ primary table [min–max]/IQR: спред-колонки читаются из `stats`;
-  `maxParallelism` (нет записи в `AggregateStats`) рендерится как «—».
-- ✅ stability block: success rate и гистограмма рангов из
-  `stats.successRank.samples`.
-- ✅ pack section: рендерит числа при `packUse` заданном; предупреждение при
-  `canDetect && calls === 0`; «not visible» при `canDetect === false`;
-  секция отсутствует при `packUse` не заданном ни на одной стороне.
-- ✅ safety section: список команд с экранированием (`|` в md, HTML-escape в
-  html); отсутствует при пустых списках.
-- ✅ secondary: строки bash-fails/invalid/duplicates/error-texts —
-  пропускаются, когда поле не задано.
-- ✅ diff section: tokens-per-line и cost-per-file, `n/a` при нулевом
-  знаменателе; per-file overlap — both/only-old/only-new.
-- ✅ header: предупреждение о рассинхроне версии при отличии от манифеста;
-  тишина при совпадении или отсутствии `opencodeVersions`.
-- ✅ secondary группы: md — 4 именованных блока на сторону; html — `<details>`,
-  первый открыт.
-- ✅ backcompat: `Report`-фикстура без единого нового поля рендерится без
-  исключений и без новых секций/строк.
-- ✅ real incident fixture (acceptance criterion, см.
-  `.research/metrics-expansion/golden-values.md`): один `Report`,
-  собранный из golden-значений реальной sample-workspace, одновременно
-  показывает Safety с реальной risky-командой, Pack signal с
-  baseline-vs-baseline warning, `bashFailCount 5`, drift-warning
-  `1.18.3`/`1.18.4`, `[min–max]`-спред, success rate `5/5` на обеих
-  сторонах, worst stall `252915ms`, и отсутствие verify-строки.
+- ✅ happy-path md, legacy-шим: `formats = ["md"]` → `report.md` в stdout и
+  файле, primary-таблица показывает 2 варианта (baseline + один), без
+  multiple-comparisons сноски (`deltas.length === 1`).
+- ✅ N-way golden: 3-вариантный `Report` → primary-таблица metric-major с
+  baseline-строкой первой в каждой группе метрики, `### vs base: <variant>`
+  дважды (по каждому не-baseline варианту), multiple-comparisons сноска
+  присутствует.
+- ✅ md with failed runs / without / with judge / judge missing / judge
+  unclear / allFailed — как раньше, атрибутировано вариантами.
+- ✅ pairIncomplete warning: один не-baseline вариант с 0 успешными
+  прогонами (не все варианты failed) → отдельное предупреждение именно на
+  него, `allFailed`-баннер не печатается.
+- ✅ json canonical / yaml output / html output / formats all / disk full /
+  invalid report schema — без изменений поведения, новых полей.
+- ✅ Contamination-секция: сигнал на варианте a против чужого пака b →
+  секция присутствует, alert в Summary называет `a`.
+- ✅ Contamination-секция отсутствует: сигналов нет ни у одного варианта.
+- ✅ header disclosure: у одного варианта свой `hint`, у остальных —
+  унаследованный глобальный → строка Hint группирует их раздельно; все
+  варианты с идентичным эффективным hint → строка не печатается.
+- ✅ primary table [min–max]/IQR / stability block / pack section / safety
+  section / secondary / diff section / header version-drift warning —
+  сохранены семантически, атрибутированы вариантами вместо сторон.
+- ✅ backcompat: `Report`-фикстура v1 (через compat-слой) рендерится без
+  исключений, как обычный 2-вариантный отчёт `old`/`new`.
+- ✅ real incident fixture: golden-фикстура из реальной sample-workspace
+  (N=3) одновременно показывает Safety, Pack signal, Contamination,
+  multiple-comparisons сноску, per-variant Stability и judge ranking.
 
-## 7. Инварианты
+## 8. Инварианты
 
-- После фазы `results/report.md` и `results/report.json` существуют **всегда**
-  (md — даже если `"md"` не в `formats`, для stdout).
-- `report.md` напечатан в stdout (`stdoutFormat = "md"` по умолчанию) — это
-  основной способ посмотреть результат без открытия файлов.
-- `report.json` содержит полное `metricsDiff` + метаданные — достаточен для
-  повторного рендера в любой формат без повторного прогона.
-- Знаки в таблице дельт согласованы с `MetricDelta.significant` и
-  `MetricDelta.better`: ✓ только при `better = "better"`, ⚠ при `significant`
-  и `better = "worse"`, — в остальных случаях.
-- Секции Failed runs и LLM-судья появляются только когда для них есть данные
-  (отсутствие секции = отсутствие данных, а не ошибка рендера). То же для
-  новых секций Pack signal и Safety.
-- Ни одна метрика waves 1+2 не входит в `PRIMARY_METRICS` и не несёт
-  дельту/вердикт — рендерятся только как detail-факты (см.
-  `.research/metrics-expansion/spec.md`).
-- Отсутствующая метрика рендерится как отсутствующая строка/секция, никогда
-  как `0` — `0` на этих полях означает «измерено, значение ноль», а
-  `undefined` — «не измерялось».
-- `summary.basis` (metric-split, `docs/phases/07-aggregate.ru.md` §9)
-  согласован с тем, что реально питает заголовок и бакеты: `"task"` ⇔
-  `metricsDiff.taskDeltas` задан, `"total"` иначе. Одностороний init никогда
-  не рендерится как `initDeltas` (нечего вычитать у стороны без init) —
-  только как cost-фигура; `setup`-сегмент несёт исключительно wall-clock и
-  никогда не входит ни в одну дельту.
+- После фазы `results/report.md` и `results/report.json` существуют
+  **всегда**.
+- `report.md` напечатан в stdout (`stdoutFormat = "md"` по умолчанию).
+- `report.json` содержит полный `MetricsReport` + метаданные — достаточен
+  для повторного рендера в любой формат без повторного прогона.
+- Знаки в таблице дельт согласованы с `MetricDelta.significant`/`better`:
+  ✓ только при `better = "better"`, ⚠ при `significant` и `better =
+  "worse"`, — в остальных случаях.
+- Каждая metric-major таблица несёт ровно `metrics.variants.length` строк на
+  метрику (одна на вариант, baseline первая в группе).
+- `summary.perVariant.length === metrics.deltas.length` (N−1, порядок
+  конфига минус baseline).
+- Секции Contamination/Pack signal/Safety/Failed runs/LLM Judge появляются
+  только когда для них есть данные.
+- `summary.basis` согласован с тем, что реально питает заголовок и бакеты:
+  `"task"` ⇔ хотя бы одна пара несёт `taskDeltas`; при расхождении между
+  парами заголовок явно раскрывает смешанный базис.
 
-## 8. Зависимости от других фаз
+## 9. Зависимости от других фаз
 
-- Зависит от: **07 aggregate** (`MetricsDiff`), **08 diff** (`DiffResult` для
-  блока диффов), **09 judge** (`JudgeResult`, опционально), **10 timeline**
-  (`Timeline` для `report.html`).
-- Блокирует: — (точка схода артефактов; review-workspace использует те же
-  пути файловой системы, но не data-dependency — может идти как до, так и
-  после report-render).
-- Параллелизуется с: **12 review-workspace** (обе фазы читают готовые
-  артефакты, не мешая друг другу; на практике запускаются последовательно для
-  удобства логов, но зависимости нет).
+- Зависит от: **07 aggregate** (`MetricsReport`), **08 diff**
+  (`DiffResult[]`), **09 judge** (`JudgeResult`, опционально), **10
+  timeline** (`Timeline` для `report.html`), опционально `results/prep.json`
+  (сборка `cli/pipeline.ts` из фаз 04b/05/06).
+- Блокирует: — (точка схода артефактов; review-workspace не имеет
+  data-dependency).
+- Параллелизуется с: **12 review-workspace**.

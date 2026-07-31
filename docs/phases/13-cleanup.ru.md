@@ -8,7 +8,9 @@
 По умолчанию **ничего не удаляет** (workspace retention включён). Управляется
 двумя режимами: `--ephemeral` (в рамках `run`) и субкоманда `gc` (отдельная,
 работает по всем прогонам). Все операции очистки логируются в
-`results/gc.log`.
+`results/gc.log`. Механика не привязана к числу вариантов — `apps/`, `home/`,
+`gitdirs/`, `pack/` удаляются целиком как корневые каталоги (не по одному на
+вариант), так что фаза уже была «N-way-ready» до появления самой фичи.
 
 ## 2. Контракт (TypeSpec)
 
@@ -17,20 +19,21 @@ Namespace: `TestAiPack.Cleanup` (см. `contract/phases/13-cleanup.tsp`).
 - Вход: `CleanupInput` — `{ runInput: RunInput, manifest: Manifest, workspace:
   WorkspaceTree, ephemeral: boolean }`. Один булев флаг `ephemeral` управляет
   поведением: `true` → удалить временные каталоги прогона (`apps/`, `home/`,
-  `pack/`); `false` → no-op. Субкоманда `testaipack gc` (полная уборка по всем
-  прогонам с политиками `--keep-last` / `--older-than` / `--aggressive`)
-  существует вне pipeline и не описывается этим контрактом.
+  `gitdirs/`, `pack/`); `false` → no-op. Субкоманда `testaipack gc` (полная
+  уборка по всем прогонам с политиками `--keep-last` / `--older-than` /
+  `--aggressive`) существует вне pipeline и не описывается этим контрактом.
 - Выход: `CleanupResult` — `{ deleted: string[], kept: string[], gcLogPath:
   string }`:
-  - `deleted` — массив путей, удалённых в этом запуске (например `apps/`,
-    `home/`, `pack/` при `ephemeral = true`).
+  - `deleted` — массив путей, удалённых в этом запуске (`apps/`, `home/`,
+    `gitdirs/`, `pack/` при `ephemeral = true` — корневые каталоги, общие для
+    всех вариантов, не по одному пути на вариант).
   - `kept` — массив путей, оставленных намеренно (`config/`, `results/`).
   - `gcLogPath` — путь к `results/gc.log`.
 - Ошибки: фаза **не имеет error-модели** — soft phase по контракту: ошибки
-  удаления логируются в `gc.log`, но **никогда не фейлят прогон** (см.
-  комментарий в `contract/phases/13-cleanup.tsp`). Сбой удаления на ROFS /
-  отсутствие прав фиксируется в `gcLogPath` warning-ом, фаза возвращает
-  `CleanupResult` с тем, что удалось удалить.
+  удаления логируются в `gc.log` (`console.warn` + запись в лог), но
+  **никогда не фейлят прогон**. Сбой удаления на ROFS / отсутствие прав
+  фиксируется warning-ом, фаза возвращает `CleanupResult` с тем, что удалось
+  удалить.
 
 ## 3. Шаги алгоритма
 
@@ -38,13 +41,16 @@ Namespace: `TestAiPack.Cleanup` (см. `contract/phases/13-cleanup.tsp`).
 
 1. Если `CleanupInput.ephemeral === false` → no-op: пишем в `results/gc.log`
    строку `"cleanup skipped (retention on)"`, возвращаем `CleanupResult` с
-   пустыми `deleted`, `kept` — базовым списком сохранённых каталогов
+   пустым `deleted`, `kept` — базовым списком сохранённых каталогов
    (`config/`, `results/`), `gcLogPath` = путь к логу.
-2. Если `ephemeral === true` → удаляем `apps/`, `home/`, `pack/` целиком
-   (рекурсивно). Каждый удалённый путь добавляем в `deleted`.
+2. Если `ephemeral === true` → удаляем `apps/`, `home/`, `gitdirs/`, `pack/`
+   целиком (`ephemeralTargets`, рекурсивно) — эти четыре пути одинаковы
+   независимо от числа вариантов эксперимента: под `apps/`/`home/`/
+   `gitdirs/` лежат подпапки на каждый вариант, но удаление идёт по корню, а
+   не по списку вариантов. Каждый удалённый путь добавляем в `deleted`.
 3. Оставляем `config/`, `results/` (включая все артефакты — metrics, diff,
-   judge, timeline, report, review.code-workspace, install.log, preflight.log).
-   Эти пути попадают в `kept`.
+   judge, timeline, report, review.code-workspace, install.log, pack-setup.log,
+   preflight.log, prep.json). Эти пути попадают в `kept`.
 4. Логируем каждое удаление в `results/gc.log` (путь + размер).
 5. Сбой удаления (ROFS, нет прав) — warning в `gc.log`, фаза **не падает**;
    неудалённый путь попадает в `kept` с пометкой.
@@ -61,7 +67,7 @@ Namespace: `TestAiPack.Cleanup` (см. `contract/phases/13-cleanup.tsp`).
 2. Формат `--older-than` — `<N><unit>`, где unit ∈ `s|m|h|d` (например `7d`,
    `12h`, `30m`). Невалидный → warning + отказ.
 3. Собрать список всех прогонов в `.testaipack/` (по подкаталогам, парсинг
-   `manifest.json` каждого для timestamp).
+   `manifest.json` каждого для timestamp — читает и v1, и v2 манифесты).
 4. Применить политику:
    - `--keep-last N`: отсортировать по timestamp убыванию, оставить первые N,
      остальные пометить на полное удаление.
@@ -70,8 +76,9 @@ Namespace: `TestAiPack.Cleanup` (см. `contract/phases/13-cleanup.tsp`).
 5. Для **полного удаления** — убрать весь `<runId>/` каталог целиком.
 6. Если `--aggressive` (без полного удаления, или дополнительно к нему) —
    во **всех оставшихся** прогонах удалить `home/` (`apps/` и `results/`
-   остаются). Это экономит место, сохраняя возможность открыть review workspace
-   и посмотреть diff.
+   остаются) — тот же корневой путь, что и в ephemeral-режиме, не
+   по-вариантно. Это экономит место, сохраняя возможность открыть review
+   workspace и посмотреть diff.
 7. Логировать все операции в `.testaipack/gc.log` (общий для всех прогонов).
 8. Сбой удаления → warning в логе, субкоманда продолжается (идемпотентна —
    повторный запуск добьёт остатки).
@@ -79,10 +86,11 @@ Namespace: `TestAiPack.Cleanup` (см. `contract/phases/13-cleanup.tsp`).
 ## 4. Входные/выходные файлы
 
 | Файл / каталог                          | Чтение/Запись   | Схема (TypeSpec/Zod) |
-| --------------------------------------- | --------------- | -------------------- |
-| `.testaipack/<runId>/manifest.json`     | Чтение (gc)     | `Manifest`           |
+| ---------------------------------------- | --------------- | -------------------- |
+| `.testaipack/<runId>/manifest.json`     | Чтение (gc)     | `Manifest` (v1 или v2) |
 | `.testaipack/<runId>/apps/`             | Удаление (opt)  | —                    |
 | `.testaipack/<runId>/home/`             | Удаление (opt)  | —                    |
+| `.testaipack/<runId>/gitdirs/`          | Удаление (opt)  | —                    |
 | `.testaipack/<runId>/pack/`             | Удаление (eph)  | —                    |
 | `.testaipack/<runId>/` целиком          | Удаление (gc)   | —                    |
 | `.testaipack/gc.log`                    | Дополнение (gc) | текст                |
@@ -102,47 +110,39 @@ Namespace: `TestAiPack.Cleanup` (см. `contract/phases/13-cleanup.tsp`).
 | ROFS / нет прав                                     | warning в `gc.log`, фаза не падает                 | —                    |
 | `manifest.json` повреждён у какого-то прогона        | warning, прогон пропускается (не участвует в keep) | —                    |
 | Удаление прервано на середине                        | gc идемпотентен, повторный запуск добьёт           | —                    |
+| N вариантов (N > 2) в `apps/`/`home/`/`gitdirs/`     | удаляются вместе с корневым каталогом, без изменений механики | —        |
 
 > Все ошибки в cleanup — soft: они логируются в `gc.log`, но **не** пробрасывают
 > error-модель фазы (контракт 13 намеренно не имеет `CleanupError`).
 
 ## 6. Тест-кейсы (по одному на ветку контракта)
 
-- ✅ ephemeral on: `ephemeral = true` → `apps/`, `home/`, `pack/` удалены
-  (`CleanupResult.deleted` содержит все три), `config/` и `results/`
-  сохранены (`kept`), `gcLogPath` описывает удалённое.
+- ✅ ephemeral on: `ephemeral = true` → `apps/`, `home/`, `gitdirs/`, `pack/`
+  удалены (`CleanupResult.deleted` содержит все четыре), `config/` и
+  `results/` сохранены (`kept`), `gcLogPath` описывает удалённое.
+- ✅ N-way ephemeral: 3 варианта в `apps/`/`home/`/`gitdirs/` → удаление
+  корневых каталогов сносит подпапки всех трёх вариантов разом, `deleted`
+  всё равно содержит 4 корневых пути (не растёт с числом вариантов).
 - ✅ ephemeral off (default): `ephemeral = false` → `CleanupResult.deleted`
   пуст, `gcLogPath` содержит `"cleanup skipped (retention on)"`.
-- ✅ gc keep-last: 5 прогонов, `gc --keep-last 2` → удалены 3 старейших,
-  оставлены 2 свежих.
-- ✅ gc keep-last > runs: 5 прогонов, `gc --keep-last 100` → ничего не удалено.
-- ✅ gc older-than: 5 прогонов, один старше 7d, `gc --older-than 7d` → удалён
-  только он.
-- ✅ gc older-than invalid format: `gc --older-than xyz` → warning, отказ, не
-  падает.
-- ✅ gc conflicting options: `gc --keep-last 5 --older-than 7d` → warning,
-  отказ, не падает.
-- ✅ gc aggressive: `gc --aggressive` → во всех прогонах удалена только
-  `home/`, `apps/` и `results/` сохранены.
-- ✅ gc aggressive + keep-last: оставить 2 свежих, в остальных удалить `home/`.
-- ✅ ROFS failure: warning в `gc.log`, фаза не падает, неудалённые пути в
-  `kept`.
-- ✅ corrupted manifest: у одного прогона битый `manifest.json` → warning,
-  прогон пропущен, gc продолжается.
-- ✅ idempotent gc: повторный `gc` после частично прерванного добивает остатки.
-- ❌ НЕ покрыто (ticket): docker-volume cleanup (v0.3 docker isolation).
-- ❌ НЕ покрыто (ticket): scheduler-based auto-gc (cron-like) — ticket про
-  v0.2.
+- ✅ gc keep-last / keep-last > runs / older-than / older-than invalid format
+  / conflicting options / aggressive / aggressive + keep-last — без
+  изменений поведения.
+- ✅ gc читает и v1-, и v2-манифесты одинаково (только `timestamp` нужен для
+  политики) — не завязан на `schemaVersion`.
+- ✅ ROFS failure / corrupted manifest / idempotent gc — без изменений.
+- ❌ НЕ покрыто (ticket): docker-volume cleanup.
+- ❌ НЕ покрыто (ticket): scheduler-based auto-gc (cron-like).
 
 ## 7. Инварианты
 
-- Фаза **никогда не падает** (нет error-модели в контракте) — даже при ROI /
+- Фаза **никогда не падает** (нет error-модели в контракте) — даже при ROFS /
   частичном сбое удаления она возвращает `CleanupResult`.
 - По умолчанию (`ephemeral = false`) **все** артефакты сохраняются — workspace
   retention включён.
 - `ephemeral = true` сохраняет **всегда** `config/` и `results/` (включая
-  отчёты, timeline, diff, judge, install.log, preflight.log,
-  review.code-workspace).
+  отчёты, timeline, diff, judge, install.log, pack-setup.log, preflight.log,
+  prep.json, review.code-workspace) — независимо от числа вариантов.
 - `gc` без `--aggressive` удаляет прогоны **целиком** или не трогает их вовсе.
 - `gc --aggressive` в оставшихся прогонах удаляет **только** `home/`, оставляя
   `apps/` (для review workspace) и `results/`.
