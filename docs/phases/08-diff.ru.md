@@ -180,6 +180,31 @@ opencode snapshot/patch export-части пропадают для **каждо
 прогона (нужен `/workspace/.git`, а он не примонтирован) — это плата за
 гарантию, а не побочный баг.
 
+## 3b. Переприменение exclude после восстановления/замены `.git`
+
+`.git/info/exclude` не является git-объектом, поэтому копия `apps/source/.git`
+(шаг 2.b «restore») или замена чужого `.git` на чистый (шаг 2.c «replace»)
+теряет любой exclude, добавленный туда раньше самим testaipack — exercise
+(`--pack-exercise`, `cli/pipeline.ts`) и pack-setup (фаза 04b, §3a) оба
+пишут в `.git/info/exclude` заранее, до этой фазы. Без переприменения
+собственные артефакты этих механизмов «всплыли» бы как обычные изменения
+агента в тот момент, когда сработала recovery. Поэтому и `restoreGit`, и
+`replaceGit` вызывают, в этом порядке, `reapplyExerciseExcludes` и
+`reapplySetupExcludes`:
+
+- `reapplyExerciseExcludes(rawDir, variant, runIndex, destGit)` — читает
+  `<raw>/<variant>/run-<n>.exercise.json` (пишется per-run в
+  `cli/pipeline.ts`), переприменяет `excludedPaths` к свежему `.git`.
+- `reapplySetupExcludes(rawDir, variant, destGit)` — читает
+  `<raw>/<variant>/setup.json` (пишется ОДИН раз на вариант в фазе 04b, §3a,
+  не per-run) и переприменяет те же пути к свежему `.git` КАЖДОГО прогона
+  этого варианта, которому потребовалось восстановление, не только run-1.
+- Оба best-effort (`Effect.ignore`): отсутствующий файл записи — норма
+  (exercise/setup не были объявлены), а сбой самого переприменения оставляет
+  лишние строки в diff вместо падения всей фазы — реальную защиту от
+  искажения измерения даёт guard в момент exercise/setup
+  (`E_PACK_EXERCISE_DIRTY`/`E_PACK_SETUP_FAILED`), не эта переприменение.
+
 ## 4. Входные/выходные файлы
 
 | Файл / каталог                          | Чтение/Запись | Схема (TypeSpec/Zod) |
@@ -190,6 +215,8 @@ opencode snapshot/patch export-части пропадают для **каждо
 | `diff/<variant>/run-<n>/summary.json`   | Запись        | `DiffSummary`        |
 | `diff/<variant>/run-<n>/variant.html`   | Запись (opt)  | HTML (diff2html)     |
 | `$TMPDIR/testaipack-diff-index/…`       | Запись+удаление | временный `GIT_INDEX_FILE`, per-прогон, удаляется сразу после шагов 2.d–2.f |
+| `<raw>/<variant>/run-<n>.exercise.json` | Чтение (opt)  | `{ excludedPaths: string[] }`, переприменяется к свежему `.git` (§3b) |
+| `<raw>/<variant>/setup.json`            | Чтение (opt)  | `{ excludedPaths: string[] }`, переприменяется к свежему `.git` КАЖДОГО прогона варианта (§3b) |
 
 ## 5. Edge-cases и ошибки
 

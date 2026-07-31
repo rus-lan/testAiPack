@@ -36,6 +36,7 @@ desugar-ится в два варианта `old`/`new` под капотом. N
 - [Сравнение двух прогонов (`compare`)](#сравнение-двух-прогонов-compare)
 - [Структура результатов](#структура-результатов)
 - [Миграция на schemaVersion 2](#миграция-на-schemaversion-2)
+- [Язык отчёта](#язык-отчёта)
 - [Архитектура](#архитектура)
 - [Разработка](#разработка)
 - [Лицензия](#лицензия)
@@ -304,7 +305,7 @@ ollama), нужен отдельный флаг `--docker-network host` — см
   "parallel": 2,
   "baseline": "old",
   "packs": [
-    { "name": "graphify", "ref": "https://github.com/Graphify-Labs/graphify", "type": "skill" },
+    { "name": "graphify", "ref": "https://github.com/Graphify-Labs/graphify", "type": "all" },
     { "name": "ast-grep", "ref": "npm:ast-grep-mcp" }
   ],
   "variants": [
@@ -338,7 +339,7 @@ ollama), нужен отдельный флаг `--docker-network host` — см
 
 ```bash
 ./dist/testaipack run https://github.com/owner/repo \
-  --pack "https://github.com/Graphify-Labs/graphify" --pack-type skill \
+  --pack "https://github.com/Graphify-Labs/graphify" --pack-type all \
   --prompt "составь подробную карту проекта и сохрани её в файл MAP.md" \
   --verify "npm test" --runs 3
 ```
@@ -394,13 +395,61 @@ config-файле) — сразу `E_CONFIG_INVALID` с указанием ко�
 цена растёт линейно: **`variants × runs`** рабочих копий, и каждая несёт свой
 собственный `$HOME` — эксперимент из 4 вариантов × 3 прогона занимает **12**
 копий приложения (плюс 12 HOME), не 6. Прежде чем поднимать `runs` или число
-вариантов на большом репозитории — прикиньте место на диске заранее.
+вариантов на большом репозитории — прикиньте место на диске заранее. На
+практике HOME обычно тяжелее рабочей копии репозитория на порядок — пак,
+чей `setup` реально ставит рантайм (venv, зависимости), может занять сотни
+МБ – единицы ГБ на каждый HOME; сама рабочая копия небольшого репозитория —
+единицы МБ. Считайте бюджет диска по HOME, а не по размеру тестируемого
+репозитория (см. реальные цифры в примере 6 ниже).
+
+### Паки, устанавливаемые через `setup`
+
+Пак не обязан приносить с собой `SKILL.md`/agent/command/plugin-файлы —
+`packs[].setup` вправе быть произвольной shell-командой, ставящей CLI/рантайм
+в `$HOME` варианта (например `pipx install <пакет>`). Три вещи, которые
+стоит знать про такой пак:
+
+1. **Пак без файлов регистрации, но с `setup`, теперь не проваливает
+   preflight.** Раньше пак без skill/agent/command/plugin-файлов, которые
+   можно проверить, считался невалидным — «no registration instructions
+   recorded». Теперь: нет файлов регистрации, но есть `setup` → прогон
+   продолжается, но видимость этого пака НЕ подтверждается гейтами 4/5
+   (`pack-visibility`/`foreign-pack-absent`) — в отчёте он помечен «видимость
+   не подтверждена». Присутствие вместо этого доказывает `check` пака,
+   запущенный гейтом 6 в каждом HOME. Пак без файлов регистрации И без
+   `setup` — по-прежнему жёсткая ошибка (`E_PREFLIGHT_FAILED`, «visibility
+   cannot be proven»). Реальный пример — graphify: в его репозитории нет
+   `SKILL.md` (файл навыка генерирует собственный CLI пака при установке),
+   поэтому нужен `type: "all"` в реестре, а не `"skill"` (см. пример 1 ниже
+   и `E_PACK_INVALID_REF`, если перепутать).
+2. **`setup` теперь заражает ВСЕ прогоны варианта одинаково, не только
+   run-1.** `setup` выполняется один раз, с рабочим каталогом = app-каталог
+   run-1 того же варианта. Всё, что он туда пишет (нетрекнутое или уже
+   игнорируемое), копируется в app-каталог КАЖДОГО прогона того же
+   варианта и исключается из измеряемого diff у всех них; после копирования
+   отдельная проверка сверяет app-каталоги всех прогонов и обрывает
+   эксперимент при расхождении. `setup`, изменивший ОТСЛЕЖИВАЕМЫЙ файл
+   (не создавший новый, а поправивший существующий), обрывает эксперимент
+   (`E_PACK_SETUP_FAILED`) — раньше это молча портило измеряемый diff.
+   **Важно:** если шаг пака пишет в РАБОЧИЙ каталог репозитория (не в
+   `$HOME`) — например `graphify opencode install`, кладущий `AGENTS.md` и
+   плагин в клон репозитория, — он принадлежит `variants[].exercise`, не
+   `packs[].setup`: `setup` гоняется один раз в общем `$HOME`, а
+   `exercise` — per-run, в рабочем каталоге каждого прогона отдельно (см.
+   пример 6 ниже).
+3. **Docker-образ (`Dockerfile.opencode`) ставит `pipx`, а с ним Python** —
+   `node:22-slim`, на котором собран образ, без единого Python не может
+   поставить ни один PyPI-пак (`pip install` падает `error:
+   externally-managed-environment`, а без Python вообще — exit 127). Если вы
+   собрали образ ДО этого изменения — пересоберите:
+   `bash scripts/build-docker-image.sh`, иначе `--isolation docker` с
+   PyPI-based `setup` (например `pipx install graphifyy`) откажет.
 
 ---
 
 ## Проверенные примеры
 
-Пять сценариев, реально прогнанных и сверенных — команды ниже не выдуманы,
+Шесть сценариев, реально прогнанных и сверенных — команды ниже не выдуманы,
 все флаги сверены с [таблицей параметров](#параметры-команды-run). Про
 разложенные по дискам артефакты — см.
 [«Структура результатов»](#структура-результатов) ниже.
@@ -411,7 +460,7 @@ config-файле) — сразу `E_CONFIG_INVALID` с указанием ко�
 
 ```bash
 ./dist/testaipack run https://github.com/tarsy-club/TarSy-Bot \
-  --pack "https://github.com/Graphify-Labs/graphify" --pack-type skill \
+  --pack "https://github.com/Graphify-Labs/graphify" --pack-type all \
   --prompt "составь подробную карту проекта и сохрани ее в файл MAP.md" \
   --model opencode/deepseek-v4-flash-free \
   --preflight-model opencode/deepseek-v4-flash-free \
@@ -421,9 +470,15 @@ config-файле) — сразу `E_CONFIG_INVALID` с указанием ко�
 ```
 
 Демонстрирует полный happy-path: клон → установка пакета → 2 прогона на
-вариант → отчёт. `--pack-type skill` здесь явный, хотя git-URL и без него
-детектируется как `skill` автоматически (см.
-[«Форматы `--pack`»](#форматы---pack)). Артефакты: `MAP.md` появится внутри
+вариант → отчёт. `--pack-type all` здесь ОБЯЗАТЕЛЕН, не опция для
+наглядности: голый git-URL без `--pack-type` детектируется как `skill`
+автоматически (см. [«Форматы `--pack`»](#форматы---pack)), а в корне
+репозитория graphify нет `SKILL.md` — файл навыка генерирует сам CLI пака
+при установке, а не хранит репозиторий. С `--pack-type skill` этот пример
+падает `E_PACK_INVALID_REF` («SKILL.md missing in pack»); `all` клонирует
+репозиторий целиком и сканирует `skills/`/`agents/`/`commands/`/`plugins/`,
+не считая их отсутствие ошибкой (см. «Форматы `--pack`» и «N-way примеры
+пакетов, установленных через `setup`» ниже). Артефакты: `MAP.md` появится внутри
 `apps/new/run-{1,2}/` (агент пишет его прямо в клон репозитория; `new` —
 имя варианта с паком, `apps/new`, не `apps/newVersion` — суффикс `Version`
 остался только в дереве прогонов, сделанных до n-way variants),
@@ -495,6 +550,115 @@ workspace содержит по одному root'у на каждый вари�
 байт-в-байт (весь progress уходит в stderr — см. `src/cli/progress.ts`),
 поэтому команда пайпится в файл или дальше по конвейеру без хвостов
 прогресс-лога.
+
+### 6. N-way: три варианта одним прогоном (реально прогнано)
+
+Реальный конфиг, которым прогнан трёхвариантный эксперимент — `baseline`
+против `graphify` и `code-review-graph` (оба пакета продают одно и то же:
+граф вызовов кода для навигации агента), на TarSy-Bot, в docker-изоляции, на
+локальной модели через ollama. Сохраните как `.testaipack/config.json`:
+
+```json
+{
+  "repoUrl": "https://github.com/tarsy-club/TarSy-Bot",
+  "prompt": "добавь возможность работать с url в которыйх есть кирилица в человеко понятных url (chpu)",
+  "hint": "Если в проекте есть готовый индекс кода (graphify или code-review-graph), используй его для навигации по коду; если его нет — работай как обычно.",
+  "runs": 3,
+  "parallel": 3,
+  "baseline": "baseline",
+  "isolation": "docker",
+  "dockerImage": "testaipack-opencode:latest",
+  "dockerNetwork": "host",
+  "model": "ollama/qwen3.5-9b-32k",
+  "preflightModel": "ollama/qwen3.5-9b-32k",
+  "formats": ["md", "html"],
+  "collapseRepeats": true,
+  "timelineMode": "side-by-side",
+  "judge": "Сравни варианты по приложенным патчам относительно базового: что сделано лучше или хуже в каждом и почему",
+  "timeouts": {
+    "preflightSeconds": 1200,
+    "runSeconds": 3600,
+    "watchdogSeconds": 300
+  },
+  "logLevel": "info",
+  "packs": [
+    {
+      "name": "graphify",
+      "ref": "https://github.com/Graphify-Labs/graphify",
+      "type": "all",
+      "setup": "pipx install graphifyy",
+      "check": "graphify --version"
+    },
+    {
+      "name": "code-review-graph",
+      "ref": "https://github.com/tirth8205/code-review-graph",
+      "type": "all",
+      "setup": "pipx install code-review-graph"
+    }
+  ],
+  "variants": [
+    { "name": "baseline", "packs": [] },
+    {
+      "name": "graphify",
+      "packs": ["graphify"],
+      "exercise": "graphify opencode install && graphify extract . --code-only --no-cluster"
+    },
+    {
+      "name": "code-review-graph",
+      "packs": ["code-review-graph"],
+      "exercise": "code-review-graph install --platform opencode && code-review-graph build"
+    }
+  ]
+}
+```
+
+```bash
+./dist/testaipack run --config ./.testaipack/config.json
+```
+
+Практические заметки, снятые с этого прогона:
+
+- **`type: "all"`, не `"skill"`, для обоих паков.** `type: "skill"` ищет
+  ровно один `SKILL.md` в корне репозитория пака — ни у graphify (файл
+  навыка генерирует его собственный CLI при установке, в репозитории его
+  нет вовсе), ни у code-review-graph (у него `SKILL.md` есть, но по семь
+  штук, в подкаталогах `skills/*/`, не в корне) такого файла нет. `"all"`
+  клонирует репозиторий целиком и сам решает, что регистрировать: для
+  graphify `registeredIn` в итоге пуст — регистрировать нечего, это не
+  ошибка; для code-review-graph находит все 7 `skills/*/SKILL.md`.
+- **`setup` пака ставит рантайм в общий `$HOME`, `exercise` варианта пишет в
+  рабочую копию репозитория** — это два разных места, и путать их нельзя.
+  `pipx install graphifyy`/`pipx install code-review-graph` в `packs[].setup`
+  выполняются один раз на пак, в изолированном `$HOME` варианта, объявившего
+  пак. А `graphify opencode install` (пишет `AGENTS.md` и подключает плагин
+  ПРЯМО В КЛОН репозитория) и `code-review-graph build` (строит
+  `.code-review-graph/` per-workspace) обязаны быть `variants[].exercise` —
+  они гоняются перед КАЖДЫМ прогоном, в рабочем каталоге именно этого
+  прогона, не один раз на весь эксперимент.
+- **`graphify extract` нужен `--code-only`**, иначе он видит только что
+  написанный `graphify opencode install`-ом `AGENTS.md` как документ,
+  требующий LLM-разбора, и падает без API-ключа. `--code-only` — offline,
+  ключ не нужен: индексирует только код через tree-sitter (см. README
+  graphify).
+- **Диск: 9 рабочих копий + 9 HOME** (3 варианта × 3 прогона), но не в
+  равной пропорции. В этом прогоне (TarSy-Bot — небольшой репозиторий)
+  каждая рабочая копия заняла меньше 1.5 МБ, а каждый HOME — от ~220 МБ
+  (`baseline`, только собственное состояние opencode) до ~615 МБ
+  (`code-review-graph` — плюс venv и зависимости пакета); на весь вариант
+  (3 прогона) HOME суммарно набежал до 1.8 ГБ. Бюджет диска считайте по
+  HOME, не по размеру тестируемого репозитория.
+- **`pack-visibility` для graphify честно репортует «не подтверждена».**
+  Реальная строка из `preflight.log` этого прогона: `pack 'graphify'
+  delivered via setup (no registration instructions) for variant 'graphify'
+  — visibility not confirmed by gate 4; presence is instead proven by gate
+  6's check command` (см. «Паки, устанавливаемые через `setup`» выше) — это
+  ожидаемо для пака без файлов регистрации, не повод для тревоги, покуда у
+  пака задан `check` и гейт 6 зелёный.
+- Реальный заголовок сводки из этого отчёта (обе метрики выросли у обоих
+  паков — прогон ollama-модели на конкретном промпте, не общий вывод про
+  сами пакеты): `По сравнению с baseline: graphify — нет значимых различий
+  (0 лучше, 4 хуже, всё в пределах шума); code-review-graph — нет значимых
+  различий (0 лучше, 4 хуже, всё в пределах шума).`
 
 ---
 
@@ -942,6 +1106,38 @@ N-way variants поменяли wire-формат `report.json`/`manifest.json`/
   запишет `report.json` уже со `schemaVersion: 2` (провенанс
   `flagDefaults.migratedFromV1: true` в манифесте отмечает, что прогон
   мигрирован, а не сделан этой версией нативно).
+
+---
+
+## Язык отчёта
+
+С v0.8.0 сгенерированный отчёт **на русском**: `report.md`, `report.html`,
+`timeline.html`, вывод `testaipack compare`, заголовок сводки, раздел
+provenance при `report --rebuild` (и его пер-полевые заметки о
+восстановленных значениях), текст деталей сигналов contamination. Если вы
+парсите эти файлы КАК ТЕКСТ (grep по заголовку секции, поиск фразы вроде
+`vs base: …`) — на прогонах v0.8.0+ это сломается; мы наткнулись на это
+сами (см. CHANGELOG 0.8.0, `report --rebuild` искал английский заголовок
+`## Summary` и подставлял provenance-блок не туда, пока отчёт не стал
+русским).
+
+**Что НЕ меняется:**
+
+- `report.json`/`report.yaml` — имена полей остаются английскими
+  (`headlineResult`, `variant`, `significant`, `better`, …), `schemaVersion`
+  не бампается. Единственное исключение — само ЗНАЧЕНИЕ поля
+  `summary.headlineResult`: это строка, а не структура контракта, и она
+  на русском, как в md/html.
+- Терминальный вывод самого CLI — строки прогресса `run`, вывод
+  `gc`/`doctor`/`list`, сообщения об ошибках валидации конфига — остаются
+  английскими. Это осознанная граница: report-рендер адресован человеку,
+  читающему готовый отчёт; вывод CLI — терминалу/логам, где инструмент
+  по умолчанию говорит по-английски.
+
+Если вам нужен отчёт на английском для существующей автоматизации — читайте
+`report.json`/`report.yaml` напрямую (структура/имена полей стабильны) или
+рендерите свой Markdown из него; сам инструмент переключателя языка не
+имеет.
 
 ---
 

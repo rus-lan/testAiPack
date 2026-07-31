@@ -81,8 +81,11 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
    записи на каждый вариант эксперимента, в порядке `runInput.variants`.
    `Timeline.mode` = `runInput.timelineMode`.
 6. Сериализовать `Timeline` в `results/timeline.json`.
-7. Сгенерировать `results/timeline.html` — self-contained файл. Режимы
-   отображения (`Timeline.mode`) — см. §7.
+7. Сгенерировать `results/timeline.html` — self-contained файл, `<html
+   lang="ru">`, легенда/лейблы UI (типы событий, `(база)`, «ОБЪЕДИНЕНО»)
+   на русском (см. `docs/phases/11-report-render.ru.md` о границе языков).
+   `results/timeline.json` — данные, схема/имена полей не переведены.
+   Режимы отображения (`Timeline.mode`) — см. §7.
 8. Вернуть `TimelineResult { timeline, jsonPath, htmlPath? }`.
 
 ## 4. Входные/выходные файлы
@@ -164,7 +167,9 @@ Namespace: `TestAiPack.TimelineBuild` (см. `contract/phases/10-timeline.tsp`).
   baseline — с объединением всех остальных, один проход.
 - **`merged`**: все события всех вариантов на одной оси, отсортированы по
   `tStart`; цветовые чипы легенды показывают палитру каждого варианта
-  (`renderPaletteChips`), имя baseline-варианта помечено `(baseline)`.
+  (`renderPaletteChips`), имя baseline-варианта помечено `(база)` (текст
+  страницы — на русском, см. `docs/phases/11-report-render.ru.md` о границе
+  языков).
 
 CSS-класс раньше был `.side.old`/`.side.new` (два хардкод-имени); теперь
 `.side[data-vi="k"]` — атрибут-индекс варианта в `lanes`, палитра

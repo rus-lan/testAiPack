@@ -13,6 +13,28 @@
 фиксированных 2-колоночных пар old/new — раскладка нормативно описана в
 `.research/n-way-variants/03-hard-problems.md §4`.
 
+### 1a. Граница языков: русский текст vs английские имена полей
+
+`report.md`/`report.html`/`timeline.html` и вывод `compare` — рендерятся на
+русском: заголовки секций, вердикты, лейблы таблиц, заголовок-summary
+(значение `summary.headlineResult`), провенанс-блок и его пер-полевые
+заметки при `report --rebuild` (`src/cli/rebuild.ts`), текст деталей
+contamination-сигналов (`src/metrics/baseline-contamination.ts`). Каждая
+строка ниже в §3, приведённая как пример вывода, — реальный русский текст
+рендерера (`src/report/md.ts`), а не перевод для документации.
+
+Это НЕ распространяется на:
+- **`report.json`/`report.yaml`** — имена полей контракта остаются
+  английскими (`headlineResult`, `variant`, `significant`, `better`, …),
+  `schemaVersion` не меняется. Единственное исключение — само ЗНАЧЕНИЕ поля
+  `summary.headlineResult`: строка, а не структура, поэтому она на русском,
+  как и в md/html.
+- **Собственный терминальный вывод CLI** — строки прогресса прогона
+  (`src/cli/progress.ts`), вывод `gc`/`doctor`/`list`, сообщения ошибок
+  валидации конфига. Это осознанная граница, не недосмотр: report-рендер —
+  для человека, читающего готовый отчёт; CLI-вывод — для терминала/логов,
+  где английский остаётся дефолтом инструмента.
+
 ## 2. Контракт (TypeSpec)
 
 Namespace: `TestAiPack.ReportRender` (см.
@@ -51,31 +73,39 @@ preparation → Pack signal → Safety → Contamination → Secondary → Faile
 при отсутствии релевантных данных.
 
 **Header** (`renderHeader`): run-id, repo,
-`**Variants:** <descriptor каждого варианта>` (было `pack | smoke-test`) —
-`variantDescriptor` перечисляет паки и pure-статус каждого варианта, например
-`base* (no packs, pure), graphify (packs: graphify), ast-grep (packs:
-ast-grep)`, звёздочка помечает baseline; `**Runs:** N per variant`;
-timestamp; версия opencode + warning о рассинхроне; опциональные
-disclosure-строки **Prompt**/**Init**/**Hint** — печатаются, только если
+`**Варианты:** <descriptor каждого варианта>` (было `pack | smoke-test`) —
+`variantDescriptor` перечисляет паки и pure-статус каждого варианта,
+например `baseline* (без пакетов, чистый), graphify (пакеты: graphify),
+code-review-graph (пакеты: code-review-graph)` (реальная строка из
+успешного трёхвариантного прогона — см. README, «N-way пример»), звёздочка
+помечает baseline; `**Запуски:** N на вариант`; timestamp; версия opencode +
+warning о рассинхроне; опциональные disclosure-строки **Промпт**/
+**Подсказка** (`hint`; отдельной строки для `init` в текущем рендере нет,
+он раскрывается только через фазовую разбивку) — печатаются, только если
 эффективные значения расходятся между вариантами (группируют варианты по
-источнику: «унаследовал глобальный» / «свой текст» / «явно отключён»,
-например `base, graphify — global init; ast-grep — own init ("...")`).
-Раньше был единственный факт «сторонам ушёл идентичный текст»; теперь per-
-variant текст — законная возможность, и заголовок обязан явно это раскрыть,
-а не молчать.
+источнику: «глобальный init» / «свой текст» / «явно отключён»). Раньше был
+единственный факт «сторонам ушёл идентичный текст»; теперь per-variant
+текст — законная возможность, и заголовок обязан явно это раскрыть, а не
+молчать.
 
 **Summary** (`renderSummary`): до трёх видов alert-строк наверху —
-`allFailed`-баннер («All variants failed — comparison unavailable»),
-`pairIncomplete`-предупреждение на каждый неполный не-baseline вариант, pack-
-noop alert, «⚠ N risky command(s) detected», contamination-alert (называет
-все затронутые варианты и суммарное число сигналов). Заголовок-summary
-(`headlineResult`) — по одной клаузе **на каждый не-baseline вариант**, в
-порядке конфига:
+`allFailed`-баннер (`> ⚠ **Все варианты провалились — сравнение
+недоступно.**`), `pairIncomplete`-предупреждение на каждый неполный
+не-baseline вариант, pack-noop alert, `⚠ обнаружено: N опасная
+команда/опасные команды/опасных команд — см. раздел «Безопасность»`,
+contamination-alert (называет все затронутые варианты и суммарное число
+сигналов). Заголовок-summary (`headlineResult`) — по одной клаузе **на
+каждый не-baseline вариант**, в порядке конфига, например (реальная строка
+из отчёта успешного трёхвариантного прогона, README «N-way пример»):
 ```
-vs base: graphify — 2 significant improvement(s): Total tokens, Steps; ast-grep — no significant differences (3 better, 1 worse, all within noise).
+По сравнению с baseline: graphify — нет значимых различий (0 лучше, 4 хуже, всё в пределах шума); code-review-graph — нет значимых различий (0 лучше, 4 хуже, всё в пределах шума).
 ```
-Ниже — блок `### vs base: <variant>` на каждый не-baseline вариант с
-бакетами Improvements/Regressions/Neutral (было — единственный плоский блок
+или, когда есть значимые различия:
+```
+По сравнению с base: graphify — 2 значимых улучшения: Всего токенов, Шаги; ast-grep — нет значимых различий (3 лучше, 1 хуже, всё в пределах шума).
+```
+Ниже — блок `### vs база: <variant>` на каждый не-baseline вариант с
+бакетами Улучшения/Регрессии/Нейтральные (было — единственный плоский блок
 new-vs-old).
 
 **Primary metrics — total (init + task)** (`renderPrimary`): metric-major
@@ -84,27 +114,36 @@ baseline идёт первой в каждой группе метрики, ко
 строке baseline:
 
 ```md
-| Metric | Variant | Median | [min–max] | Δ vs base | Δ% | Significant | Verdict |
+| Метрика | Вариант | Медиана | [мин–макс] | Δ vs база | Δ% | Значимо | Вердикт |
 |---|---|---|---|---|---|---|---|
-| Total tokens | base* | 120000 | 100000–130000 (IQR=9000) | — | — | — | — |
-| Total tokens | graphify | 90000 | 85000–99000 (IQR=5000) | -30000 | -25.0% | ✓ significant | ✓ better |
-| Total tokens | ast-grep | 118000 | 90000–160000 (IQR=30000) | -2000 | -1.7% | in noise | ✓ better |
+| Всего токенов | base* | 120000 | 100000–130000 (IQR=9000) | — | — | — | — |
+| Всего токенов | graphify | 90000 | 85000–99000 (IQR=5000) | -30000 | -25.0% | ✓ значимо | ✓ лучше |
+| Всего токенов | ast-grep | 118000 | 90000–160000 (IQR=30000) | -2000 | -1.7% | в пределах шума | ✓ лучше |
 ```
+`Значимо` ∈ `{✓ значимо, ⚠ значимо, значимо, в пределах шума, —}`
+(`sigLabel`); `Вердикт` ∈ `{✓ лучше, ⚠ хуже, = без изменений, ≈ контекст}`
+(`verdictFor`, `VERDICT_MAP`) — оба словаря зафиксированы в
+`src/report/format.ts`, не выводятся заново на каждый рендер.
 
-Футер (`primaryFootnote`): `_* baseline._`, и если `deltas.length > 1` —
-однострочная оговорка о множественных сравнениях: `N−1 = {k} comparisons
-share one baseline; at this sample size expect occasional spurious
-"significant" flags — treat cross-variant differences in flag count, not any
-single flag, as the signal.` Прежние per-pair 2-колоночные таблицы (old/new)
-физически не масштабировались бы за N=4 (>80 колонок) — metric-major long
-table и есть единственное решение, читаемое построчно.
+Футер (`primaryFootnote`): `_* база._`, и если `deltas.length > 1` —
+однострочная оговорка о множественных сравнениях (реальный текст,
+`src/report/md.ts`): `N−1 = {k} сравнения/сравнений делят один базовый
+вариант; при таком размере выборки возможны отдельные случайные пометки
+«значимо» — сигналом считайте разницу в количестве таких пометок между
+вариантами, а не единичную пометку.` Прежние per-pair 2-колоночные таблицы
+(old/new) физически не масштабировались бы за N=4 (>80 колонок) —
+metric-major long table и есть единственное решение, читаемое построчно.
 
 **Stability** (`renderStability`, вложена в конец Primary metrics): одна
-строка на КАЖДЫЙ вариант (было — 2 строки, old/new):
+строка на КАЖДЫЙ вариант (было — 2 строки, old/new), например (реальные
+строки из успешного трёхвариантного прогона):
 ```md
-- **base***: success rate 3/3 (100%); rank 4 ×3
-- **graphify**: success rate 2/3 (67%); rank 4 ×2, rank 0 ×1; unstable: Wall-clock (2.1×); verify: 2/3 passed
+- **baseline***: успешность 3/3 (100%); ранг 4 ×3
+- **graphify**: успешность 3/3 (100%); ранг 4 ×3
 ```
+или, при нестабильности (иллюстративно — `нестабильно:`/`verify:` из
+`src/report/md.ts`): `- **graphify**: успешность 2/3 (67%); ранг 4 ×2, ранг
+0 ×1; нестабильно: Wall-clock (2.1×); verify: 2/3 пройдено`.
 
 **Phase split (init vs task)** (`renderPhaseSplit`, только если хотя бы один
 вариант несёт `phaseSplit`): та же metric-major раскладка для 5
@@ -116,63 +155,91 @@ table и есть единственное решение, читаемое по
 варианту, у которого они есть.
 
 **Harness preparation** (`renderHarnessPrep`): один блок на каждый пак
-(баннер по режиму `PackPrep.mode`), таблица evidence с колонкой `Pack`
-добавленной к прежним `Variant`/`Run`:
+(баннер по режиму `PackPrep.mode`), таблица evidence с колонкой `Пакет`
+добавленной к прежним `Вариант`/`Запуск`. `Шаг` (`setup`/`check`/`exercise`)
+и единицы `Wall-clock` остаются английскими техническими терминами —
+переведены только заголовки колонок и обрамляющая проза, не сами
+шаг-идентификаторы:
 ```md
-| Step | Pack | Variant | Run | Result | Wall-clock | Artifact hash |
+| Шаг | Пакет | Вариант | Запуск | Результат | Wall-clock | Хеш артефакта |
 |---|---|---|---|---|---|---|
 | setup | graphify | graphify | — | ✓ | 12000ms | — |
 | check | graphify | graphify | 1 | ✓ | 300ms | — |
-| check | graphify | base | 1 | ✓ | 150ms | — |   <- ✓ здесь значит "корректно отсутствует"
+| check | graphify | baseline | 1 | ✓ | 150ms | — |   <- ✓ здесь значит "корректно отсутствует"
 | exercise | — | graphify | 1 | ✓ | 8000ms | ab12cd34ef56 |
 ```
-`cmdStatus` теперь решает «declared-vs-foreign» вместо «new-vs-old».
+`cmdStatus` решает «declared-vs-foreign» вместо «new-vs-old» (имена
+переменных/кода остаются английскими — переводится только рендер).
 
-**Pack signal** (`renderPackSignal`): вложено по варианту, по паку:
+**Pack signal** (`renderPackSignal`): вложено по варианту, по паку. Когда
+использование пакета видно для его типа, например:
 ```md
-- **graphify** (variant graphify): 3 call(s), 0 error(s), 3/3 runs...
-- **graphify** (variant base): 0 call(s) — foreign; any call would be contamination
+- **graphify** (вариант graphify): 3 вызова, 0 ошибок, 3/3 запусков вызвали пакет
+- **graphify** (вариант baseline): 0 вызовов — чужой; любой вызов означал бы контаминация
+```
+Когда не видно — реальная строка из успешного трёхвариантного прогона
+(README «N-way пример»): graphify — MCP/CLI-пак, вызванный из `exercise`,
+а не через инструмент, который агентские tool-calls фиксируют напрямую, так
+что `canDetect = false` для его типа доставки, и рендерится:
+```md
+- **graphify** (вариант graphify): _использование пакета не видно для этого типа пакета_
 ```
 Строки с нулевым **чужим** сигналом молчат (дублировали бы секцию
 Contamination) — ненулевое там уже сигнал сам по себе.
 
-**Safety** (`renderSafety`): таблица опасных bash-команд по всем вариантам
-(колонка `Variant`); отсутствует, если списки пусты во всех вариантах.
+**Safety** (`renderSafety`, заголовок `## Безопасность`): таблица опасных
+bash-команд по всем вариантам, реальный заголовок `| Вариант | Запуск |
+Команда | Завершено | Выход |`; отсутствует, если списки пусты во всех
+вариантах.
 
-**Contamination** (`renderContamination`, новая секция относительно v1):
-таблица с колонками `Variant`/`Pack`; alert-баннер в Summary называет
+**Contamination** (`renderContamination`, заголовок `## Контаминация`,
+новая секция относительно v1): таблица с реальным заголовком `| Тип |
+Вариант | Пакет | Запуск | Детали |`; alert-баннер в Summary называет
 затронутые варианты. Была невозможна в v1 — там contamination проверялась
 только для одной стороны против одного `--pack`.
 
-**Secondary metrics**: без изменений семантики полей, теперь по варианту (не
-по стороне) — 4 именованных блока (Behavior / Latency / Tokens & context /
-Output volume) на каждый вариант.
+**Secondary metrics** (`renderSecondary`, заголовок `## Дополнительные
+метрики`, подраздел `### <вариант>: дополнительные метрики`): без изменений
+семантики полей, теперь по варианту (не по стороне) — 4 именованных блока
+на каждый вариант, реальные заголовки: **Поведение** / **Задержки** /
+**Токены и контекст** / **Объём вывода**.
 
-**Failed runs** (`renderFailures`): таблица `(Variant, Run, Code, Message)` —
-колонка `Side` переименована в `Variant`; строки со всех вариантов вперемешку
-(`summary.failures` — плоский список, каждая запись уже несёт `variant`).
+**Failed runs** (`renderFailures`): таблица `(Вариант, Запуск, Код,
+Сообщение)` — колонка `Side` переименована в `Вариант`; строки со всех
+вариантов вперемешку (`summary.failures` — плоский список, каждая запись уже
+несёт `variant`).
 
-**LLM Judge** (`renderJudge`, N-way):
+**LLM Judge** (`renderJudge`, N-way, заголовок секции — `## LLM-судья`):
 ```md
-## LLM Judge
-- Verdict: **ok**
-- Ranking: graphify > base > ast-grep
-- Quality: base=6, graphify=8, ast-grep=5
-- Model: `ollama/qwen3.5:9b`
-- Explanation: ...
+## LLM-судья
+- Вердикт: **ok**
+- Ранжирование: graphify > base > ast-grep
+- Качество: base=6, graphify=8, ast-grep=5
+- Модель: `ollama/qwen3.5:9b`
+- Объяснение: ...
 ```
-Плюс `_Scores derived from pairwise-vs-baseline calls (prompt exceeded the
-single-call budget)._`, когда `judge.pairwiseFallback === true`.
-`judge.ran === false` → `_Judge did not run: <explanation>_` без блока
-verdict/quality, как раньше.
+Плюс `_Баллы получены через попарные вызовы каждого варианта против
+базового варианта (промпт превысил бюджет одного вызова)._`, когда
+`judge.pairwiseFallback === true`. `judge.ran === false` → `_Судья не был
+запущен: <explanation>_` без блока вердикт/качество, как раньше;
+`judge === undefined` (`--judge` не задан) → `_Судья не запрошен (--judge
+не задан)_`.
 
-**Timeline summary** (`renderTimeline`): топ-N долгих событий по всем
-lane'ам, без изменений.
+**Timeline summary** (`renderTimeline`, заголовок `## Сводка по
+таймлайну`): топ-N долгих событий по всем lane'ам, без изменений
+относительно v1 кроме языка.
 
-**Diff summary** (`renderDiff`): существующие ссылки на патчи + tokens-per-
-line/cost-per-file + per-file overlap. Overlap раньше был `both/only-old/
-only-new`; теперь на каждый не-baseline вариант — `Both`/`Only base`/`Only
-{variant}` (пары «этот вариант против baseline», не N×N).
+**Diff summary** (`renderDiff`, заголовок `## Сводка по diff`): существующие
+ссылки на патчи + tokens-per-line/cost-per-file + per-file overlap. Overlap
+раньше был `both/only-old/only-new`; теперь на каждый не-baseline вариант —
+реальный формат рендерера:
+```md
+- **Пересечение с базой (graphify)**
+  - Общие: src/app.ts, src/util.ts
+  - Только база: _нет_
+  - Только graphify: src/graphify-notes.md
+```
+(пары «этот вариант против baseline», не N×N).
 
 ## 4. Шаги алгоритма
 
@@ -235,7 +302,7 @@ only-new`; теперь на каждый не-baseline вариант — `Both
   файле, primary-таблица показывает 2 варианта (baseline + один), без
   multiple-comparisons сноски (`deltas.length === 1`).
 - ✅ N-way golden: 3-вариантный `Report` → primary-таблица metric-major с
-  baseline-строкой первой в каждой группе метрики, `### vs base: <variant>`
+  baseline-строкой первой в каждой группе метрики, `### vs база: <variant>`
   дважды (по каждому не-baseline варианту), multiple-comparisons сноска
   присутствует.
 - ✅ md with failed runs / without / with judge / judge missing / judge
