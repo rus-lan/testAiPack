@@ -263,10 +263,13 @@ describe('e2e: full A/B pipeline via runCli', () => {
       expect(existsSync(path.join(results, 'metrics.json'))).toBe(true)
       const metricsRaw = await runP(readFile(path.join(results, 'metrics.json')))
       const metrics = aggregateResultSchema.parse(JSON.parse(metricsRaw))
-      expect(metrics.metricsDiff.old.side).toBe('old')
-      expect(metrics.metricsDiff.new.side).toBe('new')
-      for (const key of Object.keys(metrics.metricsDiff.deltas) as readonly string[]) {
-        const d = (metrics.metricsDiff.deltas as Record<string, { readonly better: string }>)[key]
+      expect(metrics.metrics.baseline).toBe('old')
+      expect(metrics.metrics.variants.map((v) => v.variant)).toEqual(['old', 'new'])
+      expect(metrics.metrics.deltas).toHaveLength(1)
+      const delta = metrics.metrics.deltas[0]
+      expect(delta?.variant).toBe('new')
+      for (const key of Object.keys(delta?.deltas ?? {}) as readonly string[]) {
+        const d = (delta?.deltas as unknown as Record<string, { readonly better: string }>)[key]
         expect(d).toBeDefined()
         expect(typeof (d as { readonly better: string }).better).toBe('string')
       }
@@ -335,12 +338,12 @@ describe('e2e: full A/B pipeline via runCli', () => {
       const runDir = await findRunDir(workspace)
       const tlRaw = await runP(readFile(path.join(runDir, 'results', 'timeline.json')))
       const tl = JSON.parse(tlRaw) as {
-        readonly old: readonly { readonly swimlaneDepth: number }[]
-        readonly new: readonly { readonly swimlaneDepth: number }[]
+        readonly lanes: readonly { readonly variant: string; readonly events: readonly { readonly swimlaneDepth: number }[] }[]
       }
+      expect(tl.lanes.map((l) => l.variant)).toEqual(['old', 'new'])
       // The queried child only shows up as depth > 0 events if the tree walk
       // actually recursed into it (root events are always depth 0).
-      const allEvents = [...tl.old, ...tl.new]
+      const allEvents = tl.lanes.flatMap((l) => l.events)
       expect(allEvents.some((e) => e.swimlaneDepth > 0)).toBe(true)
     })
   }, 60_000)
@@ -470,7 +473,7 @@ describe('e2e: full A/B pipeline via runCli', () => {
 
       const runDir = await findRunDir(workspace)
       const baseline = JSON.parse(
-        await runP(readFile(path.join(runDir, 'config', 'baseline.json'))),
+        await runP(readFile(path.join(runDir, 'config', 'old.json'))),
       ) as Record<string, unknown>
       const newCfg = JSON.parse(
         await runP(readFile(path.join(runDir, 'config', 'new.json'))),
@@ -518,7 +521,7 @@ describe('e2e: full A/B pipeline via runCli', () => {
 
       const runDir = await findRunDir(workspace)
       const baseline = JSON.parse(
-        await runP(readFile(path.join(runDir, 'config', 'baseline.json'))),
+        await runP(readFile(path.join(runDir, 'config', 'old.json'))),
       ) as Record<string, unknown>
       const newCfg = JSON.parse(
         await runP(readFile(path.join(runDir, 'config', 'new.json'))),
