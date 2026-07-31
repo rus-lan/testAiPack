@@ -189,9 +189,9 @@ describe('cli/compare — cross-report compare (2-variant report vs 3-variant re
     const result = await runP(
       compare({ runId1: 'run-one', runId2: 'run-one', workspace: ws, variant1: 'old', variant2: 'new', format: 'md' }),
     )
-    expect(result.headlineResult).toContain('fewer tokens')
-    expect(result.headlineResult).toContain('less wall-clock')
-    expect(result.headlineResult).toContain('higher success rank')
+    expect(result.headlineResult).toContain('меньше токенов')
+    expect(result.headlineResult).toContain('меньше времени (wall-clock)')
+    expect(result.headlineResult).toContain('более высокого ранга успеха')
   })
 })
 
@@ -337,8 +337,8 @@ describe('cli/compare — pure helpers: buildCompareHeadline', () => {
       entry('successRank', { absolute: -1, percent: -20, significant: true, better: 'worse' }),
     ]
     const headline = buildCompareHeadline(entries)
-    expect(headline).toContain('fewer tokens')
-    expect(headline).toContain('lower success rank')
+    expect(headline).toContain('меньше токенов')
+    expect(headline).toContain('более низкого ранга успеха')
   })
 
   it('handles an omitted percent (0 -> non-zero change) without "NaN%"', () => {
@@ -349,12 +349,12 @@ describe('cli/compare — pure helpers: buildCompareHeadline', () => {
     ]
     const headline = buildCompareHeadline(entries)
     expect(headline).not.toContain('NaN')
-    expect(headline).toContain('more tokens')
+    expect(headline).toContain('больше токенов')
   })
 
   it('falls back gracefully when a headline key is missing from entries', () => {
     const headline = buildCompareHeadline([])
-    expect(headline).toContain('unmeasured')
+    expect(headline).toContain('неизмеримое')
   })
 })
 
@@ -385,16 +385,16 @@ describe('cli/compare — renderers', () => {
     const result = await makeResult()
     const md = renderCompareMd(result)
     expect(md).toContain('# testaipack compare')
-    expect(md).toContain('**Run 1:** run-one')
-    expect(md).toContain('**Run 2:** run-two')
-    expect(md).toContain('variant: new')
-    expect(md).toContain('variant: b')
-    expect(md).toContain('**Basis:** total')
+    expect(md).toContain('**Запуск 1:** run-one')
+    expect(md).toContain('**Запуск 2:** run-two')
+    expect(md).toContain('вариант: new')
+    expect(md).toContain('вариант: b')
+    expect(md).toContain('**Основа:** total')
     expect(md).toContain('## Summary')
     expect(md).toContain(result.headlineResult)
-    expect(md).toContain('| Metric | Run 1 | Run 2 | Δ | Δ% | Significant | Verdict |')
+    expect(md).toContain('| Метрика | Запуск 1 | Запуск 2 | Δ | Δ% | Значимо | Вердикт |')
     // raw per-run values (F4) — run1=new (totalTokens 10000), run2=b (totalTokens 9000)
-    expect(md).toContain('| Total tokens | 10000 | 9000 | -1000 | -10.0% | ✓ significant | ✓ better |')
+    expect(md).toContain('| Всего токенов | 10000 | 9000 | -1000 | -10.0% | ✓ значимо | ✓ лучше |')
   })
 
   it('renderCompareMd adds a warning note when the pair is incomplete (one side has no samples)', async () => {
@@ -426,7 +426,7 @@ describe('cli/compare — renderers', () => {
       compare({ runId1: 'run-incomplete', runId2: 'run-incomplete', workspace: ws, variant1: 'old', variant2: 'empty', format: 'md' }),
     )
     expect(result.delta.pairIncomplete).toBe(true)
-    expect(renderCompareMd(result)).toContain('produced no samples')
+    expect(renderCompareMd(result)).toContain('не дала ни одной выборки')
   })
 
   it('renderCompareMd shows the no-packs label for a smoke-test variant', async () => {
@@ -435,7 +435,7 @@ describe('cli/compare — renderers', () => {
     const result = await runP(
       compare({ runId1: 'run-one', runId2: 'run-two', workspace: ws, variant1: 'old', variant2: 'base', format: 'md' }),
     )
-    expect(renderCompareMd(result)).toContain('_no packs (smoke-test)_')
+    expect(renderCompareMd(result)).toContain('_нет пакетов (smoke-test)_')
   })
 
   it('renderCompareMd flags a best selection as "(requested: best)"', async () => {
@@ -445,7 +445,7 @@ describe('cli/compare — renderers', () => {
       compare({ runId1: 'run-one', runId2: 'run-two', workspace: ws, variant1: 'best', variant2: 'b', format: 'md' }),
     )
     expect(result.run1.metrics.variant).toBe('new') // old=2, new=3 -> new wins, no tie
-    expect(renderCompareMd(result)).toContain('(requested: best)')
+    expect(renderCompareMd(result)).toContain('(запрошено: best)')
   })
 
   it('compareResultToJson returns keyed delta entries', async () => {
@@ -681,9 +681,9 @@ describe('cli/compare — task basis (F8, pairs with F4s raw-value columns)', ()
 
     const md = renderCompareMd(result)
     // splittable metric: raw columns show the task slice (8000/7000), not primary (12000/10000)
-    expect(md).toContain('| Total tokens | 8000 | 7000 |')
+    expect(md).toContain('| Всего токенов | 8000 | 7000 |')
     // whole-run-only metric: raw columns still show primary (2/3), never split
-    expect(md).toContain('| Success rank | 2 | 3 |')
+    expect(md).toContain('| Ранг успеха | 2 | 3 |')
   })
 })
 
@@ -778,6 +778,6 @@ describe('cli/compare — v1 fixture through the real compat seam (F3)', () => {
     expect(result.run2.metrics.variant).toBe('b')
     const md = renderCompareMd(result)
     expect(md).toContain('# testaipack compare')
-    expect(md).toContain('| Metric | Run 1 | Run 2 |')
+    expect(md).toContain('| Метрика | Запуск 1 | Запуск 2 |')
   })
 })

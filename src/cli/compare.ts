@@ -126,7 +126,7 @@ export const selectVariant = (
       return Effect.fail(
         new CompareError({
           code: 'E_VARIANT_NOT_FOUND',
-          message: `No variants in run ${id}`,
+          message: `Нет вариантов в запуске ${id}`,
           context: { selector, runId: id },
         }),
       )
@@ -139,7 +139,7 @@ export const selectVariant = (
   return Effect.fail(
     new CompareError({
       code: 'E_VARIANT_NOT_FOUND',
-      message: `Unknown variant "${selector}"${runId === undefined ? '' : ` in run ${runId}`} (available: ${available.join(', ')})`,
+      message: `Неизвестный вариант «${selector}»${runId === undefined ? '' : ` в запуске ${runId}`} (доступны: ${available.join(', ')})`,
       context: { selector, runId, available },
     }),
   )
@@ -169,21 +169,26 @@ export const buildCompareHeadline = (entries: readonly DeltaEntry[]): string => 
   const rankD = findDelta(entries, 'successRank')
   const tokens =
     tokensD === undefined
-      ? 'an unmeasured token change'
-      : percentPhrase(tokensD.percent, 'more tokens', 'fewer tokens', 'the same tokens')
+      ? 'неизмеримое изменение по токенам'
+      : percentPhrase(tokensD.percent, 'больше токенов', 'меньше токенов', 'столько же токенов')
   const wall =
     wallD === undefined
-      ? 'an unmeasured wall-clock change'
-      : percentPhrase(wallD.percent, 'longer wall-clock', 'less wall-clock', 'the same wall-clock')
+      ? 'неизмеримое изменение по времени (wall-clock)'
+      : percentPhrase(
+          wallD.percent,
+          'больше времени (wall-clock)',
+          'меньше времени (wall-clock)',
+          'столько же времени (wall-clock)',
+        )
   const rankPhrase =
     rankD === undefined
-      ? 'an unmeasured success rank'
+      ? 'неизмеримого ранга успеха'
       : rankD.better === 'better'
-        ? 'a higher success rank'
+        ? 'более высокого ранга успеха'
         : rankD.better === 'worse'
-          ? 'a lower success rank'
-          : 'the same success rank'
-  return `Run 2 vs Run 1: used ${tokens}, took ${wall}, achieved ${rankPhrase}.`
+          ? 'более низкого ранга успеха'
+          : 'того же ранга успеха'
+  return `Запуск 2 против запуска 1: использовал ${tokens}, потратил ${wall}, достиг ${rankPhrase}.`
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +205,7 @@ const loadRunReport = (
       return yield* Effect.fail(
         new CompareError({
           code: 'E_RUN_NOT_FOUND',
-          message: `Run not found: ${runId}`,
+          message: `Запуск не найден: ${runId}`,
           context: { runId },
         }),
       )
@@ -210,7 +215,7 @@ const loadRunReport = (
         (e) =>
           new CompareError({
             code: 'E_REPORT_INVALID',
-            message: `Invalid report for ${runId}: ${e._tag}`,
+            message: `Некорректный отчёт для запуска ${runId}: ${e._tag}`,
             context: { runId },
           }),
       ),
@@ -219,7 +224,7 @@ const loadRunReport = (
       return yield* Effect.fail(
         new CompareError({
           code: 'E_REPORT_INVALID',
-          message: `No report.json for ${runId}`,
+          message: `Нет report.json для запуска ${runId}`,
           context: { runId },
         }),
       )
@@ -284,12 +289,12 @@ const variantPacks = (manifest: Manifest, variantName: string): readonly string[
 
 const packLabel = (manifest: Manifest, variantName: string): string => {
   const packs = variantPacks(manifest, variantName)
-  return packs.length === 0 ? '_no packs (smoke-test)_' : escapeCell(packs.join(', '))
+  return packs.length === 0 ? '_нет пакетов (smoke-test)_' : escapeCell(packs.join(', '))
 }
 
 const runLabel = (side: CompareRunSide): string => {
-  const requested = side.selector === 'best' ? ' (requested: best)' : ''
-  return `${side.id} (variant: ${side.metrics.variant}${requested}, packs: ${packLabel(side.manifest, side.metrics.variant)}, timestamp: ${side.manifest.timestamp})`
+  const requested = side.selector === 'best' ? ' (запрошено: best)' : ''
+  return `${side.id} (вариант: ${side.metrics.variant}${requested}, пакеты: ${packLabel(side.manifest, side.metrics.variant)}, время: ${side.manifest.timestamp})`
 }
 
 /** The five metrics that split into init/task slices (`PHASE_METRICS` in format.ts) — the other two (successRank, maxParallelism) never split. */
@@ -314,9 +319,9 @@ export const renderCompareMd = (result: CompareResult): string => {
   const header = [
     '# testaipack compare',
     '',
-    `**Run 1:** ${runLabel(result.run1)}`,
-    `**Run 2:** ${runLabel(result.run2)}`,
-    `**Basis:** ${result.basis}`,
+    `**Запуск 1:** ${runLabel(result.run1)}`,
+    `**Запуск 2:** ${runLabel(result.run2)}`,
+    `**Основа:** ${result.basis}`,
   ].join('\n')
 
   const summary = ['## Summary', '', result.headlineResult].join('\n')
@@ -324,7 +329,7 @@ export const renderCompareMd = (result: CompareResult): string => {
   const tableHeader = [
     '## Primary metrics (run2 vs run1)',
     '',
-    '| Metric | Run 1 | Run 2 | Δ | Δ% | Significant | Verdict |',
+    '| Метрика | Запуск 1 | Запуск 2 | Δ | Δ% | Значимо | Вердикт |',
     '|---|---|---|---|---|---|---|',
   ]
   const rows = result.entries.map((e) => {
@@ -338,7 +343,7 @@ export const renderCompareMd = (result: CompareResult): string => {
   // numbers) but is forced non-significant/neutral by computeVariantDelta —
   // flag it so the all-neutral row doesn't read as "no difference found".
   const pairWarning = result.delta.pairIncomplete
-    ? '\n\n_⚠ One side of this pair produced no samples — the deltas above are not meaningful._'
+    ? '\n\n_⚠ Одна из сторон этой пары не дала ни одной выборки — приведённые выше дельты не имеют смысла._'
     : ''
 
   return [header, summary, table].join('\n\n---\n\n') + pairWarning + '\n'
