@@ -189,9 +189,16 @@ per-variant. `allowPacks?` — имена паков, чей `check` разре�
       `detectPack`;
     - `variant.allowPacks` резолвится к существующим именам реестра (`reason:
       "unknown-pack-ref"`);
-    - **Stage 1 guard**: `variant.packs.length ≤ 1` (`reason:
-      "multi-pack-stage2"`) — многопаковые варианты запланированы на Stage 2,
-      сейчас упираются в явную ошибку, а не в молчаливое усечение;
+    - **`variant.packs` не содержит дублей**: `["p1", "p1"]` (или два bare-ref,
+      резолвящихся к одному и тому же имени после auto-регистрации) →
+      `E_CONFIG_INVALID` (`reason: "duplicate-pack-in-variant"`, называет
+      вариант и повторившееся имя пака). Проверка стоит ДО `detectPackTypes`
+      (детекция типа по `ref` — сеть/файловая система на каждый пак) — чисто
+      структурная, дешёвая, ловит опечатку до её цены. Пак, повторённый на
+      одном варианте, всегда опечатка, а не осмысленное «объявить сильнее» —
+      явный отказ вместо молчаливой дедупликации: молчание спрятало бы её.
+      Число паков на вариант не ограничено — многопаковые варианты полностью
+      поддержаны (Stage 2), не только структурно смоделированы;
     - `variant.exercise` требует ≥1 пака на самом варианте ИЛИ хотя бы один
       пак где-либо в прогоне (`reason: "pack-setup-without-pack"` — то же имя
       причины, что и у legacy-эквивалента ниже, ради единообразия сообщений);
@@ -348,7 +355,7 @@ variant-режим об этом молчит: там `pure: false` на люб�
 | `variants` в конфиге + любой legacy-shaping-флаг  | Fail (`legacy-flag-with-variants`, называет ключ)          | `E_CONFIG_INVALID`           |
 | Дубль/зарезервированное/невалидное имя варианта   | Fail, называет вариант                                      | `E_CONFIG_INVALID`           |
 | `baseline` называет неизвестный вариант            | Fail (`unknown-baseline`)                                   | `E_CONFIG_INVALID`           |
-| `variant.packs.length > 1`                         | Fail (`multi-pack-stage2` — Stage 2 ещё не реализован)      | `E_CONFIG_INVALID`           |
+| `variant.packs` содержит имя пака дважды (напрямую или через два bare-ref с одинаковым derived-именем) | Fail (`duplicate-pack-in-variant`, называет вариант и пак) | `E_CONFIG_INVALID` |
 | Bare-ref в `variant.packs` сталкивается по имени с уже зарегистрированным паком другого `ref` | Fail (`pack-name-collision`) | `E_CONFIG_INVALID` |
 | `variant.allowPacks` называет неизвестный пак      | Fail (`unknown-pack-ref`)                                    | `E_CONFIG_INVALID`           |
 | `--init` похож на триггер пака, `pure` вариант     | Warning в stderr на каждую подозрительную пару (вариант, чужой пак) | — |
@@ -382,7 +389,13 @@ variant-режим об этом молчит: там `pure: false` на люб�
   `UPPER`) → каждое отдельный `E_CONFIG_INVALID` с точным `reason`.
 - ✅ `baseline` называет отсутствующий вариант → `E_CONFIG_INVALID`
   (`unknown-baseline`).
-- ✅ `variant.packs.length === 2` → `E_CONFIG_INVALID` (`multi-pack-stage2`).
+- ✅ `variant.packs.length === 2` (два разных пака) → парсится без ошибки,
+  оба имени сохраняются в порядке объявления.
+- ✅ `variant.packs: ["p1", "p1"]` → `E_CONFIG_INVALID`
+  (`duplicate-pack-in-variant`, называет вариант и `"p1"`).
+- ✅ два bare-ref на одном варианте, резолвящиеся к одному derived-имени
+  (`packShortName`) → тот же `duplicate-pack-in-variant`, а не тихая
+  дедупликация.
 - ✅ у одного варианта нет ни своего, ни унаследованного промпта (глобальный
   `prompt` не задан, `variant.prompt` не задан) → `E_CONFIG_INVALID`
   (`prompt-required`, называет вариант).
@@ -406,8 +419,6 @@ variant-режим об этом молчит: там `pure: false` на люб�
   → несколько строк.
 - ❌ НЕ покрыто (ticket): `compare <id1> <id2>` — валидация run-id в отдельной
   субкоманде, не в этой фазе.
-- ❌ НЕ покрыто (ticket): Stage 2 (`variant.packs.length > 1`) — снятие guard'а
-  запланировано отдельным work package (`WP16`).
 
 ## 7. Инварианты
 
@@ -424,8 +435,9 @@ variant-режим об этом молчит: там `pure: false` на люб�
   дополнительных проверок.
 - Каждая запись `variant.packs`/`variant.allowPacks` резолвится к
   существующему `PackSpec.name` в `RunInput.packs`.
-- Stage 1: `variant.packs.length ≤ 1` для КАЖДОГО варианта (снимается в
-  Stage 2).
+- `variant.packs` не содержит повторов — уникальность имён внутри одного
+  варианта гарантирована на выходе фазы (число паков на вариант не
+  ограничено сверху).
 - `RunInput.schemaVersion === 2` всегда — эта фаза никогда не порождает v1-
   форму; v1-совместимость целиком лежит на слое чтения (`src/compat/legacy.ts`),
   не на этой фазе.

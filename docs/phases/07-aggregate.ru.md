@@ -161,7 +161,8 @@ optional, см. `contract/main.tsp`): `invalidToolCalls?`, `duplicateToolCalls?`
 3. Агрегировать по N **успешных** прогонов (failedRuns исключены) —
    `MetricDistribution`, `primary`, `secondary` — без изменений относительно
    v1. `packUses` собирается по одной записи на каждый пак, объявленный
-   вариантом (Stage 1: 0 или 1 запись).
+   вариантом — число паков на вариант не ограничено (Stage 2), так что
+   `packUses` может нести произвольное число записей, не только 0 или 1.
 4. Вычислить `MetricsReport` (`computeMetricsReport(baseline, variants)`):
    - найти `VariantAggregates` варианта с именем `runInput.baseline`
      (`baselineOf`);
@@ -255,10 +256,10 @@ optional, см. `contract/main.tsp`): `invalidToolCalls?`, `duplicateToolCalls?`
   `variant`.
 - ✅ backcompat: `reportSchema`/`aggregateResult`-схема парсит `metrics.json`,
   записанный до появления новых полей.
+- ✅ multi-pack variant: вариант объявляет 2 пака → `packUses` содержит 2
+  записи (по одной на пак), обе агрегированы независимо.
 - ❌ НЕ покрыто (ticket): значимость через bootstrap CI.
 - ❌ НЕ покрыто (ticket): `maxParallelism` при очень глубоком дереве сессий.
-- ❌ НЕ покрыто (ticket): Stage 2 — несколько паков на одном варианте,
-  `packUses` с более чем одной записью.
 
 ## 7. Инварианты
 
