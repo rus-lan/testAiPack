@@ -1,11 +1,11 @@
 /**
  * Phase 04: home-isolation
  *
- * For each `(side, run-N)` builds an isolated fake $HOME with the opencode
- * skeleton, copies auth by whitelist, applies the pack (delivered by phase 03)
- * on the new side only, writes a `build` agent into every HOME, and produces
- * two `OPENCODE_CONFIG_CONTENT` payloads (baseline / new) plus a 2D env-var
- * matrix `[side][run]`.
+ * For each `(variant, run-N)` builds an isolated fake $HOME with the opencode
+ * skeleton, copies auth by whitelist, applies the variant's declared pack(s)
+ * (delivered by phase 03), writes a `build` agent into every HOME, and
+ * produces one `OPENCODE_CONFIG_CONTENT` payload per variant plus a
+ * `VariantEnv[]` (name + one `EnvVarSet` per run — no positional indexing).
  *
  * @see docs/phases/04-home-isolation.ru.md
  * @see contract/phases/04-home-isolation.tsp
@@ -20,9 +20,13 @@ import type {
   HomeIsolationResult,
   HomeTree,
   IsolationMode,
-  Side,
+  VariantConfig,
+  VariantEnv,
+  VariantHomes,
+  VariantSpec,
 } from '@generated/types'
 import type { PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
+import { effectiveOf, packsOf } from './00-cli-parse.js'
 import { installPlugin } from '../opencode/cli.js'
 import type { DockerExec, OpencodeError } from '../opencode/cli.js'
 import { copyDir, copyFile, ensureDir, exists, isPathWithin, pathKind, readFile, removeDir, writeFile, writeJson } from '../util/fs.js'
@@ -37,11 +41,15 @@ import { homeIsolationError } from '../errors.js'
 /**
  * Local input extension: widens `packInstall` from the contract's
  * `PackInstallResult` to phase 03's `PackInstallOutcome` (which carries the
- * `instructions` field), and carries the optional `dockerImage` override
- * (`--docker-image`) for `--isolation=docker`. The orchestrator always has the
- * outcome from phase 03; this interface is the honest type for that hand-off.
+ * `instructions` field per delivery), and carries the optional `dockerImage`
+ * override (`--docker-image`) for `--isolation=docker`. The orchestrator
+ * always has the outcome from phase 03; this interface is the honest type
+ * for that hand-off. `Omit` (rather than re-declaring the field on top of
+ * `extends HomeIsolationInput`) is the cleaner way to narrow a member's type
+ * in a derived interface — no need to keep the base member's wire type in
+ * scope at all.
  */
-export interface HomeIsolationInputExt extends HomeIsolationInput {
+export interface HomeIsolationInputExt extends Omit<HomeIsolationInput, 'packInstall'> {
   readonly packInstall?: PackInstallOutcome
   readonly dockerImage?: string
 }
@@ -81,10 +89,14 @@ const SKELETON_DIRS: readonly string[] = [
 ]
 
 /**
- * Only added when `--pack-setup` is declared, on BOTH sides identically —
- * backward compatible (a run with no new flags gets byte-for-byte today's
- * skeleton), and symmetric so a HOME-installed binary is equally reachable
- * (or equally absent) regardless of side; only its actual content differs.
+ * Only added when at least one registry pack declares `setup` — on EVERY
+ * variant identically (D, `05-risks.md §2.6`, NORMATIVE): a HOME-installed
+ * binary must be equally *reachable* everywhere and differ only in actual
+ * presence, so a variant that does NOT declare the pack still resolves the
+ * command as "not found" (exit 127) rather than having it hidden from PATH —
+ * which is exactly what keeps gate 6's foreign-check meaningful (a foreign
+ * leak is caught because the binary is genuinely absent, never because PATH
+ * hides it). Do not scope this to only the declaring variants.
  */
 const PACK_SETUP_SKELETON_DIRS: readonly string[] = ['.local/bin']
 
@@ -112,15 +124,15 @@ const AUTH_TABLE: readonly AuthEntry[] = [
 const setupFail = (message: string, context: Record<string, unknown>): PhaseError =>
   homeIsolationError(message, 'E_HOME_SETUP_FAILED', context)
 
-const mapFs = (e: FsError, side: Side, runIndex: number): PhaseError =>
-  setupFail(`HOME setup failed: ${e.operation} ${e.path}`, { side, runIndex, path: e.path })
+const mapFs = (e: FsError, variant: string, runIndex: number): PhaseError =>
+  setupFail(`HOME setup failed: ${e.operation} ${e.path}`, { variant, runIndex, path: e.path })
 
 const range = (n: number): readonly number[] =>
   Array.from({ length: n }, (_, i) => i)
 
 const buildSkeleton = (
   homeDir: string,
-  side: Side,
+  variant: string,
   runIndex: number,
   packSetupDeclared: boolean,
 ): Effect.Effect<readonly string[], PhaseError> =>
@@ -129,13 +141,13 @@ const buildSkeleton = (
     yield* Effect.forEach(
       dirs,
       (rel) =>
-        ensureDir(path.join(homeDir, rel)).pipe(Effect.mapError((e) => mapFs(e, side, runIndex))),
+        ensureDir(path.join(homeDir, rel)).pipe(Effect.mapError((e) => mapFs(e, variant, runIndex))),
       { concurrency: 1 },
     )
     yield* writeFile(
       path.join(homeDir, '.config/opencode/agents/build.md'),
       BUILD_AGENT_TEMPLATE,
-    ).pipe(Effect.mapError((e) => mapFs(e, side, runIndex)))
+    ).pipe(Effect.mapError((e) => mapFs(e, variant, runIndex)))
     return [...dirs]
   })
 
@@ -419,24 +431,6 @@ const applyInstruction = (
   }
 }
 
-interface PackInfo {
-  readonly type: PackInstallOutcome['detectedType']
-  readonly name: string
-  readonly registeredIn: readonly string[]
-}
-
-const packInfoFrom = (outcome: PackInstallOutcome): PackInfo => {
-  const head = outcome.instructions.find((i) => i.kind !== 'config')
-  const configHead = outcome.instructions.find(
-    (i): i is Extract<RegistrationInstruction, { readonly kind: 'config' }> => i.kind === 'config',
-  )
-  return {
-    type: outcome.detectedType,
-    name: head === undefined ? (configHead === undefined ? 'pack' : configHead.name) : head.name,
-    registeredIn: outcome.registeredIn,
-  }
-}
-
 const collectMcpServers = (
   instructions: readonly RegistrationInstruction[] | undefined,
 ): Record<string, unknown> => {
@@ -448,7 +442,7 @@ const collectMcpServers = (
   )
 }
 
-/** Connectivity/model-selection fields copied as-is (no CLI override) into both sides' configs. */
+/** Connectivity/model-selection fields copied as-is (no CLI override) into every variant's config. */
 export interface ConnectivityExtras {
   readonly provider: Record<string, unknown> | undefined
   readonly smallModel: string | undefined
@@ -457,8 +451,7 @@ export interface ConnectivityExtras {
 }
 
 const buildConfigObject = (
-  side: Side,
-  pack: PackInfo | undefined,
+  hasDeclaredPacks: boolean,
   mcpServers: Record<string, unknown>,
   model: string | undefined,
   extras: ConnectivityExtras,
@@ -477,38 +470,41 @@ const buildConfigObject = (
       },
     },
   }
-  if (side === 'new' && pack !== undefined && pack.type !== null) {
-    return Object.keys(mcpServers).length > 0
-      ? { ...base, mcp: { ...mcpServers } }
-      : base
+  if (hasDeclaredPacks && Object.keys(mcpServers).length > 0) {
+    return { ...base, mcp: { ...mcpServers } }
   }
   return base
 }
 
+/**
+ * Purity (D1): `pure ?? declaredPacks.length === 0` — an explicit
+ * `variant.pure` always wins; absent, a variant with no declared pack
+ * defaults pure (reproduces today's hardwired baseline behavior), a variant
+ * with a declared pack defaults impure.
+ */
 const buildEnvVars = (
   homeDir: string,
-  side: Side,
-  baselineCfg: string,
-  newCfg: string,
+  pure: boolean,
+  configContent: string,
   pathValue: string | undefined,
 ): EnvVarSet => ({
   HOME: homeDir,
   OPENCODE_DISABLE_PROJECT_CONFIG: true,
-  OPENCODE_DISABLE_DEFAULT_PLUGINS: side === 'old',
-  OPENCODE_DISABLE_EXTERNAL_SKILLS: side === 'old',
-  OPENCODE_PURE: side === 'old',
-  OPENCODE_CONFIG_CONTENT: side === 'old' ? baselineCfg : newCfg,
+  OPENCODE_DISABLE_DEFAULT_PLUGINS: pure,
+  OPENCODE_DISABLE_EXTERNAL_SKILLS: pure,
+  OPENCODE_PURE: pure,
+  OPENCODE_CONFIG_CONTENT: configContent,
   ...(pathValue === undefined ? {} : { PATH: pathValue }),
 })
 
 /**
- * `--pack-setup` PATH, identical shape on both sides (§8 fairness: only its
- * content differs). Docker mode uses the in-CONTAINER home path
- * (`/home/opencode/...`) — the host `homeDir` value would resolve to nothing
- * once the process is actually inside the container (the exact class of bug
- * already fixed once for local-plugin registration, see phase 04's
- * `pluginConfigPath`). Home mode runs directly on the host, so the real host
- * path is correct there.
+ * `--pack-setup` PATH, identical shape on every variant (see
+ * `PACK_SETUP_SKELETON_DIRS` above: only its content differs). Docker mode
+ * uses the in-CONTAINER home path (`/home/opencode/...`) — the host
+ * `homeDir` value would resolve to nothing once the process is actually
+ * inside the container (the exact class of bug already fixed once for
+ * local-plugin registration, see `pluginConfigPath` above). Home mode runs
+ * directly on the host, so the real host path is correct there.
  */
 const setupPathFor = (
   homeDir: string,
@@ -519,30 +515,37 @@ const setupPathFor = (
     ? `/home/opencode/.local/bin:${imagePath}`
     : `${path.join(homeDir, '.local/bin')}:${process.env['PATH'] ?? ''}`
 
-interface SideResult {
+interface VariantResult {
+  readonly name: string
   readonly trees: readonly HomeTree[]
   readonly envs: readonly EnvVarSet[]
+  readonly config: string
 }
 
 export const homeIsolation = (
   input: HomeIsolationInputExt,
 ): Effect.Effect<HomeIsolationResultExt, PhaseError> =>
   Effect.gen(function* () {
-    const isolation = input.runInput.isolation
+    const { runInput, workspace } = input
+    const isolation = runInput.isolation
     const dockerImage =
       isolation === 'docker' ? (input.dockerImage ?? DEFAULT_OPENCODE_IMAGE) : undefined
-    const dockerNetwork = isolation === 'docker' ? input.runInput.dockerNetwork : undefined
+    const dockerNetwork = isolation === 'docker' ? runInput.dockerNetwork : undefined
     const docker: DockerExec | undefined =
       dockerImage === undefined
         ? undefined
         : { image: dockerImage, ...(dockerNetwork === undefined ? {} : { network: dockerNetwork }) }
-    const runs = input.runInput.runs
+    const runs = runInput.runs
     const sourceHome = os.homedir()
-    const authFlags = input.runInput.auth
-    const installSeconds = input.runInput.timeouts.installSeconds
-    const packSetupDeclared = input.runInput.packSetup !== undefined
+    const authFlags = runInput.auth
+    const installSeconds = runInput.timeouts.installSeconds
+    // PATH symmetry decision (05-risks.md §2.6, NORMATIVE): a registry-wide
+    // check, not per-variant — every variant gets the PATH entry as soon as
+    // ANY pack in the registry declares setup, regardless of which variant(s)
+    // actually declare that pack.
+    const anyPackDeclaresSetup = runInput.packs.some((p) => p.setup !== undefined)
     const imagePath: string =
-      packSetupDeclared && isolation === 'docker' && dockerImage !== undefined
+      anyPackDeclaresSetup && isolation === 'docker' && dockerImage !== undefined
         ? yield* probeImagePath(dockerImage, dockerNetwork).pipe(
             Effect.mapError((e: DockerError) =>
               homeIsolationError(`cannot probe image PATH for --pack-setup: ${e.stderr}`, 'E_DOCKER_FAILED', {
@@ -553,67 +556,107 @@ export const homeIsolation = (
           )
         : ''
     const packOutcome = input.packInstall
-    const packInfo = packOutcome === undefined ? undefined : packInfoFrom(packOutcome)
-    const mcpServers = collectMcpServers(packOutcome?.instructions)
     const sourceConnectivity = yield* readSourceConnectivity(sourceHome)
-    const runModel = input.runInput.model ?? sourceConnectivity.model
     const connectivityExtras: ConnectivityExtras = {
       provider: sourceConnectivity.provider,
       smallModel: sourceConnectivity.smallModel,
       enabledProviders: sourceConnectivity.enabledProviders,
       disabledProviders: sourceConnectivity.disabledProviders,
     }
-    const baselineObj = buildConfigObject('old', packInfo, mcpServers, runModel, connectivityExtras)
-    const newObj = buildConfigObject('new', packInfo, mcpServers, runModel, connectivityExtras)
-    const baselineCfg = JSON.stringify(baselineObj, null, 2)
-    const newCfg = JSON.stringify(newObj, null, 2)
 
-    const configDir = input.workspace.config
+    const configDir = workspace.config
     yield* ensureDir(configDir).pipe(
       Effect.mapError((e: FsError) => setupFail(`cannot create config dir: ${e.path}`, { path: e.path })),
     )
-    // `baselineObj`/`newObj` themselves stay unredacted — they still feed
-    // `baselineCfg`/`newCfg` below, which becomes OPENCODE_CONFIG_CONTENT and
-    // must carry real credentials for the run to authenticate. Only these
-    // disk copies, written for a human to read, are redacted.
-    yield* writeJson(path.join(configDir, 'baseline.json'), redactConfigSecrets(baselineObj)).pipe(
-      Effect.mapError((e: FsError) => setupFail(`cannot write baseline.json: ${e.path}`, { path: e.path })),
-    )
-    yield* writeJson(path.join(configDir, 'new.json'), redactConfigSecrets(newObj)).pipe(
-      Effect.mapError((e: FsError) => setupFail(`cannot write new.json: ${e.path}`, { path: e.path })),
-    )
 
-    const processSide = (side: Side): Effect.Effect<SideResult, PhaseError> =>
+    const processVariant = (v: VariantSpec): Effect.Effect<VariantResult, PhaseError> =>
       Effect.gen(function* () {
-        const homeList = side === 'old' ? input.workspace.homeOld : input.workspace.homeNew
+        const declaredPacks = packsOf(runInput, v)
+        // Apply EVERY declared pack's instructions/mcp — Stage 1 caps
+        // declaredPacks at length <=1 (enforced in phase 00), but this loop
+        // is written set-based from the start so Stage 2 (WP16) only has to
+        // drop that guard and add the instruction-collision check; it must
+        // never silently apply just the first pack.
+        const deliveries = yield* Effect.forEach(
+          declaredPacks,
+          (pack) =>
+            Effect.gen(function* () {
+              const delivery = packOutcome?.deliveries.find((d) => d.pack === pack.name)
+              // packOutcome undefined means phase 03 never ran at all (test
+              // harnesses, or a run with an empty registry) — that is not a
+              // mismatch. packOutcome defined but missing THIS declared
+              // pack's delivery is a real bug: the variant would otherwise
+              // end up impure with an empty HOME and no error.
+              if (delivery === undefined && packOutcome !== undefined) {
+                yield* Effect.fail(
+                  homeIsolationError(
+                    `declared pack has no delivery from phase 03: variant=${v.name} pack=${pack.name}`,
+                    'E_PACK_INSTALL_FAILED',
+                    { variant: v.name, pack: pack.name },
+                  ),
+                )
+              }
+              return delivery
+            }),
+          { concurrency: 1 },
+        )
+        const instructions: readonly RegistrationInstruction[] = deliveries.flatMap((d) =>
+          d === undefined ? [] : [...d.instructions],
+        )
+        const mcpServers = deliveries.reduce<Record<string, unknown>>(
+          (acc, d) => ({ ...acc, ...collectMcpServers(d?.instructions) }),
+          {},
+        )
+        const pure = v.pure ?? declaredPacks.length === 0
+        // An explicit variant.model of '' must disable the inherited global
+        // (D7) and fall through to source connectivity — correct regardless
+        // of whether effectiveOf itself already returns undefined for '' or
+        // leaks the empty string back.
+        const ownModel = effectiveOf(v, runInput.model, 'model')
+        const model = ownModel === undefined || ownModel === '' ? sourceConnectivity.model : ownModel
+        const configObj = buildConfigObject(declaredPacks.length > 0, mcpServers, model, connectivityExtras)
+        const configStr = JSON.stringify(configObj, null, 2)
+
+        // `configObj` itself stays unredacted — it feeds `configStr`, which
+        // becomes OPENCODE_CONFIG_CONTENT and must carry real credentials for
+        // the run to authenticate. Only this disk copy, written for a human
+        // to read, is redacted.
+        yield* writeJson(path.join(configDir, `${v.name}.json`), redactConfigSecrets(configObj)).pipe(
+          Effect.mapError((e: FsError) =>
+            setupFail(`cannot write ${v.name}.json: ${e.path}`, { path: e.path, variant: v.name }),
+          ),
+        )
+
+        const vt = workspace.variantTrees.find((t) => t.name === v.name)
+
         const perRun = yield* Effect.forEach(
           range(runs),
           (idx) =>
             Effect.gen(function* () {
               const runIndex = idx + 1
-              const homeDir = homeList[idx] ?? ''
+              const homeDir = vt?.homes[idx] ?? ''
               if (homeDir === '') {
                 yield* Effect.fail(
-                  setupFail(`missing HOME path for side=${side} run=${String(runIndex)}`, {
-                    side,
+                  setupFail(`missing HOME path for variant=${v.name} run=${String(runIndex)}`, {
+                    variant: v.name,
                     runIndex,
                   }),
                 )
               }
-              const structure = yield* buildSkeleton(homeDir, side, runIndex, packSetupDeclared)
+              const structure = yield* buildSkeleton(homeDir, v.name, runIndex, anyPackDeclaresSetup)
               const copiedAuth = yield* copyAuth(homeDir, sourceHome, authFlags)
               if (copiedAuth.length === 0) {
                 yield* Effect.fail(
                   homeIsolationError(
-                    `no auth sources found for side=${side} run=${String(runIndex)}`,
+                    `no auth sources found for variant=${v.name} run=${String(runIndex)}`,
                     'E_AUTH_MISSING',
-                    { side, runIndex, sourceHome },
+                    { variant: v.name, runIndex, sourceHome },
                   ),
                 )
               }
-              if (side === 'new' && packOutcome !== undefined) {
+              if (instructions.length > 0) {
                 yield* Effect.forEach(
-                  packOutcome.instructions,
+                  instructions,
                   (inst) => applyInstruction(inst, homeDir, installSeconds, docker),
                   { concurrency: 1 },
                 )
@@ -623,27 +666,30 @@ export const homeIsolation = (
                 structure: [...structure],
                 copiedAuth: [...copiedAuth],
               }
-              const pathValue = packSetupDeclared ? setupPathFor(homeDir, isolation, imagePath) : undefined
-              return { tree, env: buildEnvVars(homeDir, side, baselineCfg, newCfg, pathValue) }
+              const pathValue = anyPackDeclaresSetup ? setupPathFor(homeDir, isolation, imagePath) : undefined
+              return { tree, env: buildEnvVars(homeDir, pure, configStr, pathValue) }
             }),
           { concurrency: 1 },
         )
+
         return {
+          name: v.name,
           trees: perRun.map((p) => p.tree),
           envs: perRun.map((p) => p.env),
+          config: configStr,
         }
       })
 
-    const oldSide = yield* processSide('old')
-    const newSide = yield* processSide('new')
+    const variantResults = yield* Effect.forEach(runInput.variants, processVariant, { concurrency: 1 })
+
+    const homeTrees: readonly VariantHomes[] = variantResults.map((r) => ({ name: r.name, trees: [...r.trees] }))
+    const envVars: readonly VariantEnv[] = variantResults.map((r) => ({ name: r.name, envs: [...r.envs] }))
+    const generatedConfigs: readonly VariantConfig[] = variantResults.map((r) => ({ name: r.name, config: r.config }))
 
     return {
-      homeTrees: {
-        old: [...oldSide.trees],
-        new: [...newSide.trees],
-      },
-      envVars: [[...oldSide.envs], [...newSide.envs]],
-      generatedConfigs: { baseline: baselineCfg, new: newCfg },
+      homeTrees: [...homeTrees],
+      envVars: [...envVars],
+      generatedConfigs: [...generatedConfigs],
       isolation,
       ...(dockerImage === undefined ? {} : { dockerImage }),
     }

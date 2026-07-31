@@ -1,11 +1,14 @@
 /**
  * Phase 03: pack-install
  *
- * Delivers the pack under test into `workspace.pack/<name>/` (skill / agent /
- * command / all) and produces a declarative `instructions` list consumed by
- * phase 04 to physically register the pack inside each new-side HOME. This
- * phase writes ONLY under `workspace.pack/` and `workspace.results/` — it never
- * touches `home/<side>/run-N/` (that is phase 04's responsibility).
+ * Delivers every pack in the run's registry (`runInput.packs`) into its own
+ * `pack/<packName>/` subdirectory (skill / agent / command / all / mcp) and
+ * produces a declarative `instructions` list per pack, consumed by phase 04
+ * to physically register a variant's declared pack(s) inside its HOMEs. This
+ * phase writes ONLY under `workspace.pack/` and `workspace.results/` — it
+ * never touches `home/<variant>/run-N/` (that is phase 04's responsibility).
+ * A pack shared by several variants is still delivered exactly once here
+ * (D6) — variant attribution happens downstream, in phase 04/04b/05.
  *
  * @see docs/phases/03-pack-install.ru.md
  * @see contract/phases/03-pack-install.tsp
@@ -13,7 +16,7 @@
 import { Effect } from 'effect'
 import { Duration } from 'effect'
 import path from 'node:path'
-import type { PackInstallInput, PackInstallResult, PackType } from '@generated/types'
+import type { PackDelivery, PackInstallInput, PackSpec, PackType } from '@generated/types'
 import { detectPack, safeRefDisplay } from '../pack/detector.js'
 import type { PackDetectError, PackRef } from '../pack/detector.js'
 import { clone } from '../util/git.js'
@@ -63,17 +66,24 @@ export type RegistrationInstruction =
   | { readonly kind: 'config'; readonly section: 'mcp'; readonly name: string; readonly json: unknown }
 
 /**
- * Phase 03 outcome. Extends the contract `PackInstallResult` with:
- * - `detectedType` narrowed from the codegen quirk `PackType | unknown` to the
- *   honest `PackType | null` (null only in smoke-test).
- * - `instructions` — the local extension documented above.
- *
- * A `PackInstallOutcome` is structurally a `PackInstallResult`, so any consumer
+ * One pack's delivery. Extends the contract `PackDelivery` with `instructions`
+ * — the local 03↔04 hand-off documented above. `detectedType` keeps the
+ * generated `PackType | unknown` shape as-is (a pre-existing codegen quirk —
+ * `unknown` absorbs the union); narrow it by hand at call sites that need the
+ * concrete `PackType`, never by changing the contract.
+ */
+export type PackDeliveryExt = PackDelivery & {
+  readonly instructions: readonly RegistrationInstruction[]
+}
+
+/**
+ * Phase 03 outcome: one `PackDeliveryExt` per registry pack. A
+ * `PackInstallOutcome` is structurally a `PackInstallResult`, so any consumer
  * expecting the contract type accepts it.
  */
-export interface PackInstallOutcome extends PackInstallResult {
-  readonly detectedType: PackType | null
-  readonly instructions: readonly RegistrationInstruction[]
+export interface PackInstallOutcome {
+  readonly deliveries: readonly PackDeliveryExt[]
+  readonly installLogPath: string
 }
 
 interface Delivery {
@@ -586,14 +596,66 @@ const runDelivery = (
   }
 }
 
+const withPackContext = <A>(
+  eff: Effect.Effect<A, PhaseError>,
+  packName: string,
+): Effect.Effect<A, PhaseError> =>
+  eff.pipe(
+    Effect.mapError((e) =>
+      packInstallError(e.message, e.code, { ...(e.context ?? {}), pack: packName }),
+    ),
+  )
+
+const deliverPack = (
+  pack: PackSpec,
+  packRootBase: string,
+  seconds: number,
+  installLogPath: string,
+): Effect.Effect<PackDeliveryExt, PhaseError> =>
+  Effect.gen(function* () {
+    const packDir = path.join(packRootBase, pack.name)
+    yield* ensureDir(packDir).pipe(
+      Effect.mapError((e) =>
+        packInstallError(`cannot create pack dir: ${e.path}`, 'E_INSTALL_FAILED', {
+          path: e.path,
+          pack: pack.name,
+        }),
+      ),
+    )
+
+    const detected = yield* detectPack(pack.ref).pipe(
+      Effect.mapError((e: PackDetectError) =>
+        packInstallError(`invalid pack reference: ${e.reason}`, 'E_PACK_INVALID_REF', {
+          packRef: safeRefDisplay(pack.ref),
+          reason: e.reason,
+          pack: pack.name,
+        }),
+      ),
+    )
+    const type: PackType = pack.type ?? detected.type
+
+    const delivery = yield* withPackContext(runDelivery(type, detected, packDir, seconds), pack.name)
+
+    yield* appendLog(
+      installLogPath,
+      `[${pack.name}] installed ${type} ${detected.name} via ${detected.source}; sections=[${delivery.registeredIn.join(',')}]\n`,
+    )
+
+    return {
+      pack: pack.name,
+      packPath: delivery.packPath,
+      detectedType: type,
+      registeredIn: [...delivery.registeredIn],
+      instructions: [...delivery.instructions],
+    }
+  })
+
 export const packInstall = (
   input: PackInstallInput,
 ): Effect.Effect<PackInstallOutcome, PhaseError> =>
   Effect.gen(function* () {
     const { runInput, workspace } = input
-    const packRef = runInput.packRef
     const installLogPath = path.join(workspace.results, 'install.log')
-    const packRoot = workspace.pack
 
     yield* ensureDir(workspace.results).pipe(
       Effect.mapError((e) =>
@@ -602,7 +664,7 @@ export const packInstall = (
         }),
       ),
     )
-    yield* ensureDir(packRoot).pipe(
+    yield* ensureDir(workspace.pack).pipe(
       Effect.mapError((e) =>
         packInstallError(`cannot create pack dir: ${e.path}`, 'E_INSTALL_FAILED', {
           path: e.path,
@@ -610,41 +672,17 @@ export const packInstall = (
       ),
     )
 
-    if (packRef === undefined || packRef.trim() === '') {
+    if (runInput.packs.length === 0) {
       yield* appendLog(installLogPath, 'smoke-test: no pack\n')
-      return {
-        packPath: '',
-        detectedType: null,
-        installLogPath,
-        registeredIn: [],
-        instructions: [],
-      }
+      return { deliveries: [], installLogPath }
     }
-
-    const detected = yield* detectPack(packRef).pipe(
-      Effect.mapError((e: PackDetectError) =>
-        packInstallError(
-          `invalid pack reference: ${e.reason}`,
-          'E_PACK_INVALID_REF',
-          { packRef: safeRefDisplay(packRef), reason: e.reason },
-        ),
-      ),
-    )
-    const type: PackType = runInput.packType ?? detected.type
 
     const seconds = runInput.timeouts.installSeconds
-    const delivery = yield* runDelivery(type, detected, packRoot, seconds)
-
-    yield* appendLog(
-      installLogPath,
-      `installed ${type} ${detected.name} via ${detected.source}; sections=[${delivery.registeredIn.join(',')}]\n`,
+    const deliveries = yield* Effect.forEach(
+      runInput.packs,
+      (pack) => deliverPack(pack, workspace.pack, seconds, installLogPath),
+      { concurrency: 1 },
     )
 
-    return {
-      packPath: delivery.packPath,
-      detectedType: type,
-      installLogPath,
-      registeredIn: [...delivery.registeredIn],
-      instructions: [...delivery.instructions],
-    }
+    return { deliveries: [...deliveries], installLogPath }
   })

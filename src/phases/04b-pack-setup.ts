@@ -1,30 +1,41 @@
 /**
  * Phase 04b: pack-setup
  *
- * Installs the pack's runtime into the new side's first HOME (`--pack-setup`,
- * once for the whole experiment), then copies that HOME over every other
- * new-side HOME — they are already byte-identical at this point (phase 04
- * built each from the same skeleton + auth + instructions), so the copy is a
- * pure replacement, not a merge. Scans the delivered pack for dependency
- * markers when nothing was declared, so a pack that clearly wraps an
- * external runtime does not fail silently. No-op (mode `delivered-only`)
- * when `--pack-setup`/`--pack-check`/`--pack-exercise` are all absent — byte
- * identical to today's behavior.
+ * For each variant, for each of its own declared packs that has `setup`
+ * (declaration order): installs the pack's runtime into that variant's
+ * run-1 HOME (once per (declaring variant, pack) — D6), then copies that
+ * HOME over the variant's OTHER HOMEs — they are already byte-identical at
+ * this point (phase 04 built each from the same skeleton + auth +
+ * instructions), so the copy is a pure replacement, not a merge. Scans a
+ * pack's delivered directory for dependency markers when neither `setup`
+ * nor any declaring variant's `exercise` was declared, so a pack that
+ * clearly wraps an external runtime does not fail silently. A registry pack
+ * with none of `setup`/`check`/any declaring variant's `exercise` costs
+ * nothing here — mode `delivered-only`, byte identical to today's no-flags
+ * behavior.
  *
- * `--pack-check` (verified per-HOME on both sides) and `--pack-exercise`
- * (run per new-side run, before the agent session) are NOT executed here —
- * see gate 6 in `05-preflight.ts` and the per-run step in `cli/pipeline.ts`.
- * This phase only produces the `setup` half of `PackSetupReport`; the
- * `checks`/`exercises` arrays start empty and are filled in by those two
- * call sites.
+ * `check` (verified per-HOME by preflight gate 6, `05-preflight.ts`) and
+ * `exercise` (run per run of the declaring variant, before the agent
+ * session, in `cli/pipeline.ts`) are NOT executed here — this phase only
+ * produces the `setups` half of `PrepReport`; `checks`/`exercises` start
+ * empty and are filled in by those two call sites.
  *
  * @see docs/phases/04b-pack-setup.ru.md
  * @see contract/phases/04b-pack-setup.tsp
  */
-import { Effect } from 'effect'
+import { Effect, Ref } from 'effect'
 import path from 'node:path'
-import type { PackCmdResult, PackSetupInput, PackSetupMode, PackSetupReport } from '@generated/types'
+import type {
+  PackCmdResult,
+  PackPrep,
+  PackSetupInput,
+  PackSetupMode,
+  PrepReport,
+  VariantEnv,
+  VariantPrep,
+} from '@generated/types'
 import type { PackInstallOutcome } from './03-pack-install.js'
+import { packsOf } from './00-cli-parse.js'
 import type { DockerExec } from '../opencode/cli.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import { runShellInHome } from '../isolation/shell-runner.js'
@@ -38,20 +49,27 @@ import type { PhaseError } from '../errors.js'
  * Local input extension: widens `packInstall` to phase 03's `PackInstallOutcome`
  * (needed for `packPath`, the marker scan's root) and carries the docker
  * image resolved by phase 04, mirroring the `*Ext` pattern every phase after
- * 03 already uses for this exact hand-off. `newHomePath` is the exact
- * `EnvVarSet.PATH` phase 04 already computed for `homeNew[0]` — reused
- * rather than recomputed, so `--pack-setup` resolves a HOME-installed binary
- * (for anything it itself shells out to) exactly like the agent's own bash
- * tool will. Undefined when `--pack-setup` was never declared.
+ * 03 already uses for this exact hand-off. `Omit` (rather than re-declaring
+ * the field on top of `extends PackSetupInput`) is the cleaner way to narrow
+ * a member's type in a derived interface — no need to keep the base
+ * member's wire type in scope at all.
  */
-export interface PackSetupInputExt extends PackSetupInput {
+export interface PackSetupInputExt extends Omit<PackSetupInput, 'packInstall'> {
   readonly packInstall?: PackInstallOutcome
   readonly dockerImage?: string
-  readonly newHomePath?: string
+  /**
+   * Phase 04's per-variant env sets (`HomeIsolationResultExt.envVars`) —
+   * reused, not recomputed, for a declaring variant's run-1 HOME `PATH`, so
+   * `--pack-setup` resolves a HOME-installed binary exactly like the agent's
+   * own bash tool will. Absent entries (or an absent `envVars` altogether)
+   * simply mean no PATH override — the same as no registry pack declaring
+   * `setup` at all.
+   */
+  readonly envVars?: readonly VariantEnv[]
 }
 
 export interface PackSetupResultExt {
-  readonly report: PackSetupReport
+  readonly report: PrepReport
   readonly logPath: string
 }
 
@@ -90,10 +108,11 @@ const scanInstallTextIn = (filePath: string): Effect.Effect<boolean> =>
   })
 
 /**
- * A heuristic, not a hard requirement: self-contained skills with nothing to
+ * A heuristic, not a hard requirement: self-contained packs with nothing to
  * install must keep working with zero new flags. Only returns a message when
  * a marker was actually found — the caller decides whether that is even
- * worth checking (only when `--pack-setup`/`--pack-exercise` are absent).
+ * worth checking (only when neither `setup` nor any declaring variant's
+ * `exercise` was declared for this pack).
  */
 export const scanForDependencyMarkers = (packRoot: string): Effect.Effect<string | undefined> =>
   Effect.gen(function* () {
@@ -111,7 +130,7 @@ export const scanForDependencyMarkers = (packRoot: string): Effect.Effect<string
       ...(hasInstallText ? ['install command text in SKILL.md/README.md'] : []),
     ]
     if (markers.length === 0) return undefined
-    return `pack appears to wrap an external runtime (found: ${markers.join(', ')}) — nothing was declared (--pack-setup/--pack-check/--pack-exercise); the new side may be non-functional`
+    return `pack appears to wrap an external runtime (found: ${markers.join(', ')}) — nothing was declared (setup/check/exercise); the declaring variant(s) may be non-functional`
   })
 
 // ---------------------------------------------------------------------------
@@ -124,10 +143,10 @@ export const scanForDependencyMarkers = (packRoot: string): Effect.Effect<string
  * happened (`MODE_BANNER.exercised` in md.ts: "the harness installed the
  * pack, VERIFIED IT FUNCTIONAL, and ran its pipeline"), so it must reflect
  * completed evidence, not requested flags:
- * - `checkVerified`: `--pack-check` only ever runs inside preflight's gate 6
+ * - `checkVerified`: `check` only ever runs inside preflight's gate 6
  *   (`05-preflight.ts`) — declared while preflight is disabled, or before
  *   preflight has run at all, is not yet verified.
- * - `exerciseHappened`: `--pack-exercise` runs per new-side run — declared
+ * - `exerciseHappened`: `exercise` runs per declaring-variant run — declared
  *   with every attempt failing (see `packExerciseWithoutCheckWarning` for
  *   why an unchecked pack can fail every run) is not evidence the mechanism
  *   works.
@@ -139,9 +158,9 @@ export const scanForDependencyMarkers = (packRoot: string): Effect.Effect<string
  * the final report and its banner show. `exercised` requires
  * `checkVerified`, not just `exerciseHappened`: an exercise can run against
  * a broken install with nothing to catch it if the check was skipped.
- * `--pack-exercise` alone (no verified check) still counts as real
- * evidence, just not the strongest kind: it falls to `installed-only`, same
- * as a bare `--pack-setup`.
+ * `exercise` alone (no verified check) still counts as real evidence, just
+ * not the strongest kind: it falls to `installed-only`, same as a bare
+ * `setup`.
  */
 export const derivePackSetupMode = (
   setupDeclared: boolean,
@@ -157,8 +176,60 @@ export const derivePackSetupMode = (
 // Phase entry point
 // ---------------------------------------------------------------------------
 
-const fail = (message: string, code: 'E_PACK_SETUP_FAILED' | 'E_PACK_SETUP_TIMEOUT', context?: Record<string, unknown>): PhaseError =>
-  packSetupError(message, code, context)
+const fail = (
+  message: string,
+  code: 'E_PACK_SETUP_FAILED' | 'E_PACK_SETUP_TIMEOUT',
+  context?: Record<string, unknown>,
+): PhaseError => packSetupError(message, code, context)
+
+/**
+ * The copy-out below (`copyDir(home0, homeDir)`) is a pure replacement, sound
+ * for every byte phase 04 made identical across a variant's runs — except
+ * one: a local-plugin instruction's registration
+ * (`04-home-isolation.ts`'s `applyInstruction`, `plugin` case) writes an
+ * ABSOLUTE host path into `<home>/.config/opencode/opencode.json`'s
+ * `plugin[]` array, and in HOME mode that path is genuinely `home0`'s own —
+ * phase 04 already built run-N's OWN correctly-pathed copy before this phase
+ * ever runs, and the blind copy would clobber it with run-1's path. Rewrite
+ * every `plugin[]` entry rooted at `home0` to the same relative suffix under
+ * `homeDir` so the destination points at its own plugin file again. Docker
+ * mode is unaffected — `pluginConfigPath` already registers the
+ * homeDir-agnostic container path (`/home/opencode/...`) there.
+ */
+const tryParseJson = (raw: string) => {
+  try {
+    return JSON.parse(raw) as unknown
+  } catch {
+    return undefined
+  }
+}
+
+const rewriteLocalPluginPaths = (
+  cfgPath: string,
+  fromHome: string,
+  toHome: string,
+): Effect.Effect<void, PhaseError> =>
+  Effect.gen(function* () {
+    if (!(yield* exists(cfgPath))) return
+    const raw = yield* readFile(cfgPath).pipe(
+      Effect.mapError((e: FsError) =>
+        fail(`cannot read opencode.json for plugin path rewrite: ${e.path}`, 'E_PACK_SETUP_FAILED', {
+          path: e.path,
+        }),
+      ),
+    )
+    const parsed = tryParseJson(raw)
+    if (parsed === undefined || !isRecord(parsed)) return
+    const plugins = parsed['plugin']
+    if (!Array.isArray(plugins) || !plugins.every((p) => typeof p === 'string')) return
+    const rewritten = plugins.map((p) => (p.startsWith(fromHome) ? toHome + p.slice(fromHome.length) : p))
+    if (rewritten.every((p, i) => p === plugins[i])) return
+    yield* writeFile(cfgPath, `${JSON.stringify({ ...parsed, plugin: rewritten }, null, 2)}\n`).pipe(
+      Effect.mapError((e: FsError) =>
+        fail(`cannot rewrite opencode.json plugin paths: ${e.path}`, 'E_PACK_SETUP_FAILED', { path: e.path }),
+      ),
+    )
+  })
 
 export const packSetup = (
   input: PackSetupInputExt,
@@ -170,53 +241,69 @@ export const packSetup = (
       Effect.mapError((e: FsError) => fail(`cannot create results dir: ${e.path}`, 'E_PACK_SETUP_FAILED', { path: e.path })),
     )
 
-    const setupDeclared = runInput.packSetup !== undefined
-    const checkDeclared = runInput.packCheck !== undefined
-    const exerciseDeclared = runInput.packExercise !== undefined
-    // `--pack-check` only executes inside preflight (gate 6, 05-preflight.ts)
-    // — declared with preflight disabled means it never ran. CLI parse now
-    // refuses that combination outright (00-cli-parse.ts), but `mode` stays
-    // defensive about it too: it must reflect what ran, not what was asked.
-    const checkVerified = checkDeclared && runInput.preflightEnabled
-    const mode = derivePackSetupMode(setupDeclared, checkVerified, exerciseDeclared)
+    // Pass 1 — per registry pack: mode/flags/marker-scan, purely derived (no
+    // mutation) — one PackMeta per pack, in registry order.
+    interface PackMeta {
+      readonly pack: string
+      readonly mode: PackSetupMode
+      readonly setupDeclared: boolean
+      readonly checkDeclared: boolean
+      readonly exerciseDeclared: boolean
+      readonly undeclaredDepWarning: string | undefined
+    }
+    const packMetas: readonly PackMeta[] = yield* Effect.forEach(
+      runInput.packs,
+      (pack) =>
+        Effect.gen(function* () {
+          const declaringVariants = runInput.variants.filter((v) => v.packs.includes(pack.name))
+          const setupDeclared = pack.setup !== undefined
+          const checkDeclared = pack.check !== undefined
+          const exerciseDeclared = declaringVariants.some((v) => v.exercise !== undefined)
+          // `check` only executes inside preflight (gate 6, 05-preflight.ts)
+          // — declared with preflight disabled means it never ran. CLI parse
+          // refuses that combination outright (00-cli-parse.ts), but `mode`
+          // stays defensive about it too: it must reflect what ran, not what
+          // was asked.
+          const checkVerified = checkDeclared && runInput.preflightEnabled
+          const mode = derivePackSetupMode(setupDeclared, checkVerified, exerciseDeclared)
+          const packRoot = input.packInstall?.deliveries.find((d) => d.pack === pack.name)?.packPath ?? ''
+          const undeclaredDepWarning =
+            setupDeclared || exerciseDeclared ? undefined : yield* scanForDependencyMarkers(packRoot)
+          return { pack: pack.name, mode, setupDeclared, checkDeclared, exerciseDeclared, undeclaredDepWarning }
+        }),
+      { concurrency: 1 },
+    )
+    const metaByPack = new Map(packMetas.map((m) => [m.pack, m] as const))
 
-    const packRoot = input.packInstall?.packPath ?? ''
-    const undeclaredDepWarning =
-      setupDeclared || exerciseDeclared ? undefined : yield* scanForDependencyMarkers(packRoot)
-
-    const headerLines: readonly string[] = [
+    // Log lines and setup results both accumulate as the (potentially
+    // failing) pass-2 loop below runs — an Effect Ref, not plain mutation,
+    // so a mid-loop failure can still flush everything gathered so far.
+    const logRef = yield* Ref.make<readonly string[]>([
       '=== testaipack pack-setup log ===',
-      `mode: ${mode}`,
-      `setupDeclared=${String(setupDeclared)} checkDeclared=${String(checkDeclared)} exerciseDeclared=${String(exerciseDeclared)}`,
-      ...(undeclaredDepWarning === undefined ? [] : [`WARNING: ${undeclaredDepWarning}`]),
       '',
-    ]
+      ...packMetas.flatMap((m) => [
+        `--- pack: ${m.pack} ---`,
+        // Computed from DECLARATIONS, before gate 6 or any run — not yet
+        // verified evidence. The final `PrepReport.packs[*].mode` (recomputed
+        // in cli/pipeline.ts from what actually ran/passed, D12) is what the
+        // report banner shows; this log line must not be read as that claim.
+        `declared-mode: ${m.mode}`,
+        `setupDeclared=${String(m.setupDeclared)} checkDeclared=${String(m.checkDeclared)} exerciseDeclared=${String(m.exerciseDeclared)}`,
+        ...(m.undeclaredDepWarning === undefined ? [] : [`WARNING: ${m.undeclaredDepWarning}`]),
+        '',
+      ]),
+    ])
+    const appendLog = (lines: readonly string[]): Effect.Effect<void> =>
+      Ref.update(logRef, (prev) => [...prev, ...lines])
+    const flushLog = (): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        const lines = yield* Ref.get(logRef)
+        yield* writeFile(logPath, `${lines.join('\n')}\n`).pipe(Effect.catchAll(() => Effect.void))
+      })
 
-    const writeLog = (extra: readonly string[] = []): Effect.Effect<void> =>
-      writeFile(logPath, `${[...headerLines, ...extra].join('\n')}\n`).pipe(Effect.catchAll(() => Effect.void))
-
-    if (!setupDeclared) {
-      yield* writeLog()
-      return {
-        report: {
-          mode,
-          setupDeclared,
-          checkDeclared,
-          exerciseDeclared,
-          ...(undeclaredDepWarning === undefined ? {} : { undeclaredDepWarning }),
-          checks: [],
-          exercises: [],
-        },
-        logPath,
-      }
-    }
-
-    const homeNew0 = workspace.homeNew[0] ?? ''
-    const appsNew0 = workspace.appsNew[0] ?? ''
-    if (homeNew0 === '' || appsNew0 === '') {
-      yield* Effect.fail(fail('missing new-side HOME/app dir for --pack-setup', 'E_PACK_SETUP_FAILED', {}))
-    }
-
+    // Pass 2 — for each variant, for each of ITS declared packs with `setup`
+    // (declaration order): run setup once in that variant's run-1 HOME, then
+    // copy run-1 HOME over the variant's other HOMEs (D6).
     const isolation = runInput.isolation
     const dockerImage = isolation === 'docker' ? (input.dockerImage ?? DEFAULT_OPENCODE_IMAGE) : undefined
     const docker: DockerExec | undefined =
@@ -225,70 +312,125 @@ export const packSetup = (
         : { image: dockerImage, ...(runInput.dockerNetwork === undefined ? {} : { network: runInput.dockerNetwork }) }
     const timeoutMs = runInput.timeouts.installSeconds * 1000
 
-    const outcome = yield* runShellInHome(runInput.packSetup ?? '', homeNew0, appsNew0, docker, timeoutMs, input.newHomePath)
-    const setupLogLines: readonly string[] = [
-      `[SETUP] exitCode=${String(outcome.exitCode)} durationMs=${String(outcome.durationMs)} timedOut=${String(outcome.timedOut)}`,
-      outcome.outputTail,
-    ]
+    const setupsRef = yield* Ref.make<readonly PackCmdResult[]>([])
+    for (const v of runInput.variants) {
+      const vt = workspace.variantTrees.find((t) => t.name === v.name)
+      const declaredPacks = packsOf(runInput, v)
+      for (const pack of declaredPacks) {
+        if (pack.setup === undefined) continue
 
-    if (outcome.timedOut) {
-      yield* writeLog(setupLogLines)
-      return yield* Effect.fail(
-        fail(`--pack-setup timed out after ${String(runInput.timeouts.installSeconds)}s`, 'E_PACK_SETUP_TIMEOUT', {
-          durationMs: outcome.durationMs,
-        }),
-      )
-    }
-    if (outcome.exitCode !== 0) {
-      yield* writeLog(setupLogLines)
-      return yield* Effect.fail(
-        fail(`--pack-setup failed (exit ${String(outcome.exitCode)})`, 'E_PACK_SETUP_FAILED', {
+        const home0 = vt?.homes[0] ?? ''
+        const app0 = vt?.apps[0] ?? ''
+        if (home0 === '' || app0 === '') {
+          yield* flushLog()
+          yield* Effect.fail(
+            fail(
+              `missing HOME/app dir for pack setup (variant=${v.name}, pack=${pack.name})`,
+              'E_PACK_SETUP_FAILED',
+              { variant: v.name, pack: pack.name },
+            ),
+          )
+        }
+
+        const pathOverride = input.envVars?.find((e) => e.name === v.name)?.envs[0]?.PATH
+        const outcome = yield* runShellInHome(pack.setup, home0, app0, docker, timeoutMs, pathOverride)
+        yield* appendLog([
+          `[SETUP ${v.name}/${pack.name}] exitCode=${String(outcome.exitCode)} durationMs=${String(outcome.durationMs)} timedOut=${String(outcome.timedOut)}`,
+          outcome.outputTail,
+        ])
+
+        if (outcome.timedOut) {
+          yield* flushLog()
+          yield* Effect.fail(
+            fail(
+              `pack setup timed out after ${String(runInput.timeouts.installSeconds)}s (variant=${v.name}, pack=${pack.name})`,
+              'E_PACK_SETUP_TIMEOUT',
+              { variant: v.name, pack: pack.name, durationMs: outcome.durationMs },
+            ),
+          )
+        }
+        if (outcome.exitCode !== 0) {
+          yield* flushLog()
+          yield* Effect.fail(
+            fail(
+              `pack setup failed (exit ${String(outcome.exitCode)}) (variant=${v.name}, pack=${pack.name})`,
+              'E_PACK_SETUP_FAILED',
+              { variant: v.name, pack: pack.name, exitCode: outcome.exitCode, outputTail: outcome.outputTail },
+            ),
+          )
+        }
+
+        const cmdResult: PackCmdResult = {
+          variant: v.name,
+          pack: pack.name,
+          runIndex: 0,
           exitCode: outcome.exitCode,
+          durationMs: String(outcome.durationMs),
           outputTail: outcome.outputTail,
-        }),
-      )
-    }
+        }
+        yield* Ref.update(setupsRef, (prev) => [...prev, cmdResult])
 
-    const setupResult: PackCmdResult = {
-      side: 'new',
-      runIndex: 0,
-      exitCode: outcome.exitCode,
-      durationMs: String(outcome.durationMs),
-      outputTail: outcome.outputTail,
-    }
-
-    // Every new HOME was already byte-identical before setup ran (phase 04
-    // built each from the same skeleton + auth + pack instructions) — this is
-    // a pure replacement, not a merge, and it is the ONE network hit for the
-    // whole experiment, not one per run.
-    const restHomes = workspace.homeNew.slice(1)
-    yield* Effect.forEach(
-      restHomes,
-      (homeDir) =>
-        Effect.gen(function* () {
+        // Every HOME of this variant was already byte-identical before setup
+        // ran (phase 04 built each from the same skeleton + auth + pack
+        // instructions) — this is a pure replacement, not a merge, and it is
+        // the ONE network hit for this (variant, pack), not one per run.
+        const restHomes = (vt?.homes ?? []).slice(1)
+        for (const homeDir of restHomes) {
           yield* removeDir(homeDir).pipe(
-            Effect.mapError((e: FsError) => fail(`cannot clear ${homeDir} before HOME copy: ${e.path}`, 'E_PACK_SETUP_FAILED', { path: e.path })),
+            Effect.mapError((e: FsError) =>
+              fail(`cannot clear ${homeDir} before HOME copy: ${e.path}`, 'E_PACK_SETUP_FAILED', {
+                path: e.path,
+                variant: v.name,
+                pack: pack.name,
+              }),
+            ),
           )
-          yield* copyDir(homeNew0, homeDir).pipe(
-            Effect.mapError((e: FsError) => fail(`cannot copy setup HOME into ${homeDir}: ${e.path}`, 'E_PACK_SETUP_FAILED', { path: e.path })),
+          yield* copyDir(home0, homeDir).pipe(
+            Effect.mapError((e: FsError) =>
+              fail(`cannot copy setup HOME into ${homeDir}: ${e.path}`, 'E_PACK_SETUP_FAILED', {
+                path: e.path,
+                variant: v.name,
+                pack: pack.name,
+              }),
+            ),
           )
-        }),
-      { concurrency: 1 },
-    )
+          if (docker === undefined) {
+            yield* rewriteLocalPluginPaths(
+              path.join(homeDir, '.config/opencode/opencode.json'),
+              home0,
+              homeDir,
+            )
+          }
+        }
+      }
+    }
 
-    yield* writeLog(setupLogLines)
+    yield* flushLog()
+
+    const allSetups = yield* Ref.get(setupsRef)
+    const packPreps: readonly PackPrep[] = runInput.packs.map((pack) => {
+      const meta = metaByPack.get(pack.name)
+      const mode = meta?.mode ?? 'delivered-only'
+      return {
+        pack: pack.name,
+        mode,
+        setupDeclared: meta?.setupDeclared ?? false,
+        checkDeclared: meta?.checkDeclared ?? false,
+        exerciseDeclared: meta?.exerciseDeclared ?? false,
+        ...(meta?.undeclaredDepWarning === undefined ? {} : { undeclaredDepWarning: meta.undeclaredDepWarning }),
+        setups: allSetups.filter((s) => s.pack === pack.name),
+        checks: [],
+      }
+    })
+
+    const variantPreps: readonly VariantPrep[] = runInput.variants.map((v) => ({
+      variant: v.name,
+      exerciseDeclared: v.exercise !== undefined,
+      exercises: [],
+    }))
 
     return {
-      report: {
-        mode,
-        setupDeclared,
-        checkDeclared,
-        exerciseDeclared,
-        ...(undeclaredDepWarning === undefined ? {} : { undeclaredDepWarning }),
-        setup: setupResult,
-        checks: [],
-        exercises: [],
-      },
+      report: { packs: [...packPreps], variants: [...variantPreps] },
       logPath,
     }
   })

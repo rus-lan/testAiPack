@@ -10,8 +10,11 @@ import type {
   RunInput,
   Manifest,
   WorkspaceTree,
+  VariantTree,
+  VariantSpec,
+  PackSpec,
 } from '@generated/types'
-import type { PackInstallOutcome } from './03-pack-install.js'
+import type { PackInstallOutcome, PackDeliveryExt } from './03-pack-install.js'
 
 vi.mock('../opencode/cli.js', () => ({
   OpencodeError: class extends Error {
@@ -39,6 +42,25 @@ vi.mock('../opencode/cli.js', () => ({
   installPlugin: vi.fn(),
 }))
 
+// TODO(WP15): unmock — 00-cli-parse.ts (WP2) owns the real effectiveOf/packsOf.
+// This fake mirrors the spec'd semantics exactly (00-overview.md D7, 02-phases.md
+// §00) so these tests validate real behavior, not just that the mock was called.
+vi.mock('./00-cli-parse.js', () => ({
+  effectiveOf: (
+    v: Record<string, unknown>,
+    g: string | undefined,
+    key: string,
+  ): string | undefined => {
+    const own = v[key] as string | undefined
+    if (own !== undefined) return own === '' ? undefined : own
+    return g
+  },
+  packsOf: (runInput: RunInput, v: VariantSpec): readonly PackSpec[] =>
+    v.packs
+      .map((name) => runInput.packs.find((p) => p.name === name))
+      .filter((p): p is PackSpec => p !== undefined),
+}))
+
 const { installPlugin } = await import('../opencode/cli.js')
 const installMock = vi.mocked(installPlugin)
 
@@ -53,10 +75,19 @@ const baseTimeouts = {
   watchdogSeconds: 60,
 }
 
-const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
+const makeRunInput = (
+  variants: VariantSpec[],
+  packs: PackSpec[],
+  overrides: Partial<RunInput> = {},
+): RunInput => ({
+  schemaVersion: 2,
   repoUrl: 'https://example.com/repo.git',
   prompt: 'do thing',
   runs: 1,
+  parallel: 2,
+  baseline: variants[0]?.name ?? 'base',
+  packs,
+  variants,
   isolation: 'home',
   auth: {
     opencode: true,
@@ -68,14 +99,11 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
     ssh: false,
     git: false,
   },
-  pureBaseline: true,
-  protectGit: false,
-  allowBaselineTool: false,
-  initSide: 'both',
   preflightEnabled: true,
   formats: ['md'],
   outputPath: '/out',
   diffHtml: false,
+  protectGit: false,
   collapseRepeats: false,
   timelineMode: 'side-by-side',
   timeouts: baseTimeouts,
@@ -84,61 +112,63 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
   ...overrides,
 })
 
-const fakeManifest: Manifest = {
+const fakeManifest = (variants: VariantSpec[], packs: PackSpec[]): Manifest => ({
+  schemaVersion: 2,
   runId: 'rid',
   timestamp: new Date().toISOString(),
   repoUrl: 'https://example.com/repo.git',
   prompt: 'do thing',
   runs: 1,
+  parallel: 2,
+  baseline: variants[0]?.name ?? 'base',
+  packs,
+  variants,
   isolation: 'home',
   opencodeVersion: '1.0.0',
   flagDefaults: {},
-}
+})
 
-interface BuiltWorkspace {
-  readonly workspace: WorkspaceTree
-  readonly root: string
-  readonly homeOld: readonly string[]
-  readonly homeNew: readonly string[]
-}
-
-const buildWorkspace = (runs: number): BuiltWorkspace => {
+const buildWorkspace = (names: readonly string[], runs: number): { workspace: WorkspaceTree; root: string } => {
   const root = makeTempDir()
-  const homeOld: string[] = []
-  const homeNew: string[] = []
-  for (let i = 1; i <= runs; i++) {
-    const s = String(i)
-    homeOld.push(path.join(root, 'home', 'old', `run-${s}`))
-    homeNew.push(path.join(root, 'home', 'new', `run-${s}`))
-  }
+  const variantTrees: VariantTree[] = names.map((name) => {
+    const homes: string[] = []
+    for (let i = 1; i <= runs; i++) homes.push(path.join(root, 'home', name, `run-${String(i)}`))
+    return { name, apps: [], homes, gitDirs: [] }
+  })
   const workspace: WorkspaceTree = {
     root,
     appsSource: path.join(root, 'src'),
-    appsOld: [],
-    appsNew: [],
     pack: path.join(root, 'pack'),
-    homeOld,
-    homeNew,
-    gitDirsOld: [],
-    gitDirsNew: [],
+    variantTrees,
     config: path.join(root, 'config'),
     results: path.join(root, 'results'),
     raw: path.join(root, 'raw'),
     diff: path.join(root, 'diff'),
   }
-  return { workspace, root, homeOld, homeNew }
+  return { workspace, root }
 }
 
+const homesOf = (workspace: WorkspaceTree, name: string): readonly string[] =>
+  workspace.variantTrees.find((t) => t.name === name)?.homes ?? []
+
 const buildInput = (
-  runInputOverrides: Partial<RunInput>,
+  variants: VariantSpec[],
+  packs: PackSpec[],
   packInstall: PackInstallOutcome | undefined,
   runs = 1,
-): HomeIsolationInputExt => ({
-  runInput: makeRunInput(runInputOverrides),
-  manifest: { ...fakeManifest, runs },
-  workspace: buildWorkspace(runs).workspace,
-  ...(packInstall === undefined ? {} : { packInstall }),
-})
+  runInputOverrides: Partial<RunInput> = {},
+): HomeIsolationInputExt => {
+  const { workspace } = buildWorkspace(
+    variants.map((v) => v.name),
+    runs,
+  )
+  return {
+    runInput: makeRunInput(variants, packs, { runs, ...runInputOverrides }),
+    manifest: { ...fakeManifest(variants, packs), runs },
+    workspace,
+    ...(packInstall === undefined ? {} : { packInstall }),
+  }
+}
 
 let savedHome: string | undefined
 const useFakeHome = async (setup?: (home: string) => Promise<void>): Promise<string> => {
@@ -172,37 +202,60 @@ const writePackSkill = async (name = 'myskill'): Promise<string> => {
   return packDir
 }
 
-const skillOutcome = (packDir: string, name = 'myskill'): PackInstallOutcome => ({
+const makeOutcome = (deliveries: PackDeliveryExt[]): PackInstallOutcome => ({
+  deliveries,
+  installLogPath: '/tmp/install.log',
+})
+
+const skillDelivery = (pack: string, packDir: string, name = 'myskill'): PackDeliveryExt => ({
+  pack,
   packPath: packDir,
   detectedType: 'skill',
-  installLogPath: '/tmp/install.log',
   registeredIn: ['skills'],
   instructions: [{ kind: 'skill', name, target: packDir }],
 })
 
-const pluginOutcome = (name = 'myplugin'): PackInstallOutcome => ({
+const pluginDelivery = (pack: string, name = 'myplugin'): PackDeliveryExt => ({
+  pack,
   packPath: '',
   detectedType: 'plugin',
-  installLogPath: '/tmp/install.log',
   registeredIn: ['plugins'],
   instructions: [{ kind: 'plugin', name }],
 })
 
-const localPluginOutcome = (target: string, name = 'myplugin'): PackInstallOutcome => ({
+const localPluginDelivery = (pack: string, target: string, name = 'myplugin'): PackDeliveryExt => ({
+  pack,
   packPath: '',
   detectedType: 'all',
-  installLogPath: '/tmp/install.log',
   registeredIn: ['plugins'],
   instructions: [{ kind: 'plugin', name, target }],
 })
 
-const agentOutcome = (mdPath: string, name = 'build'): PackInstallOutcome => ({
+const agentDelivery = (pack: string, mdPath: string, name = 'deploy'): PackDeliveryExt => ({
+  pack,
   packPath: mdPath,
   detectedType: 'agent',
-  installLogPath: '/tmp/install.log',
   registeredIn: ['agents'],
   instructions: [{ kind: 'file', section: 'agents', name, target: mdPath }],
 })
+
+const mcpDelivery = (pack: string, name: string, json: unknown): PackDeliveryExt => ({
+  pack,
+  packPath: '',
+  detectedType: 'mcp',
+  registeredIn: ['mcp'],
+  instructions: [{ kind: 'config', section: 'mcp', name, json }],
+})
+
+/** Two variants: `smoke` declares no pack (pure by D1 default), `withpack` declares one. */
+const twoVariants = (packName = 'demo-pack'): VariantSpec[] => [
+  { name: 'smoke', packs: [] },
+  { name: 'withpack', packs: [packName] },
+]
+
+const onePack = (name = 'demo-pack', over: Partial<PackSpec> = {}): PackSpec[] => [
+  { name, ref: 'github:owner/demo', ...over },
+]
 
 describe('phase 04 — homeIsolation', () => {
   beforeEach(() => {
@@ -213,26 +266,31 @@ describe('phase 04 — homeIsolation', () => {
     restoreHome()
   })
 
-  it('happy-path skill: N=1 builds both HOMEs, new gets a real copy (not a symlink to the host pack dir), auth copied', async () => {
+  it('happy-path skill: declaring variant gets a real copy (not a symlink), non-declaring variant does not, auth copied', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
     const packDir = await writePackSkill('myskill')
-    const input = buildInput({}, skillOutcome(packDir))
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([skillDelivery('demo-pack', packDir)]))
     const result = await runP(homeIsolation(input))
-    expect(result.homeTrees.old).toHaveLength(1)
-    expect(result.homeTrees.new).toHaveLength(1)
+    expect(result.homeTrees).toHaveLength(2)
     expect(result.envVars).toHaveLength(2)
-    expect(result.envVars[0]).toHaveLength(1)
-    expect(result.envVars[1]).toHaveLength(1)
-    const newHome = input.workspace.homeNew[0]!
-    const destPath = path.join(newHome, '.config', 'opencode', 'skills', 'myskill')
+    for (const vh of result.homeTrees) expect(vh.trees).toHaveLength(1)
+    for (const ve of result.envVars) expect(ve.envs).toHaveLength(1)
+
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
+    const smokeHome = homesOf(input.workspace, 'smoke')[0]!
+    const destPath = path.join(withpackHome, '.config', 'opencode', 'skills', 'myskill')
     expect(await runP(exists(destPath))).toBe(true)
     // A real directory copy, not a symlink: a docker container that only
     // mounts the run HOME (never workspace.pack/) still sees the file.
     expect(await runP(pathKind(destPath))).toBe('dir')
     expect(await runP(readFile(path.join(destPath, 'SKILL.md')))).toBe('# myskill\n')
-    expect(result.homeTrees.new[0]!.copiedAuth).toContain('.local/share/opencode/auth.json')
+    expect(await runP(exists(path.join(smokeHome, '.config', 'opencode', 'skills', 'myskill')))).toBe(false)
+
+    const withpackTree = result.homeTrees.find((t) => t.name === 'withpack')!
+    expect(withpackTree.trees[0]!.copiedAuth).toContain('.local/share/opencode/auth.json')
   })
 
   it('skill instruction whose name escapes the skills dir → E_HOME_SETUP_FAILED, nothing written outside it', async () => {
@@ -240,72 +298,85 @@ describe('phase 04 — homeIsolation', () => {
       await runP(seedOpencodeAuth(h))
     })
     const packDir = await writePackSkill('evil')
-    const input = buildInput({}, skillOutcome(packDir, '../../evil'))
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([skillDelivery('demo-pack', packDir, '../../evil')]))
     const err = await runFlip(homeIsolation(input))
     expect(err.code).toBe('E_HOME_SETUP_FAILED')
-    const newHome = input.workspace.homeNew[0]!
-    expect(await runP(exists(path.join(newHome, '.config', 'opencode', 'skills')))).toBe(true)
-    expect(await runP(exists(path.join(newHome, '.config', 'evil')))).toBe(false)
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
+    expect(await runP(exists(path.join(withpackHome, '.config', 'opencode', 'skills')))).toBe(true)
+    expect(await runP(exists(path.join(withpackHome, '.config', 'evil')))).toBe(false)
   })
 
-  it('smoke-test (no packInstall): no skill install, no plugin install, identical configs', async () => {
+  it('smoke-test (no packInstall, no packs declared anywhere): no skill/plugin install, all variant configs byte-identical', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({}, undefined)
+    const variants: VariantSpec[] = [{ name: 'a', packs: [] }, { name: 'b', packs: [] }]
+    const input = buildInput(variants, [], undefined)
     const result = await runP(homeIsolation(input))
     expect(installMock).not.toHaveBeenCalled()
-    expect(result.generatedConfigs.baseline).toBe(result.generatedConfigs.new)
-    const newHome = input.workspace.homeNew[0]!
-    expect(await runP(exists(path.join(newHome, '.config', 'opencode', 'skills', 'myskill')))).toBe(false)
+    const aCfg = result.generatedConfigs.find((c) => c.name === 'a')!.config
+    const bCfg = result.generatedConfigs.find((c) => c.name === 'b')!.config
+    expect(aCfg).toBe(bCfg)
+    const aHome = homesOf(input.workspace, 'a')[0]!
+    expect(await runP(exists(path.join(aHome, '.config', 'opencode', 'skills', 'myskill')))).toBe(false)
   })
 
-  it('plugin install success → installPlugin called per new run', async () => {
+  it('plugin install success → installPlugin called once, only for the declaring variant', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({}, pluginOutcome('myplugin'))
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([pluginDelivery('demo-pack')]))
     const result = await runP(homeIsolation(input))
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
     expect(installMock).toHaveBeenCalledTimes(1)
-    expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin')
-    expect(result.homeTrees.new[0]).toBeDefined()
+    expect(installMock).toHaveBeenCalledWith(withpackHome, 'myplugin')
+    expect(result.homeTrees.find((t) => t.name === 'withpack')).toBeDefined()
   })
 
-  it('docker isolation threads the docker image into plugin install (M7)', async () => {
+  it('docker isolation threads the docker image into plugin install', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({ isolation: 'docker' }, pluginOutcome('myplugin'))
-    await runP(homeIsolation(input))
-    expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin', {
-      image: DEFAULT_OPENCODE_IMAGE,
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([pluginDelivery('demo-pack')]), 1, {
+      isolation: 'docker',
     })
+    await runP(homeIsolation(input))
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
+    expect(installMock).toHaveBeenCalledWith(withpackHome, 'myplugin', { image: DEFAULT_OPENCODE_IMAGE })
   })
 
   it('docker isolation with a custom --docker-image threads it into plugin install', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
+    const variants = twoVariants()
     const input: HomeIsolationInputExt = {
-      ...buildInput({ isolation: 'docker' }, pluginOutcome('myplugin')),
+      ...buildInput(variants, onePack(), makeOutcome([pluginDelivery('demo-pack')]), 1, { isolation: 'docker' }),
       dockerImage: 'registry.example/oc:dev',
     }
     await runP(homeIsolation(input))
-    expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin', {
-      image: 'registry.example/oc:dev',
-    })
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
+    expect(installMock).toHaveBeenCalledWith(withpackHome, 'myplugin', { image: 'registry.example/oc:dev' })
   })
 
   it('docker isolation with --docker-network threads it into plugin install', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
+    const variants = twoVariants()
     const input: HomeIsolationInputExt = {
-      ...buildInput({ isolation: 'docker', dockerNetwork: 'host' }, pluginOutcome('myplugin')),
+      ...buildInput(variants, onePack(), makeOutcome([pluginDelivery('demo-pack')]), 1, {
+        isolation: 'docker',
+        dockerNetwork: 'host',
+      }),
       dockerImage: 'registry.example/oc:dev',
     }
     await runP(homeIsolation(input))
-    expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin', {
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
+    expect(installMock).toHaveBeenCalledWith(withpackHome, 'myplugin', {
       image: 'registry.example/oc:dev',
       network: 'host',
     })
@@ -315,12 +386,17 @@ describe('phase 04 — homeIsolation', () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({ isolation: 'home', dockerNetwork: 'host' }, pluginOutcome('myplugin'))
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([pluginDelivery('demo-pack')]), 1, {
+      isolation: 'home',
+      dockerNetwork: 'host',
+    })
     await runP(homeIsolation(input))
-    expect(installMock).toHaveBeenCalledWith(input.workspace.homeNew[0], 'myplugin')
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
+    expect(installMock).toHaveBeenCalledWith(withpackHome, 'myplugin')
   })
 
-  it('local plugin file (target set): copied into new HOME plugins/ + registered as a local spec, installPlugin NOT called', async () => {
+  it('local plugin file (target set): copied into declaring variant plugins/ + registered as a local spec, installPlugin NOT called; the other variant never gets the file', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
@@ -328,14 +404,19 @@ describe('phase 04 — homeIsolation', () => {
     await runP(ensureDir(srcDir))
     const srcFile = path.join(srcDir, 'myplugin.js')
     await runP(writeFile(srcFile, 'module.exports = {}'))
-    const input = buildInput({}, localPluginOutcome(srcFile, 'myplugin'))
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([localPluginDelivery('demo-pack', srcFile)]))
     await runP(homeIsolation(input))
-    const dstFile = path.join(input.workspace.homeNew[0]!, '.config/opencode/plugins/myplugin.js')
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
+    const smokeHome = homesOf(input.workspace, 'smoke')[0]!
+    const dstFile = path.join(withpackHome, '.config/opencode/plugins/myplugin.js')
     expect(await runP(exists(dstFile))).toBe(true)
-    const cfgPath = path.join(input.workspace.homeNew[0]!, '.config/opencode/opencode.json')
+    const cfgPath = path.join(withpackHome, '.config/opencode/opencode.json')
     const cfg = JSON.parse(await runP(readFile(cfgPath))) as { plugin?: readonly string[] }
     expect(cfg.plugin).toEqual([dstFile])
     expect(installMock).not.toHaveBeenCalled()
+    const smokeDst = path.join(smokeHome, '.config/opencode/plugins/myplugin.js')
+    expect(await runP(exists(smokeDst))).toBe(false)
   })
 
   it('local plugin file under --isolation docker: registers a container-form path (/home/opencode/...), not the host path our own process wrote to', async () => {
@@ -346,32 +427,18 @@ describe('phase 04 — homeIsolation', () => {
     await runP(ensureDir(srcDir))
     const srcFile = path.join(srcDir, 'myplugin.js')
     await runP(writeFile(srcFile, 'module.exports = {}'))
-    const input = buildInput({ isolation: 'docker' }, localPluginOutcome(srcFile, 'myplugin'))
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([localPluginDelivery('demo-pack', srcFile)]), 1, {
+      isolation: 'docker',
+    })
     await runP(homeIsolation(input))
-    const newHome = input.workspace.homeNew[0]!
-    const dstFile = path.join(newHome, '.config/opencode/plugins/myplugin.js')
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
+    const dstFile = path.join(withpackHome, '.config/opencode/plugins/myplugin.js')
     expect(await runP(exists(dstFile))).toBe(true)
-    const cfgPath = path.join(newHome, '.config/opencode/opencode.json')
+    const cfgPath = path.join(withpackHome, '.config/opencode/opencode.json')
     const cfg = JSON.parse(await runP(readFile(cfgPath))) as { plugin?: readonly string[] }
-    // the registered spec must be reachable from INSIDE the container, where
-    // homeDir is mounted at /home/opencode -- the host path (dstFile) does
-    // not exist there.
     expect(cfg.plugin).toEqual(['/home/opencode/.config/opencode/plugins/myplugin.js'])
     expect(cfg.plugin?.[0]).not.toBe(dstFile)
-  })
-
-  it('local plugin file: old (baseline) side never gets the file or a plugin instruction applied', async () => {
-    await useFakeHome(async (h) => {
-      await runP(seedOpencodeAuth(h))
-    })
-    const srcDir = makeTempDir('testaipack-plugin-src-')
-    await runP(ensureDir(srcDir))
-    const srcFile = path.join(srcDir, 'myplugin.js')
-    await runP(writeFile(srcFile, 'module.exports = {}'))
-    const input = buildInput({}, localPluginOutcome(srcFile, 'myplugin'))
-    await runP(homeIsolation(input))
-    const oldDstFile = path.join(input.workspace.homeOld[0]!, '.config/opencode/plugins/myplugin.js')
-    expect(await runP(exists(oldDstFile))).toBe(false)
   })
 
   it('plugin install timeout → E_PACK_INSTALL_TIMEOUT', async () => {
@@ -379,10 +446,10 @@ describe('phase 04 — homeIsolation', () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput(
-      { timeouts: { ...baseTimeouts, installSeconds: 0.05 } },
-      pluginOutcome('myplugin'),
-    )
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([pluginDelivery('demo-pack')]), 1, {
+      timeouts: { ...baseTimeouts, installSeconds: 0.05 },
+    })
     const err = await runFlip(homeIsolation(input))
     expect(err.code).toBe('E_PACK_INSTALL_TIMEOUT')
     expect(err.phase).toBe('home-isolation')
@@ -404,28 +471,27 @@ describe('phase 04 — homeIsolation', () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({}, pluginOutcome('myplugin'))
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([pluginDelivery('demo-pack')]))
     const err = await runFlip(homeIsolation(input))
     expect(err.code).toBe('E_PACK_INSTALL_FAILED')
   })
 
   it('auth fully missing → E_AUTH_MISSING', async () => {
     await useFakeHome()
-    const input = buildInput(
-      {
-        auth: {
-          opencode: true,
-          npmrc: true,
-          anthropic: true,
-          openai: true,
-          gemini: true,
-          aws: true,
-          ssh: true,
-          git: true,
-        },
+    const variants: VariantSpec[] = [{ name: 'a', packs: [] }]
+    const input = buildInput(variants, [], undefined, 1, {
+      auth: {
+        opencode: true,
+        npmrc: true,
+        anthropic: true,
+        openai: true,
+        gemini: true,
+        aws: true,
+        ssh: true,
+        git: true,
       },
-      undefined,
-    )
+    })
     const err = await runFlip(homeIsolation(input))
     expect(err.code).toBe('E_AUTH_MISSING')
   })
@@ -434,130 +500,253 @@ describe('phase 04 — homeIsolation', () => {
     await useFakeHome(async (h) => {
       await runP(writeFile(path.join(h, '.npmrc'), 'registry=https://registry.npmjs.org\n'))
     })
-    const input = buildInput(
-      {
-        auth: {
-          opencode: false,
-          npmrc: true,
-          anthropic: false,
-          openai: false,
-          gemini: false,
-          aws: false,
-          ssh: false,
-          git: false,
-        },
+    const variants: VariantSpec[] = [{ name: 'a', packs: [] }]
+    const input = buildInput(variants, [], undefined, 1, {
+      auth: {
+        opencode: false,
+        npmrc: true,
+        anthropic: false,
+        openai: false,
+        gemini: false,
+        aws: false,
+        ssh: false,
+        git: false,
       },
-      undefined,
-    )
+    })
     const result = await runP(homeIsolation(input))
-    const copied = result.homeTrees.new[0]!.copiedAuth
+    const copied = result.homeTrees.find((t) => t.name === 'a')!.trees[0]!.copiedAuth
     expect(copied).toEqual(['.npmrc'])
   })
 
-  it('envVars: old has PURE+DISABLE flags, new does not', async () => {
+  it('purity (D1): a no-pack variant is pure by default, a pack-declaring variant is impure by default', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({}, undefined)
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), undefined)
     const result = await runP(homeIsolation(input))
-    const oldEnv = result.envVars[0]![0]!
-    const newEnv = result.envVars[1]![0]!
-    expect(oldEnv.OPENCODE_PURE).toBe(true)
-    expect(oldEnv.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe(true)
-    expect(oldEnv.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe(true)
-    expect(oldEnv.OPENCODE_DISABLE_PROJECT_CONFIG).toBe(true)
-    expect(newEnv.OPENCODE_PURE).toBe(false)
-    expect(newEnv.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe(false)
-    expect(newEnv.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe(false)
-    expect(newEnv.OPENCODE_DISABLE_PROJECT_CONFIG).toBe(true)
-    expect(oldEnv.HOME).toBe(input.workspace.homeOld[0])
-    expect(newEnv.HOME).toBe(input.workspace.homeNew[0])
+    const smokeEnv = result.envVars.find((e) => e.name === 'smoke')!.envs[0]!
+    const withpackEnv = result.envVars.find((e) => e.name === 'withpack')!.envs[0]!
+    expect(smokeEnv.OPENCODE_PURE).toBe(true)
+    expect(smokeEnv.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe(true)
+    expect(smokeEnv.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe(true)
+    expect(smokeEnv.OPENCODE_DISABLE_PROJECT_CONFIG).toBe(true)
+    expect(withpackEnv.OPENCODE_PURE).toBe(false)
+    expect(withpackEnv.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe(false)
+    expect(withpackEnv.OPENCODE_DISABLE_EXTERNAL_SKILLS).toBe(false)
+    expect(withpackEnv.OPENCODE_DISABLE_PROJECT_CONFIG).toBe(true)
+    expect(smokeEnv.HOME).toBe(homesOf(input.workspace, 'smoke')[0])
+    expect(withpackEnv.HOME).toBe(homesOf(input.workspace, 'withpack')[0])
   })
 
-  it('skill pack → baseline and new configs identical (pack lives on the filesystem, not the config)', async () => {
+  it('purity (D1): explicit variant.pure overrides the packs-based default in both directions', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const packDir = await writePackSkill('myskill')
-    const input = buildInput({}, skillOutcome(packDir))
+    const variants: VariantSpec[] = [
+      { name: 'forced-impure', packs: [], pure: false },
+      { name: 'forced-pure', packs: ['demo-pack'], pure: true },
+    ]
+    const input = buildInput(variants, onePack(), makeOutcome([pluginDelivery('demo-pack')]))
     const result = await runP(homeIsolation(input))
-    expect(result.generatedConfigs.baseline).toBe(result.generatedConfigs.new)
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    expect(baselineJson['agent']).toBeDefined()
-    expect(baselineJson['testaipack']).toBeUndefined()
+    expect(result.envVars.find((e) => e.name === 'forced-impure')!.envs[0]!.OPENCODE_PURE).toBe(false)
+    expect(result.envVars.find((e) => e.name === 'forced-pure')!.envs[0]!.OPENCODE_PURE).toBe(true)
   })
 
-  it('propagates the model from the source opencode.json into both configs', async () => {
+  it('N4: a declared pack with no matching delivery (packInstall supplied but missing this pack) fails E_PACK_INSTALL_FAILED naming variant+pack, instead of silently yielding an impure empty HOME', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
-      await runP(ensureDir(path.join(h, '.config', 'opencode')))
-      await runP(
-        writeFile(
-          path.join(h, '.config', 'opencode', 'opencode.json'),
-          '{"model":"zai-coding-plan/glm-5.2"}',
-        ),
-      )
     })
-    const input = buildInput({}, undefined)
-    const result = await runP(homeIsolation(input))
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
-    expect(baselineJson['model']).toBe('zai-coding-plan/glm-5.2')
-    expect(newJson['model']).toBe('zai-coding-plan/glm-5.2')
+    // packInstall ran (deliveries present) but does not contain 'demo-pack' —
+    // a real mismatch, not the "phase 03 never ran" smoke-test case.
+    const variants = twoVariants()
+    const outcome = makeOutcome([pluginDelivery('some-other-pack')])
+    const input = buildInput(variants, onePack(), outcome)
+    const err = await runFlip(homeIsolation(input))
+    expect(err.code).toBe('E_PACK_INSTALL_FAILED')
+    expect(err.context?.['variant']).toBe('withpack')
+    expect(err.context?.['pack']).toBe('demo-pack')
   })
 
-  it('omits model from both configs when the source opencode.json has none', async () => {
+  it('N1: a variant is applied and purity-gated on the FULL declared pack set, not just the first pack (regression guard for Stage 2)', async () => {
+    // Stage 1 caps declaredPacks at length <=1, so this simulates what
+    // packsOf would return once WP16 lifts that guard, proving processVariant
+    // does not special-case index 0.
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({}, undefined)
+    const aSkillDir = await writePackSkill('a-skill')
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-a', 'pack-b'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a' },
+      { name: 'pack-b', ref: 'github:owner/b' },
+    ]
+    const outcome = makeOutcome([
+      skillDelivery('pack-a', aSkillDir, 'a-skill'),
+      pluginDelivery('pack-b', 'b-plugin'),
+    ])
+    const input = buildInput(variants, packs, outcome)
     const result = await runP(homeIsolation(input))
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    expect(baselineJson['model']).toBeUndefined()
+    const multiHome = homesOf(input.workspace, 'multi')[0]!
+    expect(await runP(exists(path.join(multiHome, '.config', 'opencode', 'skills', 'a-skill')))).toBe(true)
+    expect(installMock).toHaveBeenCalledWith(multiHome, 'b-plugin')
+    expect(result.envVars.find((e) => e.name === 'multi')!.envs[0]!.OPENCODE_PURE).toBe(false)
   })
 
-  it('runInput.model overrides the source opencode.json model in both configs', async () => {
+  it('3 variants (smoke, pack-a, pack-b): purity only on the smoke variant, each pack lands only in its own declaring variant HOMEs, per-variant config/<name>.json written, envVars carries names not positions', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
-      await runP(ensureDir(path.join(h, '.config', 'opencode')))
-      await runP(
-        writeFile(
-          path.join(h, '.config', 'opencode', 'opencode.json'),
-          '{"model":"zai-coding-plan/glm-5.2"}',
-        ),
-      )
     })
-    const input = buildInput({ model: 'anthropic/claude-x' }, undefined)
+    const aSkillDir = await writePackSkill('a-skill')
+    const variants: VariantSpec[] = [
+      { name: 'smoke', packs: [] },
+      { name: 'variant-a', packs: ['pack-a'] },
+      { name: 'variant-b', packs: ['pack-b'] },
+    ]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a' },
+      { name: 'pack-b', ref: 'github:owner/b' },
+    ]
+    const outcome = makeOutcome([
+      skillDelivery('pack-a', aSkillDir, 'a-skill'),
+      pluginDelivery('pack-b', 'b-plugin'),
+    ])
+    const input = buildInput(variants, packs, outcome)
     const result = await runP(homeIsolation(input))
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
-    expect(baselineJson['model']).toBe('anthropic/claude-x')
-    expect(newJson['model']).toBe('anthropic/claude-x')
-  })
 
-  it('runInput.model + mcp pack: baseline and new configs still differ only in mcp', async () => {
-    await useFakeHome(async (h) => {
-      await runP(seedOpencodeAuth(h))
-    })
-    const outcome: PackInstallOutcome = {
-      packPath: '',
-      detectedType: 'mcp',
-      installLogPath: '/tmp/install.log',
-      registeredIn: ['mcp'],
-      instructions: [
-        { kind: 'config', section: 'mcp', name: 'myserver', json: { command: 'npx' } },
-      ],
+    expect(result.envVars.find((e) => e.name === 'smoke')!.envs[0]!.OPENCODE_PURE).toBe(true)
+    expect(result.envVars.find((e) => e.name === 'variant-a')!.envs[0]!.OPENCODE_PURE).toBe(false)
+    expect(result.envVars.find((e) => e.name === 'variant-b')!.envs[0]!.OPENCODE_PURE).toBe(false)
+
+    const aHome = homesOf(input.workspace, 'variant-a')[0]!
+    const bHome = homesOf(input.workspace, 'variant-b')[0]!
+    const smokeHome = homesOf(input.workspace, 'smoke')[0]!
+    expect(await runP(exists(path.join(aHome, '.config', 'opencode', 'skills', 'a-skill')))).toBe(true)
+    expect(await runP(exists(path.join(bHome, '.config', 'opencode', 'skills', 'a-skill')))).toBe(false)
+    expect(await runP(exists(path.join(smokeHome, '.config', 'opencode', 'skills', 'a-skill')))).toBe(false)
+    expect(installMock).toHaveBeenCalledTimes(1)
+    expect(installMock).toHaveBeenCalledWith(bHome, 'b-plugin')
+
+    for (const name of ['smoke', 'variant-a', 'variant-b']) {
+      expect(await runP(exists(path.join(input.workspace.config, `${name}.json`)))).toBe(true)
     }
-    const input = buildInput({ model: 'anthropic/claude-x' }, outcome)
+
+    // no positional indexing: shuffled lookup by name still resolves correctly
+    const byName = new Map(result.envVars.map((e) => [e.name, e]))
+    expect(byName.get('variant-b')!.envs[0]!.HOME).toBe(bHome)
+    expect(byName.get('variant-a')!.envs[0]!.HOME).toBe(aHome)
+  })
+
+  it('mcp pack isolation: variant a config carries only pack-a mcp server, variant b only pack-b, smoke has none', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const variants: VariantSpec[] = [
+      { name: 'smoke', packs: [] },
+      { name: 'variant-a', packs: ['pack-a'] },
+      { name: 'variant-b', packs: ['pack-b'] },
+    ]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'mcp:srv-a:{}' },
+      { name: 'pack-b', ref: 'mcp:srv-b:{}' },
+    ]
+    const outcome = makeOutcome([
+      mcpDelivery('pack-a', 'srv-a', { command: 'npx' }),
+      mcpDelivery('pack-b', 'srv-b', { command: 'node' }),
+    ])
+    const input = buildInput(variants, packs, outcome)
     const result = await runP(homeIsolation(input))
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
-    expect(baselineJson['model']).toBe('anthropic/claude-x')
-    expect(newJson['model']).toBe('anthropic/claude-x')
-    expect(baselineJson['mcp']).toBeUndefined()
-    expect(newJson['mcp']).toBeDefined()
-    const { mcp: _newMcp, ...newRest } = newJson
-    expect(newRest).toEqual(baselineJson)
+
+    const cfgFor = (name: string): Record<string, unknown> =>
+      JSON.parse(result.generatedConfigs.find((c) => c.name === name)!.config) as Record<string, unknown>
+
+    expect(cfgFor('smoke')['mcp']).toBeUndefined()
+    const aMcp = cfgFor('variant-a')['mcp'] as Record<string, unknown>
+    expect(aMcp['srv-a']).toBeDefined()
+    expect(aMcp['srv-b']).toBeUndefined()
+    const bMcp = cfgFor('variant-b')['mcp'] as Record<string, unknown>
+    expect(bMcp['srv-b']).toBeDefined()
+    expect(bMcp['srv-a']).toBeUndefined()
+  })
+
+  it('effectiveOf precedence: variant.model > runInput.model > source opencode.json model', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+      await runP(ensureDir(path.join(h, '.config', 'opencode')))
+      await runP(writeFile(path.join(h, '.config', 'opencode', 'opencode.json'), '{"model":"source/model"}'))
+    })
+    const variants: VariantSpec[] = [
+      { name: 'own-model', packs: [], model: 'variant/model' },
+      { name: 'global-model', packs: [] },
+    ]
+    const input = buildInput(variants, [], undefined, 1, { model: 'global/model' })
+    const result = await runP(homeIsolation(input))
+    const ownCfg = JSON.parse(result.generatedConfigs.find((c) => c.name === 'own-model')!.config) as Record<string, unknown>
+    const globalCfg = JSON.parse(result.generatedConfigs.find((c) => c.name === 'global-model')!.config) as Record<string, unknown>
+    expect(ownCfg['model']).toBe('variant/model')
+    expect(globalCfg['model']).toBe('global/model')
+  })
+
+  it('effectiveOf: an explicit empty-string variant.model disables the global, falls through to source connectivity', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+      await runP(ensureDir(path.join(h, '.config', 'opencode')))
+      await runP(writeFile(path.join(h, '.config', 'opencode', 'opencode.json'), '{"model":"source/model"}'))
+    })
+    const variants: VariantSpec[] = [{ name: 'disabled', packs: [], model: '' }]
+    const input = buildInput(variants, [], undefined, 1, { model: 'global/model' })
+    const result = await runP(homeIsolation(input))
+    const cfg = JSON.parse(result.generatedConfigs[0]!.config) as Record<string, unknown>
+    expect(cfg['model']).toBe('source/model')
+  })
+
+  it('PATH symmetry (05-risks.md §2.6, NORMATIVE): any registry pack declaring setup gives EVERY variant .local/bin on PATH, including non-declaring ones', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const variants = twoVariants()
+    const packs = onePack('demo-pack', { setup: 'npm install -g x' })
+    const input = buildInput(variants, packs, undefined)
+    const result = await runP(homeIsolation(input))
+    const smokeEnv = result.envVars.find((e) => e.name === 'smoke')!.envs[0]!
+    const withpackEnv = result.envVars.find((e) => e.name === 'withpack')!.envs[0]!
+    expect(smokeEnv.PATH).toBeDefined()
+    expect(withpackEnv.PATH).toBeDefined()
+    const smokeHome = homesOf(input.workspace, 'smoke')[0]!
+    expect(smokeEnv.PATH).toContain(path.join(smokeHome, '.local', 'bin'))
+    expect(await runP(exists(path.join(smokeHome, '.local', 'bin')))).toBe(true)
+  })
+
+  it('no registry pack declares setup → no PATH override, no .local/bin skeleton dir', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), undefined)
+    const result = await runP(homeIsolation(input))
+    expect(result.envVars.find((e) => e.name === 'smoke')!.envs[0]!.PATH).toBeUndefined()
+    const smokeHome = homesOf(input.workspace, 'smoke')[0]!
+    expect(await runP(exists(path.join(smokeHome, '.local', 'bin')))).toBe(false)
+  })
+
+  it('propagates the model from the source opencode.json into every variant config when no override exists', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+      await runP(ensureDir(path.join(h, '.config', 'opencode')))
+      await runP(
+        writeFile(
+          path.join(h, '.config', 'opencode', 'opencode.json'),
+          '{"model":"zai-coding-plan/glm-5.2"}',
+        ),
+      )
+    })
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), undefined)
+    const result = await runP(homeIsolation(input))
+    for (const name of ['smoke', 'withpack']) {
+      const cfg = JSON.parse(result.generatedConfigs.find((c) => c.name === name)!.config) as Record<string, unknown>
+      expect(cfg['model']).toBe('zai-coding-plan/glm-5.2')
+    }
   })
 
   const OLLAMA_PROVIDER = {
@@ -584,7 +773,7 @@ describe('phase 04 — homeIsolation', () => {
     expect(json['disabled_providers']).toEqual(['openai'])
   }
 
-  it('propagates provider/small_model/enabled_providers/disabled_providers from the source opencode.json into both configs', async () => {
+  it('propagates provider/small_model/enabled_providers/disabled_providers from the source opencode.json into every variant config', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
       await runP(ensureDir(path.join(h, '.config', 'opencode')))
@@ -595,27 +784,12 @@ describe('phase 04 — homeIsolation', () => {
         ),
       )
     })
-    const input = buildInput({}, undefined)
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), undefined)
     const result = await runP(homeIsolation(input))
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
-    expectConnectivityPropagated(baselineJson)
-    expectConnectivityPropagated(newJson)
-  })
-
-  it('omits provider/small_model/enabled_providers/disabled_providers from both configs when the source opencode.json has none (byte-identical to today)', async () => {
-    await useFakeHome(async (h) => {
-      await runP(seedOpencodeAuth(h))
-    })
-    const input = buildInput({}, undefined)
-    const result = await runP(homeIsolation(input))
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
-    for (const json of [baselineJson, newJson]) {
-      expect(json['provider']).toBeUndefined()
-      expect(json['small_model']).toBeUndefined()
-      expect(json['enabled_providers']).toBeUndefined()
-      expect(json['disabled_providers']).toBeUndefined()
+    for (const name of ['smoke', 'withpack']) {
+      const cfg = JSON.parse(result.generatedConfigs.find((c) => c.name === name)!.config) as Record<string, unknown>
+      expectConnectivityPropagated(cfg)
     }
   })
 
@@ -630,64 +804,31 @@ describe('phase 04 — homeIsolation', () => {
         ),
       )
     })
-    const input = buildInput({}, undefined)
+    const variants: VariantSpec[] = [{ name: 'a', packs: [] }]
+    const input = buildInput(variants, [], undefined)
     const result = await runP(homeIsolation(input))
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    expect(baselineJson['enabled_providers']).toBeUndefined()
-    expect(baselineJson['disabled_providers']).toBeUndefined()
-    expect(baselineJson['small_model']).toBeUndefined()
+    const cfg = JSON.parse(result.generatedConfigs[0]!.config) as Record<string, unknown>
+    expect(cfg['enabled_providers']).toBeUndefined()
+    expect(cfg['disabled_providers']).toBeUndefined()
+    expect(cfg['small_model']).toBeUndefined()
   })
 
-  it('custom provider/small_model/enabled_providers/disabled_providers + mcp pack: baseline and new configs still differ only in mcp', async () => {
-    await useFakeHome(async (h) => {
-      await runP(seedOpencodeAuth(h))
-      await runP(ensureDir(path.join(h, '.config', 'opencode')))
-      await runP(
-        writeFile(
-          path.join(h, '.config', 'opencode', 'opencode.json'),
-          JSON.stringify(SOURCE_CONNECTIVITY_CONFIG),
-        ),
-      )
-    })
-    const outcome: PackInstallOutcome = {
-      packPath: '',
-      detectedType: 'mcp',
-      installLogPath: '/tmp/install.log',
-      registeredIn: ['mcp'],
-      instructions: [
-        { kind: 'config', section: 'mcp', name: 'myserver', json: { command: 'npx' } },
-      ],
-    }
-    const input = buildInput({}, outcome)
-    const result = await runP(homeIsolation(input))
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
-    expectConnectivityPropagated(baselineJson)
-    expectConnectivityPropagated(newJson)
-    expect(baselineJson['mcp']).toBeUndefined()
-    expect(newJson['mcp']).toBeDefined()
-    const { mcp: _newMcp, ...newRest } = newJson
-    expect(newRest).toEqual(baselineJson)
-  })
-
-  it('writes config/baseline.json and config/new.json to disk', async () => {
+  it('writes config/<name>.json to disk for every variant', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
     const packDir = await writePackSkill('myskill')
-    const input = buildInput({}, skillOutcome(packDir))
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([skillDelivery('demo-pack', packDir)]))
     const result = await runP(homeIsolation(input))
-    const baselinePath = path.join(input.workspace.config, 'baseline.json')
-    const newPath = path.join(input.workspace.config, 'new.json')
-    expect(await runP(exists(baselinePath))).toBe(true)
-    expect(await runP(exists(newPath))).toBe(true)
-    const baselineOnDisk = JSON.parse(await runP(readFile(baselinePath))) as Record<string, unknown>
-    const newOnDisk = JSON.parse(await runP(readFile(newPath))) as Record<string, unknown>
-    expect(baselineOnDisk).toEqual(JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>)
-    expect(newOnDisk).toEqual(JSON.parse(result.generatedConfigs.new) as Record<string, unknown>)
-    expect(baselineOnDisk['testaipack']).toBeUndefined()
-    expect(newOnDisk['testaipack']).toBeUndefined()
-    expect(newOnDisk['agent']).toBeDefined()
+    for (const name of ['smoke', 'withpack']) {
+      const p = path.join(input.workspace.config, `${name}.json`)
+      expect(await runP(exists(p))).toBe(true)
+      const onDisk = JSON.parse(await runP(readFile(p))) as Record<string, unknown>
+      const inMemory = JSON.parse(result.generatedConfigs.find((c) => c.name === name)!.config) as Record<string, unknown>
+      expect(onDisk).toEqual(inMemory)
+      expect(onDisk['testaipack']).toBeUndefined()
+    }
   })
 
   it('redacts a provider apiKey on disk, but the in-memory generatedConfigs (fed to OPENCODE_CONFIG_CONTENT) keeps the real value', async () => {
@@ -705,90 +846,73 @@ describe('phase 04 — homeIsolation', () => {
         ),
       )
     })
-    const input = buildInput({}, undefined)
+    const variants: VariantSpec[] = [{ name: 'a', packs: [] }]
+    const input = buildInput(variants, [], undefined)
     const result = await runP(homeIsolation(input))
 
-    // execution path: unredacted, real credential
-    const baselineCfg = JSON.parse(result.generatedConfigs.baseline) as { provider: { anthropic: { options: { apiKey: string } } } }
-    expect(baselineCfg.provider.anthropic.options.apiKey).toBe('sk-ant-REAL-SECRET')
+    const cfg = JSON.parse(result.generatedConfigs[0]!.config) as {
+      provider: { anthropic: { options: { apiKey: string } } }
+    }
+    expect(cfg.provider.anthropic.options.apiKey).toBe('sk-ant-REAL-SECRET')
 
-    // disk artifact: redacted
-    const baselinePath = path.join(input.workspace.config, 'baseline.json')
-    const onDiskText = await runP(readFile(baselinePath))
+    const onDiskPath = path.join(input.workspace.config, 'a.json')
+    const onDiskText = await runP(readFile(onDiskPath))
     expect(onDiskText).not.toContain('sk-ant-REAL-SECRET')
     const onDisk = JSON.parse(onDiskText) as { provider: { anthropic: { npm: string; options: { apiKey: string } } } }
     expect(onDisk.provider.anthropic.options.apiKey).toBe('[REDACTED]')
     expect(onDisk.provider.anthropic.npm).toBe('@ai-sdk/anthropic')
   })
 
-  it('redacts an mcp server env secret on disk, keeps it real in generatedConfigs.new', async () => {
+  it('redacts an mcp server env secret on disk, keeps it real in generatedConfigs for the declaring variant', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const outcome: PackInstallOutcome = {
-      packPath: '',
-      detectedType: 'mcp',
-      installLogPath: '/tmp/install.log',
-      registeredIn: ['mcp'],
-      instructions: [
-        {
-          kind: 'config',
-          section: 'mcp',
-          name: 'myserver',
-          json: { command: 'npx', args: ['-y', 'myserver'], env: { API_TOKEN: 'sk-mcp-REAL-SECRET' } },
-        },
-      ],
-    }
-    const input = buildInput({}, outcome)
+    const variants = twoVariants()
+    const outcome = makeOutcome([
+      mcpDelivery('demo-pack', 'myserver', {
+        command: 'npx',
+        args: ['-y', 'myserver'],
+        env: { API_TOKEN: 'sk-mcp-REAL-SECRET' },
+      }),
+    ])
+    const input = buildInput(variants, onePack(), outcome)
     const result = await runP(homeIsolation(input))
 
-    const newCfg = JSON.parse(result.generatedConfigs.new) as {
+    const cfg = JSON.parse(result.generatedConfigs.find((c) => c.name === 'withpack')!.config) as {
       mcp: { myserver: { env: { API_TOKEN: string } } }
     }
-    expect(newCfg.mcp.myserver.env.API_TOKEN).toBe('sk-mcp-REAL-SECRET')
+    expect(cfg.mcp.myserver.env.API_TOKEN).toBe('sk-mcp-REAL-SECRET')
 
-    const newPath = path.join(input.workspace.config, 'new.json')
-    const onDiskText = await runP(readFile(newPath))
+    const onDiskPath = path.join(input.workspace.config, 'withpack.json')
+    const onDiskText = await runP(readFile(onDiskPath))
     expect(onDiskText).not.toContain('sk-mcp-REAL-SECRET')
     const onDisk = JSON.parse(onDiskText) as { mcp: { myserver: { env: { API_TOKEN: string } } } }
     expect(onDisk.mcp.myserver.env.API_TOKEN).toBe('[REDACTED]')
   })
 
-  it('re-verify: a bare <VENDOR>_KEY and a URL with embedded userinfo stay real in generatedConfigs.new (the OPENCODE_CONFIG_CONTENT source), redacted only on disk', async () => {
+  it('re-verify: a bare <VENDOR>_KEY and a URL with embedded userinfo stay real in generatedConfigs (the OPENCODE_CONFIG_CONTENT source), redacted only on disk', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const outcome: PackInstallOutcome = {
-      packPath: '',
-      detectedType: 'mcp',
-      installLogPath: '/tmp/install.log',
-      registeredIn: ['mcp'],
-      instructions: [
-        {
-          kind: 'config',
-          section: 'mcp',
-          name: 'myserver',
-          json: {
-            command: 'npx',
-            env: { GEMINI_KEY: 'sk-gemini-REAL-SECRET' },
-            url: 'https://svcuser:svcpass@remote.example/sse',
-          },
-        },
-      ],
-    }
-    const input = buildInput({}, outcome)
+    const variants = twoVariants()
+    const outcome = makeOutcome([
+      mcpDelivery('demo-pack', 'myserver', {
+        command: 'npx',
+        env: { GEMINI_KEY: 'sk-gemini-REAL-SECRET' },
+        url: 'https://svcuser:svcpass@remote.example/sse',
+      }),
+    ])
+    const input = buildInput(variants, onePack(), outcome)
     const result = await runP(homeIsolation(input))
 
-    // runtime path: real values, exactly what OPENCODE_CONFIG_CONTENT carries
-    const newCfg = JSON.parse(result.generatedConfigs.new) as {
+    const cfg = JSON.parse(result.generatedConfigs.find((c) => c.name === 'withpack')!.config) as {
       mcp: { myserver: { env: { GEMINI_KEY: string }; url: string } }
     }
-    expect(newCfg.mcp.myserver.env.GEMINI_KEY).toBe('sk-gemini-REAL-SECRET')
-    expect(newCfg.mcp.myserver.url).toBe('https://svcuser:svcpass@remote.example/sse')
+    expect(cfg.mcp.myserver.env.GEMINI_KEY).toBe('sk-gemini-REAL-SECRET')
+    expect(cfg.mcp.myserver.url).toBe('https://svcuser:svcpass@remote.example/sse')
 
-    // disk artifact: both shapes redacted
-    const newPath = path.join(input.workspace.config, 'new.json')
-    const onDiskText = await runP(readFile(newPath))
+    const onDiskPath = path.join(input.workspace.config, 'withpack.json')
+    const onDiskText = await runP(readFile(onDiskPath))
     expect(onDiskText).not.toContain('sk-gemini-REAL-SECRET')
     expect(onDiskText).not.toContain('svcuser:svcpass')
     const onDisk = JSON.parse(onDiskText) as {
@@ -798,37 +922,21 @@ describe('phase 04 — homeIsolation', () => {
     expect(onDisk.mcp.myserver.url).toBe('https://remote.example/sse')
   })
 
-  it('smoke-test writes identical baseline.json and new.json (no pack metadata)', async () => {
+  it('N=3 → three home trees per variant, three env sets per variant', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({}, undefined)
-    await runP(homeIsolation(input))
-    const baselinePath = path.join(input.workspace.config, 'baseline.json')
-    const newPath = path.join(input.workspace.config, 'new.json')
-    const baselineOnDisk = JSON.parse(await runP(readFile(baselinePath))) as Record<string, unknown>
-    const newOnDisk = JSON.parse(await runP(readFile(newPath))) as Record<string, unknown>
-    expect(baselineOnDisk['testaipack']).toBeUndefined()
-    expect(newOnDisk['testaipack']).toBeUndefined()
-    expect(baselineOnDisk).toEqual(newOnDisk)
-  })
-
-  it('N=3 → three homeTrees per side, three envVars per side', async () => {
-    await useFakeHome(async (h) => {
-      await runP(seedOpencodeAuth(h))
-    })
-    const input = buildInput({ runs: 3 }, undefined, 3)
+    const variants: VariantSpec[] = [{ name: 'a', packs: [] }]
+    const input = buildInput(variants, [], undefined, 3, { runs: 3 })
     const result = await runP(homeIsolation(input))
-    expect(result.homeTrees.old).toHaveLength(3)
-    expect(result.homeTrees.new).toHaveLength(3)
-    expect(result.envVars[0]).toHaveLength(3)
-    expect(result.envVars[1]).toHaveLength(3)
-    for (const t of result.homeTrees.old) {
-      expect(t.structure.length).toBeGreaterThan(0)
-    }
+    const aTrees = result.homeTrees.find((t) => t.name === 'a')!.trees
+    const aEnvs = result.envVars.find((e) => e.name === 'a')!.envs
+    expect(aTrees).toHaveLength(3)
+    expect(aEnvs).toHaveLength(3)
+    for (const t of aTrees) expect(t.structure.length).toBeGreaterThan(0)
   })
 
-  it('agent file instruction → .md copied into agents/ on new side only', async () => {
+  it('agent file instruction → .md copied into agents/ on the declaring variant only', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
@@ -836,29 +944,17 @@ describe('phase 04 — homeIsolation', () => {
     await runP(ensureDir(mdSrc))
     const mdPath = path.join(mdSrc, 'deploy.md')
     await runP(writeFile(mdPath, '# deploy agent\n'))
-    const input = buildInput({}, agentOutcome(mdPath, 'deploy'))
-    const result = await runP(homeIsolation(input))
-    const newAgentsFile = path.join(
-      input.workspace.homeNew[0]!,
-      '.config',
-      'opencode',
-      'agents',
-      'deploy.md',
-    )
-    const oldAgentsFile = path.join(
-      input.workspace.homeOld[0]!,
-      '.config',
-      'opencode',
-      'agents',
-      'deploy.md',
-    )
-    expect(await runP(exists(newAgentsFile))).toBe(true)
-    expect(await runP(exists(oldAgentsFile))).toBe(false)
-    expect(await runP(readFile(newAgentsFile))).toBe('# deploy agent\n')
-    void result
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), makeOutcome([agentDelivery('demo-pack', mdPath, 'deploy')]))
+    await runP(homeIsolation(input))
+    const withpackAgents = path.join(homesOf(input.workspace, 'withpack')[0]!, '.config', 'opencode', 'agents', 'deploy.md')
+    const smokeAgents = path.join(homesOf(input.workspace, 'smoke')[0]!, '.config', 'opencode', 'agents', 'deploy.md')
+    expect(await runP(exists(withpackAgents))).toBe(true)
+    expect(await runP(exists(smokeAgents))).toBe(false)
+    expect(await runP(readFile(withpackAgents))).toBe('# deploy agent\n')
   })
 
-  it('command file instruction → .md copied into command/ (singular dir) on new side', async () => {
+  it('command file instruction → .md copied into command/ (singular dir) on the declaring variant', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
@@ -866,94 +962,27 @@ describe('phase 04 — homeIsolation', () => {
     await runP(ensureDir(mdSrc))
     const mdPath = path.join(mdSrc, 'run.md')
     await runP(writeFile(mdPath, '# run command\n'))
-    const outcome: PackInstallOutcome = {
-      packPath: mdPath,
-      detectedType: 'command',
-      installLogPath: '/tmp/install.log',
-      registeredIn: ['commands'],
-      instructions: [{ kind: 'file', section: 'commands', name: 'run', target: mdPath }],
-    }
-    const input = buildInput({}, outcome)
+    const variants = twoVariants()
+    const outcome = makeOutcome([
+      { pack: 'demo-pack', packPath: mdPath, detectedType: 'command', registeredIn: ['commands'], instructions: [{ kind: 'file', section: 'commands', name: 'run', target: mdPath }] },
+    ])
+    const input = buildInput(variants, onePack(), outcome)
     await runP(homeIsolation(input))
-    const newCmdFile = path.join(
-      input.workspace.homeNew[0]!,
-      '.config',
-      'opencode',
-      'command',
-      'run.md',
-    )
-    const oldCmdFile = path.join(
-      input.workspace.homeOld[0]!,
-      '.config',
-      'opencode',
-      'command',
-      'run.md',
-    )
-    expect(await runP(exists(newCmdFile))).toBe(true)
-    expect(await runP(exists(oldCmdFile))).toBe(false)
-  })
-
-  it('mcp config instruction → writes mcp.<name> into opencode.json on new side', async () => {
-    await useFakeHome(async (h) => {
-      await runP(seedOpencodeAuth(h))
-    })
-    const outcome: PackInstallOutcome = {
-      packPath: '',
-      detectedType: 'mcp',
-      installLogPath: '/tmp/install.log',
-      registeredIn: ['mcp'],
-      instructions: [
-        {
-          kind: 'config',
-          section: 'mcp',
-          name: 'myserver',
-          json: { command: 'npx', args: ['-y', 'myserver'] },
-        },
-      ],
-    }
-    const input = buildInput({}, outcome)
-    const result = await runP(homeIsolation(input))
-    const newCfgPath = path.join(
-      input.workspace.homeNew[0]!,
-      '.config',
-      'opencode',
-      'opencode.json',
-    )
-    const oldCfgPath = path.join(
-      input.workspace.homeOld[0]!,
-      '.config',
-      'opencode',
-      'opencode.json',
-    )
-    expect(await runP(exists(newCfgPath))).toBe(true)
-    const newCfg = JSON.parse(await runP(readFile(newCfgPath))) as Record<string, unknown>
-    const mcp = newCfg['mcp'] as Record<string, unknown>
-    expect(mcp).toBeDefined()
-    expect(mcp['myserver']).toEqual({ command: 'npx', args: ['-y', 'myserver'] })
-    expect(await runP(exists(oldCfgPath))).toBe(false)
-    const newJson = JSON.parse(result.generatedConfigs.new) as Record<string, unknown>
-    expect((newJson['mcp'] as Record<string, unknown>)['myserver']).toBeDefined()
-    const baselineJson = JSON.parse(result.generatedConfigs.baseline) as Record<string, unknown>
-    expect(baselineJson['mcp']).toBeUndefined()
+    const withpackCmd = path.join(homesOf(input.workspace, 'withpack')[0]!, '.config', 'opencode', 'command', 'run.md')
+    const smokeCmd = path.join(homesOf(input.workspace, 'smoke')[0]!, '.config', 'opencode', 'command', 'run.md')
+    expect(await runP(exists(withpackCmd))).toBe(true)
+    expect(await runP(exists(smokeCmd))).toBe(false)
   })
 
   it('mcp config extends an existing opencode.json instead of overwriting', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const outcome: PackInstallOutcome = {
-      packPath: '',
-      detectedType: 'mcp',
-      installLogPath: '/tmp/install.log',
-      registeredIn: ['mcp'],
-      instructions: [
-        { kind: 'config', section: 'mcp', name: 'srv2', json: { command: 'node' } },
-      ],
-    }
-    const input = buildInput({}, outcome)
-    // pre-place an existing opencode.json with a prior mcp server on the new side
-    const newHome = input.workspace.homeNew[0]!
-    const cfgDir = path.join(newHome, '.config', 'opencode')
+    const variants = twoVariants()
+    const outcome = makeOutcome([mcpDelivery('demo-pack', 'srv2', { command: 'node' })])
+    const input = buildInput(variants, onePack(), outcome)
+    const withpackHome = homesOf(input.workspace, 'withpack')[0]!
+    const cfgDir = path.join(withpackHome, '.config', 'opencode')
     await runP(ensureDir(cfgDir))
     const preExisting = { otherKey: 1, mcp: { srv1: { command: 'a' } } }
     await runP(writeFile(path.join(cfgDir, 'opencode.json'), JSON.stringify(preExisting)))
@@ -965,24 +994,25 @@ describe('phase 04 — homeIsolation', () => {
     expect(mcp['srv2']).toEqual({ command: 'node' })
   })
 
-  it('docker isolation (v0.3) builds HOMEs and records isolation/dockerImage', async () => {
+  it('docker isolation builds HOMEs and records isolation/dockerImage', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({ isolation: 'docker' }, undefined)
+    const variants: VariantSpec[] = [{ name: 'a', packs: [] }]
+    const input = buildInput(variants, [], undefined, 1, { isolation: 'docker' })
     const result = await runP(homeIsolation(input))
     expect(result.isolation).toBe('docker')
     expect(result.dockerImage).toBe(DEFAULT_OPENCODE_IMAGE)
-    expect(result.homeTrees.old).toHaveLength(1)
-    expect(result.homeTrees.new).toHaveLength(1)
+    expect(result.homeTrees).toHaveLength(1)
   })
 
   it('docker isolation honours a custom --docker-image override', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
+    const variants: VariantSpec[] = [{ name: 'a', packs: [] }]
     const input: HomeIsolationInputExt = {
-      ...buildInput({ isolation: 'docker' }, undefined),
+      ...buildInput(variants, [], undefined, 1, { isolation: 'docker' }),
       dockerImage: 'registry.example/oc:dev',
     }
     const result = await runP(homeIsolation(input))
@@ -993,33 +1023,23 @@ describe('phase 04 — homeIsolation', () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({ isolation: 'home' }, undefined)
+    const variants: VariantSpec[] = [{ name: 'a', packs: [] }]
+    const input = buildInput(variants, [], undefined, 1, { isolation: 'home' })
     const result = await runP(homeIsolation(input))
     expect(result.isolation).toBe('home')
     expect(result.dockerImage).toBeUndefined()
   })
 
-  it('build.md written into every HOME (for preflight gate 3)', async () => {
+  it('build.md written into every variant HOME (for preflight gate 3)', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))
     })
-    const input = buildInput({}, undefined)
+    const variants = twoVariants()
+    const input = buildInput(variants, onePack(), undefined)
     await runP(homeIsolation(input))
-    const oldBuild = path.join(
-      input.workspace.homeOld[0]!,
-      '.config',
-      'opencode',
-      'agents',
-      'build.md',
-    )
-    const newBuild = path.join(
-      input.workspace.homeNew[0]!,
-      '.config',
-      'opencode',
-      'agents',
-      'build.md',
-    )
-    expect(await runP(exists(oldBuild))).toBe(true)
-    expect(await runP(exists(newBuild))).toBe(true)
+    for (const name of ['smoke', 'withpack']) {
+      const build = path.join(homesOf(input.workspace, name)[0]!, '.config', 'opencode', 'agents', 'build.md')
+      expect(await runP(exists(build))).toBe(true)
+    }
   })
 })
