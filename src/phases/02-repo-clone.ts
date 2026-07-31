@@ -169,14 +169,14 @@ export const repoClone = (
 
     yield* checkDeterminism(sourcePath, allPairs, runInput.protectGit, safeRepoUrl)
 
-    const copyPaths: VariantCopyPaths[] = workspace.variantTrees.map((vt) => ({
+    const copyPaths: readonly VariantCopyPaths[] = workspace.variantTrees.map((vt) => ({
       name: vt.name,
       paths: [...vt.apps],
     }))
 
     return {
       sourcePath,
-      copyPaths,
+      copyPaths: [...copyPaths],
       cloneDurationMs,
     }
   })

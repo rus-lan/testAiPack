@@ -129,7 +129,7 @@ export const buildTreePaths = (
   const runPaths = (base: string) => range(runs).map((n) => path.join(base, `run-${n.toString()}`))
   const appsDirName = (name: string) => (schemaVersion === 1 ? `${name}Version` : name)
 
-  const variantTrees: VariantTree[] = variants.map((name) => ({
+  const variantTrees: readonly VariantTree[] = variants.map((name) => ({
     name,
     apps: runPaths(path.join(rootPath, 'apps', appsDirName(name))),
     homes: runPaths(path.join(rootPath, 'home', name)),
@@ -140,7 +140,7 @@ export const buildTreePaths = (
     root: rootPath,
     appsSource,
     pack,
-    variantTrees,
+    variantTrees: [...variantTrees],
     config,
     results,
     raw,
