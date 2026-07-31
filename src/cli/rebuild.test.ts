@@ -15,9 +15,10 @@ vi.mock('../phases/09-judge.js', () => ({ judge: vi.fn() }))
 import { executeRebuild, injectAfterBodyTag } from './rebuild.js'
 import type { RebuildFlags } from './rebuild.js'
 import { judge } from '../phases/09-judge.js'
+import { renderMd } from '../report/md.js'
 import { PhaseError } from '../errors.js'
 import { reportSchema, runInputSchema } from '@generated/schemas'
-import type { Manifest, RunInput, WorkspaceTree } from '@generated/types'
+import type { Manifest, Report, RunInput, WorkspaceTree } from '@generated/types'
 
 const judgeMock = vi.mocked(judge)
 
@@ -373,8 +374,26 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
+
+    // Derive the title/summary anchors from the actual renderer (report.json
+    // is the pristine, unpatched Report reportRender rendered from) instead
+    // of hardcoding md.ts's current wording — a future re-wording of either
+    // heading then fails this assertion loudly instead of the code silently
+    // prepending the disclosure to the top of the file.
+    const report = JSON.parse(await runP(readFile(path.join(tree.results, 'report.json')))) as Report
+    const pristineLines = renderMd(report).split('\n')
+    const titleLine = pristineLines[0] ?? ''
+    const summaryHeadingLine = pristineLines.find((l) => l.startsWith('## ')) ?? ''
+    expect(titleLine).not.toBe('')
+    expect(summaryHeadingLine).not.toBe('')
+
     expect(md).toContain('## Rebuild provenance')
-    expect(md.indexOf('## Rebuild provenance')).toBeLessThan(md.indexOf('## Summary'))
+    const titleIndex = md.indexOf(titleLine)
+    const provenanceIndex = md.indexOf('## Rebuild provenance')
+    const summaryIndex = md.indexOf(summaryHeadingLine)
+    expect(titleIndex).toBeGreaterThanOrEqual(0)
+    expect(provenanceIndex).toBeGreaterThan(titleIndex)
+    expect(summaryIndex).toBeGreaterThan(provenanceIndex)
   })
 })
 

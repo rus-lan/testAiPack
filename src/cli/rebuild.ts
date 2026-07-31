@@ -650,9 +650,9 @@ const SOURCE_LABEL: Record<ProvenanceSource, string> = {
 
 /**
  * A proper `##`-level section (not a top-of-file blockquote) so it reads as
- * one clearly delimited part of the report, spliced in before `## Summary`
- * by `applyDisclosure` — see the note there on why this lives outside
- * `src/report/*`.
+ * one clearly delimited part of the report, spliced in before the summary
+ * heading by `applyDisclosure` — see the note there on why this lives
+ * outside `src/report/*`.
  */
 const renderProvenanceMd = (p: RebuildProvenance): string => {
   const header =
@@ -696,9 +696,9 @@ const renderProvenanceHtml = (p: RebuildProvenance): string => {
   return `<section class="rebuild-provenance"><h2>Rebuild provenance</h2><p>${escapeHtml(header)}</p><ul>${fieldItems}<li><strong>judge</strong>: ${escapeHtml(p.judge.note)}</li><li><strong>pack setup</strong>: ${escapeHtml(p.packSetup.note)}</li>${pricingItem}</ul></section>`
 }
 
-const JUDGE_NOT_REQUESTED_MD = '_Judge was not requested (--judge not set)_'
-const JUDGE_NOT_REQUESTED_HTML = '<em>Judge was not requested.</em>'
-const MD_SUMMARY_HEADING = '## Summary'
+const JUDGE_NOT_REQUESTED_MD = '_Судья не запрошен (--judge не задан)_'
+const JUDGE_NOT_REQUESTED_HTML = '<em>Судья не запрошен (--judge не задан)</em>'
+const MD_SUMMARY_HEADING = '## Сводка'
 const OUTCOME_UNRECOVERABLE_NOTE = ' — outcome unrecoverable, see Rebuild provenance (this is NOT a confirmed failure)'
 
 const patchOnce = (content: string, marker: string, replacement: string): string =>
@@ -754,9 +754,9 @@ export const injectAfterBodyTag = (html: string, injection: string): string => {
  * requested-but-missing or genuinely unknown judge state that line would
  * misrepresent the run. Patched here (string substitution on the rendered
  * output) rather than in the renderer, to keep this change out of
- * `src/report/*`. The provenance section itself is spliced in before
- * `## Summary` (a proper, clearly delimited section) rather than prepended
- * ahead of the report title.
+ * `src/report/*`. The provenance section itself is spliced in before the
+ * summary heading (a proper, clearly delimited section) rather than
+ * prepended ahead of the report title.
  */
 const applyDisclosure = (
   mdContent: string,
