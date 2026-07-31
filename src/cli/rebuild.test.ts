@@ -3,7 +3,7 @@ import { Effect } from 'effect'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { makeTempDir } from '../../tests/setup.js'
-import { ensureDir, copyDir, moveDir, writeFile, writeJson, readFile } from '../util/fs.js'
+import { ensureDir, copyDir, copyFile, moveDir, writeFile, writeJson, readFile } from '../util/fs.js'
 import { init, addAll, commit } from '../util/git.js'
 import { buildTreePaths } from '../phases/01-workspace-setup.js'
 
@@ -861,17 +861,52 @@ describe('rebuild — refusals', () => {
 // v1 compat — the checked-in mini v1 workspace fixture
 // (tests/fixtures/v1-workspace/**). Real pre-n-way-variants layout: no
 // run-input.json (exercises the recovered path), manifest.json without
-// schemaVersion, raw/old + raw/new, apps/oldVersion + apps/newVersion (real
-// tiny git worktrees).
+// schemaVersion, raw/old + raw/new.
+//
+// The two worktrees (apps/oldVersion/run-1, apps/newVersion/run-1) are NOT
+// checked in as pre-built git repos — a nested .git dir stages as a gitlink
+// (mode 160000), which git clone leaves empty, so the fixture would pass
+// here and fail (or pass vacuously) on any fresh clone/CI. Instead only the
+// plain seed text (tests/fixtures/v1-workspace/worktree-seed/{base,new-
+// edit}/a.txt) is checked in, and this test builds the real git repos at
+// setup time — same technique this file's own `buildRepo` already uses, and
+// the same one WP3's 02-repo-clone tests use for their source repo.
 // ---------------------------------------------------------------------------
 
 const V1_FIXTURE_ROOT = path.resolve(import.meta.dirname, '../../tests/fixtures/v1-workspace')
+
+/** Builds a real, tiny git repo at `dir` seeded from `worktree-seed/<seedName>/a.txt`, matching `buildRepo` above but from fixture content instead of a hardcoded literal. */
+const buildFixtureWorktree = async (dir: string, seedName: 'base' | 'new-edit'): Promise<void> => {
+  const seedText = await runP(readFile(path.join(V1_FIXTURE_ROOT, 'worktree-seed', seedName, 'a.txt')))
+  await runP(ensureDir(dir))
+  await runP(init(dir))
+  await runP(writeFile(path.join(dir, 'a.txt'), seedText))
+  await runP(addAll(dir))
+  await runP(commit(dir, 'init'))
+}
 
 describe('rebuild — v1 workspace fixture (report --rebuild on a pre-n-way-variants run)', () => {
   it('rebuilds successfully; report.json is v2 (schemaVersion 2); provenance discloses migratedFromV1', async () => {
     const parentDir = makeTempDir()
     const runDir = path.join(parentDir, 'v1-run')
-    await runP(copyDir(V1_FIXTURE_ROOT, runDir))
+    await runP(ensureDir(runDir))
+    await runP(copyFile(path.join(V1_FIXTURE_ROOT, 'manifest.json'), path.join(runDir, 'manifest.json')))
+    await runP(copyDir(path.join(V1_FIXTURE_ROOT, 'config'), path.join(runDir, 'config')))
+    await runP(copyDir(path.join(V1_FIXTURE_ROOT, 'results'), path.join(runDir, 'results')))
+
+    // diff()'s resolveSourceHead reads apps/source's HEAD (protectGit=false
+    // path) — needs to be a real repo too, not just the two run worktrees.
+    // Both worktrees start identical to the seed (the "old" side never
+    // changes, matching the checked-in fixture's original intent); the
+    // "new" side then gets an UNCOMMITTED edit (diff() stages + diffs
+    // against HEAD, so a committed edit would hide the change).
+    await buildFixtureWorktree(path.join(runDir, 'apps', 'source'), 'base')
+    await buildFixtureWorktree(path.join(runDir, 'apps', 'oldVersion', 'run-1'), 'base')
+    await buildFixtureWorktree(path.join(runDir, 'apps', 'newVersion', 'run-1'), 'base')
+    const editedText = await runP(
+      readFile(path.join(V1_FIXTURE_ROOT, 'worktree-seed', 'new-edit', 'a.txt')),
+    )
+    await runP(writeFile(path.join(runDir, 'apps', 'newVersion', 'run-1', 'a.txt'), editedText))
 
     const code = await executeRebuild(baseFlags(parentDir))
     expect(code).toBe(0)

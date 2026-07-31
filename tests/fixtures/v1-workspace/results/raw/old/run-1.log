@@ -1,0 +1,6 @@
+[START] side=old runIndex=1 sessionId=sess-old-1
+[PROMPT] running --prompt
+[PROMPT_DONE] exitCode=0 timedOut=false watchdog=false sessionId=sess-old-1
+[EXPORT] attempt 1: requesting opencode export
+[EXPORT] attempt 1: written to run-1.json
+[STOP] finish=stop rank=4 durationMs=1000

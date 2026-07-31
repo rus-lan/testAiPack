@@ -1,0 +1,25 @@
+{
+  "info": {
+    "id": "sess-new-1",
+    "slug": "fixture",
+    "projectID": "p",
+    "directory": "/app",
+    "title": "fixture run",
+    "agent": "build",
+    "model": { "id": "m1", "providerID": "anthropic" },
+    "version": "1.18.3",
+    "summary": { "additions": 1, "deletions": 0, "files": 1 },
+    "cost": 0,
+    "tokens": { "input": 900, "output": 400, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+    "time": { "created": 0, "updated": 1200 }
+  },
+  "messages": [
+    {
+      "info": { "role": "assistant", "finish": "stop", "time": { "created": 0, "completed": 1200 } },
+      "parts": [
+        { "type": "tool", "tool": "edit", "callID": "c1", "state": { "status": "completed" }, "id": "p1" },
+        { "type": "text", "text": "added a friendly comment", "id": "p2" }
+      ]
+    }
+  ]
+}

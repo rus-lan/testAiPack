@@ -46,6 +46,8 @@ npm-debug.log*
 .turbo/
 .eslintcache
 results/
+!tests/fixtures/**/results/
+!tests/fixtures/**/results/**
 .testaipack-cloud/
 .testaipack-docker/
 .testaipack-installed/
