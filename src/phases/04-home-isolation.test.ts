@@ -42,25 +42,6 @@ vi.mock('../opencode/cli.js', () => ({
   installPlugin: vi.fn(),
 }))
 
-// TODO(WP15): unmock — 00-cli-parse.ts (WP2) owns the real effectiveOf/packsOf.
-// This fake mirrors the spec'd semantics exactly (00-overview.md D7, 02-phases.md
-// §00) so these tests validate real behavior, not just that the mock was called.
-vi.mock('./00-cli-parse.js', () => ({
-  effectiveOf: (
-    v: Record<string, unknown>,
-    g: string | undefined,
-    key: string,
-  ): string | undefined => {
-    const own = v[key] as string | undefined
-    if (own !== undefined) return own === '' ? undefined : own
-    return g
-  },
-  packsOf: (runInput: RunInput, v: VariantSpec): readonly PackSpec[] =>
-    v.packs
-      .map((name) => runInput.packs.find((p) => p.name === name))
-      .filter((p): p is PackSpec => p !== undefined),
-}))
-
 const { installPlugin } = await import('../opencode/cli.js')
 const installMock = vi.mocked(installPlugin)
 

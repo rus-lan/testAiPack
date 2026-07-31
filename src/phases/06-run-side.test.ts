@@ -9,20 +9,6 @@ vi.mock('../util/fs.js', async () => {
   return { ...actual, writeFile: vi.fn(actual.writeFile) }
 })
 
-// TODO(WP15): unmock — 00-cli-parse.ts (WP2) owns effectiveOf/VARIANT_NAME_RE
-// etc. This stub reproduces the spec'd D7 semantics only: a variant field
-// defined (even as '') overrides the global; undefined falls back to it.
-vi.mock('./00-cli-parse.js', () => ({
-  effectiveOf: (
-    v: Record<string, unknown>,
-    g: string | undefined,
-    key: string,
-  ): string | undefined => {
-    const val = v[key]
-    return typeof val === 'string' ? val : g
-  },
-}))
-
 import { existsSync } from 'node:fs'
 import { ensureDir, readFile, writeFile, FsError } from '../util/fs.js'
 import {

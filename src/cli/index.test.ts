@@ -23,11 +23,6 @@ const makeFakeManifest = (over: Partial<Manifest> = {}): Manifest => ({
 
 vi.mock('./pipeline.js', () => ({ runPipeline: vi.fn() }))
 vi.mock('node:child_process', () => ({ spawn: vi.fn() }))
-// src/cli/rebuild.ts (WP13's file) still references a v1-only generated
-// schema removed by the contract barrier and crashes at module load — stub
-// it here so importing cli/index.ts (which imports rebuild.js) doesn't take
-// this whole test file down. TODO(WP15): unmock once rebuild.ts is v2-shaped.
-vi.mock('./rebuild.js', () => ({ executeRebuild: vi.fn(() => Promise.resolve(0)) }))
 // compare.ts (WP14) has landed with real `isVariantSelector`/`isCompareFormat`
 // — those are pure, pinned, trivial functions, so they run for real here.
 // `executeCompare` alone stays mocked: it does real report I/O, and this file

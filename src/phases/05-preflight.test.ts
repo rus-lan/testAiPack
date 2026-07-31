@@ -16,6 +16,7 @@ import type {
   VariantSpec,
 } from '@generated/types'
 import type { PackInstallOutcome, PackDeliveryExt } from './03-pack-install.js'
+import type * as CliParseModule from './00-cli-parse.js'
 
 vi.mock('../opencode/cli.js', () => ({
   OpencodeError: class extends Error {
@@ -78,47 +79,19 @@ vi.mock('../isolation/docker-runner.js', () => ({
   },
 }))
 
-// TODO(WP15): unmock — WP2 owns 00-cli-parse.ts and has not implemented
-// packsOf/foreignPacksOf yet. These stand-ins implement exactly the spec'd
-// signatures from 02-phases.md's shared conveniences (name-resolution over
-// runInput.packs / VariantSpec.packs, foreign = union(others) - own).
-// Default (real) behavior for the mocked helpers below — kept as plain
-// functions so individual tests can override just one via
+// Real packsOf/foreignPacksOf/effectiveOf run by default (wrapped as
+// vi.fn() so individual tests can still override just one via
 // `foreignPacksOfMock.mockReturnValueOnce(...)` etc. to isolate a gate's own
-// logic from what a real WP2 implementation could produce.
-const defaultPacksOf = (runInput: RunInput, v: VariantSpec): readonly PackSpec[] =>
-  v.packs.map((name) => runInput.packs.find((p) => p.name === name)).filter((p): p is PackSpec => p !== undefined)
-
-const defaultForeignPacksOf = (runInput: RunInput, v: VariantSpec): readonly PackSpec[] => {
-  const own = new Set(v.packs)
-  const foreignNames = new Set<string>()
-  for (const other of runInput.variants) {
-    if (other.name === v.name) continue
-    for (const name of other.packs) {
-      if (!own.has(name)) foreignNames.add(name)
-    }
+// logic from real name-resolution behavior).
+vi.mock('./00-cli-parse.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof CliParseModule>()
+  return {
+    ...actual,
+    packsOf: vi.fn(actual.packsOf),
+    foreignPacksOf: vi.fn(actual.foreignPacksOf),
+    effectiveOf: vi.fn(actual.effectiveOf),
   }
-  return runInput.packs.filter((p) => foreignNames.has(p.name))
-}
-
-const defaultEffectiveOf = (
-  v: VariantSpec,
-  g: string | undefined,
-  key: 'prompt' | 'init' | 'model' | 'hint' | 'verify',
-): string | undefined => {
-  const local = (v as unknown as Record<string, unknown>)[key]
-  if (local === '') return undefined
-  if (typeof local === 'string') return local
-  return g
-}
-
-vi.mock('./00-cli-parse.js', () => ({
-  // TODO(WP15): unmock — WP2 owns 00-cli-parse.ts and has not implemented
-  // packsOf/foreignPacksOf/effectiveOf yet.
-  packsOf: vi.fn(),
-  foreignPacksOf: vi.fn(),
-  effectiveOf: vi.fn(),
-}))
+})
 
 const { version, run, OpencodeError } = await import('../opencode/cli.js')
 const versionMock = vi.mocked(version)
@@ -132,6 +105,11 @@ const { packsOf, foreignPacksOf, effectiveOf } = await import('./00-cli-parse.js
 const packsOfMock = vi.mocked(packsOf)
 const foreignPacksOfMock = vi.mocked(foreignPacksOf)
 const effectiveOfMock = vi.mocked(effectiveOf)
+const {
+  packsOf: realPacksOf,
+  foreignPacksOf: realForeignPacksOf,
+  effectiveOf: realEffectiveOf,
+} = await vi.importActual<typeof CliParseModule>('./00-cli-parse.js')
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
@@ -321,11 +299,11 @@ describe('phase 05 — preflight', () => {
       }),
     )
     packsOfMock.mockReset()
-    packsOfMock.mockImplementation(defaultPacksOf)
+    packsOfMock.mockImplementation(realPacksOf)
     foreignPacksOfMock.mockReset()
-    foreignPacksOfMock.mockImplementation(defaultForeignPacksOf)
+    foreignPacksOfMock.mockImplementation(realForeignPacksOf)
     effectiveOfMock.mockReset()
-    effectiveOfMock.mockImplementation(defaultEffectiveOf)
+    effectiveOfMock.mockImplementation(realEffectiveOf)
   })
 
   it('--no-preflight → checks=[], allPassed=true, exitCode=0', async () => {
@@ -656,7 +634,7 @@ describe('phase 05 — preflight', () => {
     const root = makeTempDir()
     const homes = await buildVariantHomes(root, ['smoke'])
     foreignPacksOfMock.mockImplementation((runInput: RunInput, v: VariantSpec) =>
-      v.name === 'smoke' ? runInput.packs.filter((p) => p.name === 'pack-a') : defaultForeignPacksOf(runInput, v),
+      v.name === 'smoke' ? runInput.packs.filter((p) => p.name === 'pack-a') : realForeignPacksOf(runInput, v),
     )
     const input = buildInput(
       homes,

@@ -32,93 +32,27 @@ import type {
   PrepReport,
   RunInput,
 } from '@generated/types'
+import type * as CliParseModule from '../phases/00-cli-parse.js'
+import type * as PackSetupModule from '../phases/04b-pack-setup.js'
 
 const run = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 
-// ---------------------------------------------------------------------------
-// 00-cli-parse.ts (WP2) owns effectiveOf/packsOf/foreignPacksOf/packShortName
-// and cliParse itself — none of it has landed yet. Real, spec-shaped
-// implementations here (per D7/D4 in 00-overview.md) so the pure warning
-// helpers below behave correctly; `cliParse` stays a bare vi.fn() the
-// integration suite configures per test. TODO(WP15): unmock — delete this
-// whole vi.mock once 00-cli-parse.ts exports the real thing.
-// ---------------------------------------------------------------------------
-const cliParseHelpers = vi.hoisted(() => {
-  const effectiveOf = (
-    v: Record<string, unknown>,
-    g: string | undefined,
-    key: string,
-  ): string | undefined => {
-    const own = v[key]
-    if (own === undefined) return g
-    return own === '' ? undefined : (own as string)
-  }
-  const packsOf = (
-    runInput: { readonly packs: readonly { readonly name: string }[] },
-    v: { readonly packs: readonly string[] },
-  ): readonly { readonly name: string }[] =>
-    v.packs.flatMap((name) => {
-      const p = runInput.packs.find((pk) => pk.name === name)
-      return p === undefined ? [] : [p]
-    })
-  const foreignPacksOf = (
-    runInput: {
-      readonly packs: readonly { readonly name: string }[]
-      readonly variants: readonly { readonly name: string; readonly packs: readonly string[] }[]
-    },
-    v: { readonly name: string; readonly packs: readonly string[] },
-  ): readonly { readonly name: string }[] => {
-    const ownNames = new Set(v.packs)
-    const foreignNames = new Set(
-      runInput.variants
-        .filter((other) => other.name !== v.name)
-        .flatMap((other) => other.packs)
-        .filter((n) => !ownNames.has(n)),
-    )
-    return runInput.packs.filter((p) => foreignNames.has(p.name))
-  }
-  const packShortName = (ref: string): string => {
-    const prefixMatch = /^(npm:|mcp:|agent:|command:)/i.exec(ref)
-    const afterPrefix = prefixMatch === null ? ref : ref.slice(prefixMatch[0].length)
-    const afterMcpConfig =
-      prefixMatch?.[0].toLowerCase() === 'mcp:' && afterPrefix.includes(':')
-        ? afterPrefix.slice(0, afterPrefix.indexOf(':'))
-        : afterPrefix
-    const clean = afterMcpConfig.replace(/\.git$/, '').replace(/\/+$/, '')
-    const parts = clean.split('/')
-    return (parts[parts.length - 1] ?? clean).toLowerCase()
-  }
-  return { effectiveOf, packsOf, foreignPacksOf, packShortName }
+// Real effectiveOf/packsOf/foreignPacksOf/packShortName run for these pure
+// warning helpers; only cliParse itself and the phase entrypoints below are
+// mocked so the integration suite can configure each test's RunInput and
+// phase outcomes directly.
+vi.mock('../phases/00-cli-parse.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof CliParseModule>()
+  return { ...actual, cliParse: vi.fn() }
 })
-
-const packSetupHelpers = vi.hoisted(() => {
-  const derivePackSetupMode = (
-    setupDeclared: boolean,
-    checkVerified: boolean,
-    exerciseHappened: boolean,
-  ): 'exercised' | 'installed-only' | 'delivered-only' => {
-    if (checkVerified && exerciseHappened) return 'exercised'
-    if (setupDeclared || checkVerified || exerciseHappened) return 'installed-only'
-    return 'delivered-only'
-  }
-  return { derivePackSetupMode }
-})
-
-vi.mock('../phases/00-cli-parse.js', () => ({
-  cliParse: vi.fn(),
-  effectiveOf: cliParseHelpers.effectiveOf,
-  packsOf: cliParseHelpers.packsOf,
-  foreignPacksOf: cliParseHelpers.foreignPacksOf,
-  packShortName: cliParseHelpers.packShortName,
-}))
 vi.mock('../phases/01-workspace-setup.js', () => ({ workspaceSetup: vi.fn() }))
 vi.mock('../phases/02-repo-clone.js', () => ({ repoClone: vi.fn() }))
 vi.mock('../phases/03-pack-install.js', () => ({ packInstall: vi.fn() }))
 vi.mock('../phases/04-home-isolation.js', () => ({ homeIsolation: vi.fn() }))
-vi.mock('../phases/04b-pack-setup.js', () => ({
-  packSetup: vi.fn(),
-  derivePackSetupMode: packSetupHelpers.derivePackSetupMode,
-}))
+vi.mock('../phases/04b-pack-setup.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof PackSetupModule>()
+  return { ...actual, packSetup: vi.fn() }
+})
 vi.mock('../phases/05-preflight.js', () => ({ preflight: vi.fn() }))
 vi.mock('../phases/06-run-side.js', () => ({ runSide: vi.fn() }))
 vi.mock('../phases/06-config-capture.js', () => ({ captureOpencodeConfig: vi.fn() }))

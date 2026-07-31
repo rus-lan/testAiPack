@@ -13,14 +13,6 @@ vi.mock('../opencode/spawn.js', () => ({
   execCmd: vi.fn(),
 }))
 
-// TODO(WP15): unmock — 00-cli-parse.ts (WP2) owns the real packsOf.
-vi.mock('./00-cli-parse.js', () => ({
-  packsOf: (runInput: RunInput, v: VariantSpec): readonly PackSpec[] =>
-    v.packs
-      .map((name) => runInput.packs.find((p) => p.name === name))
-      .filter((p): p is PackSpec => p !== undefined),
-}))
-
 const { spawnProcess } = await import('../opencode/spawn.js')
 const spawnMock = vi.mocked(spawnProcess)
 

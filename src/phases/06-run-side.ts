@@ -34,8 +34,6 @@ import { appendFile, ensureDir, readJson, writeFile, writeJson } from '../util/f
 import { isRecord } from '../util/types.js'
 import type { PhaseError } from '../errors.js'
 import { runSideError } from '../errors.js'
-// TODO(WP15): unmock — 00-cli-parse.ts (WP2) owns effectiveOf; tests here
-// vi.mock this import until WP2 lands.
 import { effectiveOf } from './00-cli-parse.js'
 
 /** Consecutive identical tool calls above which a run with no clean finish is a doom-loop. */

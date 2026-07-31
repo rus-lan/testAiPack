@@ -44,9 +44,6 @@ import type { GitError } from '../util/git.js'
 import type { DockerExec } from '../opencode/cli.js'
 import { runShellInHome } from '../isolation/shell-runner.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
-// TODO(WP15): unmock — 00-cli-parse.ts (WP2) owns cliParse + the shared
-// helpers below; tests here vi.mock this whole import until WP2 lands (same
-// pattern already used by 06-run-side.ts and 05-preflight.ts).
 import { cliParse, effectiveOf, foreignPacksOf, packShortName, packsOf } from '../phases/00-cli-parse.js'
 import { workspaceSetup } from '../phases/01-workspace-setup.js'
 import { repoClone } from '../phases/02-repo-clone.js'
