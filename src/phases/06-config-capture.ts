@@ -25,12 +25,14 @@
  * @see docs/phases/06-run-side.ru.md
  */
 import { Effect } from 'effect'
+import crypto from 'node:crypto'
 import path from 'node:path'
 import type { VariantConfig, VariantTree, WorkspaceTree } from '@generated/types'
 import {
   copyFile,
   ensureDir,
   exists,
+  pathKind,
   readDir,
   readFile,
   readSymlink,
@@ -55,6 +57,7 @@ export interface ConfigCaptureResult {
 
 export interface SkillCapture {
   readonly name: string
+  /** Symlink target, or `copy:<sha256>` of the entry's content when it was copied rather than symlinked. */
   readonly target: string
 }
 
@@ -162,6 +165,38 @@ const readMdBasenames = (variant: string, dir: string): Effect.Effect<readonly s
     return names.filter((n) => n.endsWith('.md')).map((n) => n.slice(0, -'.md'.length))
   })
 
+/**
+ * Content identity for a skills entry that is not a symlink (phase 04 always
+ * `copyDir`s a real skill pack into HOME — see `applyInstruction`'s `skill`
+ * case in `04-home-isolation.ts` — so this is the common case, not a rare
+ * fallback). `entryPath` itself is unusable as the fingerprint: it is the
+ * absolute path inside THIS run's own home dir
+ * (`.../run-N/.config/opencode/skills/<name>`), which differs between runs
+ * by construction even when the copied content is byte-identical. SHA-256
+ * over sorted (path-relative-to-entry, content) pairs instead: stable across
+ * runs that copied the same source, still changes when the content does.
+ */
+const hashSkillCopy = (variant: string, entryPath: string): Effect.Effect<string, PhaseError> =>
+  Effect.gen(function* () {
+    const hash = crypto.createHash('sha256')
+    const walk = (p: string, rel: string): Effect.Effect<void, PhaseError> =>
+      Effect.gen(function* () {
+        const kind = yield* pathKind(p)
+        if (kind === 'file') {
+          const content = yield* readFile(p).pipe(Effect.mapError((e) => mapFs(variant, e)))
+          hash.update(`f:${rel}:${content}\n`)
+          return
+        }
+        if (kind !== 'dir') return
+        const names = yield* readDirNames(variant, p)
+        for (const name of [...names].sort()) {
+          yield* walk(path.join(p, name), rel === '' ? name : `${rel}/${name}`)
+        }
+      })
+    yield* walk(entryPath, '')
+    return `copy:${hash.digest('hex')}`
+  })
+
 const readSkills = (
   variant: string,
   skillsDir: string,
@@ -176,7 +211,7 @@ const readSkills = (
           // A real (non-symlink) skills entry fails `readlink` — that is the
           // expected fallback branch (skills copied as plain files), not an error.
           const target = yield* readSymlink(entryPath).pipe(
-            Effect.catchAll(() => Effect.succeed(entryPath)),
+            Effect.catchAll(() => hashSkillCopy(variant, entryPath)),
           )
           return { name, target }
         }),

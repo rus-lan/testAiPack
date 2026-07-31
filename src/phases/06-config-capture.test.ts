@@ -323,6 +323,79 @@ describe('phase 06 (sibling) — captureOpencodeConfig', () => {
     expect(installed.driftFiles).toContain('skills')
   })
 
+  it('drift honesty: a skill copied (not symlinked) with byte-identical content across runs is NOT flagged as drift', async () => {
+    // Real skill packs are always delivered this way (phase 04 `copyDir`s
+    // them into HOME) — this is the false positive the fallback used to
+    // cause: `target` used to be each run's own absolute path, which always
+    // differs between run-1 and run-2 even when the copied bytes match.
+    const { workspace, homeNew } = await buildWorkspace(2)
+    const run1Cfg = path.join(homeNew[0]!, '.config/opencode')
+    const run2Cfg = path.join(homeNew[1]!, '.config/opencode')
+    await runP(ensureDir(path.join(run1Cfg, 'skills/graphify')))
+    await runP(ensureDir(path.join(run2Cfg, 'skills/graphify')))
+    await runP(writeFile(path.join(run1Cfg, 'skills/graphify/SKILL.md'), '# graphify\n'))
+    await runP(writeFile(path.join(run2Cfg, 'skills/graphify/SKILL.md'), '# graphify\n'))
+
+    await runP(captureOpencodeConfig({ workspace, runs: 2, generatedConfigs: GENERATED }))
+    const installed = await readInstalled('new', workspace.root)
+    expect(installed.identicalAcrossRuns).toBe(true)
+    expect(installed.driftFiles).not.toContain('skills')
+    expect(installed.skills).toHaveLength(1)
+    expect(installed.skills[0]!.name).toBe('graphify')
+    expect(installed.skills[0]!.target).toMatch(/^copy:[0-9a-f]{64}$/)
+  })
+
+  it('drift honesty: a skill copied (not symlinked) whose content genuinely differs across runs IS flagged as drift', async () => {
+    const { workspace, homeNew } = await buildWorkspace(2)
+    const run1Cfg = path.join(homeNew[0]!, '.config/opencode')
+    const run2Cfg = path.join(homeNew[1]!, '.config/opencode')
+    await runP(ensureDir(path.join(run1Cfg, 'skills/graphify')))
+    await runP(ensureDir(path.join(run2Cfg, 'skills/graphify')))
+    await runP(writeFile(path.join(run1Cfg, 'skills/graphify/SKILL.md'), '# graphify v1\n'))
+    await runP(writeFile(path.join(run2Cfg, 'skills/graphify/SKILL.md'), '# graphify v2\n'))
+
+    await runP(captureOpencodeConfig({ workspace, runs: 2, generatedConfigs: GENERATED }))
+    const installed = await readInstalled('new', workspace.root)
+    expect(installed.identicalAcrossRuns).toBe(false)
+    expect(installed.driftFiles).toContain('skills')
+  })
+
+  it('drift honesty: a symlinked skill pointing at the same target across runs is NOT flagged as drift', async () => {
+    const { workspace, homeNew } = await buildWorkspace(2)
+    const run1Cfg = path.join(homeNew[0]!, '.config/opencode')
+    const run2Cfg = path.join(homeNew[1]!, '.config/opencode')
+    const target = makeTempDir('config-capture-skill-src-')
+    await runP(ensureDir(target))
+    await runP(ensureDir(path.join(run1Cfg, 'skills')))
+    await runP(ensureDir(path.join(run2Cfg, 'skills')))
+    await runP(symlink(target, path.join(run1Cfg, 'skills/graphify')))
+    await runP(symlink(target, path.join(run2Cfg, 'skills/graphify')))
+
+    await runP(captureOpencodeConfig({ workspace, runs: 2, generatedConfigs: GENERATED }))
+    const installed = await readInstalled('new', workspace.root)
+    expect(installed.identicalAcrossRuns).toBe(true)
+    expect(installed.driftFiles).not.toContain('skills')
+  })
+
+  it('drift honesty: a symlinked skill whose target genuinely changes across runs IS flagged as drift', async () => {
+    const { workspace, homeNew } = await buildWorkspace(2)
+    const run1Cfg = path.join(homeNew[0]!, '.config/opencode')
+    const run2Cfg = path.join(homeNew[1]!, '.config/opencode')
+    const targetA = makeTempDir('config-capture-skill-src-a-')
+    const targetB = makeTempDir('config-capture-skill-src-b-')
+    await runP(ensureDir(targetA))
+    await runP(ensureDir(targetB))
+    await runP(ensureDir(path.join(run1Cfg, 'skills')))
+    await runP(ensureDir(path.join(run2Cfg, 'skills')))
+    await runP(symlink(targetA, path.join(run1Cfg, 'skills/graphify')))
+    await runP(symlink(targetB, path.join(run2Cfg, 'skills/graphify')))
+
+    await runP(captureOpencodeConfig({ workspace, runs: 2, generatedConfigs: GENERATED }))
+    const installed = await readInstalled('new', workspace.root)
+    expect(installed.identicalAcrossRuns).toBe(false)
+    expect(installed.driftFiles).toContain('skills')
+  })
+
   it('generatedConfigs missing an entry for a variant (phase 04/06 mismatch) → fails loud with E_HOME_SETUP_FAILED instead of fabricating an empty config', async () => {
     const { workspace } = await buildWorkspace(1)
     const incompleteConfigs: readonly VariantConfig[] = [GENERATED[0]!] // no entry for 'new'
