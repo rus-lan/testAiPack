@@ -26,7 +26,7 @@ const TEST_EXPORT_SCHEMA = z.object({ info: z.object({ version: z.string() }) })
 describe('parseRunLog', () => {
   it('happy path: full log with init, prompt, one export attempt, verify, stop', () => {
     const log = [
-      '[START] side=old runIndex=1 sessionId=abc',
+      '[START] variant=old runIndex=1 sessionId=abc',
       '[INIT] running --init',
       '[INIT_DONE] exitCode=0 timedOut=false watchdog=false sessionId=abc',
       '[PROMPT] running --prompt',
@@ -48,6 +48,21 @@ describe('parseRunLog', () => {
     expect(p.exportAttempts).toBe(1)
   })
 
+  // Binding rule (05-risks.md §1.3): the recovery log parser must accept
+  // BOTH the old `side=` and the new `variant=` key in bracketed log lines.
+  // Neither is actually consumed by anything below (the START line's fields
+  // are unused) — the generic `[TAG] key=val ...` grammar this parser uses
+  // is key-name-agnostic, so it already accepts both without special-casing
+  // either. These two logs, differing only in that key, must parse
+  // identically.
+  it('accepts a legacy [START] side= line and a v2 [START] variant= line identically', () => {
+    const legacy = parseRunLog(['[START] side=old runIndex=1 sessionId=abc', '[STOP] finish=stop rank=4 durationMs=100'].join('\n'))
+    const v2 = parseRunLog(['[START] variant=old runIndex=1 sessionId=abc', '[STOP] finish=stop rank=4 durationMs=100'].join('\n'))
+    expect(legacy).toEqual(v2)
+    expect(legacy.stopFinish).toBe('stop')
+    expect(legacy.stopRank).toBe(4)
+  })
+
   it('retried export: two attempts logged, exportAttempts is the max attempt number, not the line count', () => {
     const log = [
       '[EXPORT] attempt 1: requesting opencode export',
@@ -61,7 +76,7 @@ describe('parseRunLog', () => {
   })
 
   it('crashed before STOP: only START/INIT_DONE present, everything past that is absent', () => {
-    const log = ['[START] side=old runIndex=1 sessionId=abc', '[INIT] running --init', '[INIT_DONE] exitCode=1 timedOut=false watchdog=false sessionId=abc'].join('\n')
+    const log = ['[START] variant=old runIndex=1 sessionId=abc', '[INIT] running --init', '[INIT_DONE] exitCode=1 timedOut=false watchdog=false sessionId=abc'].join('\n')
     const p = parseRunLog(log)
     expect(p.initDone).toEqual({ exitCode: 1, watchdog: false })
     expect(p.promptDone).toBeUndefined()
@@ -149,11 +164,11 @@ describe('combineWatchdog', () => {
 
 const writeRawFiles = async (
   rawDir: string,
-  side: string,
+  variant: string,
   runIndex: number,
   files: { readonly log?: string; readonly json?: string; readonly ndjson?: string },
 ): Promise<void> => {
-  const dir = path.join(rawDir, side)
+  const dir = path.join(rawDir, variant)
   await runP(ensureDir(dir))
   if (files.log !== undefined) await runP(writeFile(path.join(dir, `run-${String(runIndex)}.log`), files.log))
   if (files.json !== undefined) await runP(writeFile(path.join(dir, `run-${String(runIndex)}.json`), files.json))
@@ -171,6 +186,7 @@ describe('recoverRunResult', () => {
       ndjson: '{"a":1}\n{"b":2}\n',
     })
     const r = await runP(recoverRunResult(rawDir, 'old', 1, TEST_EXPORT_SCHEMA))
+    expect(r.variant).toBe('old')
     expect(r.successRank).toBe(4)
     expect(r.finishCause).toBe('stop')
     expect(r.durationMs).toBe('1234')
@@ -182,6 +198,14 @@ describe('recoverRunResult', () => {
     expect(r.diagnostics.eventsParseableLineCount).toBe(2)
     expect(r.notRecoverable).toEqual(['errorCode'])
     expect(r.initRan).toBe(false) // no [INIT_DONE] line in this fixture
+  })
+
+  it('an arbitrary v2 variant name (not old/new) works the same', async () => {
+    const rawDir = makeTempDir('run-recovery-')
+    await writeRawFiles(rawDir, 'graphify', 1, { log: '[STOP] finish=stop rank=4 durationMs=1000' })
+    const r = await runP(recoverRunResult(rawDir, 'graphify', 1, TEST_EXPORT_SCHEMA))
+    expect(r.variant).toBe('graphify')
+    expect(r.successRank).toBe(4)
   })
 
   it('missing log file entirely: outcome fields absent, diagnostics say so, no throw', async () => {
@@ -250,11 +274,14 @@ describe('recoverRunResult', () => {
 
 describe('censusManifestFields', () => {
   const FULL_MANIFEST = {
+    schemaVersion: 2,
     runId: 'x',
     timestamp: 'x',
     repoUrl: 'https://example.com/repo.git',
-    packRef: 'https://example.com/pack.git',
-    packType: 'skill',
+    packs: [{ name: 'graphify', ref: 'https://example.com/graphify.git' }],
+    variants: [{ name: 'old', packs: [] }, { name: 'new', packs: ['graphify'] }],
+    baseline: 'old',
+    parallel: 2,
     prompt: 'do thing',
     init: '/graphify .',
     verify: 'npm test',
@@ -264,10 +291,14 @@ describe('censusManifestFields', () => {
     flagDefaults: {},
   }
 
-  it('fields the Manifest contract declares are reported recoverable when present', () => {
+  it('fields the v2 Manifest contract declares are reported recoverable when present', () => {
     const fields = censusManifestFields(FULL_MANIFEST, true)
     const byName = new Map(fields.map((f) => [f.field, f]))
     expect(byName.get('repoUrl')?.recoverable).toBe(true)
+    expect(byName.get('packs')?.recoverable).toBe(true)
+    expect(byName.get('variants')?.recoverable).toBe(true)
+    expect(byName.get('baseline')?.recoverable).toBe(true)
+    expect(byName.get('parallel')?.recoverable).toBe(true)
     expect(byName.get('prompt')?.recoverable).toBe(true)
     expect(byName.get('init')?.recoverable).toBe(true)
     expect(byName.get('verify')?.recoverable).toBe(true)
@@ -279,7 +310,7 @@ describe('censusManifestFields', () => {
   it('fields the Manifest contract never carries are always not-recoverable, even in a full manifest', () => {
     const fields = censusManifestFields(FULL_MANIFEST, true)
     const byName = new Map(fields.map((f) => [f.field, f]))
-    for (const name of ['dockerNetwork', 'auth', 'pureBaseline', 'judge', 'judgeFiles', 'preflightEnabled', 'preflightModel', 'formats', 'outputPath', 'diffHtml', 'collapseRepeats', 'timelineMode', 'timeouts', 'logLevel', 'pricingPath']) {
+    for (const name of ['dockerNetwork', 'auth', 'judge', 'judgeFiles', 'preflightEnabled', 'preflightModel', 'formats', 'outputPath', 'diffHtml', 'collapseRepeats', 'timelineMode', 'timeouts', 'logLevel', 'pricingPath']) {
       expect(byName.get(name)?.recoverable, `${name} should be not-recoverable`).toBe(false)
       expect(byName.get(name)?.source).toBe('not-recoverable')
     }
@@ -300,12 +331,13 @@ describe('censusManifestFields', () => {
   })
 
   it('optional manifest fields absent from a minimal manifest are reported not recoverable', () => {
-    const minimal = { runId: 'x', timestamp: 'x', repoUrl: 'r', prompt: 'p', runs: 1, isolation: 'home', opencodeVersion: '1.0.0', flagDefaults: {} }
+    const minimal = { schemaVersion: 2, runId: 'x', timestamp: 'x', repoUrl: 'r', runs: 1, isolation: 'home', opencodeVersion: '1.0.0', baseline: 'old', parallel: 2, packs: [], variants: [], flagDefaults: {} }
     const fields = censusManifestFields(minimal, false)
     const byName = new Map(fields.map((f) => [f.field, f]))
-    expect(byName.get('packRef')?.recoverable).toBe(false)
+    expect(byName.get('prompt')?.recoverable).toBe(false)
     expect(byName.get('init')?.recoverable).toBe(false)
     expect(byName.get('verify')?.recoverable).toBe(false)
+    expect(byName.get('hint')?.recoverable).toBe(false)
   })
 })
 
@@ -316,9 +348,55 @@ describe('recoverManifestCensus', () => {
     expect(result.manifest).toEqual({})
     expect(result.modelFoundInConfig).toBe(false)
     expect(result.fields.find((f) => f.field === 'repoUrl')?.recoverable).toBe(false)
+    expect(result.schemaVersion).toBe(1)
   })
 
-  it('reads model out of config/new.json when manifest.json lacks it', async () => {
+  it('a v2 manifest.json (schemaVersion present) passes through untouched, schemaVersion 2', async () => {
+    const runRoot = makeTempDir('run-recovery-')
+    await runP(ensureDir(runRoot))
+    await runP(writeFile(
+      path.join(runRoot, 'manifest.json'),
+      JSON.stringify({
+        schemaVersion: 2, runId: 'x', timestamp: 'x', repoUrl: 'r', runs: 1, isolation: 'home',
+        opencodeVersion: '1.0.0', baseline: 'base', parallel: 2, packs: [], variants: [{ name: 'base', packs: [] }],
+        flagDefaults: {},
+      }),
+    ))
+    const result = await runP(recoverManifestCensus(runRoot))
+    expect(result.schemaVersion).toBe(2)
+    expect(result.manifest['baseline']).toBe('base')
+  })
+
+  it('a v1 manifest.json (schemaVersion absent) is mapped: packs/variants/baseline become recoverable', async () => {
+    const runRoot = makeTempDir('run-recovery-')
+    await runP(ensureDir(runRoot))
+    await runP(writeFile(
+      path.join(runRoot, 'manifest.json'),
+      JSON.stringify({
+        runId: 'x', timestamp: 'x', repoUrl: 'r', packRef: 'https://example.com/x.git', prompt: 'p',
+        runs: 1, isolation: 'home', opencodeVersion: '1.0.0', flagDefaults: {},
+      }),
+    ))
+    const result = await runP(recoverManifestCensus(runRoot))
+    expect(result.schemaVersion).toBe(1)
+    expect(result.manifest['baseline']).toBe('old')
+    const byName = new Map(result.fields.map((f) => [f.field, f]))
+    expect(byName.get('packs')?.recoverable).toBe(true)
+    expect(byName.get('variants')?.recoverable).toBe(true)
+    expect(byName.get('baseline')?.recoverable).toBe(true)
+  })
+
+  it('reads model out of any config/*.json file when manifest.json lacks it (v2 per-variant naming)', async () => {
+    const runRoot = makeTempDir('run-recovery-')
+    await runP(ensureDir(path.join(runRoot, 'config')))
+    await runP(writeFile(path.join(runRoot, 'manifest.json'), JSON.stringify({ schemaVersion: 2, repoUrl: 'r', runs: 1, isolation: 'home', opencodeVersion: '1.0.0', baseline: 'base', parallel: 2, packs: [], variants: [] })))
+    await runP(writeFile(path.join(runRoot, 'config', 'graphify.json'), JSON.stringify({ model: 'ollama/qwen3.5' })))
+    const result = await runP(recoverManifestCensus(runRoot))
+    expect(result.modelFoundInConfig).toBe(true)
+    expect(result.fields.find((f) => f.field === 'model')?.recoverable).toBe(true)
+  })
+
+  it('reads model out of the legacy config/new.json naming too', async () => {
     const runRoot = makeTempDir('run-recovery-')
     await runP(ensureDir(path.join(runRoot, 'config')))
     await runP(writeFile(path.join(runRoot, 'manifest.json'), JSON.stringify({ repoUrl: 'r', prompt: 'p', runs: 1, isolation: 'home', opencodeVersion: '1.0.0' })))
@@ -333,7 +411,10 @@ describe('recoverManifestCensus', () => {
 // Real ground truth — the actual incident workspace. Lives outside the repo
 // (a real testaipack run under the user's home, not a checked-in fixture),
 // so the whole block skips cleanly when absent — same pattern as
-// src/metrics/events-profile.test.ts's golden-values block.
+// src/metrics/events-profile.test.ts's golden-values block. This workspace
+// predates schemaVersion entirely (v1), which is exactly what makes it
+// valuable here: recoverManifestCensus must still read it correctly through
+// the compat mapping.
 // ---------------------------------------------------------------------------
 
 const REAL_ROOT = '/home/ruslan/.testaipack/2026-07-29_20-44-07_ed1eeb'
@@ -356,26 +437,29 @@ describe.skipIf(!hasRealWorkspace)('recoverRunResult — real incident workspace
 
   it('all 10 runs recover a successRank from the real logs (none crash the parser)', async () => {
     const rawDir = path.join(REAL_ROOT, 'results', 'raw')
-    for (const side of ['old', 'new'] as const) {
+    for (const variant of ['old', 'new'] as const) {
       for (let runIndex = 1; runIndex <= 5; runIndex++) {
-        const r = await runP(recoverRunResult(rawDir, side, runIndex, opencodeExportSchema))
-        expect(r.successRank, `${side}/run-${String(runIndex)}`).toBeDefined()
+        const r = await runP(recoverRunResult(rawDir, variant, runIndex, opencodeExportSchema))
+        expect(r.successRank, `${variant}/run-${String(runIndex)}`).toBeDefined()
       }
     }
   })
 })
 
 describe.skipIf(!hasRealWorkspace)('recoverManifestCensus — real incident workspace', () => {
-  it('reports the real manifest.json field inventory', async () => {
+  it('reports the real manifest.json field inventory, mapped to v2 (schemaVersion 1 on disk)', async () => {
     const result = await runP(recoverManifestCensus(REAL_ROOT))
+    expect(result.schemaVersion).toBe(1)
     expect(result.manifest['repoUrl']).toBe('https://github.com/tarsy-club/TarSy-Bot')
     expect(result.manifest['isolation']).toBe('docker')
     expect(result.manifest['opencodeVersion']).toBe('1.18.3')
+    expect(result.manifest['baseline']).toBe('old')
     expect(result.modelFoundInConfig).toBe(true)
     const byName = new Map(result.fields.map((f) => [f.field, f]))
     expect(byName.get('model')?.source).toBe('config')
     expect(byName.get('judge')?.recoverable).toBe(false)
     expect(byName.get('diffHtml')?.recoverable).toBe(false)
+    expect(byName.get('packs')?.recoverable).toBe(true)
   })
 
   it('cross-check: the real config/new.json actually carries the model this workspace used', () => {

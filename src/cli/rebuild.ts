@@ -15,16 +15,26 @@
  *   used.
  * - pre-upgrade: `run-input.json` is missing. Falls back to best-effort
  *   recovery (`src/recovery/run-recovery.ts`) from `manifest.json` and
- *   `config/{baseline,new}.json`; unrecoverable fields take a CLI override
- *   when the caller supplies one, else a documented default. Every
- *   recovered / supplied / defaulted field is disclosed in the rebuilt
- *   report — pricing and judge get a loud warning, since a silent default
- *   there would misrepresent cost or imply judging was never requested.
+ *   `config/*.json`; unrecoverable fields take a CLI override when the
+ *   caller supplies one, else a documented default. Every recovered /
+ *   supplied / defaulted field is disclosed in the rebuilt report —
+ *   pricing and judge get a loud warning, since a silent default there
+ *   would misrepresent cost or imply judging was never requested.
  *
- * Same rule per run: `raw/<side>/run-N.result.json` (§3) is used when it
+ * Same rule per run: `raw/<variant>/run-N.result.json` (§3) is used when it
  * parses; otherwise the run's outcome is reconstructed from its `.log` /
  * `.events.ndjson`, and any field even that cannot recover (mainly a run
  * that died before writing a `[STOP]` line) takes a disclosed default.
+ *
+ * v1 workspaces (pre-n-way-variants, `schemaVersion` absent from
+ * manifest.json) are read through `src/compat/legacy.ts` transparently:
+ * `findRun` (`src/cli/workspace-runs.ts`) always hands back a v2-shaped
+ * `Manifest` (variants old/new, baseline 'old'), so everything below this
+ * point works uniformly across schema versions. The one place the ORIGINAL
+ * schema version still matters is on-disk PATH LAYOUT — v1 workspaces spell
+ * their directories `apps/oldVersion` / `apps/newVersion` etc, which
+ * `buildTreePaths`'s `schemaVersion` parameter reproduces exactly
+ * (`01-contract.md §7`).
  */
 import { Effect } from 'effect'
 import path from 'node:path'
@@ -33,21 +43,16 @@ import type {
   JudgeResult,
   Manifest,
   OutputFormat,
-  PackSetupReport,
+  PackPrep,
+  PrepReport,
   ReportRenderInput,
   RunInput,
-  Side,
   TimelineMode,
+  VariantPrep,
+  VariantRunResults,
   WorkspaceTree,
 } from '@generated/types'
-import {
-  runInputSchema,
-  runSideResultSchema,
-  errorCodeSchema,
-  judgeResultSchema,
-  opencodeExportSchema,
-  packSetupReportSchema,
-} from '@generated/schemas'
+import { opencodeExportSchema } from '@generated/schemas'
 import { exists, isPathWithin, readFile, writeJson, writeFile } from '../util/fs.js'
 import { findRun } from './workspace-runs.js'
 import { buildTreePaths } from '../phases/01-workspace-setup.js'
@@ -56,22 +61,25 @@ import { derivePackSetupMode } from '../phases/04b-pack-setup.js'
 import { recoverRunResult, recoverManifestCensus } from '../recovery/run-recovery.js'
 import type { ManifestFieldStatus, RecoveredRunResult } from '../recovery/run-recovery.js'
 import { loadPricing } from '../pricing/lookup.js'
-import { aggregate } from '../phases/07-aggregate.js'
+import { aggregate, failedRunMarker } from '../phases/07-aggregate.js'
 import { diff } from '../phases/08-diff.js'
 import { judge } from '../phases/09-judge.js'
 import { timeline } from '../phases/10-timeline.js'
 import { reportRender } from '../phases/11-report-render.js'
 import { buildReportSummary } from './summary.js'
 import {
-  DEFAULT_ALLOW_BASELINE_TOOL,
+  parseJudgeResultCompat,
+  parsePrepReportCompat,
+  parseRunInputCompat,
+  parseRunResultCompat,
+} from '../compat/legacy.js'
+import {
   DEFAULT_AUTH,
   DEFAULT_COLLAPSE_REPEATS,
   DEFAULT_DIFF_HTML,
   DEFAULT_FORMATS,
-  DEFAULT_INIT_SIDE,
   DEFAULT_LOG_LEVEL,
   DEFAULT_PREFLIGHT_ENABLED,
-  DEFAULT_PURE_BASELINE,
   DEFAULT_TIMELINE_MODE,
   DEFAULT_TIMEOUTS,
 } from '../phases/00-cli-parse.js'
@@ -114,7 +122,7 @@ export interface ProvenanceEntry {
 }
 
 export interface RunProvenance {
-  readonly side: Side
+  readonly variant: string
   readonly runIndex: number
   readonly source: 'result-json' | 'log-recovery'
   readonly defaultedFields: readonly string[]
@@ -165,12 +173,12 @@ const readJsonOrUndefined = (filePath: string): Effect.Effect<unknown> =>
     }
   })
 
+/** `parseRunInputCompat` handles both a v2 run-input.json (passthrough) and a v1 one (mapped) — a workspace's run-input.json predates schemaVersion exactly when its manifest.json does. */
 const readRunInputExact = (runRoot: string): Effect.Effect<RunInput | undefined> =>
   Effect.gen(function* () {
     const parsed = yield* readJsonOrUndefined(path.join(runRoot, 'run-input.json'))
     if (parsed === undefined) return undefined
-    const check = runInputSchema.safeParse(parsed)
-    return check.success ? (check.data as RunInput) : undefined
+    return parseRunInputCompat(parsed)?.runInput
   })
 
 const censusNote = (fields: readonly ManifestFieldStatus[], field: string): string =>
@@ -193,7 +201,7 @@ interface SyntheticRunInputResult {
 }
 
 const MANIFEST_RECOVERABLE_FIELDS: readonly string[] = [
-  'repoUrl', 'packRef', 'packType', 'prompt', 'init', 'verify', 'runs', 'isolation', 'opencodeVersion',
+  'repoUrl', 'packs', 'variants', 'baseline', 'parallel', 'prompt', 'init', 'hint', 'verify', 'runs', 'isolation', 'opencodeVersion',
 ]
 
 /** `manifest.flagDefaults.protectGit` exists only for workspaces produced since --protect-git shipped (`pipeline.ts`). */
@@ -204,33 +212,34 @@ const manifestProtectGit = (manifest: Manifest): boolean | undefined => {
 
 const resolveProtectGit = (
   manifest: Manifest,
-  gitDirsOldRun1: string,
+  baselineGitDirRun1: string,
 ): Effect.Effect<{ readonly value: boolean; readonly source: 'manifest' | 'disk-evidence' }> =>
   Effect.gen(function* () {
     const fromManifest = manifestProtectGit(manifest)
     if (fromManifest !== undefined) return { value: fromManifest, source: 'manifest' as const }
-    const detected = yield* exists(gitDirsOldRun1)
+    const detected = yield* exists(baselineGitDirRun1)
     return { value: detected, source: 'disk-evidence' as const }
   })
 
+/** `initSide`/`pureBaseline`/`allowBaselineTool` no longer exist on a v2 RunInput — dropped from here (`02-phases.md` §rebuild). */
 const FOREVER_DEFAULTED_FIELDS: readonly string[] = [
-  'auth', 'pureBaseline', 'initSide', 'preflightEnabled', 'dockerNetwork', 'preflightModel', 'timeouts', 'workspacePath', 'logLevel',
-  'allowBaselineTool',
+  'auth', 'preflightEnabled', 'dockerNetwork', 'preflightModel', 'timeouts', 'workspacePath', 'logLevel',
 ]
 
 /**
  * Builds a best-effort `RunInput` for a workspace with no `run-input.json`,
- * from `manifest.json` (via `recoverManifestCensus`) plus any CLI override.
- * `resultsDir` is the in-workspace `results/` — a pre-upgrade workspace never
- * recorded a custom `--output`, so this is the only value available.
- * `protectGit` is never guessed: `resolveProtectGit` prefers
+ * from `manifest.json` (via `recoverManifestCensus`, already v2-shaped —
+ * compat-mapped when the source is v1) plus any CLI override. `resultsDir`
+ * is the in-workspace `results/` — a pre-upgrade workspace never recorded a
+ * custom `--output`, so this is the only value available. `protectGit` is
+ * never guessed: `resolveProtectGit` prefers
  * `manifest.flagDefaults.protectGit` (written by `pipeline.ts` since the
  * --protect-git feature landed — the stronger, authoritative signal when
- * present) and falls back to checking whether `gitdirs/old/run-1` actually
- * exists on disk (`repoClone` only populates it when `--protect-git` moved
- * `.git` there — real evidence for workspaces from before that manifest
- * field existed) — either way `diff` looks in the right place for a
- * protected run's `.git`.
+ * present) and falls back to checking whether the baseline variant's
+ * `gitdirs/<baseline>/run-1` actually exists on disk (`repoClone` only
+ * populates it when `--protect-git` moved `.git` there — real evidence for
+ * workspaces from before that manifest field existed) — either way `diff`
+ * looks in the right place for a protected run's `.git`.
  */
 const buildSyntheticRunInput = (
   manifest: Manifest,
@@ -248,24 +257,22 @@ const buildSyntheticRunInput = (
   const timelineMode = resolveOverridable('timelineMode', overrides.timelineMode, DEFAULT_TIMELINE_MODE, fs)
 
   const runInput: RunInput = {
+    schemaVersion: 2,
     repoUrl: manifest.repoUrl,
-    ...(manifest.packRef === undefined ? {} : { packRef: manifest.packRef }),
-    ...(manifest.packType === undefined ? {} : { packType: manifest.packType }),
-    prompt: manifest.prompt,
+    ...(manifest.prompt === undefined ? {} : { prompt: manifest.prompt }),
     ...(manifest.init === undefined ? {} : { init: manifest.init }),
-    initSide: DEFAULT_INIT_SIDE,
+    ...(manifest.hint === undefined ? {} : { hint: manifest.hint }),
     ...(manifest.verify === undefined ? {} : { verify: manifest.verify }),
-    ...(manifest.packSetup === undefined ? {} : { packSetup: manifest.packSetup }),
-    ...(manifest.packCheck === undefined ? {} : { packCheck: manifest.packCheck }),
-    ...(manifest.packExercise === undefined ? {} : { packExercise: manifest.packExercise }),
     runs: manifest.runs,
+    parallel: manifest.parallel,
+    baseline: manifest.baseline,
+    packs: manifest.packs,
+    variants: manifest.variants,
     isolation: manifest.isolation,
     opencodeVersion: manifest.opencodeVersion,
     auth: DEFAULT_AUTH,
-    pureBaseline: DEFAULT_PURE_BASELINE,
     protectGit: protectGit.value,
     preflightEnabled: DEFAULT_PREFLIGHT_ENABLED,
-    allowBaselineTool: DEFAULT_ALLOW_BASELINE_TOOL,
     formats: [...formats.value],
     outputPath: resultsDir,
     diffHtml: diffHtml.value,
@@ -293,7 +300,7 @@ const buildSyntheticRunInput = (
     note:
       protectGit.source === 'manifest'
         ? `recovered from manifest.flagDefaults.protectGit (written by pipeline.ts since --protect-git shipped): ${String(protectGit.value)}`
-        : `manifest.flagDefaults has no protectGit entry (workspace predates that field) — detected instead from whether gitdirs/old/run-1 exists on disk: ${String(protectGit.value)}`,
+        : `manifest.flagDefaults has no protectGit entry (workspace predates that field) — detected instead from whether gitdirs/${manifest.baseline}/run-1 exists on disk: ${String(protectGit.value)}`,
   }
   const foreverDefaultedEntries: readonly ProvenanceEntry[] = FOREVER_DEFAULTED_FIELDS.map((field) => {
     const base = censusNote(fs, field)
@@ -340,21 +347,19 @@ const applyOverrides = (
 }
 
 // ---------------------------------------------------------------------------
-// Per-run RunSideResult resolution
+// Per-run RunResult resolution
 // ---------------------------------------------------------------------------
 
-const runSideResultExtSchema = runSideResultSchema.extend({ errorCode: errorCodeSchema.optional() })
-
+/** `parseRunResultCompat` handles both a v2 `run-N.result.json` (passthrough) and a v1 one (`side` field, mapped). */
 const readResultJson = (
   rawDir: string,
-  side: Side,
+  variant: string,
   runIndex: number,
 ): Effect.Effect<RunSideResultExt | undefined> =>
   Effect.gen(function* () {
-    const parsed = yield* readJsonOrUndefined(path.join(rawDir, side, `run-${String(runIndex)}.result.json`))
+    const parsed = yield* readJsonOrUndefined(path.join(rawDir, variant, `run-${String(runIndex)}.result.json`))
     if (parsed === undefined) return undefined
-    const check = runSideResultExtSchema.safeParse(parsed)
-    return check.success ? (check.data as RunSideResultExt) : undefined
+    return parseRunResultCompat(parsed)
   })
 
 const RECOVERABLE_RESULT_FIELDS: readonly (keyof RecoveredRunResult)[] = [
@@ -380,7 +385,7 @@ const bridgeRecovered = (
   recovered: RecoveredRunResult,
 ): { readonly result: RunSideResultExt; readonly defaultedFields: readonly string[] } => {
   const result: RunSideResultExt = {
-    side: recovered.side,
+    variant: recovered.variant,
     runIndex: recovered.runIndex,
     exportPath: recovered.exportPath,
     eventsLogPath: recovered.eventsLogPath,
@@ -395,32 +400,32 @@ const bridgeRecovered = (
   return { result, defaultedFields: defaultedFieldsOf(recovered) }
 }
 
-const resolveSideResult = (
+const resolveVariantRunResult = (
   rawDir: string,
-  side: Side,
+  variant: string,
   runIndex: number,
 ): Effect.Effect<{ readonly result: RunSideResultExt; readonly provenance: RunProvenance }> =>
   Effect.gen(function* () {
-    const fromResultJson = yield* readResultJson(rawDir, side, runIndex)
+    const fromResultJson = yield* readResultJson(rawDir, variant, runIndex)
     if (fromResultJson !== undefined) {
       return {
         result: fromResultJson,
-        provenance: { side, runIndex, source: 'result-json' as const, defaultedFields: [] },
+        provenance: { variant, runIndex, source: 'result-json' as const, defaultedFields: [] },
       }
     }
-    const recovered = yield* recoverRunResult(rawDir, side, runIndex, opencodeExportSchema)
+    const recovered = yield* recoverRunResult(rawDir, variant, runIndex, opencodeExportSchema)
     const { result, defaultedFields } = bridgeRecovered(recovered)
-    return { result, provenance: { side, runIndex, source: 'log-recovery' as const, defaultedFields } }
+    return { result, provenance: { variant, runIndex, source: 'log-recovery' as const, defaultedFields } }
   })
 
-const resolveSideResults = (
+const resolveVariantRunResults = (
   rawDir: string,
-  side: Side,
+  variant: string,
   runs: number,
 ): Effect.Effect<{ readonly results: readonly RunSideResultExt[]; readonly provenance: readonly RunProvenance[] }> =>
   Effect.gen(function* () {
     const range = Array.from({ length: runs }, (_, i) => i + 1)
-    const resolved = yield* Effect.forEach(range, (n) => resolveSideResult(rawDir, side, n), { concurrency: 1 })
+    const resolved = yield* Effect.forEach(range, (n) => resolveVariantRunResult(rawDir, variant, n), { concurrency: 1 })
     return { results: resolved.map((r) => r.result), provenance: resolved.map((r) => r.provenance) }
   })
 
@@ -438,7 +443,7 @@ const resolveJudge = (
   judgeHint: string | undefined,
   rejudge: boolean,
   manifest: Manifest,
-  diffResult: { readonly old: DiffResult; readonly new: DiffResult },
+  diffs: readonly DiffResult[],
 ): Effect.Effect<{ readonly judge: JudgeResult | undefined; readonly disclosure: JudgeDisclosure }> =>
   Effect.gen(function* () {
     if (rejudge) {
@@ -453,7 +458,7 @@ const resolveJudge = (
         }
       }
       const outcome = yield* Effect.either(
-        judge({ runInput: { ...runInput, judge: instructions }, manifest, diff: diffResult }),
+        judge({ runInput: { ...runInput, judge: instructions }, manifest, diffs: [...diffs] }),
       )
       if (outcome._tag === 'Left') {
         return {
@@ -464,7 +469,7 @@ const resolveJudge = (
           },
         }
       }
-      if (outcome.right.judge === null) {
+      if (outcome.right.judge === null || outcome.right.judge === undefined) {
         return {
           judge: undefined,
           disclosure: { state: 'unknown' as const, note: '--rejudge ran but produced no verdict' },
@@ -480,10 +485,10 @@ const resolveJudge = (
     }
 
     const parsedJudge = yield* readJsonOrUndefined(path.join(resultsDir, 'judge.json'))
-    const check = parsedJudge === undefined ? undefined : judgeResultSchema.safeParse(parsedJudge)
-    if (check?.success === true) {
+    const mapped = parsedJudge === undefined ? undefined : parseJudgeResultCompat(parsedJudge)
+    if (mapped !== undefined) {
       return {
-        judge: check.data as JudgeResult,
+        judge: mapped,
         disclosure: { state: 'reused', note: 'existing verdict in judge.json reused verbatim; judge was not re-invoked' },
       }
     }
@@ -521,75 +526,93 @@ const resolveJudge = (
   })
 
 // ---------------------------------------------------------------------------
-// Pack setup — reuse only, never recomputed (harness shell-command evidence,
-// nothing else on disk can reconstruct it)
+// Prep (pack setup) — reuse only, never recomputed (harness shell-command
+// evidence, nothing else on disk can reconstruct it)
 // ---------------------------------------------------------------------------
 
 /**
- * Reads back `results/pack-setup.json` — the same `PackSetupReport`
- * `pipeline.ts` writes once at the end of a live run — and threads it into
- * the rebuilt report verbatim. Unlike aggregate/diff/timeline, this is never
- * recomputed: `checks`/`exercises` are exit codes and output tails from
- * harness-run shell commands, and nothing else on disk (raw exports, git
- * diffs) records them.
+ * Reads back `results/prep.json` (falling back to the legacy
+ * `results/pack-setup.json` name, mapped from its v1 shape) and threads it
+ * into the rebuilt report verbatim. Unlike aggregate/diff/timeline, this is
+ * never recomputed: `checks`/`exercises` are exit codes and output tails
+ * from harness-run shell commands, and nothing else on disk (raw exports,
+ * git diffs) records them.
  *
- * A missing file is genuinely ambiguous: either no `--pack-setup`/
- * `--pack-check`/`--pack-exercise` was ever declared for this run (correct
- * absence — the section should stay absent), or one WAS declared but the
- * evidence file itself did not survive (a workspace predating this artifact,
- * or the original run crashed before `pipeline.ts`'s write). The manifest's
- * own `packSetup`/`packCheck`/`packExercise` provenance strings are written
- * whenever declared regardless of `pack-setup.json`'s fate, so they settle
- * the ambiguity: absence there means genuinely unused; presence there with
- * `pack-setup.json` missing means "declared, evidence lost" — and that case
- * gets a synthesized report instead of silent omission, so "the section is
- * absent" is never mistaken for "no pack setup was used". `mode` in that
- * synthesized report is derived conservatively (never `exercised` — that
- * claims verification this path cannot prove) and `checks`/`exercises` stay
- * empty, since no per-run exit code survives outside the missing file.
+ * Neither file existing is genuinely ambiguous: either no pack setup/check/
+ * exercise was ever declared for this run (correct absence — the section
+ * should stay absent), or one WAS declared but the evidence file itself did
+ * not survive (a workspace predating this artifact, or the original run
+ * crashed before `pipeline.ts`'s write). The manifest's own `packs`/
+ * `variants` provenance settles the ambiguity: no pack declaring
+ * setup/check and no variant declaring exercise means genuinely unused;
+ * otherwise the section gets a synthesized report instead of silent
+ * omission, so "the section is absent" is never mistaken for "no pack setup
+ * was used". `mode` in that synthesized report is derived conservatively
+ * (never `exercised` — that claims verification this path cannot prove) and
+ * `checks`/`exercises` stay empty, since no per-run exit code survives
+ * outside the missing file.
  */
-const resolvePackSetup = (
+const resolvePrep = (
   resultsDir: string,
   manifest: Manifest,
-): Effect.Effect<{ readonly packSetup: PackSetupReport | undefined; readonly disclosure: PackSetupDisclosure }> =>
+): Effect.Effect<{ readonly prep: PrepReport | undefined; readonly disclosure: PackSetupDisclosure }> =>
   Effect.gen(function* () {
-    const parsed = yield* readJsonOrUndefined(path.join(resultsDir, 'pack-setup.json'))
-    const check = parsed === undefined ? undefined : packSetupReportSchema.safeParse(parsed)
-    if (check?.success === true) {
+    const packName = manifest.packs[0]?.name
+
+    const parsedPrep = yield* readJsonOrUndefined(path.join(resultsDir, 'prep.json'))
+    const mappedPrep = parsedPrep === undefined ? undefined : parsePrepReportCompat(parsedPrep, packName)
+    if (mappedPrep !== undefined) {
       return {
-        packSetup: check.data as PackSetupReport,
+        prep: mappedPrep,
+        disclosure: { state: 'reused' as const, note: 'prep.json reused verbatim; harness pack preparation was not re-run' },
+      }
+    }
+
+    const parsedLegacy = yield* readJsonOrUndefined(path.join(resultsDir, 'pack-setup.json'))
+    const mappedLegacy = parsedLegacy === undefined ? undefined : parsePrepReportCompat(parsedLegacy, packName)
+    if (mappedLegacy !== undefined) {
+      return {
+        prep: mappedLegacy,
         disclosure: {
           state: 'reused' as const,
-          note: 'pack-setup.json reused verbatim; harness pack preparation was not re-run',
+          note: 'results/pack-setup.json (legacy artifact name, pre-n-way-variants) reused verbatim, mapped to the current shape; harness pack preparation was not re-run',
         },
       }
     }
 
-    const setupDeclared = manifest.packSetup !== undefined
-    const checkDeclared = manifest.packCheck !== undefined
-    const exerciseDeclared = manifest.packExercise !== undefined
+    const setupDeclared = manifest.packs.some((p) => p.setup !== undefined)
+    const checkDeclared = manifest.packs.some((p) => p.check !== undefined)
+    const exerciseDeclared = manifest.variants.some((v) => v.exercise !== undefined)
     if (!setupDeclared && !checkDeclared && !exerciseDeclared) {
       return {
-        packSetup: undefined,
+        prep: undefined,
         disclosure: {
           state: 'confirmed-not-used' as const,
-          note: 'manifest confirms no --pack-setup/--pack-check/--pack-exercise was declared on the original run',
+          note: 'manifest confirms no pack setup/check/exercise was declared on the original run',
         },
       }
     }
 
-    return {
-      packSetup: {
-        mode: derivePackSetupMode(setupDeclared, false, false),
-        setupDeclared,
-        checkDeclared,
-        exerciseDeclared,
+    const packs = manifest.packs.map(
+      (p): PackPrep => ({
+        pack: p.name,
+        mode: derivePackSetupMode(p.setup !== undefined, false, false),
+        setupDeclared: p.setup !== undefined,
+        checkDeclared: p.check !== undefined,
+        exerciseDeclared: manifest.variants.some((v) => v.packs.includes(p.name) && v.exercise !== undefined),
+        setups: [],
         checks: [],
-        exercises: [],
-      },
+      }),
+    )
+    const variants = manifest.variants
+      .filter((v) => v.exercise !== undefined)
+      .map((v): VariantPrep => ({ variant: v.name, exerciseDeclared: true, exercises: [] }))
+
+    return {
+      prep: { packs, variants },
       disclosure: {
         state: 'unavailable' as const,
-        note: 'manifest shows pack-setup was declared (packSetup/packCheck/packExercise), but pack-setup.json is missing or unreadable — mode below is a conservative lower bound, not verified evidence, and per-run check/exercise rows could not be recovered',
+        note: 'manifest shows pack setup was declared (packs[*].setup/check or variants[*].exercise), but neither prep.json nor pack-setup.json is present/readable — mode below is a conservative lower bound, not verified evidence, and per-run check/exercise rows could not be recovered',
       },
     }
   })
@@ -622,7 +645,7 @@ const renderProvenanceMd = (p: RebuildProvenance): string => {
     .filter((r) => r.source === 'log-recovery')
     .map(
       (r) =>
-        `> - ${r.side}/run-${String(r.runIndex)}: recovered from its \`.log\`/\`.events.ndjson\`${r.defaultedFields.length === 0 ? '' : `, defaulted: ${r.defaultedFields.join(', ')}${r.defaultedFields.includes('successRank') ? ' — **outcome unrecoverable** (no [STOP] line found; rank/finishCause below are placeholders, not a real failure)' : ' (no [STOP] line found)'}`}`,
+        `> - ${r.variant}/run-${String(r.runIndex)}: recovered from its \`.log\`/\`.events.ndjson\`${r.defaultedFields.length === 0 ? '' : `, defaulted: ${r.defaultedFields.join(', ')}${r.defaultedFields.includes('successRank') ? ' — **outcome unrecoverable** (no [STOP] line found; rank/finishCause below are placeholders, not a real failure)' : ' (no [STOP] line found)'}`}`,
     )
   const pricingLine = p.pricingWarning === undefined ? [] : [`> ⚠ ${p.pricingWarning}`]
   const body = [
@@ -664,37 +687,24 @@ const patchAppend = (content: string, marker: string, suffix: string): string =>
   content.includes(marker) ? content.replace(marker, `${marker}${suffix}`) : content
 
 /**
- * `toFailedRun` (`src/phases/07-aggregate.ts`) builds this exact
- * `errorMessage` shape for every rank-0 run. Reconstructed here (from the
- * same bridged `RunSideResultExt` this module fed into `aggregate`) so the
- * unrecoverable-outcome runs can be found and annotated in the rendered
- * Failed Runs table without touching `07-aggregate.ts` or `src/report/*`.
- */
-const failedRunMarker = (
-  side: Side,
-  r: { readonly runIndex: number; readonly finishCause: string; readonly exitCode: number; readonly watchdogTriggered: boolean },
-): string =>
-  `run ${side}/${String(r.runIndex)} failed: finishCause=${r.finishCause} exitCode=${String(r.exitCode)} watchdog=${String(r.watchdogTriggered)}`
-
-/**
- * Per requirement: "we could not tell how this run ended" must not render
- * identically to "this run ended badly". Only runs whose `successRank` was
- * itself defaulted (no `[STOP]` line at all, so rank/finishCause are
- * placeholders, not a recovered fact) qualify — a run genuinely recovered as
- * rank 0 from a real `[STOP] finish=error rank=0` line is a confirmed
- * failure and is left alone.
+ * `toFailedRun`/`failedRunMarker` (`src/phases/07-aggregate.ts`) build this
+ * exact `errorMessage` shape for every rank-0 run — imported (not
+ * reimplemented) so both sides of the coupling stay byte-for-byte identical
+ * (`02-phases.md` §rebuild). Reconstructed here from the same bridged
+ * `RunSideResultExt` this module fed into `aggregate`, so the unrecoverable-outcome
+ * runs can be found and annotated in the rendered Failed Runs table without
+ * touching `07-aggregate.ts` or `src/report/*`.
  */
 const unrecoverableOutcomeMarkers = (
   provenance: RebuildProvenance,
-  oldResults: readonly RunSideResultExt[],
-  newResults: readonly RunSideResultExt[],
+  resultsByVariant: ReadonlyMap<string, readonly RunSideResultExt[]>,
 ): readonly string[] =>
   provenance.runs
     .filter((r) => r.defaultedFields.includes('successRank'))
     .flatMap((r) => {
-      const pool = r.side === 'old' ? oldResults : newResults
+      const pool = resultsByVariant.get(r.variant) ?? []
       const result = pool.find((x) => x.runIndex === r.runIndex)
-      return result === undefined ? [] : [failedRunMarker(r.side, result)]
+      return result === undefined ? [] : [failedRunMarker(r.variant, result)]
     })
 
 /**
@@ -731,12 +741,11 @@ const applyDisclosure = (
   mdContent: string,
   htmlContent: string | undefined,
   provenance: RebuildProvenance,
-  oldResults: readonly RunSideResultExt[],
-  newResults: readonly RunSideResultExt[],
+  resultsByVariant: ReadonlyMap<string, readonly RunSideResultExt[]>,
 ): { readonly md: string; readonly html: string | undefined } => {
   const needsJudgeCorrection =
     provenance.judge.state === 'requested-but-missing' || provenance.judge.state === 'unknown'
-  const unrecoverableMarkers = unrecoverableOutcomeMarkers(provenance, oldResults, newResults)
+  const unrecoverableMarkers = unrecoverableOutcomeMarkers(provenance, resultsByVariant)
 
   const mdWithJudge = needsJudgeCorrection
     ? patchOnce(mdContent, JUDGE_NOT_REQUESTED_MD, `_${provenance.judge.note}_`)
@@ -770,10 +779,9 @@ const missingWorktrees = (
 ): Effect.Effect<readonly string[]> =>
   Effect.gen(function* () {
     const range = Array.from({ length: runs }, (_, i) => i)
-    const checks: readonly { readonly label: string; readonly dir: string }[] = range.flatMap((i) => [
-      { label: `old/run-${String(i + 1)}`, dir: tree.appsOld[i] ?? '' },
-      { label: `new/run-${String(i + 1)}`, dir: tree.appsNew[i] ?? '' },
-    ])
+    const checks: readonly { readonly label: string; readonly dir: string }[] = tree.variantTrees.flatMap((vt) =>
+      range.map((i) => ({ label: `${vt.name}/run-${String(i + 1)}`, dir: vt.apps[i] ?? '' })),
+    )
     const results = yield* Effect.forEach(checks, (c) =>
       Effect.gen(function* () {
         const has = c.dir !== '' && (yield* exists(c.dir))
@@ -801,11 +809,13 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
   const exact = await Effect.runPromise(readRunInputExact(runRoot))
   const runInputMode: 'exact' | 'recovered' = exact === undefined ? 'recovered' : 'exact'
 
-  const treePaths = buildTreePaths(runRoot, manifest.runs)
+  const variantNames = manifest.variants.map((v) => v.name)
+  const treePaths = buildTreePaths(runRoot, manifest.runs, variantNames, found.schemaVersion)
   const baseResolution: SyntheticRunInputResult = await (async () => {
     if (exact !== undefined) return { runInput: exact, fields: [] }
     const census = await Effect.runPromise(recoverManifestCensus(runRoot))
-    const protectGit = await Effect.runPromise(resolveProtectGit(manifest, treePaths.gitDirsOld[0] ?? ''))
+    const baselineGitDir = treePaths.variantTrees.find((vt) => vt.name === manifest.baseline)?.gitDirs[0] ?? ''
+    const protectGit = await Effect.runPromise(resolveProtectGit(manifest, baselineGitDir))
     return buildSyntheticRunInput(manifest, runRoot, treePaths.results, census, flags, protectGit)
   })()
   const overridden = applyOverrides(baseResolution.runInput, flags)
@@ -864,12 +874,15 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
     return 1
   }
 
-  const oldSide = await Effect.runPromise(resolveSideResults(treePaths.raw, 'old', manifest.runs))
-  const newSide = await Effect.runPromise(resolveSideResults(treePaths.raw, 'new', manifest.runs))
-  const sideResults = {
-    old: [...oldSide.results],
-    new: [...newSide.results],
-  }
+  const perVariant = await Promise.all(
+    variantNames.map(async (name) => ({
+      name,
+      resolution: await Effect.runPromise(resolveVariantRunResults(treePaths.raw, name, manifest.runs)),
+    })),
+  )
+  const results = perVariant.map((v): VariantRunResults => ({ name: v.name, runs: [...v.resolution.results] }))
+  const resultsByVariant = new Map(perVariant.map((v) => [v.name, v.resolution.results] as const))
+  const allRunProvenance = perVariant.flatMap((v) => v.resolution.provenance)
 
   // No opencode/* import anywhere in this module (grep-checkable) — the
   // sub-agent session tree walk both phases can do is disabled by always
@@ -877,7 +890,7 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
   const noSubAgentTree = { loadTree: () => Effect.succeed([]) }
 
   const aggOutcome = await Effect.runPromise(
-    Effect.either(aggregate({ runInput, manifest, workspace: treePathsUsed, sideResults }, noSubAgentTree)),
+    Effect.either(aggregate({ runInput, manifest, workspace: treePathsUsed, results }, noSubAgentTree)),
   )
   if (aggOutcome._tag === 'Left') {
     console.error(`[aggregate] ${aggOutcome.left.code}: ${aggOutcome.left.message}`)
@@ -900,13 +913,13 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
       flags.judge,
       flags.rejudge,
       manifest,
-      diffOutcome.right.diff,
+      diffOutcome.right.diffs,
     ),
   )
-  const packSetupResolution = await Effect.runPromise(resolvePackSetup(treePathsUsed.results, manifest))
+  const prepResolution = await Effect.runPromise(resolvePrep(treePathsUsed.results, manifest))
 
   const timelineOutcome = await Effect.runPromise(
-    Effect.either(timeline({ runInput, manifest, workspace: treePathsUsed, sideResults }, noSubAgentTree)),
+    Effect.either(timeline({ runInput, manifest, workspace: treePathsUsed, results }, noSubAgentTree)),
   )
   if (timelineOutcome._tag === 'Left') {
     console.error(`[timeline] ${timelineOutcome.left.code}: ${timelineOutcome.left.message}`)
@@ -937,14 +950,17 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
     console.error(`rebuild: ${pricingWarning}`)
   }
 
-  const summary = buildReportSummary(aggOutcome.right.metricsDiff)
+  const summary = buildReportSummary(aggOutcome.right.metrics)
 
   // Honesty gap: report.json (and the --format json stdout path) must also
   // carry a rebuild signal, not just the human-readable md/html sections —
   // `list`/`compare`/a plain `report` reprint all read report.json, never
   // the patched md. `flagDefaults` is the one contract field already typed
   // as an open record (`recordUnknownSchema` — no strict-object stripping),
-  // so this survives every schema round-trip without a contract change.
+  // so this survives every schema round-trip without a contract change. A
+  // v1-sourced manifest already carries `flagDefaults.migratedFromV1: true`
+  // (`src/compat/legacy.ts`) — merged straight through here, so the rebuilt
+  // report keeps disclosing it too.
   const rebuiltManifest: Manifest = {
     ...manifest,
     flagDefaults: {
@@ -953,7 +969,7 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
       rebuiltAt: new Date().toISOString(),
       rebuiltRunInputMode: runInputMode,
       rebuiltJudgeState: judgeResolution.disclosure.state,
-      rebuiltPackSetupState: packSetupResolution.disclosure.state,
+      rebuiltPackSetupState: prepResolution.disclosure.state,
       rebuiltPricingWarning: pricingWarning !== undefined,
     },
   }
@@ -961,12 +977,12 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
   const reportInput: ReportRenderInput = {
     runInput,
     manifest: rebuiltManifest,
-    metricsDiff: aggOutcome.right.metricsDiff,
+    metrics: aggOutcome.right.metrics,
     timeline: timelineOutcome.right.timeline,
-    diff: diffOutcome.right.diff,
+    diffs: diffOutcome.right.diffs,
     summary,
     ...(judgeResolution.judge === undefined ? {} : { judge: judgeResolution.judge }),
-    ...(packSetupResolution.packSetup === undefined ? {} : { packSetup: packSetupResolution.packSetup }),
+    ...(prepResolution.prep === undefined ? {} : { prep: prepResolution.prep }),
   }
   const renderOutcome = await Effect.runPromise(Effect.either(reportRender(reportInput)))
   if (renderOutcome._tag === 'Left') {
@@ -978,9 +994,9 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
   const provenance: RebuildProvenance = {
     runInputMode,
     fields,
-    runs: [...oldSide.provenance, ...newSide.provenance],
+    runs: allRunProvenance,
     judge: judgeResolution.disclosure,
-    packSetup: packSetupResolution.disclosure,
+    packSetup: prepResolution.disclosure,
     pricingWarning,
   }
 
@@ -1009,7 +1025,7 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
       : await Effect.runPromise(
           readFile(render.paths.html).pipe(Effect.catchAll(() => Effect.succeed(undefined as string | undefined))),
         )
-  const patched = applyDisclosure(mdContent, htmlContent, provenance, oldSide.results, newSide.results)
+  const patched = applyDisclosure(mdContent, htmlContent, provenance, resultsByVariant)
 
   if (render.paths.md !== undefined && !mdReadFailed) {
     await Effect.runPromise(writeFile(render.paths.md, patched.md).pipe(Effect.ignore))

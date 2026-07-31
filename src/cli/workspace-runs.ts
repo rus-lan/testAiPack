@@ -3,21 +3,27 @@
  * commands: enumerate run directories under the workspace root, read their
  * manifests, and resolve the "latest" run. All filesystem access goes through
  * the Effect-based `util/fs` seam so errors surface as normal Effects.
+ *
+ * `manifest.json`/`report.json` reads route through `src/compat/legacy.ts`:
+ * a v1 workspace (predates `schemaVersion`) is transparently mapped to the
+ * current v2 shape, so every caller of `listRuns`/`findRun`/`readReport`
+ * sees v2 objects regardless of which schema version produced the run.
  */
 import { Effect } from 'effect'
 import path from 'node:path'
-import type { Manifest } from '@generated/types'
-import { manifestSchema } from '@generated/schemas'
-import { ensureDir, exists, readDir, readJson, removeDir, readFile } from '../util/fs.js'
-import type { FsError, ParseError } from '../util/fs.js'
-import { reportSchema } from '@generated/schemas'
-import type { Report } from '@generated/types'
+import type { Manifest, Report } from '@generated/types'
+import { ensureDir, exists, readDir, readFile, removeDir, ParseError } from '../util/fs.js'
+import type { FsError } from '../util/fs.js'
+import { parseManifestCompat, parseReportCompat } from '../compat/legacy.js'
 
 export interface RunEntry {
   readonly runId: string
   readonly dir: string
   readonly timestamp: string
+  /** Always v2-shaped — compat-mapped from v1 when the run predates `schemaVersion`. */
   readonly manifest: Manifest
+  /** The run's true on-disk schema version. Layout (`buildTreePaths`) depends on this, not on `manifest` (which is always v2-shaped). */
+  readonly schemaVersion: 1 | 2
   readonly resultsDir: string
 }
 
@@ -26,6 +32,17 @@ const DEFAULT_WORKSPACE = '.testaipack'
 export const resolveWorkspace = (workspacePath: string | undefined): string =>
   workspacePath === undefined || workspacePath === '' ? DEFAULT_WORKSPACE : workspacePath
 
+const readJsonUnknown = (filePath: string): Effect.Effect<unknown> =>
+  Effect.gen(function* () {
+    const raw = yield* readFile(filePath).pipe(Effect.catchAll(() => Effect.succeed('')))
+    if (raw === '') return undefined
+    try {
+      return JSON.parse(raw) as unknown
+    } catch {
+      return undefined
+    }
+  })
+
 const tryReadManifest = (
   dir: string,
 ): Effect.Effect<RunEntry | null> =>
@@ -33,17 +50,16 @@ const tryReadManifest = (
     const manifestPath = path.join(dir, 'manifest.json')
     const has = yield* exists(manifestPath)
     if (!has) return null
-    const read = yield* readJson(manifestPath, manifestSchema).pipe(
-      Effect.catchAll(() => Effect.succeed(null)),
-    )
-    if (read === null) return null
-    // Zod-inferred optionals vs generated exact-optional; schema-validated.
-    const manifest = read as Manifest
+    const parsed = yield* readJsonUnknown(manifestPath)
+    if (parsed === undefined) return null
+    const result = parseManifestCompat(parsed)
+    if (result === undefined) return null
     return {
-      runId: manifest.runId,
+      runId: result.manifest.runId,
       dir,
-      timestamp: manifest.timestamp,
-      manifest,
+      timestamp: result.manifest.timestamp,
+      manifest: result.manifest,
+      schemaVersion: result.schemaVersion,
       resultsDir: path.join(dir, 'results'),
     }
   })
@@ -160,9 +176,22 @@ export const readReport = (
     const file = path.join(resultsDir, 'report.json')
     const has = yield* exists(file)
     if (!has) return null
-    const parsed = yield* readJson(file, reportSchema)
-    // Zod-inferred optionals vs generated exact-optional; schema-validated.
-    return parsed as Report
+    const raw = yield* readFile(file)
+    const parsedJson = yield* Effect.try({
+      try: () => JSON.parse(raw) as unknown,
+      catch: (e) => new ParseError({ path: file, reason: 'invalid-json', issues: e }),
+    })
+    const result = parseReportCompat(parsedJson)
+    if (result === undefined) {
+      return yield* Effect.fail(
+        new ParseError({
+          path: file,
+          reason: 'schema-mismatch',
+          issues: 'report.json matched neither the v2 nor the legacy v1 report schema',
+        }),
+      )
+    }
+    return result.report
   })
 
 export const readMetricsText = (resultsDir: string): Effect.Effect<string> =>

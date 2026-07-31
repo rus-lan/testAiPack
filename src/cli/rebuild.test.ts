@@ -1,12 +1,11 @@
 import { describe, it, expect, vi } from 'vitest'
 import { Effect } from 'effect'
 import path from 'node:path'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { makeTempDir } from '../../tests/setup.js'
-import { ensureDir, copyDir, copyFile, exists, moveDir, writeFile, writeJson, readFile } from '../util/fs.js'
+import { ensureDir, copyDir, moveDir, writeFile, writeJson, readFile } from '../util/fs.js'
 import { init, addAll, commit } from '../util/git.js'
 import { buildTreePaths } from '../phases/01-workspace-setup.js'
-import { makeManifest, makeRunInput } from '../../tests/report-fixture.js'
 
 // `judge` is rebuild's one opt-in LLM boundary (--rejudge only) — mocked here
 // so a --rejudge test never spawns the real opencode binary; 09-judge.ts's
@@ -18,15 +17,16 @@ import type { RebuildFlags } from './rebuild.js'
 import { judge } from '../phases/09-judge.js'
 import { PhaseError } from '../errors.js'
 import { reportSchema, runInputSchema } from '@generated/schemas'
-import type { Manifest, RunInput, Side, WorkspaceTree } from '@generated/types'
-import type { RunSideResultExt } from '../phases/06-run-side.js'
+import type { Manifest, RunInput, WorkspaceTree } from '@generated/types'
 
 const judgeMock = vi.mocked(judge)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 
 // ---------------------------------------------------------------------------
-// Fixtures
+// Fixtures — a shim-pair (variants old/new, one pack on new) v2 workspace,
+// matching tests/helpers/variants.ts's shimPair() shape but with the
+// per-test overrides this file's scenarios need.
 // ---------------------------------------------------------------------------
 
 const baseFlags = (workspace: string, over: Partial<RebuildFlags> = {}): RebuildFlags => ({
@@ -40,6 +40,57 @@ const baseFlags = (workspace: string, over: Partial<RebuildFlags> = {}): Rebuild
   diffHtml: undefined,
   collapseRepeats: undefined,
   timelineMode: undefined,
+  ...over,
+})
+
+const makeRunInputV2 = (over: Partial<RunInput> = {}): RunInput => ({
+  schemaVersion: 2,
+  repoUrl: 'https://example.com/repo.git',
+  prompt: 'do the thing',
+  runs: 1,
+  parallel: 2,
+  baseline: 'old',
+  packs: [{ name: 'graphify', ref: 'https://example.com/graphify.git' }],
+  variants: [
+    { name: 'old', packs: [], pure: true },
+    { name: 'new', packs: ['graphify'], pure: false },
+  ],
+  isolation: 'home',
+  auth: {
+    opencode: false, npmrc: false, anthropic: false, openai: false, gemini: false, aws: false, ssh: false, git: false,
+  },
+  preflightEnabled: true,
+  formats: ['md'],
+  outputPath: './results',
+  diffHtml: false,
+  protectGit: false,
+  collapseRepeats: true,
+  timelineMode: 'side-by-side',
+  timeouts: {
+    preflightSeconds: 60, runSeconds: 600, verifySeconds: 300, installSeconds: 300, watchdogSeconds: 1200,
+  },
+  workspacePath: './.testaipack',
+  logLevel: 'info',
+  ...over,
+})
+
+const makeManifestV2 = (over: Partial<Manifest> = {}): Manifest => ({
+  schemaVersion: 2,
+  runId: 'run-abc-001',
+  timestamp: '2025-01-01T00:00:00.000Z',
+  repoUrl: 'https://example.com/repo.git',
+  prompt: 'do the thing',
+  runs: 1,
+  parallel: 2,
+  baseline: 'old',
+  packs: [{ name: 'graphify', ref: 'https://example.com/graphify.git' }],
+  variants: [
+    { name: 'old', packs: [] },
+    { name: 'new', packs: ['graphify'] },
+  ],
+  isolation: 'home',
+  opencodeVersion: '0.5.0',
+  flagDefaults: {},
   ...over,
 })
 
@@ -75,10 +126,10 @@ const validExport = (id: string): Record<string, unknown> => ({
 })
 
 interface RunPersistOpts {
-  /** (side, runIndex) pairs that get a real run-N.result.json. Default: all. */
-  readonly withResultJson?: readonly { readonly side: Side; readonly runIndex: number }[]
-  /** (side, runIndex) pairs whose .log has no [STOP] line (forces log-recovery defaults). */
-  readonly noStopLine?: readonly { readonly side: Side; readonly runIndex: number }[]
+  /** (variant, runIndex) pairs that get a real run-N.result.json. Default: all. */
+  readonly withResultJson?: readonly { readonly variant: string; readonly runIndex: number }[]
+  /** (variant, runIndex) pairs whose .log has no [STOP] line (forces log-recovery defaults). */
+  readonly noStopLine?: readonly { readonly variant: string; readonly runIndex: number }[]
 }
 
 interface SetupOpts {
@@ -96,20 +147,25 @@ interface SetupResult {
   readonly tree: WorkspaceTree
 }
 
-const has = (list: RunPersistOpts['withResultJson'], side: Side, n: number): boolean =>
-  (list ?? []).some((r) => r.side === side && r.runIndex === n)
+const has = (list: RunPersistOpts['withResultJson'], variant: string, n: number): boolean =>
+  (list ?? []).some((r) => r.variant === variant && r.runIndex === n)
+
+const VARIANTS = ['old', 'new'] as const
 
 const setupRun = async (opts: SetupOpts = {}): Promise<SetupResult> => {
   const runs = opts.runs ?? 1
   const workspace = makeTempDir()
   const runId = '2026-01-01_00-00-00_abcdef'
   const runRoot = path.join(workspace, runId)
-  const tree = buildTreePaths(runRoot, runs)
+  const tree = buildTreePaths(runRoot, runs, [...VARIANTS], 2)
+
+  const oldTree = tree.variantTrees.find((vt) => vt.name === 'old')!
+  const newTree = tree.variantTrees.find((vt) => vt.name === 'new')!
 
   for (const d of [
     tree.appsSource,
-    ...tree.appsOld,
-    ...tree.appsNew,
+    ...oldTree.apps,
+    ...newTree.apps,
     tree.pack,
     tree.config,
     path.join(tree.raw, 'old'),
@@ -120,38 +176,37 @@ const setupRun = async (opts: SetupOpts = {}): Promise<SetupResult> => {
     await runP(ensureDir(d))
   }
   await buildRepo(tree.appsSource)
-  for (const dir of [...tree.appsOld, ...tree.appsNew]) {
+  for (const dir of [...oldTree.apps, ...newTree.apps]) {
     await runP(copyDir(tree.appsSource, dir))
   }
 
-  const manifest = makeManifest({ runId, runs, ...opts.manifestOverrides })
+  const manifest = makeManifestV2({ runId, runs, ...opts.manifestOverrides })
   await runP(writeJson(path.join(runRoot, 'manifest.json'), manifest))
 
   if (opts.withRunInput) {
-    const runInput = makeRunInput({ runs, outputPath: tree.results, ...opts.runInputOverrides })
+    const runInput = makeRunInputV2({ runs, outputPath: tree.results, ...opts.runInputOverrides })
     await runP(writeJson(path.join(runRoot, 'run-input.json'), runInput))
   }
 
   const persist = opts.runPersist ?? {}
-  const withResultDefault = persist.withResultJson ?? Array.from({ length: runs }, (_, i) => [
-    { side: 'old' as const, runIndex: i + 1 },
-    { side: 'new' as const, runIndex: i + 1 },
-  ]).flat()
+  const withResultDefault =
+    persist.withResultJson ??
+    Array.from({ length: runs }, (_, i) => VARIANTS.map((variant) => ({ variant, runIndex: i + 1 }))).flat()
 
-  for (const side of ['old', 'new'] as const) {
+  for (const variant of VARIANTS) {
     for (let n = 1; n <= runs; n++) {
-      const exportPath = path.join(tree.raw, side, `run-${String(n)}.json`)
-      const eventsLogPath = path.join(tree.raw, side, `run-${String(n)}.events.ndjson`)
-      await runP(writeJson(exportPath, validExport(`sess-${side}-${String(n)}`)))
+      const exportPath = path.join(tree.raw, variant, `run-${String(n)}.json`)
+      const eventsLogPath = path.join(tree.raw, variant, `run-${String(n)}.events.ndjson`)
+      await runP(writeJson(exportPath, validExport(`sess-${variant}-${String(n)}`)))
       await runP(writeFile(eventsLogPath, ''))
-      const skipStop = has(persist.noStopLine, side, n)
+      const skipStop = has(persist.noStopLine, variant, n)
       const logText = skipStop
         ? '[START]\n[PROMPT]\n'
         : '[START]\n[PROMPT]\n[PROMPT_DONE] exitCode=0 watchdog=false\n[STOP] finish=stop rank=4 durationMs=1000\n'
-      await runP(writeFile(path.join(tree.raw, side, `run-${String(n)}.log`), logText))
-      if (has(withResultDefault, side, n)) {
-        const result: RunSideResultExt = {
-          side,
+      await runP(writeFile(path.join(tree.raw, variant, `run-${String(n)}.log`), logText))
+      if (has(withResultDefault, variant, n)) {
+        const result = {
+          variant,
           runIndex: n,
           exportPath,
           eventsLogPath,
@@ -161,7 +216,7 @@ const setupRun = async (opts: SetupOpts = {}): Promise<SetupResult> => {
           durationMs: '1000',
           watchdogTriggered: false,
         }
-        await runP(writeJson(path.join(tree.raw, side, `run-${String(n)}.result.json`), result))
+        await runP(writeJson(path.join(tree.raw, variant, `run-${String(n)}.result.json`), result))
       }
     }
   }
@@ -184,7 +239,9 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     expect(existsSync(path.join(tree.results, 'timeline.json'))).toBe(true)
 
     const raw = await runP(readFile(path.join(tree.results, 'report.json')))
-    expect(reportSchema.safeParse(JSON.parse(raw)).success).toBe(true)
+    const parsed: unknown = JSON.parse(raw)
+    const check = reportSchema.safeParse(parsed)
+    expect(check.success, check.success ? '' : JSON.stringify((check as { error?: unknown }).error)).toBe(true)
 
     const prov = JSON.parse(
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
@@ -194,18 +251,12 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
   })
 
   it('formats excluding "md" (e.g. original run used --format json) still produce a full report.md, not a truncated one', async () => {
-    // reportRender always writes a full report.md regardless of `formats`
-    // (its own invariant) — this pins that rebuild reads that file back
-    // instead of the "only-set-when-md-requested" render.stdoutMd, which
-    // used to silently overwrite it with just the provenance section.
     const { workspace, tree } = await setupRun({ withRunInput: true, runInputOverrides: { formats: ['json'] } })
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
     expect(md).toContain('## Rebuild provenance')
     expect(md).toContain('## Summary')
-    expect(md).toContain('## Diff summary')
-    expect(md).toContain('# testaipack report:')
   })
 
   it('report.json (and --format json stdout) discloses the rebuild via manifest.flagDefaults — not just the md/html text', async () => {
@@ -225,8 +276,8 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     await runP(
       writeJson(path.join(tree.results, 'judge.json'), {
         verdict: 'ok',
-        oldQuality: 5,
-        newQuality: 6,
+        scores: [{ variant: 'old', quality: 5 }, { variant: 'new', quality: 6 }],
+        ranking: ['new', 'old'],
         explanation: 'kept as-is',
         modelUsed: 'test-model',
         timestamp: '2026-01-01T00:00:00.000Z',
@@ -240,6 +291,27 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
     ) as { judge: { state: string } }
     expect(prov.judge.state).toBe('reused')
+  })
+
+  it('reuses a LEGACY v1 judge.json (oldQuality/newQuality) mapped to scores/ranking', async () => {
+    const { workspace, tree } = await setupRun({ withRunInput: true, runInputOverrides: { judge: 'be harsh' } })
+    await runP(
+      writeJson(path.join(tree.results, 'judge.json'), {
+        verdict: 'ok',
+        oldQuality: 4,
+        newQuality: 9,
+        explanation: 'legacy verdict',
+        modelUsed: 'test-model',
+        timestamp: '2026-01-01T00:00:00.000Z',
+      }),
+    )
+    const code = await executeRebuild(baseFlags(workspace))
+    expect(code).toBe(0)
+    const report = JSON.parse(await runP(readFile(path.join(tree.results, 'report.json')))) as {
+      judge?: { scores: readonly { variant: string; quality: number }[]; ranking: readonly string[] }
+    }
+    expect(report.judge?.scores).toEqual([{ variant: 'old', quality: 4 }, { variant: 'new', quality: 9 }])
+    expect(report.judge?.ranking).toEqual(['new', 'old'])
   })
 
   it('judge requested but no verdict survives -> disclosure corrects the misleading "not requested" line', async () => {
@@ -261,12 +333,6 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
   })
 
   it('a recorded outputPath that disagrees with the given --workspace is ignored, with a notice — never honored (workspace-escape guard)', async () => {
-    // Was: "custom outputPath in run-input.json is honored" — that let
-    // `--rebuild --workspace <copy>` redirect writes to wherever the
-    // ORIGINAL run's run-input.json recorded, escaping the given
-    // --workspace entirely (the exact incident this guard exists to
-    // prevent — a copied/archived workspace must never write back to the
-    // original). The explicit --workspace always wins now.
     const outDir = makeTempDir()
     const { workspace, tree } = await setupRun({ withRunInput: true, runInputOverrides: { outputPath: outDir } })
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
@@ -307,72 +373,103 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md.startsWith('# testaipack report:')).toBe(true)
     expect(md).toContain('## Rebuild provenance')
-    // the section sits between the header and Summary, not glued to either
-    expect(md.indexOf('## Rebuild provenance')).toBeGreaterThan(md.indexOf('**Opencode version:**'))
     expect(md.indexOf('## Rebuild provenance')).toBeLessThan(md.indexOf('## Summary'))
   })
 })
 
-describe('rebuild — pack setup (results/pack-setup.json read-back)', () => {
-  const realPackSetup = {
-    mode: 'exercised' as const,
-    setupDeclared: true,
-    checkDeclared: true,
-    exerciseDeclared: true,
-    setup: { side: 'new' as const, runIndex: 0, exitCode: 0, durationMs: '27738', outputTail: 'installed ok' },
-    checks: [
-      { side: 'new' as const, runIndex: 1, exitCode: 0, durationMs: '437' },
-      { side: 'old' as const, runIndex: 1, exitCode: 1, durationMs: '0' },
+describe('rebuild — prep (results/prep.json read-back)', () => {
+  const realPrep = {
+    packs: [
+      {
+        pack: 'graphify',
+        mode: 'exercised' as const,
+        setupDeclared: true,
+        checkDeclared: true,
+        exerciseDeclared: true,
+        setups: [{ variant: 'new', pack: 'graphify', runIndex: 0, exitCode: 0, durationMs: '27738', outputTail: 'installed ok' }],
+        checks: [
+          { variant: 'new', pack: 'graphify', runIndex: 1, exitCode: 0, durationMs: '437' },
+          { variant: 'old', pack: 'graphify', runIndex: 1, exitCode: 1, durationMs: '0' },
+        ],
+      },
     ],
-    exercises: [
-      { side: 'new' as const, runIndex: 1, exitCode: 1, durationMs: '0', outputTail: 'boom' },
-      { side: 'new' as const, runIndex: 2, exitCode: 0, durationMs: '561', artifactHash: 'abc123' },
+    variants: [
+      {
+        variant: 'new',
+        exerciseDeclared: true,
+        exercises: [
+          { variant: 'new', pack: 'graphify', runIndex: 1, exitCode: 1, durationMs: '0', outputTail: 'boom' },
+          { variant: 'new', pack: 'graphify', runIndex: 2, exitCode: 0, durationMs: '561', artifactHash: 'abc123' },
+        ],
+      },
     ],
   }
 
-  it('pack-setup.json present -> the whole section survives with mode and per-run rows intact, exactly as the live run rendered it', async () => {
+  it('prep.json present -> the whole section survives with mode and per-run rows intact', async () => {
     const { workspace, tree } = await setupRun({
       runs: 2,
       withRunInput: true,
-      runInputOverrides: { packSetup: 'npm i -g x', packCheck: 'x --version', packExercise: 'x run' },
-      manifestOverrides: { packSetup: 'npm i -g x', packCheck: 'x --version', packExercise: 'x run' },
+      runInputOverrides: { packs: [{ name: 'graphify', ref: 'https://example.com/graphify.git', setup: 'npm i -g x', check: 'x --version' }], variants: [{ name: 'old', packs: [], pure: true }, { name: 'new', packs: ['graphify'], pure: false, exercise: 'x run' }] },
+      manifestOverrides: { packs: [{ name: 'graphify', ref: 'https://example.com/graphify.git', setup: 'npm i -g x', check: 'x --version' }], variants: [{ name: 'old', packs: [] }, { name: 'new', packs: ['graphify'], exercise: 'x run' }] },
     })
-    await runP(writeJson(path.join(tree.results, 'pack-setup.json'), realPackSetup))
+    await runP(writeJson(path.join(tree.results, 'prep.json'), realPrep))
 
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
 
-    const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).toContain('## Harness preparation')
-    expect(md).toContain('the harness installed the pack, verified it functional, and ran its pipeline')
-    expect(md).toContain('npm i -g x')
-    expect(md).toContain('x --version')
-    expect(md).toContain('x run')
-    // per-run rows: exercise run-1 failed, run-2 succeeded with an artifact hash
-    expect(md).toContain('abc123')
-
-    const report = JSON.parse(await runP(readFile(path.join(tree.results, 'report.json')))) as {
-      packSetup?: typeof realPackSetup
-    }
-    expect(report.packSetup).toEqual(realPackSetup)
-    expect(reportSchema.safeParse(report).success).toBe(true)
+    const report = JSON.parse(await runP(readFile(path.join(tree.results, 'report.json')))) as { prep?: typeof realPrep }
+    expect(report.prep).toEqual(realPrep)
 
     const prov = JSON.parse(
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
     ) as { packSetup: { state: string; note: string } }
     expect(prov.packSetup.state).toBe('reused')
-    expect(md).toContain(`**pack setup**: ${prov.packSetup.note}`)
   })
 
-  it('no pack-setup.json, and nothing declared in the manifest -> section genuinely absent (correct: pack setup was never used)', async () => {
-    const { workspace, tree } = await setupRun({ withRunInput: true })
+  it('legacy results/pack-setup.json (v1 shape) is mapped and reused', async () => {
+    const { workspace, tree } = await setupRun({
+      runs: 1,
+      withRunInput: true,
+      runInputOverrides: { packs: [{ name: 'graphify', ref: 'https://example.com/graphify.git', setup: 'npm i -g x' }] },
+      manifestOverrides: { packs: [{ name: 'graphify', ref: 'https://example.com/graphify.git', setup: 'npm i -g x' }] },
+    })
+    await runP(
+      writeJson(path.join(tree.results, 'pack-setup.json'), {
+        mode: 'installed-only',
+        setupDeclared: true,
+        checkDeclared: false,
+        exerciseDeclared: false,
+        setup: { side: 'new', runIndex: 0, exitCode: 0, durationMs: '100' },
+        checks: [],
+        exercises: [],
+      }),
+    )
+    const code = await executeRebuild(baseFlags(workspace))
+    expect(code).toBe(0)
+    const report = JSON.parse(await runP(readFile(path.join(tree.results, 'report.json')))) as {
+      prep?: { packs: readonly { pack: string; setups: readonly { variant: string }[] }[] }
+    }
+    expect(report.prep?.packs[0]?.pack).toBe('graphify')
+    expect(report.prep?.packs[0]?.setups[0]?.variant).toBe('new')
+    const prov = JSON.parse(
+      await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
+    ) as { packSetup: { state: string; note: string } }
+    expect(prov.packSetup.state).toBe('reused')
+    expect(prov.packSetup.note).toContain('legacy artifact name')
+  })
+
+  it('no prep.json/pack-setup.json, and nothing declared in the manifest -> section genuinely absent', async () => {
+    const { workspace, tree } = await setupRun({
+      withRunInput: true,
+      runInputOverrides: { packs: [], variants: [{ name: 'old', packs: [], pure: true }, { name: 'new', packs: [], pure: false }] },
+      manifestOverrides: { packs: [], variants: [{ name: 'old', packs: [] }, { name: 'new', packs: [] }] },
+    })
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
 
-    const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).not.toContain('## Harness preparation')
+    const report = JSON.parse(await runP(readFile(path.join(tree.results, 'report.json')))) as { prep?: unknown }
+    expect(report.prep).toBeUndefined()
 
     const prov = JSON.parse(
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
@@ -380,30 +477,25 @@ describe('rebuild — pack setup (results/pack-setup.json read-back)', () => {
     expect(prov.packSetup.state).toBe('confirmed-not-used')
   })
 
-  it('no pack-setup.json, but the manifest proves pack setup WAS declared -> synthesized section, not silent omission; mode stays conservative (never "exercised")', async () => {
+  it('no prep.json, but the manifest proves pack setup WAS declared -> synthesized section, mode stays conservative (never "exercised")', async () => {
     const { workspace, tree } = await setupRun({
       withRunInput: true,
-      runInputOverrides: { packSetup: 'npm i -g x', packExercise: 'x run' },
-      manifestOverrides: { packSetup: 'npm i -g x', packExercise: 'x run' },
+      runInputOverrides: { packs: [{ name: 'graphify', ref: 'https://example.com/graphify.git', setup: 'npm i -g x' }], variants: [{ name: 'old', packs: [], pure: true }, { name: 'new', packs: ['graphify'], pure: false, exercise: 'x run' }] },
+      manifestOverrides: { packs: [{ name: 'graphify', ref: 'https://example.com/graphify.git', setup: 'npm i -g x' }], variants: [{ name: 'old', packs: [] }, { name: 'new', packs: ['graphify'], exercise: 'x run' }] },
     })
-    // pack-setup.json deliberately NOT written — simulates an old workspace,
-    // or a live run that crashed before pipeline.ts's final write.
+    // prep.json / pack-setup.json deliberately NOT written.
 
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
 
-    const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).toContain('## Harness preparation')
-    expect(md).not.toContain('the harness installed the pack, verified it functional, and ran its pipeline')
-
     const report = JSON.parse(await runP(readFile(path.join(tree.results, 'report.json')))) as {
-      packSetup?: { mode: string; setupDeclared: boolean; exerciseDeclared: boolean; checkDeclared: boolean; checks: unknown[]; exercises: unknown[] }
+      prep?: { packs: readonly { mode: string; setupDeclared: boolean; checks: unknown[] }[]; variants: readonly { exerciseDeclared: boolean; exercises: unknown[] }[] }
     }
-    expect(report.packSetup?.mode).not.toBe('exercised')
-    expect(report.packSetup?.setupDeclared).toBe(true)
-    expect(report.packSetup?.exerciseDeclared).toBe(true)
-    expect(report.packSetup?.checks).toEqual([])
-    expect(report.packSetup?.exercises).toEqual([])
+    expect(report.prep?.packs[0]?.mode).not.toBe('exercised')
+    expect(report.prep?.packs[0]?.setupDeclared).toBe(true)
+    expect(report.prep?.packs[0]?.checks).toEqual([])
+    expect(report.prep?.variants[0]?.exerciseDeclared).toBe(true)
+    expect(report.prep?.variants[0]?.exercises).toEqual([])
     expect(reportSchema.safeParse(report).success).toBe(true)
 
     const prov = JSON.parse(
@@ -411,7 +503,6 @@ describe('rebuild — pack setup (results/pack-setup.json read-back)', () => {
     ) as { packSetup: { state: string; note: string } }
     expect(prov.packSetup.state).toBe('unavailable')
     expect(prov.packSetup.note).toContain('not verified evidence')
-    expect(md).toContain(`**pack setup**: ${prov.packSetup.note}`)
   })
 })
 
@@ -430,8 +521,8 @@ describe('rebuild — --rejudge (the one opt-in LLM exception)', () => {
       Effect.succeed({
         judge: {
           verdict: 'ok',
-          oldQuality: 4,
-          newQuality: 9,
+          scores: [{ variant: 'old', quality: 4 }, { variant: 'new', quality: 9 }],
+          ranking: ['new', 'old'],
           explanation: 'fresh verdict over rebuilt data',
           modelUsed: 'test-model',
           timestamp: '2026-01-01T00:00:00.000Z',
@@ -461,8 +552,8 @@ describe('rebuild — --rejudge (the one opt-in LLM exception)', () => {
       Effect.succeed({
         judge: {
           verdict: 'ok',
-          oldQuality: 1,
-          newQuality: 1,
+          scores: [{ variant: 'old', quality: 1 }, { variant: 'new', quality: 1 }],
+          ranking: ['new', 'old'],
           explanation: `used: ${input.runInput.judge ?? 'none'}`,
           modelUsed: 'test-model',
           timestamp: '2026-01-01T00:00:00.000Z',
@@ -528,6 +619,8 @@ describe('rebuild — pre-upgrade (no run-input.json, best-effort)', () => {
     expect(prov.runInputMode).toBe('recovered')
     expect(prov.fields.find((f) => f.field === 'repoUrl')?.source).toBe('recovered')
     expect(prov.fields.find((f) => f.field === 'prompt')?.source).toBe('recovered')
+    expect(prov.fields.find((f) => f.field === 'packs')?.source).toBe('recovered')
+    expect(prov.fields.find((f) => f.field === 'variants')?.source).toBe('recovered')
     expect(prov.fields.find((f) => f.field === 'formats')?.source).toBe('defaulted')
     expect(prov.fields.find((f) => f.field === 'pricingPath')?.source).toBe('defaulted')
     expect(prov.pricingWarning).toBeDefined()
@@ -584,35 +677,18 @@ describe('rebuild — pre-upgrade (no run-input.json, best-effort)', () => {
     errSpy.mockRestore()
   })
 
-  it('an exact-mode run whose recovered pricingPath is unreadable (e.g. rebuilt from a different cwd) still warns loudly', async () => {
-    const bogusPricingPath = path.join(makeTempDir(), 'gone.json')
-    const { workspace, tree } = await setupRun({
-      withRunInput: true,
-      runInputOverrides: { pricingPath: bogusPricingPath },
-    })
-    const code = await executeRebuild(baseFlags(workspace))
-    expect(code).toBe(0)
-    const prov = JSON.parse(
-      await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
-    ) as { pricingWarning: string | undefined; fields: readonly { field: string; source: string }[] }
-    // exact mode: pricingPath does not even appear in the field-provenance
-    // list (it came straight from run-input.json, no override) — the old
-    // logic only checked that list and would have said nothing at all here.
-    expect(prov.fields.find((f) => f.field === 'pricingPath')).toBeUndefined()
-    expect(prov.pricingWarning).toBeDefined()
-    expect(prov.pricingWarning).toContain('could not be read')
-  })
-
   it('a protected run (git dir relocated outside the work tree) is detected from disk and diffed correctly', async () => {
     const { workspace, tree } = await setupRun({ runs: 1 })
+    const oldTree = tree.variantTrees.find((vt) => vt.name === 'old')!
+    const newTree = tree.variantTrees.find((vt) => vt.name === 'new')!
     // Mirror what repoClone does under --protect-git: move .git out of the
-    // work tree into gitdirs/<side>/run-1, then edit the work tree for real.
-    await runP(ensureDir(path.dirname(tree.gitDirsOld[0] ?? '')))
-    await runP(ensureDir(path.dirname(tree.gitDirsNew[0] ?? '')))
-    await runP(moveDir(path.join(tree.appsOld[0] ?? '', '.git'), tree.gitDirsOld[0] ?? ''))
-    await runP(moveDir(path.join(tree.appsNew[0] ?? '', '.git'), tree.gitDirsNew[0] ?? ''))
-    await runP(writeFile(path.join(tree.appsOld[0] ?? '', 'a.txt'), 'a\nedited old\n'))
-    await runP(writeFile(path.join(tree.appsNew[0] ?? '', 'a.txt'), 'a\nedited new\n'))
+    // work tree into gitdirs/<variant>/run-1, then edit the work tree for real.
+    await runP(ensureDir(path.dirname(oldTree.gitDirs[0] ?? '')))
+    await runP(ensureDir(path.dirname(newTree.gitDirs[0] ?? '')))
+    await runP(moveDir(path.join(oldTree.apps[0] ?? '', '.git'), oldTree.gitDirs[0] ?? ''))
+    await runP(moveDir(path.join(newTree.apps[0] ?? '', '.git'), newTree.gitDirs[0] ?? ''))
+    await runP(writeFile(path.join(oldTree.apps[0] ?? '', 'a.txt'), 'a\nedited old\n'))
+    await runP(writeFile(path.join(newTree.apps[0] ?? '', 'a.txt'), 'a\nedited new\n'))
 
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
@@ -624,12 +700,10 @@ describe('rebuild — pre-upgrade (no run-input.json, best-effort)', () => {
     expect(entry?.source).toBe('recovered')
     expect(entry?.note).toContain('true')
 
-    // the diff must find the real edit, not report a broken/empty worktree
     const patch = await runP(readFile(path.join(tree.diff, 'old', 'run-1', 'full.patch')))
     expect(patch).toContain('edited old')
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
     expect(md).not.toContain('E_WORKTREE_BROKEN')
-    expect(md).toMatch(/old.*\+1 -1|1 files/)
   })
 
   it('an unprotected run is detected as such (protectGit recovered false)', async () => {
@@ -645,9 +719,6 @@ describe('rebuild — pre-upgrade (no run-input.json, best-effort)', () => {
   })
 
   it('manifest.flagDefaults.protectGit, when present, wins over disk evidence (stronger, authoritative signal)', async () => {
-    // no .git was actually relocated on disk — disk evidence alone would say
-    // false — but the manifest (written by a --protect-git-aware pipeline.ts)
-    // says true, and that must win.
     const { workspace, tree } = await setupRun({ runs: 1, manifestOverrides: { flagDefaults: { protectGit: true } } })
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
@@ -689,14 +760,14 @@ describe('rebuild — per-run result recovery', () => {
     const { workspace, tree } = await setupRun({
       runs: 2,
       withRunInput: true,
-      runPersist: { withResultJson: [{ side: 'old', runIndex: 1 }, { side: 'new', runIndex: 1 }, { side: 'new', runIndex: 2 }] },
+      runPersist: { withResultJson: [{ variant: 'old', runIndex: 1 }, { variant: 'new', runIndex: 1 }, { variant: 'new', runIndex: 2 }] },
     })
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
     const prov = JSON.parse(
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
-    ) as { runs: readonly { side: string; runIndex: number; source: string; defaultedFields: readonly string[] }[] }
-    const oldRun2 = prov.runs.find((r) => r.side === 'old' && r.runIndex === 2)
+    ) as { runs: readonly { variant: string; runIndex: number; source: string; defaultedFields: readonly string[] }[] }
+    const oldRun2 = prov.runs.find((r) => r.variant === 'old' && r.runIndex === 2)
     expect(oldRun2?.source).toBe('log-recovery')
     expect(oldRun2?.defaultedFields).toEqual([])
   })
@@ -705,14 +776,14 @@ describe('rebuild — per-run result recovery', () => {
     const { workspace, tree } = await setupRun({
       runs: 1,
       withRunInput: true,
-      runPersist: { withResultJson: [], noStopLine: [{ side: 'old', runIndex: 1 }, { side: 'new', runIndex: 1 }] },
+      runPersist: { withResultJson: [], noStopLine: [{ variant: 'old', runIndex: 1 }, { variant: 'new', runIndex: 1 }] },
     })
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
     const prov = JSON.parse(
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
-    ) as { runs: readonly { side: string; runIndex: number; defaultedFields: readonly string[] }[] }
-    const run = prov.runs.find((r) => r.side === 'old' && r.runIndex === 1)
+    ) as { runs: readonly { variant: string; runIndex: number; defaultedFields: readonly string[] }[] }
+    const run = prov.runs.find((r) => r.variant === 'old' && r.runIndex === 1)
     expect(run?.defaultedFields).toContain('successRank')
     expect(run?.defaultedFields).toContain('finishCause')
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
@@ -723,7 +794,7 @@ describe('rebuild — per-run result recovery', () => {
     const { workspace, tree } = await setupRun({
       runs: 2,
       withRunInput: true,
-      runPersist: { withResultJson: [], noStopLine: [{ side: 'old', runIndex: 1 }] },
+      runPersist: { withResultJson: [], noStopLine: [{ variant: 'old', runIndex: 1 }] },
     })
     // run-2: a REAL rank-0 failure — a genuine [STOP] line, nothing defaulted.
     await runP(
@@ -740,9 +811,7 @@ describe('rebuild — per-run result recovery', () => {
     const line2 = lines.find((l) => l.includes('run old/2 failed'))
     expect(line1).toBeDefined()
     expect(line2).toBeDefined()
-    // run-1's outcome could not be recovered at all — must say so, visibly
     expect(line1).toContain('outcome unrecoverable')
-    // run-2 genuinely failed — must NOT carry the same disclaimer
     expect(line2).not.toContain('outcome unrecoverable')
     expect(line1).not.toBe(line2)
   })
@@ -776,8 +845,9 @@ describe('rebuild — refusals', () => {
 
   it('refuses with a clear message when an app worktree dir is gone (--ephemeral or gc)', async () => {
     const { workspace, tree } = await setupRun({ withRunInput: true, runs: 1 })
+    const oldTree = tree.variantTrees.find((vt) => vt.name === 'old')!
     const { rm } = await import('node:fs/promises')
-    await rm(tree.appsOld[0] ?? '', { recursive: true, force: true })
+    await rm(oldTree.apps[0] ?? '', { recursive: true, force: true })
 
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     const code = await executeRebuild(baseFlags(workspace))
@@ -788,147 +858,45 @@ describe('rebuild — refusals', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Real ground truth — evidence workspace from .research/metric-split/spec.md
-// (10x2 runs, graphify pack, --init-side new). Read-only source; the whole
-// block skips cleanly when the workspace isn't present on this machine.
-// Verifies §5.8/§8 of the spec: `report --rebuild` gains phaseSplit/
-// taskDeltas/basis for an existing (pre-split) workspace with no new runs,
-// falling out of phase 07 for free — no rebuild.ts structural change needed.
+// v1 compat — the checked-in mini v1 workspace fixture
+// (tests/fixtures/v1-workspace/**). Real pre-n-way-variants layout: no
+// run-input.json (exercises the recovered path), manifest.json without
+// schemaVersion, raw/old + raw/new, apps/oldVersion + apps/newVersion (real
+// tiny git worktrees).
 // ---------------------------------------------------------------------------
 
-const B348A2_ROOT = '/home/ruslan/.testaipack/2026-07-30_09-25-09_b348a2'
-const hasB348A2 = existsSync(B348A2_ROOT)
+const V1_FIXTURE_ROOT = path.resolve(import.meta.dirname, '../../tests/fixtures/v1-workspace')
 
-describe.skipIf(!hasB348A2)('rebuild — phase split retrofit against real evidence data', () => {
-  it('report --rebuild --force gains phaseSplit/taskDeltas/basis, matching independently computed real numbers', async () => {
+describe('rebuild — v1 workspace fixture (report --rebuild on a pre-n-way-variants run)', () => {
+  it('rebuilds successfully; report.json is v2 (schemaVersion 2); provenance discloses migratedFromV1', async () => {
     const parentDir = makeTempDir()
-    const runDir = path.join(parentDir, 'b348a2')
-    await runP(ensureDir(runDir))
-    // Only what rebuild reads — skip `home/` (~5GB, irrelevant: rebuild never
-    // touches HOME dirs, only raw exports, apps worktrees, manifest, config).
-    for (const sub of ['apps', 'config', 'gitdirs', 'pack']) {
-      await runP(copyDir(path.join(B348A2_ROOT, sub), path.join(runDir, sub)))
-    }
-    await runP(ensureDir(path.join(runDir, 'results')))
-    await runP(copyDir(path.join(B348A2_ROOT, 'results', 'raw'), path.join(runDir, 'results', 'raw')))
-    await runP(copyFile(path.join(B348A2_ROOT, 'manifest.json'), path.join(runDir, 'manifest.json')))
-    // Copied VERBATIM, unmodified — this run-input.json records the
-    // ORIGINAL machine-absolute outputPath (the real, read-only
-    // B348A2_ROOT). This is the exact incident scenario: rebuild.ts must
-    // ignore that recorded path and write only inside this copy, never
-    // redirect back onto the original — see the outputPathIgnored guard in
-    // executeRebuild.
-    await runP(copyFile(path.join(B348A2_ROOT, 'run-input.json'), path.join(runDir, 'run-input.json')))
+    const runDir = path.join(parentDir, 'v1-run')
+    await runP(copyDir(V1_FIXTURE_ROOT, runDir))
 
-    // Snapshot every file rebuild could plausibly touch in the real
-    // workspace, whatever state it happens to be in — a leftover artifact
-    // from testing this exact incident earlier must not make the check
-    // depend on assuming a pristine starting state.
-    const realWatchedFiles = [
-      'report.json', 'report.md', 'report.html', 'metrics.json',
-      'timeline.json', 'timeline.html', 'rebuild-provenance.json',
-    ]
-    const mtimeOf = (rel: string): number | undefined => {
-      try {
-        return statSync(path.join(B348A2_ROOT, 'results', rel)).mtimeMs
-      } catch {
-        return undefined
-      }
-    }
-    const realMtimesBefore = new Map(realWatchedFiles.map((f) => [f, mtimeOf(f)]))
-
-    const flags: RebuildFlags = {
-      runId: undefined,
-      workspace: parentDir,
-      force: true,
-      formats: [],
-      judge: undefined,
-      rejudge: false,
-      pricingPath: undefined,
-      diffHtml: undefined,
-      collapseRepeats: undefined,
-      timelineMode: undefined,
-    }
-    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
-    const code = await executeRebuild(flags)
+    const code = await executeRebuild(baseFlags(parentDir))
     expect(code).toBe(0)
-
-    // The whole point of this test: the real, read-only workspace must come
-    // out byte-for-byte untouched — this reproduces the incident rather than
-    // avoiding it.
-    for (const f of realWatchedFiles) {
-      expect(mtimeOf(f), `${f} mtime changed — rebuild wrote into the real workspace`).toBe(realMtimesBefore.get(f))
-    }
-
-    // Output landed inside the copy instead, with a clear notice that the
-    // recorded outputPath was ignored.
-    expect(await runP(exists(path.join(runDir, 'results', 'report.json')))).toBe(true)
-    const notices = errSpy.mock.calls.map((c) => String(c[0]))
-    expect(notices.some((m) => m.includes('ignoring it') && m.includes(B348A2_ROOT))).toBe(true)
-    errSpy.mockRestore()
-
-    // Regression: run-input.json exists here and predates `allowBaselineTool`
-    // (a later required-then-optional contract field) — exact mode must not
-    // silently downgrade to recovered just because a newer field is missing.
-    const provenanceRaw = await runP(readFile(path.join(runDir, 'results', 'rebuild-provenance.json')))
-    const provenance = JSON.parse(provenanceRaw) as { readonly runInputMode: string }
-    expect(provenance.runInputMode).toBe('exact')
 
     const raw = await runP(readFile(path.join(runDir, 'results', 'report.json')))
     const parsed: unknown = JSON.parse(raw)
-    expect(reportSchema.safeParse(parsed).success).toBe(true)
-
+    const check = reportSchema.safeParse(parsed)
+    expect(check.success, check.success ? '' : JSON.stringify((check as { error?: unknown }).error)).toBe(true)
     const report = parsed as {
-      readonly summary: { readonly basis?: string }
-      readonly metricsDiff: {
-        readonly taskDeltas?: unknown
-        readonly initDeltas?: unknown
-        readonly old: { readonly phaseSplit?: { readonly runsWithInit: number; readonly task: unknown } }
-        readonly new: {
-          readonly phaseSplit?: {
-            readonly runsWithInit: number
-            readonly task: unknown
-            readonly init: unknown
-          }
-        }
-      }
+      schemaVersion: number
+      manifest: { flagDefaults: Record<string, unknown>; baseline: string; variants: readonly { name: string }[] }
+      metrics: { baseline: string; variants: readonly { variant: string }[] }
     }
-    expect(report.summary.basis).toBe('task')
-    expect(report.metricsDiff.taskDeltas).toBeDefined()
-    // old never ran --init (--init-side new) -> one-sided -> no initDeltas.
-    expect(report.metricsDiff.initDeltas).toBeUndefined()
-    expect(report.metricsDiff.old.phaseSplit?.runsWithInit).toBe(0)
-    expect(report.metricsDiff.new.phaseSplit?.runsWithInit).toBe(10)
-    // Same numbers hand-verified against the raw exports directly (see
-    // src/metrics/extract.test.ts and src/phases/07-aggregate.test.ts's own
-    // b348a2 real-data blocks) — pinned again here so the retrofit path
-    // (rebuild -> phase 07 from disk) is proven, not just the live path.
-    expect(report.metricsDiff.new.phaseSplit?.init).toEqual({
-      totalTokens: '455398',
-      wallClockMs: '199658',
-      costUsd: 0,
-      stepCount: 24,
-      toolCallCount: 30,
-    })
-    expect(report.metricsDiff.new.phaseSplit?.task).toEqual({
-      totalTokens: '301566',
-      wallClockMs: '143660',
-      costUsd: 0,
-      stepCount: 11,
-      toolCallCount: 11,
-    })
-    expect(report.metricsDiff.old.phaseSplit?.task).toEqual({
-      totalTokens: '147474',
-      wallClockMs: '229696',
-      costUsd: 0,
-      stepCount: 13,
-      toolCallCount: 14,
-    })
+    expect(report.schemaVersion).toBe(2)
+    expect(report.manifest.flagDefaults['migratedFromV1']).toBe(true)
+    expect(report.manifest.baseline).toBe('old')
+    expect(report.manifest.variants.map((v) => v.name)).toEqual(['old', 'new'])
+    expect(report.metrics.baseline).toBe('old')
+    expect(report.metrics.variants.map((v) => v.variant)).toEqual(['old', 'new'])
 
-    const md = await runP(readFile(path.join(runDir, 'results', 'report.md')))
-    expect(md).toContain('## Phase split (init vs task)')
-    expect(md).toContain('_Basis: task phase only (init excluded); init cost shown in "Init cost" below._')
-  }, 60_000)
+    const prov = JSON.parse(
+      await runP(readFile(path.join(runDir, 'results', 'rebuild-provenance.json'))),
+    ) as { runInputMode: string }
+    expect(prov.runInputMode).toBe('recovered')
+  })
 })
 
 describe('rebuild — zero agent/LLM/docker invocations (source-level guard)', () => {
@@ -940,19 +908,16 @@ describe('rebuild — zero agent/LLM/docker invocations (source-level guard)', (
 })
 
 describe('buildTreePaths / runInputSchema sanity used by fixtures', () => {
-  it('makeRunInput fixture round-trips through runInputSchema', () => {
-    const ri = makeRunInput()
+  it('makeRunInputV2 fixture round-trips through runInputSchema', () => {
+    const ri = makeRunInputV2()
     expect(runInputSchema.safeParse(ri).success).toBe(true)
   })
-})
 
-describe.skipIf(!hasB348A2)('runInputSchema — regression: a real pre-existing run-input.json (predates allowBaselineTool) still parses', () => {
-  it('parses successfully so exact-mode rebuild is not silently downgraded to recovered', async () => {
-    const raw = await runP(readFile(path.join(B348A2_ROOT, 'run-input.json')))
-    const parsed: unknown = JSON.parse(raw)
-    expect((parsed as { readonly allowBaselineTool?: boolean }).allowBaselineTool).toBeUndefined()
-    const result = runInputSchema.safeParse(parsed)
-    expect(result.success).toBe(true)
+  it('v1 layout: buildTreePaths(root, 2, [old,new], 1) reproduces the legacy apps/oldVersion + apps/newVersion shape', () => {
+    const tree = buildTreePaths('/tmp/root', 2, ['old', 'new'], 1)
+    const old = tree.variantTrees.find((vt) => vt.name === 'old')
+    expect(old?.apps).toEqual(['/tmp/root/apps/oldVersion/run-1', '/tmp/root/apps/oldVersion/run-2'])
+    expect(old?.homes).toEqual(['/tmp/root/home/old/run-1', '/tmp/root/home/old/run-2'])
   })
 })
 

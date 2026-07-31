@@ -2,32 +2,33 @@
  * Reconstructs what a finished (or crashed) run left behind on disk, for
  * workspaces where the pipeline died before persisting a structured result —
  * e.g. phase 08 aborting the whole run before 09/10/11/12 ever wrote
- * anything. `RunSideResult` itself is never serialized as JSON anywhere; the
+ * anything. `RunResult` itself is never serialized as JSON anywhere; the
  * only durable trace of a run's outcome is the free-text
- * `results/raw/<side>/run-N.log` line `[STOP] finish=... rank=...
+ * `results/raw/<variant>/run-N.log` line `[STOP] finish=... rank=...
  * durationMs=...` written by phase 06 (`src/phases/06-run-side.ts`), plus
  * the export/events files next to it.
  *
  * Every field here is `undefined` unless a durable artifact directly says
  * so — nothing is inferred or guessed. `errorCode` cannot be recovered by
  * this module under any circumstance: it is never written to the `.log`
- * text, only carried in the in-memory `RunSideResultExt` (see
+ * text, only carried in the in-memory `RunResult` (see
  * `notRecoverableFields`).
  *
  * Read-only: never writes to the workspace it inspects. No CLI or pipeline
- * wiring here on purpose — a later rebuild command owns that.
+ * wiring here on purpose — the rebuild command owns that.
  */
 import { Effect } from 'effect'
 import path from 'node:path'
 import type { ZodType } from 'zod'
-import type { FinishCause, Side, SuccessRank } from '@generated/types'
-import { exists, readFile } from '../util/fs.js'
+import type { FinishCause, SuccessRank } from '@generated/types'
+import { exists, readDir, readFile } from '../util/fs.js'
+import { parseManifestCompat } from '../compat/legacy.js'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-/** Fields of the wire `RunSideResult` this module can never fill in. */
+/** Fields of the wire `RunResult` this module can never fill in. */
 export const NOT_RECOVERABLE_FIELDS: readonly string[] = ['errorCode']
 
 export interface RunArtifactDiagnostics {
@@ -45,7 +46,7 @@ export interface RunArtifactDiagnostics {
 }
 
 export interface RecoveredRunResult {
-  readonly side: Side
+  readonly variant: string
   readonly runIndex: number
   readonly exportPath: string
   readonly eventsLogPath: string
@@ -83,7 +84,14 @@ const FINISH_VALUES: ReadonlySet<string> = new Set([
   'unknown',
 ])
 
-/** `[TAG] key=val key=val ...` — the shape every 06-run-side.ts log line uses. */
+/**
+ * `[TAG] key=val key=val ...` — the shape every 06-run-side.ts log line uses.
+ * Key-name-agnostic on purpose: whatever keys a line carries land in
+ * `fields` under their own names, so a `[START]` line's `side=`/`variant=`
+ * key (only its name changed when the n-way variants rename landed —
+ * `05-risks.md` §1.3) is captured either way. Neither is read downstream
+ * today; captured for completeness and future callers.
+ */
 const parseTaggedLine = (line: string): { readonly tag: string; readonly fields: Record<string, string> } | undefined => {
   const trimmed = line.trim()
   const tagMatch = /^\[([A-Z_]+)\]\s*(.*)$/.exec(trimmed)
@@ -235,19 +243,21 @@ const countParseableLines = (text: string): number =>
 /**
  * `rawDir` is the workspace's `results/raw` directory (same path
  * `WorkspaceTree.raw` points to) — passed as a plain string so this module
- * has no dependency on the contract or on a live pipeline run.
+ * has no dependency on the contract or on a live pipeline run. `variant` is
+ * a plain path-segment string (the variant's name — `'old'`/`'new'` for a
+ * v1-mapped workspace, whatever the config declared for a v2 one).
  */
 export const recoverRunResult = (
   rawDir: string,
-  side: Side,
+  variant: string,
   runIndex: number,
   exportSchema: ZodType,
 ): Effect.Effect<RecoveredRunResult> =>
   Effect.gen(function* () {
-    const sideDir = path.join(rawDir, side)
-    const logPath = path.join(sideDir, `run-${String(runIndex)}.log`)
-    const exportPath = path.join(sideDir, `run-${String(runIndex)}.json`)
-    const eventsLogPath = path.join(sideDir, `run-${String(runIndex)}.events.ndjson`)
+    const variantDir = path.join(rawDir, variant)
+    const logPath = path.join(variantDir, `run-${String(runIndex)}.log`)
+    const exportPath = path.join(variantDir, `run-${String(runIndex)}.json`)
+    const eventsLogPath = path.join(variantDir, `run-${String(runIndex)}.events.ndjson`)
 
     const logExists = yield* exists(logPath)
     const logText = logExists ? yield* readFile(logPath).pipe(Effect.catchAll(() => Effect.succeed(''))) : ''
@@ -285,7 +295,7 @@ export const recoverRunResult = (
     }
 
     return {
-      side,
+      variant,
       runIndex,
       exportPath,
       eventsLogPath,
@@ -318,39 +328,45 @@ const has = (obj: Record<string, unknown>, key: string): boolean =>
   Object.prototype.hasOwnProperty.call(obj, key) && obj[key] !== undefined && obj[key] !== null
 
 /**
- * Pure: given the parsed `manifest.json` object and whether `model` turned
- * up in `config/{baseline,new}.json`, report each `RunInput` field's
- * recoverability. `manifest` field names are those the current `Manifest`
- * contract (`contract/main.tsp`) actually declares — fields the contract has
- * never carried are marked not-recoverable regardless of what any single
- * instance happens to contain.
+ * Pure: given the (v2-shaped, compat-mapped when the source predates
+ * `schemaVersion`) manifest object and whether `model` turned up in any
+ * `config/*.json`, report each `RunInput` field's recoverability. Field
+ * names are those the current v2 `Manifest` contract (`contract/main.tsp`)
+ * actually declares — fields the contract has never carried are marked
+ * not-recoverable regardless of what any single instance happens to
+ * contain. `packs`/`variants`/`baseline`/`parallel` are recoverable
+ * verbatim off the manifest even for a v1-sourced workspace, because
+ * `parseManifestCompat` has already synthesized them via the legacy
+ * mapping before this function ever sees the object.
  */
 export const censusManifestFields = (
   manifest: Record<string, unknown>,
   modelFoundInConfig: boolean,
 ): readonly ManifestFieldStatus[] => [
   { field: 'repoUrl', recoverable: has(manifest, 'repoUrl'), source: 'manifest', note: 'credential-redacted copy (redactUrlCredentials), not byte-identical to the original clone URL' },
-  { field: 'packRef', recoverable: has(manifest, 'packRef'), source: 'manifest', note: 'credential-redacted + safeRefDisplay copy; absent for smoke-test runs' },
-  { field: 'packType', recoverable: has(manifest, 'packType'), source: 'manifest', note: 'absent when no pack was installed' },
-  { field: 'prompt', recoverable: has(manifest, 'prompt'), source: 'manifest', note: 'verbatim resolved text, not the original --prompt-file path' },
+  { field: 'packs', recoverable: has(manifest, 'packs'), source: 'manifest', note: 'provenance copy (ref redacted); empty for smoke-test runs. For a pre-n-way (v1) workspace this is synthesized from packRef/packType via the legacy compat mapping, not read directly' },
+  { field: 'variants', recoverable: has(manifest, 'variants'), source: 'manifest', note: 'provenance copy of each variant spec (name/packs/pure/init/exercise/...); for a v1-sourced workspace this is synthesized (old/new, pureBaseline/allowBaselineTool unrecoverable from the manifest alone) via the legacy compat mapping' },
+  { field: 'baseline', recoverable: has(manifest, 'baseline'), source: 'manifest', note: '' },
+  { field: 'parallel', recoverable: has(manifest, 'parallel'), source: 'manifest', note: 'a v1-sourced workspace never recorded this — the mapping fills in the historical default (2)' },
+  { field: 'prompt', recoverable: has(manifest, 'prompt'), source: 'manifest', note: 'verbatim resolved GLOBAL default text; per-variant prompt overrides live under variants[*].prompt' },
   { field: 'promptFiles', recoverable: false, source: 'not-recoverable', note: 'file path lost; only the resolved prompt text survives — irrelevant for a report-only rebuild since opencode is not re-run' },
-  { field: 'init', recoverable: has(manifest, 'init'), source: 'manifest', note: 'verbatim resolved text' },
+  { field: 'init', recoverable: has(manifest, 'init'), source: 'manifest', note: 'verbatim resolved GLOBAL default text; per-variant init overrides (including the whole of a v1-sourced --init-side split) live under variants[*].init' },
   { field: 'initFiles', recoverable: false, source: 'not-recoverable', note: 'same as promptFiles' },
+  { field: 'hint', recoverable: has(manifest, 'hint'), source: 'manifest', note: 'absent when no --hint/--pack-hint was used' },
   { field: 'verify', recoverable: has(manifest, 'verify'), source: 'manifest', note: 'absent when --verify was not used' },
   { field: 'runs', recoverable: has(manifest, 'runs'), source: 'manifest', note: '' },
   { field: 'isolation', recoverable: has(manifest, 'isolation'), source: 'manifest', note: '' },
   { field: 'dockerNetwork', recoverable: false, source: 'not-recoverable', note: 'Manifest never carries it; only matters for re-running opencode, not for rebuilding a report from existing raw exports' },
   { field: 'opencodeVersion', recoverable: has(manifest, 'opencodeVersion'), source: 'manifest', note: 'for isolation=docker workspaces recorded before the phase-01 probe fix, this may be the HOST binary version, not the one the runs actually used' },
   { field: 'auth', recoverable: false, source: 'not-recoverable', note: 'Manifest never carries it; only matters for re-running opencode' },
-  { field: 'pureBaseline', recoverable: false, source: 'not-recoverable', note: "Manifest never carries it; its effect is already baked into the old side's raw exports" },
-  { field: 'judge', recoverable: false, source: 'not-recoverable', note: 'Manifest never carries it, and no judge.json is ever written — a rebuild cannot know whether judging was requested or reproduce the original verdict, only run a new one' },
+  { field: 'judge', recoverable: false, source: 'not-recoverable', note: 'Manifest never carries it, and no judge.json is ever written when judging genuinely was not requested — a rebuild cannot know whether judging was requested or reproduce the original verdict, only run a new one' },
   { field: 'judgeFiles', recoverable: false, source: 'not-recoverable', note: 'same as judge' },
   { field: 'preflightEnabled', recoverable: false, source: 'not-recoverable', note: 'inferable only indirectly from preflight.log presence/content, not a structured field' },
   { field: 'preflightModel', recoverable: false, source: 'not-recoverable', note: 'Manifest never carries it' },
-  { field: 'model', recoverable: modelFoundInConfig, source: modelFoundInConfig ? 'config' : 'not-recoverable', note: 'not in manifest.json at all — only recoverable from config/baseline.json or config/new.json, which phase 04 has always written' },
+  { field: 'model', recoverable: modelFoundInConfig, source: modelFoundInConfig ? 'config' : 'not-recoverable', note: 'not in manifest.json at all — only recoverable from a config/*.json file, which phase 04 has always written per variant' },
   { field: 'formats', recoverable: false, source: 'not-recoverable', note: 'report format(s) requested; must default (likely md) — may not match what the user originally asked for' },
   { field: 'outputPath', recoverable: false, source: 'not-recoverable', note: "not recorded; inferable only by absence of a separate --output tree next to results/, which is not a reliable positive signal" },
-  { field: 'diffHtml', recoverable: false, source: 'not-recoverable', note: 'no side.html anywhere to infer from when phase 08 died before writing any — must default, and the rebuilt report may link to files it never generates or vice versa' },
+  { field: 'diffHtml', recoverable: false, source: 'not-recoverable', note: 'no <variant>.html anywhere to infer from when phase 08 died before writing any — must default, and the rebuilt report may link to files it never generates or vice versa' },
   { field: 'collapseRepeats', recoverable: false, source: 'not-recoverable', note: 'report-formatting-only option, no artifact reveals it' },
   { field: 'timelineMode', recoverable: false, source: 'not-recoverable', note: 'no timeline.html exists to infer from; must default' },
   { field: 'timeouts', recoverable: false, source: 'not-recoverable', note: 'only matters for re-running opencode, not for rebuilding a report from existing raw exports' },
@@ -371,24 +387,54 @@ const readJsonRecord = (p: string): Effect.Effect<Record<string, unknown>> =>
     }
   })
 
+/**
+ * Generic on purpose: v2 writes `config/<variantName>.json` per variant,
+ * v1 wrote the fixed `config/baseline.json` + `config/new.json` — rather
+ * than branch on the workspace's schema version and variant names, this
+ * just probes every `.json` file directly under `config/` for a `model`
+ * key. Correct for both naming schemes and any future one.
+ */
+const configDirHasModel = (runRoot: string): Effect.Effect<boolean> =>
+  Effect.gen(function* () {
+    const configDir = path.join(runRoot, 'config')
+    const dirExists = yield* exists(configDir)
+    if (!dirExists) return false
+    const entries = yield* readDir(configDir).pipe(Effect.catchAll(() => Effect.succeed([])))
+    const jsonFiles = entries.filter((e) => e.endsWith('.json'))
+    const flags = yield* Effect.forEach(jsonFiles, (f) =>
+      readJsonRecord(path.join(configDir, f)).pipe(Effect.map((obj) => has(obj, 'model'))),
+    )
+    return flags.some((f) => f)
+  })
+
 export interface ManifestCensusResult {
   readonly manifest: Record<string, unknown>
   readonly modelFoundInConfig: boolean
   readonly fields: readonly ManifestFieldStatus[]
+  /** The workspace's true on-disk schema version (1 when manifest.json predates `schemaVersion`, or is missing/unreadable). */
+  readonly schemaVersion: 1 | 2
 }
 
 /**
  * `runRoot` is one run directory (e.g. `<workspace>/<run-id>/`, the same
- * level `manifest.json` and `config/` live at). Reads `manifest.json` plus
- * `config/{baseline,new}.json` (only for the `model` field — see the note on
- * that entry) and never fails: a missing/unreadable file just yields an
- * empty object, which `censusManifestFields` reports as fully not-recoverable.
+ * level `manifest.json` and `config/` live at). Reads `manifest.json`
+ * (routed through `parseManifestCompat` so a v1-sourced manifest is
+ * v1->v2-mapped before `censusManifestFields` ever sees it) plus every
+ * `config/*.json` file (only for the `model` field — see the note on that
+ * entry) and never fails: a missing/unreadable file just yields an empty
+ * object, which `censusManifestFields` reports as fully not-recoverable.
  */
 export const recoverManifestCensus = (runRoot: string): Effect.Effect<ManifestCensusResult> =>
   Effect.gen(function* () {
-    const manifest = yield* readJsonRecord(path.join(runRoot, 'manifest.json'))
-    const baseline = yield* readJsonRecord(path.join(runRoot, 'config', 'baseline.json'))
-    const newConfig = yield* readJsonRecord(path.join(runRoot, 'config', 'new.json'))
-    const modelFoundInConfig = has(baseline, 'model') || has(newConfig, 'model')
-    return { manifest, modelFoundInConfig, fields: censusManifestFields(manifest, modelFoundInConfig) }
+    const rawManifest = yield* readJsonRecord(path.join(runRoot, 'manifest.json'))
+    const compat = parseManifestCompat(rawManifest)
+    const manifest: Record<string, unknown> =
+      compat === undefined ? rawManifest : compat.manifest
+    const modelFoundInConfig = yield* configDirHasModel(runRoot)
+    return {
+      manifest,
+      modelFoundInConfig,
+      fields: censusManifestFields(manifest, modelFoundInConfig),
+      schemaVersion: compat?.schemaVersion ?? 1,
+    }
   })
