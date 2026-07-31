@@ -296,8 +296,20 @@ export interface StatusEntry {
  * `--porcelain` (v1, not `=v2`) keeps the two-char code + path format stable
  * across git versions; each line is `XY path` with a single space separator,
  * a renamed entry's `path` carries the `old -> new` text verbatim.
+ *
+ * `includeIgnored` adds `--ignored` (default git behavior, not
+ * `--ignored=matching`: an ignored directory collapses to one `!!ignored-dir/`
+ * line, same granularity plain status already gives untracked directories).
+ * Without it, a path the target repo's own `.gitignore` already covers is
+ * invisible to this call — `04b-pack-setup.ts` needs `!!` entries too, or a
+ * `setup` that writes into a gitignored path (npm's `node_modules/`, a
+ * tool's own `.env`) silently never gets detected at all.
  */
-export const statusPorcelain = (cwd: string, gitDir?: string): Effect.Effect<readonly StatusEntry[], GitError> =>
+export const statusPorcelain = (
+  cwd: string,
+  gitDir?: string,
+  includeIgnored = false,
+): Effect.Effect<readonly StatusEntry[], GitError> =>
   Effect.gen(function* () {
     const { stdout } = yield* runGit(
       'status',
@@ -307,7 +319,12 @@ export const statusPorcelain = (cwd: string, gitDir?: string): Effect.Effect<rea
       // itself into `.git/info/exclude` as a pattern, which then matches
       // nothing real — the artifact it was meant to hide leaks straight
       // into the measured diff instead.
-      [...gitDirArgs(cwd, gitDir), '-c', 'core.quotePath=false', 'status', '--porcelain'],
+      [
+        ...gitDirArgs(cwd, gitDir),
+        '-c', 'core.quotePath=false',
+        'status', '--porcelain',
+        ...(includeIgnored ? ['--ignored'] : []),
+      ],
       cwd,
     )
     return stdout.split('\n').flatMap((line) => {

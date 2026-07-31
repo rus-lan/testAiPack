@@ -323,16 +323,50 @@ export const packSetup = (
     const timeoutMs = runInput.timeouts.installSeconds * 1000
 
     const setupsRef = yield* Ref.make<readonly PackCmdResult[]>([])
-    // Per-variant accumulator for paths a `setup` command wrote into run-1's
-    // APP dir (as opposed to its HOME) — merged across every pack that
-    // declares `setup` on the same variant, then persisted once as
-    // `<raw>/<variant>/setup.json` after the loop below. Mirrors
-    // `cli/pipeline.ts`'s `run-N.exercise.json`, but per-variant rather than
-    // per-run: a setup runs once per (variant, pack), not once per run.
-    const appExcludesRef = yield* Ref.make<ReadonlyMap<string, readonly string[]>>(new Map())
     for (const v of runInput.variants) {
       const vt = workspace.variantTrees.find((t) => t.name === v.name)
       const declaredPacks = packsOf(runInput, v)
+      const gitDirsForVariant = vt?.gitDirs ?? []
+
+      // Structural precondition for the app-dir git work below: under
+      // `--protect-git`, a variant's `gitDirs` must pair 1:1 with its `apps`
+      // (mirrors `08-diff.ts`'s `pairRunDirs` guard) — a silent
+      // `gitDirsForVariant[idx] ?? path.join(appDir, '.git')` fallback inside
+      // `gitDirFor` would otherwise write a bogus in-tree `.git` into a
+      // protected worktree instead of failing. Unreachable today
+      // (`01-workspace-setup` builds both arrays from the same run paths, and
+      // `08-diff.ts` hard-fails on this exact mismatch first) — defensive,
+      // not a fix for an active bug. Only checked when this variant actually
+      // has a pack declaring `setup` — nothing below touches git otherwise.
+      if (runInput.protectGit && declaredPacks.some((p) => p.setup !== undefined)) {
+        const appCount = (vt?.apps ?? []).length
+        if (gitDirsForVariant.length !== appCount) {
+          yield* flushLog()
+          yield* Effect.fail(
+            fail(
+              `protect-git dir count (${String(gitDirsForVariant.length)}) does not match run count (${String(appCount)}) for variant ${v.name}`,
+              'E_PACK_SETUP_FAILED',
+              { variant: v.name },
+            ),
+          )
+        }
+      }
+
+      // Per-variant accumulators for paths a `setup` command wrote into
+      // run-1's APP dir (as opposed to its HOME) — merged across every pack
+      // that declares `setup` on this variant (declaration order), then
+      // acted on ONCE after the pack loop below, not per pack (see the
+      // comment at that point for why). Untracked (`??`) paths need explicit
+      // exclusion and get persisted to `<raw>/<variant>/setup.json` for
+      // `08-diff.ts` to re-apply after a `.git` restore/replace
+      // (`reapplySetupExcludes`), mirroring `run-N.exercise.json`. Ignored
+      // (`!!`) paths — already covered by the target repo's own
+      // `.gitignore` — are copied the same way but never need excluding or
+      // persisting: `.gitignore` is a tracked working-tree file, unaffected
+      // by a `.git` restore.
+      const untrackedPathsRef = yield* Ref.make<readonly string[]>([])
+      const ignoredPathsRef = yield* Ref.make<readonly string[]>([])
+
       for (const pack of declaredPacks) {
         if (pack.setup === undefined) continue
 
@@ -420,23 +454,23 @@ export const packSetup = (
           }
         }
 
-        // A setup that writes into the workspace (not just HOME) — e.g. an
-        // install command that drops config into cwd — otherwise contaminates
-        // ONLY run-1's app dir: 08-diff.ts measures every run's app dir
-        // independently, so run-1 and runs 2..N would silently measure
-        // different starting states. `git status --porcelain` on run-1's app
-        // dir is the instrument (the app dir is a git worktree, cloned by
-        // phase 02 before this phase ever runs): a tracked-file modification
-        // means the setup changed the baseline repo itself — that cannot be
-        // fixed by excluding a path after the fact, so it aborts loudly,
-        // mirroring `cli/pipeline.ts`'s `E_PACK_EXERCISE_DIRTY` handling for
-        // `--pack-exercise`. A new untracked path is the setup's own output —
-        // copied onto every other run's app dir and excluded from every run's
-        // OWN `.git/info/exclude` (mirroring `runPackExercise` in
-        // `cli/pipeline.ts`), so no run's measured diff ever sees it.
-        const gitDirsForVariant = vt?.gitDirs ?? []
+        // Detect what THIS pack's setup wrote into run-1's app dir — but do
+        // NOT write run-1's own `.git/info/exclude` yet (that happens once,
+        // after every pack in this variant's loop has run — see below): a
+        // second pack declaring `setup` on the same variant must still see
+        // whatever an earlier pack wrote as `??`/`!!`, or a further edit
+        // under an already-created path (pack B appending to pack A's
+        // AGENTS.md, or dropping a second file into a directory pack A
+        // created) would go undetected and never reach runs 2..N.
+        //
+        // `--ignored` (the third arg) also surfaces `!!` entries: a path the
+        // TARGET repo's own `.gitignore` already covers (npm's
+        // `node_modules/`, a tool's own `.env`, ...) is otherwise invisible
+        // to plain `git status --porcelain` — silently never propagated, the
+        // same class of divergence this phase exists to close, just without
+        // run-1's exercise failing loudly to make it visible.
         const gitDir0 = gitDirFor(runInput.protectGit, app0, gitDirsForVariant, 0)
-        const statuses = yield* statusPorcelain(app0, gitDir0).pipe(
+        const statuses = yield* statusPorcelain(app0, gitDir0, true).pipe(
           Effect.mapError((e: GitError) =>
             fail(`cannot verify pack setup diff hygiene (git status failed): ${e.stderr}`, 'E_PACK_SETUP_FAILED', {
               variant: v.name,
@@ -444,7 +478,12 @@ export const packSetup = (
             }),
           ),
         )
-        const dirtyTracked = statuses.filter((s) => s.code !== '??' && s.code.trim() !== '')
+        // `!!` (already gitignored) is filtered out here alongside `??` — it
+        // must never be treated as "modified tracked file": the moment
+        // `--ignored` is passed, every ignored path shows up in `status`
+        // output, and without this exclusion every one of them would abort a
+        // legitimate run.
+        const dirtyTracked = statuses.filter((s) => s.code !== '??' && s.code !== '!!' && s.code.trim() !== '')
         if (dirtyTracked.length > 0) {
           yield* flushLog()
           yield* Effect.fail(
@@ -456,72 +495,107 @@ export const packSetup = (
           )
         }
 
-        const setupUntrackedPaths = statuses.filter((s) => s.code === '??').map((s) => s.path)
-        if (setupUntrackedPaths.length > 0) {
-          yield* appendInfoExclude(gitDir0, setupUntrackedPaths).pipe(
+        const newUntracked = statuses.filter((s) => s.code === '??').map((s) => s.path)
+        const newIgnored = statuses.filter((s) => s.code === '!!').map((s) => s.path)
+        if (newUntracked.length > 0) {
+          yield* Ref.update(untrackedPathsRef, (prev) => [...new Set([...prev, ...newUntracked])])
+        }
+        if (newIgnored.length > 0) {
+          yield* Ref.update(ignoredPathsRef, (prev) => [...new Set([...prev, ...newIgnored])])
+        }
+      }
+
+      // ONCE per variant, after every one of its packs' setups has run:
+      // exclude, propagate, persist and verify. Deferred out of the per-pack
+      // loop above for the reason noted there — nothing reads `gitDir0`'s
+      // `.git/info/exclude` between two packs' setups, so deferring is safe.
+      const untrackedPaths = yield* Ref.get(untrackedPathsRef)
+      const ignoredPaths = yield* Ref.get(ignoredPathsRef)
+      const allNewPaths = [...untrackedPaths, ...ignoredPaths]
+      if (allNewPaths.length > 0) {
+        const app0 = vt?.apps[0] ?? ''
+        const gitDir0 = gitDirFor(runInput.protectGit, app0, gitDirsForVariant, 0)
+
+        if (untrackedPaths.length > 0) {
+          yield* appendInfoExclude(gitDir0, untrackedPaths).pipe(
             Effect.mapError((e: FsError) =>
-              fail(`cannot exclude setup artifacts in ${gitDir0}: ${e.path}`, 'E_PACK_SETUP_FAILED', {
-                variant: v.name,
-                pack: pack.name,
-              }),
+              fail(`cannot exclude setup artifacts in ${gitDir0}: ${e.path}`, 'E_PACK_SETUP_FAILED', { variant: v.name }),
             ),
           )
+        }
 
-          const restApps = (vt?.apps ?? []).slice(1)
-          for (const [i, appDir] of restApps.entries()) {
-            for (const relPath of setupUntrackedPaths) {
-              const dst = path.join(appDir, relPath)
-              yield* ensureDir(path.dirname(dst)).pipe(
-                Effect.mapError((e: FsError) =>
-                  fail(`cannot prepare ${dst} for setup artifact copy: ${e.path}`, 'E_PACK_SETUP_FAILED', {
-                    variant: v.name,
-                    pack: pack.name,
-                  }),
-                ),
-              )
-              yield* copyDir(path.join(app0, relPath), dst).pipe(
-                Effect.mapError((e: FsError) =>
-                  fail(`cannot copy setup artifact ${relPath} into ${appDir}: ${e.path}`, 'E_PACK_SETUP_FAILED', {
-                    variant: v.name,
-                    pack: pack.name,
-                  }),
-                ),
-              )
-            }
-            const otherGitDir = gitDirFor(runInput.protectGit, appDir, gitDirsForVariant, i + 1)
-            yield* appendInfoExclude(otherGitDir, setupUntrackedPaths).pipe(
+        const restApps = (vt?.apps ?? []).slice(1)
+        for (const [i, appDir] of restApps.entries()) {
+          for (const relPath of allNewPaths) {
+            const dst = path.join(appDir, relPath)
+            yield* ensureDir(path.dirname(dst)).pipe(
               Effect.mapError((e: FsError) =>
-                fail(`cannot exclude setup artifacts in ${otherGitDir}: ${e.path}`, 'E_PACK_SETUP_FAILED', {
-                  variant: v.name,
-                  pack: pack.name,
-                }),
+                fail(`cannot prepare ${dst} for setup artifact copy: ${e.path}`, 'E_PACK_SETUP_FAILED', { variant: v.name }),
+              ),
+            )
+            yield* copyDir(path.join(app0, relPath), dst).pipe(
+              Effect.mapError((e: FsError) =>
+                fail(`cannot copy setup artifact ${relPath} into ${appDir}: ${e.path}`, 'E_PACK_SETUP_FAILED', { variant: v.name }),
               ),
             )
           }
+          if (untrackedPaths.length > 0) {
+            const otherGitDir = gitDirFor(runInput.protectGit, appDir, gitDirsForVariant, i + 1)
+            yield* appendInfoExclude(otherGitDir, untrackedPaths).pipe(
+              Effect.mapError((e: FsError) =>
+                fail(`cannot exclude setup artifacts in ${otherGitDir}: ${e.path}`, 'E_PACK_SETUP_FAILED', { variant: v.name }),
+              ),
+            )
+          }
+        }
 
-          yield* Ref.update(appExcludesRef, (prev) => {
-            const merged = [...new Set([...(prev.get(v.name) ?? []), ...setupUntrackedPaths])]
-            return new Map(prev).set(v.name, merged)
-          })
+        if (untrackedPaths.length > 0) {
+          yield* ensureDir(path.join(workspace.raw, v.name)).pipe(Effect.catchAll(() => Effect.void))
+          yield* writeJson(path.join(workspace.raw, v.name, 'setup.json'), { excludedPaths: untrackedPaths }).pipe(
+            Effect.catchAll(() => Effect.void),
+          )
+        }
+
+        // Safety net: verify propagation actually reached every run, not
+        // just that the copy/exclude calls above returned success — this is
+        // what closes the whole CLASS of "runs silently measure different
+        // states" bug, including one this phase does not yet know to look
+        // for. Compares every run's own untracked+ignored path set (after
+        // the copy/exclude above) against run-1's; any difference names the
+        // diverging run(s) and aborts rather than letting the measurement
+        // continue on mismatched ground.
+        const allApps = vt?.apps ?? []
+        const perRunPaths = yield* Effect.forEach(
+          allApps,
+          (appDir, idx) =>
+            Effect.gen(function* () {
+              const gd = gitDirFor(runInput.protectGit, appDir, gitDirsForVariant, idx)
+              const st = yield* statusPorcelain(appDir, gd, true).pipe(
+                Effect.mapError((e: GitError) =>
+                  fail(`cannot verify setup propagation (git status failed): ${e.stderr}`, 'E_PACK_SETUP_FAILED', {
+                    variant: v.name,
+                  }),
+                ),
+              )
+              const paths = [...new Set(st.filter((s) => s.code === '??' || s.code === '!!').map((s) => s.path))].sort()
+              return { appDir, paths }
+            }),
+          { concurrency: 1 },
+        )
+        const reference = perRunPaths[0]?.paths ?? []
+        const referenceJson = JSON.stringify(reference)
+        const diverging = perRunPaths.filter((r) => JSON.stringify(r.paths) !== referenceJson)
+        if (diverging.length > 0) {
+          yield* flushLog()
+          yield* Effect.fail(
+            fail(
+              `pack setup left run(s) of variant "${v.name}" with a different app-dir state than run-1: ${diverging.map((d) => `${d.appDir} has [${d.paths.join(', ')}]`).join('; ')} (run-1 has [${reference.join(', ')}])`,
+              'E_PACK_SETUP_FAILED',
+              { variant: v.name, diverging: diverging.map((d) => ({ appDir: d.appDir, paths: d.paths })) },
+            ),
+          )
         }
       }
-    }
-
-    // Persist the merged setup-written app-dir paths per variant — one write
-    // per variant, after every one of its packs' setups has run — so
-    // `08-diff.ts` can re-apply the same excludes to any run of this variant
-    // whose `.git` later needs restoring/replacing (`reapplySetupExcludes`),
-    // the same gap `run-N.exercise.json` closes for `--pack-exercise`.
-    // Best-effort like that record: it only matters on the git-restore edge
-    // case, the live `.git/info/exclude` written above is what protects the
-    // ordinary path.
-    const appExcludes = yield* Ref.get(appExcludesRef)
-    for (const [variantName, paths] of appExcludes) {
-      if (paths.length === 0) continue
-      yield* ensureDir(path.join(workspace.raw, variantName)).pipe(Effect.catchAll(() => Effect.void))
-      yield* writeJson(path.join(workspace.raw, variantName, 'setup.json'), { excludedPaths: paths }).pipe(
-        Effect.catchAll(() => Effect.void),
-      )
     }
 
     yield* flushLog()

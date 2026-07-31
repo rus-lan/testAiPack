@@ -272,4 +272,39 @@ describe('git utils — statusPorcelain / appendInfoExclude (pack-exercise exclu
     const afterStatus = await run(statusPorcelain(repo))
     expect(afterStatus).toEqual([])
   })
+
+  it('includeIgnored=false (default) never reports a gitignored path — it stays invisible to plain status', async () => {
+    const repo = await buildSourceRepo()
+    const { writeFile, ensureDir } = await import('./fs.js')
+    await run(writeFile(path.join(repo, '.gitignore'), 'ignored-dir/\n'))
+    await run(addAll(repo))
+    const { commit } = await import('./git.js')
+    await run(commit(repo, 'add gitignore'))
+    await run(ensureDir(path.join(repo, 'ignored-dir')))
+    await run(writeFile(path.join(repo, 'ignored-dir', 'file.txt'), 'x\n'))
+    await run(writeFile(path.join(repo, 'plain-untracked.txt'), 'y\n'))
+
+    const statuses = await run(statusPorcelain(repo))
+    expect(statuses.map((s) => s.code)).not.toContain('!!')
+    expect(statuses.map((s) => s.path)).toEqual(['plain-untracked.txt'])
+  })
+
+  it('includeIgnored=true reports gitignored paths as `!!`, collapsing an ignored directory to one entry (same granularity plain status already gives untracked directories)', async () => {
+    const repo = await buildSourceRepo()
+    const { writeFile, ensureDir } = await import('./fs.js')
+    await run(writeFile(path.join(repo, '.gitignore'), 'ignored-dir/\nrun.log\n'))
+    await run(addAll(repo))
+    const { commit } = await import('./git.js')
+    await run(commit(repo, 'add gitignore'))
+    await run(ensureDir(path.join(repo, 'ignored-dir')))
+    await run(writeFile(path.join(repo, 'ignored-dir', 'file.txt'), 'x\n'))
+    await run(writeFile(path.join(repo, 'run.log'), 'log\n'))
+    await run(writeFile(path.join(repo, 'plain-untracked.txt'), 'y\n'))
+
+    const statuses = await run(statusPorcelain(repo, undefined, true))
+    const byCode = (code: string): readonly string[] =>
+      statuses.filter((s) => s.code === code).map((s) => s.path).sort()
+    expect(byCode('??')).toEqual(['plain-untracked.txt'])
+    expect(byCode('!!')).toEqual(['ignored-dir/', 'run.log'])
+  })
 })

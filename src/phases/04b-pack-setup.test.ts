@@ -3,7 +3,7 @@ import { Effect } from 'effect'
 import { writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { makeTempDir } from '../../tests/setup.js'
-import { ensureDir, exists, readFile, writeFile } from '../util/fs.js'
+import { copyDir, ensureDir, exists, moveDir, readFile, writeFile } from '../util/fs.js'
 import { addAll, commit, init } from '../util/git.js'
 import { packSetup, derivePackSetupMode, scanForDependencyMarkers } from './04b-pack-setup.js'
 import type { PackSetupInputExt } from './04b-pack-setup.js'
@@ -14,12 +14,28 @@ vi.mock('../opencode/spawn.js', () => ({
   spawnProcess: vi.fn(),
   execCmd: vi.fn(),
 }))
+// `copyDir` is spied (not fully mocked — defaults to the real implementation,
+// reset every test below) so ONE test can simulate a copy that "succeeds"
+// without actually reaching a target run's app dir, proving the propagation
+// safety-net check in `04b-pack-setup.ts` fires on that silent mismatch.
+vi.mock('../util/fs.js', async (importOriginal) => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  const actual = await importOriginal<typeof import('../util/fs.js')>()
+  return { ...actual, copyDir: vi.fn(actual.copyDir) }
+})
 
 const { spawnProcess } = await import('../opencode/spawn.js')
 const spawnMock = vi.mocked(spawnProcess)
+const copyDirMock = vi.mocked(copyDir)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
+
+beforeEach(async () => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  const actual = await vi.importActual<typeof import('../util/fs.js')>('../util/fs.js')
+  copyDirMock.mockImplementation(actual.copyDir)
+})
 
 const baseTimeouts = {
   preflightSeconds: 30,
@@ -154,6 +170,29 @@ const buildInput = async (
       ...(envVars === undefined ? {} : { envVars }),
     },
     workspace,
+  }
+}
+
+/**
+ * Relocates a variant's app-dir `.git` dirs outside the work tree, mirroring
+ * `--protect-git` (phase 02's `repoClone`) — returns a NEW `WorkspaceTree`
+ * with that variant's `gitDirs` populated. `buildInput`'s `initAppRepo`
+ * always `git init`s in-tree, so this is applied on top for the one test
+ * that needs a genuinely protected layout.
+ */
+const protectGitVariant = async (workspace: WorkspaceTree, name: string): Promise<WorkspaceTree> => {
+  const vt = workspace.variantTrees.find((t) => t.name === name)
+  if (vt === undefined) return workspace
+  const gitDirs: string[] = []
+  for (const appDir of vt.apps) {
+    const gitDir = path.join(workspace.root, 'protected-git', name, path.basename(appDir))
+    await runP(ensureDir(path.dirname(gitDir)))
+    await runP(moveDir(path.join(appDir, '.git'), gitDir))
+    gitDirs.push(gitDir)
+  }
+  return {
+    ...workspace,
+    variantTrees: workspace.variantTrees.map((t) => (t.name === name ? { ...t, gitDirs } : t)),
   }
 }
 
@@ -649,6 +688,143 @@ describe('phase 04b — pack-setup: app-dir contamination', () => {
       await runP(readFile(path.join(workspace.raw, 'multi', 'setup.json'))),
     ) as { excludedPaths: string[] }
     expect([...record.excludedPaths].sort()).toEqual(['from-a.txt', 'from-b.txt'])
+  })
+
+  it('setup writes a whole untracked DIRECTORY (`?? .opencode/`, the actual shape of the real graphify case) -> the whole dir, nested file included, propagates and gets excluded', async () => {
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
+    const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'graphify opencode install' }]
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
+    const apps = appsOf(workspace, 'a')
+    await runP(ensureDir(path.join(apps[0]!, '.opencode', 'plugins')))
+    await runP(writeFile(path.join(apps[0]!, '.opencode', 'plugins', 'graphify.js'), 'module.exports = {}\n'))
+
+    await runP(packSetup(input))
+
+    expect(await runP(exists(path.join(apps[1]!, '.opencode', 'plugins', 'graphify.js')))).toBe(true)
+    expect(await runP(readFile(path.join(apps[1]!, '.opencode', 'plugins', 'graphify.js')))).toBe(
+      'module.exports = {}\n',
+    )
+    const exclude = await runP(readFile(path.join(apps[0]!, '.git', 'info', 'exclude')))
+    expect(exclude).toContain('.opencode/')
+  })
+
+  it('gitignored setup output: a path the TARGET repo\'s own .gitignore already covers is still propagated, but never added to info/exclude or setup.json (already hidden everywhere by .gitignore itself)', async () => {
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
+    const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'npm install' }]
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
+    const apps = appsOf(workspace, 'a')
+    // Extend the seed repo with a .gitignore covering `dist/`, committed like
+    // any other tracked file (mirrors a real target repo, not something 04b
+    // itself writes).
+    await runP(writeFile(path.join(apps[0]!, '.gitignore'), 'dist/\n'))
+    await runP(addAll(apps[0]!))
+    await runP(commit(apps[0]!, 'add gitignore'))
+    await runP(writeFile(path.join(apps[1]!, '.gitignore'), 'dist/\n'))
+    await runP(addAll(apps[1]!))
+    await runP(commit(apps[1]!, 'add gitignore'))
+    // Simulate `npm install` writing into the gitignored path.
+    await runP(ensureDir(path.join(apps[0]!, 'dist')))
+    await runP(writeFile(path.join(apps[0]!, 'dist', 'bundle.js'), 'bundled\n'))
+
+    await runP(packSetup(input))
+
+    expect(await runP(exists(path.join(apps[1]!, 'dist', 'bundle.js')))).toBe(true)
+    expect(await runP(readFile(path.join(apps[1]!, 'dist', 'bundle.js')))).toBe('bundled\n')
+    const exclude0 = await runP(readFile(path.join(apps[0]!, '.git', 'info', 'exclude')))
+    expect(exclude0).not.toContain('dist')
+    expect(await runP(exists(path.join(workspace.raw, 'a', 'setup.json')))).toBe(false)
+  })
+
+  it('a SECOND pack modifying the FIRST pack\'s already-excluded file is still detected and its post-B content reaches run-2 (excluding run-1\'s own info/exclude is deferred to end-of-variant)', async () => {
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-a', 'pack-b'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a', setup: 'install-a' },
+      { name: 'pack-b', ref: 'github:owner/b', setup: 'install-b' },
+    ]
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
+    const apps = appsOf(workspace, 'multi')
+    spawnMock.mockImplementation((opts: { args: readonly string[] }) => {
+      const cmd = opts.args[1] ?? ''
+      if (cmd === 'install-a') writeFileSync(path.join(apps[0]!, 'AGENTS.md'), 'from pack-a\n')
+      // pack-b APPENDS to the same file pack-a created — if run-1's own
+      // info/exclude were written right after pack-a (the bug this test
+      // guards against), pack-b's own `git status` would no longer see
+      // AGENTS.md at all, and run-2 would end up stuck with pack-a's content.
+      if (cmd === 'install-b') writeFileSync(path.join(apps[0]!, 'AGENTS.md'), 'from pack-a\nfrom pack-b\n')
+      return Effect.succeed({ stdout: '', stderr: '', exitCode: 0, durationMs: 5, timedOut: false })
+    })
+
+    await runP(packSetup(input))
+
+    expect(await runP(readFile(path.join(apps[1]!, 'AGENTS.md')))).toBe('from pack-a\nfrom pack-b\n')
+    const record = JSON.parse(
+      await runP(readFile(path.join(workspace.raw, 'multi', 'setup.json'))),
+    ) as { excludedPaths: string[] }
+    expect(record.excludedPaths).toEqual(['AGENTS.md'])
+  })
+
+  it('protect-git: setup-written untracked file is detected/propagated/excluded when .git is relocated outside the app tree', async () => {
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
+    const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'graphify opencode install' }]
+    const built = await buildInput(variants, packs, { runs: 2, protectGit: true })
+    const workspace = await protectGitVariant(built.workspace, 'a')
+    const input: PackSetupInputExt = { ...built.input, workspace }
+    const apps = appsOf(workspace, 'a')
+    await runP(writeFile(path.join(apps[0]!, 'AGENTS.md'), 'contamination\n'))
+
+    await runP(packSetup(input))
+
+    expect(await runP(exists(path.join(apps[1]!, 'AGENTS.md')))).toBe(true)
+    const gitDirs = workspace.variantTrees.find((t) => t.name === 'a')?.gitDirs ?? []
+    expect(await runP(readFile(path.join(gitDirs[0]!, 'info', 'exclude')))).toContain('AGENTS.md')
+    expect(await runP(readFile(path.join(gitDirs[1]!, 'info', 'exclude')))).toContain('AGENTS.md')
+    // `.git` must never have been recreated inside the (protected) app tree.
+    expect(await runP(exists(path.join(apps[0]!, '.git')))).toBe(false)
+    expect(await runP(exists(path.join(apps[1]!, '.git')))).toBe(false)
+  })
+
+  it('protect-git: a gitDirs/apps count mismatch aborts loudly naming the variant, instead of silently writing an in-tree .git into a protected worktree', async () => {
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
+    const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 's' }]
+    const built = await buildInput(variants, packs, { runs: 2, protectGit: true })
+    const protectedWs = await protectGitVariant(built.workspace, 'a')
+    // structural mismatch: only one gitDir recorded for two runs
+    const vt = protectedWs.variantTrees.find((t) => t.name === 'a')!
+    const mismatched: WorkspaceTree = {
+      ...protectedWs,
+      variantTrees: protectedWs.variantTrees.map((t) => (t.name === 'a' ? { ...t, gitDirs: vt.gitDirs.slice(0, 1) } : t)),
+    }
+    const input: PackSetupInputExt = { ...built.input, workspace: mismatched }
+
+    const err = await runFlip(packSetup(input))
+    expect(err.code).toBe('E_PACK_SETUP_FAILED')
+    expect(err.message).toContain('protect-git dir count')
+    expect(err.context?.['variant']).toBe('a')
+    // no in-tree .git was recreated inside the (still) protected app dir
+    expect(await runP(exists(path.join(appsOf(mismatched, 'a')[0]!, '.git')))).toBe(false)
+  })
+
+  it('safety net: a propagation that silently does not reach run-3 (copy "succeeds" without writing) is caught and aborts, not just a copy-error path', async () => {
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
+    const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'graphify opencode install' }]
+    const { input, workspace } = await buildInput(variants, packs, { runs: 3 })
+    const apps = appsOf(workspace, 'a')
+    await runP(writeFile(path.join(apps[0]!, 'AGENTS.md'), 'contamination\n'))
+    // Simulate a hypothetical future bug where the copy call for run-3
+    // reports success without actually writing anything — the ordinary
+    // "cannot copy setup artifact" error path never fires here, only the
+    // dedicated propagation-verification check should.
+    // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+    const realCopyDir = (await vi.importActual<typeof import('../util/fs.js')>('../util/fs.js')).copyDir
+    copyDirMock.mockImplementation((src, dst) =>
+      dst.startsWith(apps[2]!) ? Effect.succeed(undefined) : realCopyDir(src, dst),
+    )
+
+    const err = await runFlip(packSetup(input))
+    expect(err.code).toBe('E_PACK_SETUP_FAILED')
+    expect(err.message).toContain('different app-dir state')
+    expect(err.message).toContain(apps[2]!)
+    expect(err.message).not.toContain('cannot copy setup artifact')
   })
 })
 
