@@ -1211,6 +1211,26 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
 
     const packResolution = yield* resolvePacksForVariants(modeResult.packs, modeResult.variants)
 
+    // A variant naming the same pack twice (`packs: ['p1', 'p1']`) is always a
+    // config mistake, not a meaningful "declare it harder" — reject rather
+    // than silently de-duplicating, so the collision is visible at parse time
+    // instead of surfacing later as a confusing double-apply in phase 04.
+    // Hoisted above detectPackTypes (network/filesystem detection per pack
+    // ref, below): this is a pure structural check on resolved names, so a
+    // config typo fails before paying for full pack detection.
+    for (const v of packResolution.variants) {
+      const dup = v.packs.find((name, i) => v.packs.indexOf(name) !== i)
+      if (dup !== undefined) {
+        return yield* Effect.fail(
+          cliParseError(
+            `variant "${v.name}" declares pack "${dup}" more than once`,
+            'E_CONFIG_INVALID',
+            { reason: 'duplicate-pack-in-variant', variant: v.name, pack: dup },
+          ),
+        )
+      }
+    }
+
     // Pack names become a `pack/<name>/` path segment downstream (phase 03)
     // with no containment guard there — reject anything unsafe here, the
     // single validation point (both config-declared names and D4 bare-ref
@@ -1255,23 +1275,6 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
             ),
           )
         }
-      }
-    }
-
-    // A variant naming the same pack twice (`packs: ['p1', 'p1']`) is always a
-    // config mistake, not a meaningful "declare it harder" — reject rather
-    // than silently de-duplicating, so the collision is visible at parse time
-    // instead of surfacing later as a confusing double-apply in phase 04.
-    for (const v of variants) {
-      const dup = v.packs.find((name, i) => v.packs.indexOf(name) !== i)
-      if (dup !== undefined) {
-        return yield* Effect.fail(
-          cliParseError(
-            `variant "${v.name}" declares pack "${dup}" more than once`,
-            'E_CONFIG_INVALID',
-            { reason: 'duplicate-pack-in-variant', variant: v.name, pack: dup },
-          ),
-        )
       }
     }
 

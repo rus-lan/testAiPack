@@ -602,6 +602,161 @@ describe('phase 04 — homeIsolation', () => {
     expect(await runP(exists(path.join(multiHome, '.config', 'opencode', 'skills', 'shared-skill')))).toBe(false)
   })
 
+  // Review-gate fix 1: the collision check must run in a whole-run pre-pass,
+  // BEFORE any variant's HOME is built — otherwise a collision on a LATER
+  // variant leaves EARLIER variants half-built on disk.
+  it('Stage 2 (fix 1): a collision on the THIRD variant is caught in a pre-pass — no earlier variant gets any HOME built', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const aDir = await writePackSkill('shared-skill')
+    const bDir = await writePackSkill('shared-skill')
+    const variants: VariantSpec[] = [
+      { name: 'first', packs: [] },
+      { name: 'second', packs: [] },
+      { name: 'multi', packs: ['pack-a', 'pack-b'] },
+    ]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a' },
+      { name: 'pack-b', ref: 'github:owner/b' },
+    ]
+    const outcome = makeOutcome([
+      skillDelivery('pack-a', aDir, 'shared-skill'),
+      skillDelivery('pack-b', bDir, 'shared-skill'),
+    ])
+    const input = buildInput(variants, packs, outcome)
+    const err = await runFlip(homeIsolation(input))
+    expect(err.code).toBe('E_PACK_INSTALL_FAILED')
+    expect(err.context?.['variant']).toBe('multi')
+    const firstHome = homesOf(input.workspace, 'first')[0]!
+    const secondHome = homesOf(input.workspace, 'second')[0]!
+    expect(await runP(exists(path.join(firstHome, '.config', 'opencode', 'agents', 'build.md')))).toBe(false)
+    expect(await runP(exists(path.join(secondHome, '.config', 'opencode', 'agents', 'build.md')))).toBe(false)
+    expect(await runP(exists(path.join(input.workspace.config, 'first.json')))).toBe(false)
+    expect(await runP(exists(path.join(input.workspace.config, 'second.json')))).toBe(false)
+  })
+
+  // Review-gate fixes 2+3: the harness's OWN build.md (written outside any
+  // pack, by buildSkeleton) is now a reserved destination — a pack shipping
+  // an agent literally named "build" must collide with the harness, not
+  // silently clobber it; and the error must name the `file` section so
+  // "build" (agent) is never confused with a same-named command.
+  it('Stage 2 (fix 2+3): a pack delivering an agent named "build" collides with the harness build agent, message/context name the section', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const mdSrc = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(mdSrc))
+    const mdPath = path.join(mdSrc, 'build.md')
+    await runP(writeFile(mdPath, '# rogue build agent\n'))
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['pack-a'] }]
+    const packs: PackSpec[] = [{ name: 'pack-a', ref: 'github:owner/a' }]
+    const outcome = makeOutcome([agentDelivery('pack-a', mdPath, 'build')])
+    const input = buildInput(variants, packs, outcome)
+    const err = await runFlip(homeIsolation(input))
+    expect(err.code).toBe('E_PACK_INSTALL_FAILED')
+    expect(err.context?.['packs']).toContain('pack-a')
+    expect(err.context?.['kind']).toBe('file')
+    expect(err.context?.['section']).toBe('agents')
+    expect(err.context?.['name']).toBe('build')
+    expect(err.message).toContain('harness')
+    expect(err.message).toContain('agents')
+    const aHome = homesOf(input.workspace, 'a')[0]!
+    expect(await runP(exists(path.join(aHome, '.config', 'opencode', 'agents', 'build.md')))).toBe(false)
+  })
+
+  // Fix 3, isolated: two DIFFERENT-section file instructions sharing a name
+  // must still collide correctly (own test above) when they truly share a
+  // section — and the message/context distinguish which section collided.
+  it('Stage 2 (fix 3): two packs delivering the same COMMAND name → error names the "commands" section, not "agents"', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const aMd = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(aMd))
+    const aFile = path.join(aMd, 'run.md')
+    await runP(writeFile(aFile, '# a\n'))
+    const bMd = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(bMd))
+    const bFile = path.join(bMd, 'run.md')
+    await runP(writeFile(bFile, '# b\n'))
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-a', 'pack-b'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a' },
+      { name: 'pack-b', ref: 'github:owner/b' },
+    ]
+    const outcome = makeOutcome([
+      {
+        pack: 'pack-a',
+        packPath: aFile,
+        detectedType: 'command',
+        registeredIn: ['commands'],
+        instructions: [{ kind: 'file', section: 'commands', name: 'run', target: aFile }],
+      },
+      {
+        pack: 'pack-b',
+        packPath: bFile,
+        detectedType: 'command',
+        registeredIn: ['commands'],
+        instructions: [{ kind: 'file', section: 'commands', name: 'run', target: bFile }],
+      },
+    ])
+    const input = buildInput(variants, packs, outcome)
+    const err = await runFlip(homeIsolation(input))
+    expect(err.code).toBe('E_PACK_INSTALL_FAILED')
+    expect(err.context?.['packs']).toEqual(['pack-a', 'pack-b'])
+    expect(err.context?.['section']).toBe('commands')
+    expect(err.message).toContain('commands')
+    expect(err.message).not.toContain('agents')
+  })
+
+  // Fix 5 (coverage): the happy path for multi-pack mcp merging had no
+  // dedicated test — only the collision case exercised two packs' mcp
+  // servers together.
+  it('Stage 2 (fix 5): two DIFFERENT mcp server names from two packs on ONE variant both land in config/<variant>.json and OPENCODE_CONFIG_CONTENT, neither leaks to a non-declaring variant', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const variants: VariantSpec[] = [
+      { name: 'multi', packs: ['pack-a', 'pack-b'] },
+      { name: 'smoke', packs: [] },
+    ]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'mcp:srv-a:{}' },
+      { name: 'pack-b', ref: 'mcp:srv-b:{}' },
+    ]
+    const outcome = makeOutcome([
+      mcpDelivery('pack-a', 'srv-a', { command: 'npx' }),
+      mcpDelivery('pack-b', 'srv-b', { command: 'node' }),
+    ])
+    const input = buildInput(variants, packs, outcome)
+    const result = await runP(homeIsolation(input))
+
+    const cfgFor = (name: string): Record<string, unknown> =>
+      JSON.parse(result.generatedConfigs.find((c) => c.name === name)!.config) as Record<string, unknown>
+
+    const multiMcp = cfgFor('multi')['mcp'] as Record<string, unknown>
+    expect(multiMcp['srv-a']).toEqual({ command: 'npx' })
+    expect(multiMcp['srv-b']).toEqual({ command: 'node' })
+    expect(cfgFor('smoke')['mcp']).toBeUndefined()
+
+    // OPENCODE_CONFIG_CONTENT is the same string as generatedConfigs (both
+    // fed by the same `configStr`) — assert on the env var directly too.
+    const multiEnvContent = result.envVars.find((e) => e.name === 'multi')!.envs[0]!.OPENCODE_CONFIG_CONTENT
+    if (multiEnvContent === undefined) throw new Error('missing OPENCODE_CONFIG_CONTENT')
+    const multiEnvCfg = JSON.parse(multiEnvContent) as Record<string, unknown>
+    const multiEnvMcp = multiEnvCfg['mcp'] as Record<string, unknown>
+    expect(multiEnvMcp['srv-a']).toEqual({ command: 'npx' })
+    expect(multiEnvMcp['srv-b']).toEqual({ command: 'node' })
+
+    const diskCfg = JSON.parse(
+      await runP(readFile(path.join(input.workspace.config, 'multi.json'))),
+    ) as Record<string, unknown>
+    const diskMcp = diskCfg['mcp'] as Record<string, unknown>
+    expect(diskMcp['srv-a']).toBeDefined()
+    expect(diskMcp['srv-b']).toBeDefined()
+  })
+
   it('Stage 2: two packs declaring the same mcp server name for one variant → E_PACK_INSTALL_FAILED naming both packs', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))

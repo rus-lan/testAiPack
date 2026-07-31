@@ -20,6 +20,7 @@ import type {
   HomeIsolationResult,
   HomeTree,
   IsolationMode,
+  RunInput,
   VariantConfig,
   VariantEnv,
   VariantHomes,
@@ -492,26 +493,125 @@ const findInstructionCollision = (
 }
 
 /**
+ * Sentinel "pack" standing in for the harness itself in the collision key
+ * space (review-gate finding): `buildSkeleton` below writes its OWN
+ * `agents/build.md` outside any pack, BEFORE instructions are applied — a
+ * pack delivering an agent genuinely named `build` would silently clobber it
+ * with no collision ever detected, since the check only ever compared pack
+ * against pack. Seeding this key means that case is caught the same way a
+ * pack-vs-pack collision is, naming the harness instead of a second pack.
+ * Contains characters `PACK_NAME_SAFE_RE` (00-cli-parse.ts) forbids in a
+ * real pack name (space, angle brackets), so it can never collide with a
+ * legitimately named pack.
+ */
+const HARNESS_OWNER = '<testaipack harness>'
+const HARNESS_RESERVED_INSTRUCTIONS: readonly RegistrationInstruction[] = [
+  { kind: 'file', section: 'agents', name: 'build', target: '' },
+]
+const HARNESS_ENTRIES: readonly KeyedInstruction[] = HARNESS_RESERVED_INSTRUCTIONS.map((inst) => ({
+  key: instructionDestKey(inst),
+  pack: HARNESS_OWNER,
+  inst,
+}))
+
+/** A `file` instruction's destination also depends on its section — name that in both message and context. */
+const describeInstruction = (inst: RegistrationInstruction): string =>
+  inst.kind === 'file' ? `file (${inst.section}) '${inst.name}'` : `${inst.kind} '${inst.name}'`
+
+/**
  * Stage 2 (WP16): a variant's declared pack set can now be arbitrarily large
  * — run this BEFORE any instruction is applied, across the variant's full
- * set of deliveries, so two packs colliding on the same destination fail
- * loud (naming both packs) instead of one silently clobbering the other.
+ * set of deliveries (plus the harness's own reserved destinations), so two
+ * packs — or a pack and the harness — colliding on the same destination
+ * fail loud (naming both) instead of one silently clobbering the other.
  */
 const checkInstructionCollisions = (
   variantName: string,
   deliveries: readonly PackDeliveryExt[],
 ): Effect.Effect<void, PhaseError> => {
-  const collision = findInstructionCollision(flattenKeyed(deliveries))
+  const collision = findInstructionCollision([...HARNESS_ENTRIES, ...flattenKeyed(deliveries)])
   if (collision === undefined) return Effect.void
   const { a, b } = collision
   return Effect.fail(
     homeIsolationError(
-      `packs '${a.pack}' and '${b.pack}' both deliver the same ${a.inst.kind} '${a.inst.name}' for variant '${variantName}'`,
+      `packs '${a.pack}' and '${b.pack}' both deliver the same ${describeInstruction(a.inst)} for variant '${variantName}'`,
       'E_PACK_INSTALL_FAILED',
-      { variant: variantName, packs: [a.pack, b.pack], kind: a.inst.kind, name: a.inst.name },
+      {
+        variant: variantName,
+        packs: [a.pack, b.pack],
+        kind: a.inst.kind,
+        name: a.inst.name,
+        ...(a.inst.kind === 'file' ? { section: a.inst.section } : {}),
+      },
     ),
   )
 }
+
+/**
+ * Resolves ONE variant's declared packs to their phase-03 deliveries — pure
+ * apart from the E_PACK_INSTALL_FAILED it can raise when `packOutcome` ran
+ * but is missing a declared pack (a real phase-03/04 mismatch, see below).
+ */
+const resolveVariantDeliveries = (
+  runInput: RunInput,
+  packOutcome: PackInstallOutcome | undefined,
+  v: VariantSpec,
+): Effect.Effect<readonly PackDeliveryExt[], PhaseError> =>
+  Effect.gen(function* () {
+    const declaredPacks = packsOf(runInput, v)
+    const deliveries = yield* Effect.forEach(
+      declaredPacks,
+      (pack) =>
+        Effect.gen(function* () {
+          const delivery = packOutcome?.deliveries.find((d) => d.pack === pack.name)
+          // packOutcome undefined means phase 03 never ran at all (test
+          // harnesses, or a run with an empty registry) — that is not a
+          // mismatch. packOutcome defined but missing THIS declared pack's
+          // delivery is a real bug: the variant would otherwise end up
+          // impure with an empty HOME and no error.
+          if (delivery === undefined && packOutcome !== undefined) {
+            yield* Effect.fail(
+              homeIsolationError(
+                `declared pack has no delivery from phase 03: variant=${v.name} pack=${pack.name}`,
+                'E_PACK_INSTALL_FAILED',
+                { variant: v.name, pack: pack.name },
+              ),
+            )
+          }
+          return delivery
+        }),
+      { concurrency: 1 },
+    )
+    return deliveries.filter((d): d is PackDeliveryExt => d !== undefined)
+  })
+
+interface VariantDeliveries {
+  readonly variant: string
+  readonly deliveries: readonly PackDeliveryExt[]
+}
+
+/**
+ * Review-gate fix: resolves EVERY variant's deliveries and runs the
+ * instruction-collision check for EVERY variant in one whole-run pre-pass,
+ * BEFORE any variant's HOME is touched (the `Effect.forEach(runInput.variants,
+ * processVariant, ...)` below). Without this, a collision on variant 3 would
+ * only be discovered after variants 1 and 2 already had HOMEs fully built
+ * and `config/<name>.json` written to disk.
+ */
+const resolveAllVariantDeliveries = (
+  runInput: RunInput,
+  packOutcome: PackInstallOutcome | undefined,
+): Effect.Effect<readonly VariantDeliveries[], PhaseError> =>
+  Effect.forEach(
+    runInput.variants,
+    (v) =>
+      Effect.gen(function* () {
+        const deliveries = yield* resolveVariantDeliveries(runInput, packOutcome, v)
+        yield* checkInstructionCollisions(v.name, deliveries)
+        return { variant: v.name, deliveries }
+      }),
+    { concurrency: 1 },
+  )
 
 /** Connectivity/model-selection fields copied as-is (no CLI override) into every variant's config. */
 export interface ConnectivityExtras {
@@ -640,37 +740,22 @@ export const homeIsolation = (
       Effect.mapError((e: FsError) => setupFail(`cannot create config dir: ${e.path}`, { path: e.path })),
     )
 
+    // Whole-run pre-pass (review-gate fix): resolve every variant's
+    // deliveries and check every variant for instruction collisions BEFORE
+    // any variant's HOME is touched below — see resolveAllVariantDeliveries.
+    const allDeliveries = yield* resolveAllVariantDeliveries(runInput, packOutcome)
+    const deliveriesOf = (name: string): readonly PackDeliveryExt[] =>
+      allDeliveries.find((d) => d.variant === name)?.deliveries ?? []
+
     const processVariant = (v: VariantSpec): Effect.Effect<VariantResult, PhaseError> =>
       Effect.gen(function* () {
         const declaredPacks = packsOf(runInput, v)
         // Apply EVERY declared pack's instructions/mcp — this loop is
         // set-based (Stage 2, WP16: no cap on declaredPacks length); it must
-        // never silently apply just the first pack.
-        const deliveries = yield* Effect.forEach(
-          declaredPacks,
-          (pack) =>
-            Effect.gen(function* () {
-              const delivery = packOutcome?.deliveries.find((d) => d.pack === pack.name)
-              // packOutcome undefined means phase 03 never ran at all (test
-              // harnesses, or a run with an empty registry) — that is not a
-              // mismatch. packOutcome defined but missing THIS declared
-              // pack's delivery is a real bug: the variant would otherwise
-              // end up impure with an empty HOME and no error.
-              if (delivery === undefined && packOutcome !== undefined) {
-                yield* Effect.fail(
-                  homeIsolationError(
-                    `declared pack has no delivery from phase 03: variant=${v.name} pack=${pack.name}`,
-                    'E_PACK_INSTALL_FAILED',
-                    { variant: v.name, pack: pack.name },
-                  ),
-                )
-              }
-              return delivery
-            }),
-          { concurrency: 1 },
-        )
-        const definedDeliveries = deliveries.filter((d): d is PackDeliveryExt => d !== undefined)
-        yield* checkInstructionCollisions(v.name, definedDeliveries)
+        // never silently apply just the first pack. Deliveries were already
+        // resolved (and collision-checked) by the pre-pass above — reused,
+        // not recomputed, so there is one single source of truth for them.
+        const definedDeliveries = deliveriesOf(v.name)
         const instructions: readonly RegistrationInstruction[] = definedDeliveries.flatMap((d) => [...d.instructions])
         const mcpServers = definedDeliveries.reduce<Record<string, unknown>>(
           (acc, d) => ({ ...acc, ...collectMcpServers(d.instructions) }),
