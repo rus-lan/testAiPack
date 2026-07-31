@@ -2,17 +2,19 @@ import { describe, it, expect } from 'vitest'
 import type {
   PrimaryMetrics,
   SecondaryMetrics,
-  SideAggregates,
+  VariantAggregates,
 } from '@generated/types'
 import {
   aggregatePrimary,
   aggregateSecondary,
-  buildSideAggregates,
-  computeDelta,
+  buildVariantAggregates,
   computeMetricDelta,
+  computeMetricsReport,
+  computeVariantDelta,
   countStalls,
   STALL_THRESHOLD_MS,
 } from './aggregate.js'
+import type { DeclaredPack } from './aggregate.js'
 import type { EventsProfile } from './events-profile.js'
 import type { ExtractedExtras, ExtractedMetrics, ExtractedPhases } from './extract.js'
 import { profileEvents } from './events-profile.js'
@@ -65,15 +67,15 @@ const emptySecondary = (): SecondaryMetrics => ({
 })
 
 const extras = (over: Partial<ExtractedExtras> = {}): ExtractedExtras => ({
-  packCalls: 0,
-  packErrors: 0,
-  firstPackCallMs: undefined,
+  packCalls: {},
+  packErrors: {},
+  firstPackCallMs: {},
   invalidToolCalls: 0,
   duplicateToolCalls: 0,
   bashFailCount: 0,
   toolErrorTexts: [],
   riskyCommands: [],
-  packActivitySignals: [],
+  packActivitySignals: {},
   opencodeVersion: '1.18.4',
   firstStepInputTokens: undefined,
   lastStepInputTokens: undefined,
@@ -91,9 +93,21 @@ const profile = (over: Partial<EventsProfile> = {}): EventsProfile => ({
   ...over,
 })
 
-const sideFromPrimary = (side: 'old' | 'new', list: readonly PrimaryMetrics[]): SideAggregates => {
+/** Minimal VariantAggregates straight from aggregatePrimary — no packUses/contamination/phaseSplit (all optional). */
+const variantAggFromPrimary = (variant: string, list: readonly PrimaryMetrics[]): VariantAggregates => {
   const { median, stats } = aggregatePrimary(list)
-  return { side, primary: median, secondary: emptySecondary(), stats, failedRuns: [], rawRunIds: [] }
+  return { variant, primary: median, secondary: emptySecondary(), stats, failedRuns: [], rawRunIds: [] }
+}
+
+/** Shared no-op values for fields every `buildVariantAggregates` call must supply but most tests don't exercise. */
+const baseInput = {
+  extras: [] as readonly ExtractedExtras[],
+  runIndexes: [] as readonly number[],
+  eventsProfiles: [] as readonly EventsProfile[],
+  initRanFlags: [] as readonly boolean[],
+  setupWallMsList: [] as readonly (number | undefined)[],
+  packs: [] as readonly DeclaredPack[],
+  foreignPacks: [] as readonly string[],
 }
 
 describe('computeMetricDelta (table)', () => {
@@ -228,7 +242,7 @@ describe('aggregateSecondary', () => {
   })
 })
 
-describe('buildSideAggregates', () => {
+describe('buildVariantAggregates', () => {
   const extracted = (over: Partial<PrimaryMetrics>): ExtractedMetrics => ({
     primary: primary(over),
     secondary: emptySecondary(),
@@ -236,40 +250,30 @@ describe('buildSideAggregates', () => {
     phases: emptyPhases(),
   })
 
-  const baseInput = {
-    extras: [] as readonly ExtractedExtras[],
-    runIndexes: [] as readonly number[],
-    eventsProfiles: [] as readonly EventsProfile[],
-    initRanFlags: [] as readonly boolean[],
-    setupWallMsList: [] as readonly (number | undefined)[],
-    canDetect: false,
-    visibilityConfirmed: false,
-  }
-
   it('aggregates successful runs and carries failedRuns', () => {
-    const agg = buildSideAggregates({
-      side: 'new',
+    const agg = buildVariantAggregates({
+      variant: 'graphify',
       extracted: [extracted({ totalTokens: '10' }), extracted({ totalTokens: '30' })],
-      failedRuns: [{ runIndex: 2, errorCode: 'E_RUN_CRASH', errorMessage: 'boom', timestamp: 't' }],
+      failedRuns: [{ variant: 'graphify', runIndex: 2, errorCode: 'E_RUN_CRASH', errorMessage: 'boom', timestamp: 't' }],
       rawRunIds: ['s1', 's3'],
       extras: [extras(), extras()],
       runIndexes: [1, 3],
       eventsProfiles: [],
       initRanFlags: [],
       setupWallMsList: [],
-      canDetect: false,
-      visibilityConfirmed: false,
+      packs: [],
+      foreignPacks: [],
     })
-    expect(agg.side).toBe('new')
+    expect(agg.variant).toBe('graphify')
     expect(agg.primary.totalTokens).toBe('20') // median of [10,30]
     expect(agg.failedRuns).toHaveLength(1)
     expect(agg.failedRuns[0]?.errorCode).toBe('E_RUN_CRASH')
     expect(agg.rawRunIds).toEqual(['s1', 's3'])
   })
 
-  it('no successful runs -> empty primary, empty samples, neutral-ready', () => {
-    const agg = buildSideAggregates({
-      side: 'old',
+  it('no successful runs -> empty primary, empty samples, neutral-ready, contaminationSignals omitted (nothing was ever inspected)', () => {
+    const agg = buildVariantAggregates({
+      variant: 'base',
       extracted: [],
       failedRuns: [],
       rawRunIds: [],
@@ -281,10 +285,16 @@ describe('buildSideAggregates', () => {
     expect(agg.stats.totalTokens.samples).toEqual([])
     expect(agg.riskyCommands).toBeUndefined()
     expect(agg.opencodeVersions).toBeUndefined()
+    expect(agg.contaminationSignals).toBeUndefined()
   })
 })
 
-describe('buildSideAggregates — contaminationSignals only ever surface on the baseline (old) side', () => {
+// ---------------------------------------------------------------------------
+// contaminationSignals — every variant now, checked against its own foreign
+// set (03-hard-problems.md §1.2/§3.3): a pack this variant does NOT declare.
+// ---------------------------------------------------------------------------
+
+describe('buildVariantAggregates — contaminationSignals for every variant, foreign-pack-based', () => {
   const extracted = (): ExtractedMetrics => ({
     primary: primary({}),
     secondary: emptySecondary(),
@@ -292,33 +302,70 @@ describe('buildSideAggregates — contaminationSignals only ever surface on the 
     phases: emptyPhases(),
   })
 
-  it('attaches runIndex to per-run activity signals and appends the config-drift signal, on old', () => {
-    const agg = buildSideAggregates({
-      side: 'old',
+  it('survives an all-failed variant: config drift comes from installed.json, not from any successful run', () => {
+    const agg = buildVariantAggregates({
+      variant: 'base',
+      extracted: [], // every run crashed
+      failedRuns: [{ variant: 'base', runIndex: 1, errorCode: 'E_RUN_CRASH', errorMessage: 'boom', timestamp: 't' }],
+      rawRunIds: [],
+      extras: [],
+      runIndexes: [],
+      eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
+      packs: [],
+      foreignPacks: ['graphify'],
+      configDriftSignal: { kind: 'install-drift', detail: "captured config differs across this variant's own runs in: skills" },
+    })
+    expect(agg.contaminationSignals).toEqual([
+      { kind: 'install-drift', pack: '', detail: "captured config differs across this variant's own runs in: skills" },
+    ])
+    // No successful run means no export was left to scan for foreign-pack activity.
+    expect(agg.riskyCommands).toBeUndefined()
+  })
+
+  it('an all-failed variant with no config-drift signal still omits contaminationSignals entirely', () => {
+    const agg = buildVariantAggregates({
+      variant: 'base',
+      extracted: [],
+      failedRuns: [],
+      rawRunIds: [],
+      extras: [],
+      runIndexes: [],
+      eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
+      packs: [],
+      foreignPacks: ['graphify'],
+    })
+    expect(agg.contaminationSignals).toBeUndefined()
+  })
+
+  it('attaches runIndex to per-run activity signals for a foreign pack', () => {
+    const agg = buildVariantAggregates({
+      variant: 'base',
       extracted: [extracted(), extracted()],
       failedRuns: [],
       rawRunIds: ['s1', 's2'],
       extras: [
-        extras({ packActivitySignals: [{ kind: 'bash-install', detail: 'npm install -g @sentropic/graphify' }] }),
-        extras({ packActivitySignals: [] }),
+        extras({ packActivitySignals: { graphify: [{ kind: 'bash-install', pack: 'graphify', detail: 'npm install -g @sentropic/graphify' }] } }),
+        extras({ packActivitySignals: { graphify: [] } }),
       ],
       runIndexes: [1, 2],
       eventsProfiles: [],
       initRanFlags: [],
       setupWallMsList: [],
-      canDetect: false,
-      visibilityConfirmed: false,
-      configDriftSignal: { kind: 'install-drift', detail: "captured config differs across this side's own runs in: skills" },
+      packs: [],
+      foreignPacks: ['graphify'],
     })
     expect(agg.contaminationSignals).toEqual([
-      { kind: 'bash-install', detail: 'npm install -g @sentropic/graphify', runIndex: 1 },
-      { kind: 'install-drift', detail: "captured config differs across this side's own runs in: skills" },
+      { kind: 'bash-install', pack: 'graphify', detail: 'npm install -g @sentropic/graphify', runIndex: 1 },
     ])
   })
 
-  it('present but empty on old when nothing was observed — checked and clean, not "not checked"', () => {
-    const agg = buildSideAggregates({
-      side: 'old',
+  it('appends the variant-level config-drift signal, stamped with an empty pack (it names no single pack)', () => {
+    const agg = buildVariantAggregates({
+      variant: 'base',
       extracted: [extracted()],
       failedRuns: [],
       rawRunIds: ['s1'],
@@ -327,28 +374,108 @@ describe('buildSideAggregates — contaminationSignals only ever surface on the 
       eventsProfiles: [],
       initRanFlags: [],
       setupWallMsList: [],
-      canDetect: false,
-      visibilityConfirmed: false,
+      packs: [],
+      foreignPacks: ['graphify'],
+      configDriftSignal: { kind: 'install-drift', detail: "captured config differs across this variant's own runs in: skills" },
     })
-    expect(agg.contaminationSignals).toEqual([])
+    expect(agg.contaminationSignals).toEqual([
+      { kind: 'install-drift', pack: '', detail: "captured config differs across this variant's own runs in: skills" },
+    ])
   })
 
-  it('never surfaced on new, even with the same signals present in extras', () => {
-    const agg = buildSideAggregates({
-      side: 'new',
+  it('present but empty when nothing was observed for the foreign set — checked and clean, not "not checked"', () => {
+    const agg = buildVariantAggregates({
+      variant: 'base',
       extracted: [extracted()],
       failedRuns: [],
       rawRunIds: ['s1'],
-      extras: [extras({ packActivitySignals: [{ kind: 'skill-call', detail: 'skill tool call succeeded for "graphify"' }] })],
+      extras: [extras({ packActivitySignals: { graphify: [] } })],
       runIndexes: [1],
       eventsProfiles: [],
       initRanFlags: [],
       setupWallMsList: [],
-      canDetect: true,
-      visibilityConfirmed: true,
-      configDriftSignal: { kind: 'install-drift', detail: 'irrelevant on new' },
+      packs: [],
+      foreignPacks: ['graphify'],
     })
-    expect(agg.contaminationSignals).toBeUndefined()
+    expect(agg.contaminationSignals).toEqual([])
+  })
+
+  it('present but empty when foreignPacks is empty (nothing foreign to check) — still not omitted, a successful run was inspected', () => {
+    const agg = buildVariantAggregates({
+      variant: 'base',
+      extracted: [extracted()],
+      failedRuns: [],
+      rawRunIds: ['s1'],
+      extras: [extras()],
+      runIndexes: [1],
+      eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
+      packs: [],
+      foreignPacks: [],
+    })
+    expect(agg.contaminationSignals).toEqual([])
+  })
+
+  it("a variant's OWN pack never contaminates itself, even when its packActivitySignals entry is non-empty", () => {
+    // graphify declares 'graphify' — its own high pack activity is expected
+    // and lives under packUses, not contaminationSignals. 'graphify' is
+    // absent from graphify's OWN foreignPacks (only 'astgrep', another
+    // variant's pack, is foreign to it).
+    const agg = buildVariantAggregates({
+      variant: 'graphify',
+      extracted: [extracted()],
+      failedRuns: [],
+      rawRunIds: ['s1'],
+      extras: [
+        extras({
+          packActivitySignals: {
+            graphify: [{ kind: 'skill-call', pack: 'graphify', detail: 'skill tool call succeeded for "graphify"' }],
+            astgrep: [],
+          },
+        }),
+      ],
+      runIndexes: [1],
+      eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
+      packs: [{ name: 'graphify', canDetect: true, visibilityConfirmed: true }],
+      foreignPacks: ['astgrep'],
+    })
+    expect(agg.contaminationSignals).toEqual([])
+  })
+
+  it('multiple foreign packs: grouped by foreign pack (declaration order), then by run; each signal already carries its own pack name', () => {
+    const agg = buildVariantAggregates({
+      variant: 'base',
+      extracted: [extracted(), extracted()],
+      failedRuns: [],
+      rawRunIds: ['s1', 's2'],
+      extras: [
+        extras({
+          packActivitySignals: {
+            graphify: [{ kind: 'skill-call', pack: 'graphify', detail: 'skill tool call succeeded for "graphify"' }],
+            astgrep: [],
+          },
+        }),
+        extras({
+          packActivitySignals: {
+            graphify: [],
+            astgrep: [{ kind: 'bash-install', pack: 'astgrep', detail: 'npm install -g astgrep' }],
+          },
+        }),
+      ],
+      runIndexes: [1, 2],
+      eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
+      packs: [],
+      foreignPacks: ['graphify', 'astgrep'],
+    })
+    expect(agg.contaminationSignals).toEqual([
+      { kind: 'skill-call', pack: 'graphify', detail: 'skill tool call succeeded for "graphify"', runIndex: 1 },
+      { kind: 'bash-install', pack: 'astgrep', detail: 'npm install -g astgrep', runIndex: 2 },
+    ])
   })
 })
 
@@ -544,44 +671,44 @@ describe.skipIf(!hasGoldenWorkspace)('countStalls — real ground truth (golden-
   })
 })
 
-describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', () => {
-  it('packUse omitted without packName', () => {
-    const agg = buildSideAggregates({
-      side: 'old',
-      extracted: [{ primary: primary({}), secondary: emptySecondary(), extras: extras({ packCalls: 1 }), phases: emptyPhases() }],
+describe('buildVariantAggregates — packUses / riskyCommands / opencodeVersions', () => {
+  it('packUses omitted without any declared packs', () => {
+    const agg = buildVariantAggregates({
+      variant: 'base',
+      extracted: [{ primary: primary({}), secondary: emptySecondary(), extras: extras({ packCalls: { graphify: 1 } }), phases: emptyPhases() }],
       failedRuns: [],
       rawRunIds: ['s1'],
-      extras: [extras({ packCalls: 1 })],
+      extras: [extras({ packCalls: { graphify: 1 } })],
       runIndexes: [1],
       eventsProfiles: [],
       initRanFlags: [],
       setupWallMsList: [],
-      canDetect: true,
-      visibilityConfirmed: true,
+      packs: [],
+      foreignPacks: [],
     })
-    expect(agg.packUse).toBeUndefined()
+    expect(agg.packUses).toBeUndefined()
   })
 
-  it('packUse: sums, runsWithCall, runCount, median firstCall over defined values only', () => {
-    const agg = buildSideAggregates({
-      side: 'old',
+  it('packUses: sums, runsWithCall, runCount, median firstCall over defined values only', () => {
+    const agg = buildVariantAggregates({
+      variant: 'graphify',
       extracted: [1, 2, 3].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras(), phases: emptyPhases() })),
       failedRuns: [],
       rawRunIds: ['s1', 's2', 's3'],
       extras: [
-        extras({ packCalls: 1, packErrors: 0, firstPackCallMs: 100 }),
-        extras({ packCalls: 0 }),
-        extras({ packCalls: 2, packErrors: 1, firstPackCallMs: 300 }),
+        extras({ packCalls: { graphify: 1 }, packErrors: { graphify: 0 }, firstPackCallMs: { graphify: 100 } }),
+        extras({ packCalls: { graphify: 0 } }),
+        extras({ packCalls: { graphify: 2 }, packErrors: { graphify: 1 }, firstPackCallMs: { graphify: 300 } }),
       ],
       runIndexes: [1, 2, 3],
       eventsProfiles: [],
       initRanFlags: [],
       setupWallMsList: [],
-      packName: 'graphify',
-      canDetect: true,
-      visibilityConfirmed: true,
+      packs: [{ name: 'graphify', canDetect: true, visibilityConfirmed: true }],
+      foreignPacks: [],
     })
-    expect(agg.packUse).toEqual({
+    expect(agg.packUses).toEqual([{
+      pack: 'graphify',
       calls: 3,
       errors: 1,
       runsWithCall: 2,
@@ -590,30 +717,59 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       canDetect: true,
       visibilityConfirmed: true,
       runsWithoutCall: [2],
-    })
+    }])
   })
 
-  it('packUse.runsWithoutCall: present but empty when every run called the pack — measured-clean, not "never checked"', () => {
-    const agg = buildSideAggregates({
-      side: 'old',
+  it('packUses: two declared packs on one variant -> two independent PackUse entries (forward-compat with Stage 2)', () => {
+    // Totals (3 vs 5) AND runsWithoutCall ([] vs [1]) are deliberately
+    // distinct per pack, so a bug that swapped which pack's numbers land on
+    // which PackUse entry would fail this assertion instead of passing by
+    // coincidence (both packs summing to the same total previously hid this).
+    const agg = buildVariantAggregates({
+      variant: 'both',
       extracted: [1, 2].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras(), phases: emptyPhases() })),
       failedRuns: [],
       rawRunIds: ['s1', 's2'],
-      extras: [extras({ packCalls: 1 }), extras({ packCalls: 2 })],
+      extras: [
+        extras({ packCalls: { graphify: 1, astgrep: 0 } }),
+        extras({ packCalls: { graphify: 2, astgrep: 5 } }),
+      ],
       runIndexes: [1, 2],
       eventsProfiles: [],
       initRanFlags: [],
       setupWallMsList: [],
-      packName: 'graphify',
-      canDetect: true,
-      visibilityConfirmed: true,
+      packs: [
+        { name: 'graphify', canDetect: true, visibilityConfirmed: true },
+        { name: 'astgrep', canDetect: true, visibilityConfirmed: false },
+      ],
+      foreignPacks: [],
     })
-    expect(agg.packUse?.runsWithoutCall).toEqual([])
+    expect(agg.packUses).toEqual([
+      expect.objectContaining({ pack: 'graphify', calls: 3, visibilityConfirmed: true, runsWithoutCall: [] }),
+      expect.objectContaining({ pack: 'astgrep', calls: 5, visibilityConfirmed: false, runsWithoutCall: [1] }),
+    ])
+  })
+
+  it('packUses.runsWithoutCall: present but empty when every run called the pack — measured-clean, not "never checked"', () => {
+    const agg = buildVariantAggregates({
+      variant: 'graphify',
+      extracted: [1, 2].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras(), phases: emptyPhases() })),
+      failedRuns: [],
+      rawRunIds: ['s1', 's2'],
+      extras: [extras({ packCalls: { graphify: 1 } }), extras({ packCalls: { graphify: 2 } })],
+      runIndexes: [1, 2],
+      eventsProfiles: [],
+      initRanFlags: [],
+      setupWallMsList: [],
+      packs: [{ name: 'graphify', canDetect: true, visibilityConfirmed: true }],
+      foreignPacks: [],
+    })
+    expect(agg.packUses?.[0]?.runsWithoutCall).toEqual([])
   })
 
   it('riskyCommands concatenated with runIndex attached', () => {
-    const agg = buildSideAggregates({
-      side: 'old',
+    const agg = buildVariantAggregates({
+      variant: 'base',
       extracted: [1, 2].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras(), phases: emptyPhases() })),
       failedRuns: [],
       rawRunIds: ['s1', 's2'],
@@ -625,15 +781,15 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       eventsProfiles: [],
       initRanFlags: [],
       setupWallMsList: [],
-      canDetect: false,
-      visibilityConfirmed: false,
+      packs: [],
+      foreignPacks: [],
     })
     expect(agg.riskyCommands).toEqual([{ command: 'rm -rf x', completed: true, exitCode: 0, runIndex: 1 }])
   })
 
   it('opencodeVersions distinct + sorted', () => {
-    const agg = buildSideAggregates({
-      side: 'old',
+    const agg = buildVariantAggregates({
+      variant: 'base',
       extracted: [1, 2, 3].map(() => ({ primary: primary({}), secondary: emptySecondary(), extras: extras(), phases: emptyPhases() })),
       failedRuns: [],
       rawRunIds: ['s1', 's2', 's3'],
@@ -646,18 +802,18 @@ describe('buildSideAggregates — packUse / riskyCommands / opencodeVersions', (
       eventsProfiles: [],
       initRanFlags: [],
       setupWallMsList: [],
-      canDetect: false,
-      visibilityConfirmed: false,
+      packs: [],
+      foreignPacks: [],
     })
     expect(agg.opencodeVersions).toEqual(['1.18.3', '1.18.4'])
   })
 })
 
 // ---------------------------------------------------------------------------
-// buildSideAggregates — phaseSplit (metric-split spec §5.5)
+// buildVariantAggregates — phaseSplit (metric-split spec §5.5)
 // ---------------------------------------------------------------------------
 
-describe('buildSideAggregates — phaseSplit', () => {
+describe('buildVariantAggregates — phaseSplit', () => {
   const runWith = (p: ExtractedPhases): ExtractedMetrics => ({
     primary: primary({}),
     secondary: emptySecondary(),
@@ -666,9 +822,9 @@ describe('buildSideAggregates — phaseSplit', () => {
   })
 
   it('phaseSplit absent when no successful runs at all', () => {
-    const agg = buildSideAggregates({
-      side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+    const agg = buildVariantAggregates({
+      variant: 'base', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], packs: [], foreignPacks: [],
     })
     expect(agg.phaseSplit).toBeUndefined()
   })
@@ -679,11 +835,11 @@ describe('buildSideAggregates — phaseSplit', () => {
       runWith(phases({ init: { totalTokens: 200 }, task: { totalTokens: 20 } })),
       runWith(phases({ task: { totalTokens: 30 } })), // no init on this run
     ]
-    const agg = buildSideAggregates({
-      side: 'new', extracted: runs, failedRuns: [], rawRunIds: ['s1', 's2', 's3'],
+    const agg = buildVariantAggregates({
+      variant: 'graphify', extracted: runs, failedRuns: [], rawRunIds: ['s1', 's2', 's3'],
       extras: [extras(), extras(), extras()], runIndexes: [1, 2, 3], eventsProfiles: [],
       initRanFlags: [true, true, false], setupWallMsList: [],
-      canDetect: false, visibilityConfirmed: false,
+      packs: [], foreignPacks: [],
     })
     expect(agg.phaseSplit?.runsWithInit).toBe(2)
     expect(agg.phaseSplit?.runsWithLostInit).toBe(0)
@@ -697,11 +853,11 @@ describe('buildSideAggregates — phaseSplit', () => {
       runWith(phases({ task: { totalTokens: 10 } })), // initRan true, no boundary -> lost
       runWith(phases({ task: { totalTokens: 20 } })), // initRan false, no boundary -> normal no-init run
     ]
-    const agg = buildSideAggregates({
-      side: 'new', extracted: runs, failedRuns: [], rawRunIds: ['s1', 's2'],
+    const agg = buildVariantAggregates({
+      variant: 'graphify', extracted: runs, failedRuns: [], rawRunIds: ['s1', 's2'],
       extras: [extras(), extras()], runIndexes: [1, 2], eventsProfiles: [],
       initRanFlags: [true, false], setupWallMsList: [],
-      canDetect: false, visibilityConfirmed: false,
+      packs: [], foreignPacks: [],
     })
     expect(agg.phaseSplit?.runsWithInit).toBe(0)
     expect(agg.phaseSplit?.runsWithLostInit).toBe(1)
@@ -709,101 +865,249 @@ describe('buildSideAggregates — phaseSplit', () => {
   })
 
   it('costProrated: true when at least one contributing slice was prorated, absent otherwise', () => {
-    const prorated = buildSideAggregates({
-      side: 'new',
+    const prorated = buildVariantAggregates({
+      variant: 'graphify',
       extracted: [runWith(phases({ init: { costProrated: true }, task: {} }))],
       failedRuns: [], rawRunIds: ['s1'], extras: [extras()], runIndexes: [1], eventsProfiles: [],
-      initRanFlags: [true], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+      initRanFlags: [true], setupWallMsList: [], packs: [], foreignPacks: [],
     })
     expect(prorated.phaseSplit?.costProrated).toBe(true)
 
-    const measured = buildSideAggregates({
-      side: 'new',
+    const measured = buildVariantAggregates({
+      variant: 'graphify',
       extracted: [runWith(phases({ init: { costProrated: false }, task: {} }))],
       failedRuns: [], rawRunIds: ['s1'], extras: [extras()], runIndexes: [1], eventsProfiles: [],
-      initRanFlags: [true], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+      initRanFlags: [true], setupWallMsList: [], packs: [], foreignPacks: [],
     })
     expect(measured.phaseSplit?.costProrated).toBeUndefined()
   })
 
   it('setup: median wall-clock over runs that had one, absent when none did, never a fabricated 0', () => {
-    const withSetup = buildSideAggregates({
-      side: 'new',
+    const withSetup = buildVariantAggregates({
+      variant: 'graphify',
       extracted: [runWith(emptyPhases()), runWith(emptyPhases())],
       failedRuns: [], rawRunIds: ['s1', 's2'], extras: [extras(), extras()], runIndexes: [1, 2], eventsProfiles: [],
       initRanFlags: [false, false], setupWallMsList: [1000, 2000],
-      canDetect: false, visibilityConfirmed: false,
+      packs: [], foreignPacks: [],
     })
     expect(withSetup.phaseSplit?.setup).toEqual({ wallClockMs: '1500' })
     expect(withSetup.phaseSplit?.setupStats?.samples).toEqual([1000, 2000])
 
-    const noSetup = buildSideAggregates({
-      side: 'old',
+    const noSetup = buildVariantAggregates({
+      variant: 'base',
       extracted: [runWith(emptyPhases())],
       failedRuns: [], rawRunIds: ['s1'], extras: [extras()], runIndexes: [1], eventsProfiles: [],
       initRanFlags: [false], setupWallMsList: [undefined],
-      canDetect: false, visibilityConfirmed: false,
+      packs: [], foreignPacks: [],
     })
     expect(noSetup.phaseSplit?.setup).toBeUndefined()
     expect(noSetup.phaseSplit?.setupStats).toBeUndefined()
   })
 })
 
-describe('computeDelta', () => {
-  it('both sides with samples -> computed deltas, bothFailed false', () => {
-    const oldAgg = sideFromPrimary('old', [primary({ totalTokens: '100' })])
-    const newAgg = sideFromPrimary('new', [primary({ totalTokens: '120' })])
-    const diff = computeDelta(oldAgg, newAgg)
-    expect(diff.bothFailed).toBe(false)
-    expect(diff.deltas.totalTokens.absolute).toBe(20)
-    expect(diff.deltas.totalTokens.better).toBe('worse')
+describe('computeVariantDelta', () => {
+  it('both variants with samples -> computed deltas, pairIncomplete false', () => {
+    const base = variantAggFromPrimary('base', [primary({ totalTokens: '100' })])
+    const v = variantAggFromPrimary('graphify', [primary({ totalTokens: '120' })])
+    const delta = computeVariantDelta(base, v)
+    expect(delta.variant).toBe('graphify')
+    expect(delta.pairIncomplete).toBe(false)
+    expect(delta.deltas.totalTokens.absolute).toBe(20)
+    expect(delta.deltas.totalTokens.better).toBe('worse')
     // no IQR (N=1) -> not significant
-    expect(diff.deltas.totalTokens.significant).toBe(false)
+    expect(delta.deltas.totalTokens.significant).toBe(false)
   })
 
-  it('one side empty -> neutral deltas, bothFailed false', () => {
-    const oldAgg = sideFromPrimary('old', [primary({ totalTokens: '100' })])
-    const newAgg = buildSideAggregates({
-      side: 'new', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+  it('variant empty -> neutral deltas, pairIncomplete true', () => {
+    const base = variantAggFromPrimary('base', [primary({ totalTokens: '100' })])
+    const v = buildVariantAggregates({
+      variant: 'graphify', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], packs: [], foreignPacks: [],
     })
-    const diff = computeDelta(oldAgg, newAgg)
-    expect(diff.bothFailed).toBe(false)
-    expect(diff.deltas.totalTokens.better).toBe('neutral')
-    expect(diff.deltas.totalTokens.significant).toBe(false)
+    const delta = computeVariantDelta(base, v)
+    expect(delta.pairIncomplete).toBe(true)
+    expect(delta.deltas.totalTokens.better).toBe('neutral')
+    expect(delta.deltas.totalTokens.significant).toBe(false)
   })
 
-  it('both sides empty -> bothFailed true, all neutral', () => {
-    const oldAgg = buildSideAggregates({
-      side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+  it('both variants empty -> pairIncomplete true, all neutral', () => {
+    const base = buildVariantAggregates({
+      variant: 'base', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], packs: [], foreignPacks: [],
     })
-    const newAgg = buildSideAggregates({
-      side: 'new', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+    const v = buildVariantAggregates({
+      variant: 'graphify', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], packs: [], foreignPacks: [],
     })
-    const diff = computeDelta(oldAgg, newAgg)
-    expect(diff.bothFailed).toBe(true)
-    expect(diff.deltas.maxParallelism.better).toBe('neutral')
+    const delta = computeVariantDelta(base, v)
+    expect(delta.pairIncomplete).toBe(true)
+    expect(delta.deltas.maxParallelism.better).toBe('neutral')
   })
 
-  it('old side empty (0 tokens) vs a new side with tokens -> percent omitted, not 0', () => {
-    const oldAgg = buildSideAggregates({
-      side: 'old', extracted: [], failedRuns: [], rawRunIds: [],
-      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], canDetect: false, visibilityConfirmed: false,
+  it('baseline empty (0 tokens) vs a variant with tokens -> percent omitted, not 0', () => {
+    const base = buildVariantAggregates({
+      variant: 'base', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], packs: [], foreignPacks: [],
     })
-    const newAgg = sideFromPrimary('new', [primary({ totalTokens: '100' })])
-    const diff = computeDelta(oldAgg, newAgg)
-    expect(diff.deltas.totalTokens.absolute).toBe(100)
-    expect(diff.deltas.totalTokens.percent).toBeUndefined()
+    const v = variantAggFromPrimary('graphify', [primary({ totalTokens: '100' })])
+    const delta = computeVariantDelta(base, v)
+    expect(delta.deltas.totalTokens.absolute).toBe(100)
+    expect(delta.deltas.totalTokens.percent).toBeUndefined()
   })
 })
 
 // ---------------------------------------------------------------------------
-// computeDelta — taskDeltas/initDeltas (metric-split spec §5.5, §6, §9)
+// computeVariantDelta — significance flips exactly at 1.5×IQR of the
+// BASELINE (03-hard-problems.md §1.2 — the reference distribution is always
+// the baseline, never either side's own).
 // ---------------------------------------------------------------------------
 
-describe('computeDelta — taskDeltas/initDeltas', () => {
+describe('computeVariantDelta — significance flips exactly at 1.5×IQR of the baseline', () => {
+  // Arithmetic progression [a, a+d, a+2d, a+3d]: median = a+1.5d, IQR = 1.5d
+  // (same shape as tests/helpers/variants.ts's fixtures) — chosen so median,
+  // IQR, and 1.5×IQR are all whole numbers, immune to computeMetricDelta's
+  // `primary.totalTokens` rounding (median/IQR themselves are never rounded,
+  // but the delta is computed off the ROUNDED `primary` field).
+  it('base totalTokens = [10,14,18,22] -> median 16, IQR 6, threshold 9', () => {
+    const base = variantAggFromPrimary('base', [10, 14, 18, 22].map((n) => primary({ totalTokens: String(n) })))
+    expect(base.stats.totalTokens.median).toBe(16)
+    expect(base.stats.totalTokens.iqr).toBe(6)
+
+    const atThreshold = computeVariantDelta(base, variantAggFromPrimary('v', [primary({ totalTokens: '25' })]))
+    expect(atThreshold.deltas.totalTokens.absolute).toBe(9)
+    // exactly at 1.5*IQR -> NOT significant (strictly greater than required)
+    expect(atThreshold.deltas.totalTokens.significant).toBe(false)
+
+    const justOver = computeVariantDelta(base, variantAggFromPrimary('v', [primary({ totalTokens: '26' })]))
+    expect(justOver.deltas.totalTokens.absolute).toBe(10)
+    expect(justOver.deltas.totalTokens.significant).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// computeMetricsReport — N-1 deltas vs one baseline + allFailed (§1.2)
+// ---------------------------------------------------------------------------
+
+describe('computeMetricsReport', () => {
+  it('3 variants: variants in config order, deltas = N-1 entries vs baseline, allFailed false', () => {
+    const base = variantAggFromPrimary('base', [primary({ totalTokens: '100' })])
+    const graphify = variantAggFromPrimary('graphify', [primary({ totalTokens: '90' })])
+    const astgrep = variantAggFromPrimary('astgrep', [primary({ totalTokens: '95' })])
+    const report = computeMetricsReport('base', [base, graphify, astgrep])
+    expect(report.baseline).toBe('base')
+    expect(report.variants.map((v) => v.variant)).toEqual(['base', 'graphify', 'astgrep'])
+    expect(report.deltas).toHaveLength(2)
+    expect(report.deltas.map((d) => d.variant)).toEqual(['graphify', 'astgrep'])
+    expect(report.allFailed).toBe(false)
+  })
+
+  it('allFailed: true only when EVERY variant has zero samples', () => {
+    const emptyAgg = (name: string): VariantAggregates =>
+      buildVariantAggregates({
+        variant: name, extracted: [], failedRuns: [], rawRunIds: [],
+        extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], packs: [], foreignPacks: [],
+      })
+    const report = computeMetricsReport('base', [emptyAgg('base'), emptyAgg('graphify')])
+    expect(report.allFailed).toBe(true)
+    expect(report.deltas.every((d) => d.pairIncomplete)).toBe(true)
+  })
+
+  it('allFailed: false when only SOME variants are empty — a per-pair pairIncomplete, not a global failure', () => {
+    const base = variantAggFromPrimary('base', [primary({ totalTokens: '100' })])
+    const emptyV = buildVariantAggregates({
+      variant: 'graphify', extracted: [], failedRuns: [], rawRunIds: [],
+      extras: [], runIndexes: [], eventsProfiles: [], initRanFlags: [], setupWallMsList: [], packs: [], foreignPacks: [],
+    })
+    const report = computeMetricsReport('base', [base, emptyV])
+    expect(report.allFailed).toBe(false)
+    expect(report.deltas[0]?.pairIncomplete).toBe(true)
+  })
+
+  it('throws when the named baseline is not among the given variants, rather than silently reporting zero comparisons', () => {
+    const graphify = variantAggFromPrimary('graphify', [primary({ totalTokens: '90' })])
+    expect(() => computeMetricsReport('base', [graphify])).toThrow(/baseline variant "base" not found/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 3-variant + contamination-foreign-set integration (02-phases.md §07 AC)
+// ---------------------------------------------------------------------------
+
+describe('buildVariantAggregates + computeMetricsReport — 3-variant integration (AC)', () => {
+  it("variant a's export containing an install of variant b's pack fires contamination on a, never on b's own use of its own pack", () => {
+    const oneRun = (over: { readonly extras: ExtractedExtras; readonly totalTokens: string }): ExtractedMetrics => ({
+      primary: primary({ totalTokens: over.totalTokens }),
+      secondary: emptySecondary(),
+      extras: over.extras,
+      phases: emptyPhases(),
+    })
+
+    const baseAgg = buildVariantAggregates({
+      variant: 'base',
+      extracted: [oneRun({ totalTokens: '100', extras: extras() })],
+      failedRuns: [], rawRunIds: ['s1'],
+      extras: [
+        extras({
+          packActivitySignals: {
+            graphify: [{ kind: 'bash-install', pack: 'graphify', detail: 'npm install -g graphify' }],
+            astgrep: [],
+          },
+        }),
+      ],
+      runIndexes: [1], eventsProfiles: [], initRanFlags: [], setupWallMsList: [],
+      packs: [], // base declares nothing
+      foreignPacks: ['graphify', 'astgrep'], // both other variants' packs are foreign to base
+    })
+    const graphifyAgg = buildVariantAggregates({
+      variant: 'graphify',
+      extracted: [oneRun({ totalTokens: '90', extras: extras() })],
+      failedRuns: [], rawRunIds: ['s1'],
+      extras: [
+        extras({
+          packCalls: { graphify: 3 },
+          packActivitySignals: {
+            graphify: [{ kind: 'skill-call', pack: 'graphify', detail: 'skill tool call succeeded for "graphify"' }],
+            astgrep: [],
+          },
+        }),
+      ],
+      runIndexes: [1], eventsProfiles: [], initRanFlags: [], setupWallMsList: [],
+      packs: [{ name: 'graphify', canDetect: true, visibilityConfirmed: true }],
+      foreignPacks: ['astgrep'], // graphify's OWN pack is excluded from its own foreign set
+    })
+    const astgrepAgg = buildVariantAggregates({
+      variant: 'astgrep',
+      extracted: [oneRun({ totalTokens: '95', extras: extras() })],
+      failedRuns: [], rawRunIds: ['s1'],
+      extras: [extras({ packActivitySignals: { graphify: [], astgrep: [] } })],
+      runIndexes: [1], eventsProfiles: [], initRanFlags: [], setupWallMsList: [],
+      packs: [{ name: 'astgrep', canDetect: true, visibilityConfirmed: true }],
+      foreignPacks: ['graphify'],
+    })
+
+    // base's export shows a "npm install graphify" -> contamination fires on base, stamped pack: 'graphify'.
+    expect(baseAgg.contaminationSignals).toEqual([
+      { kind: 'bash-install', pack: 'graphify', detail: 'npm install -g graphify', runIndex: 1 },
+    ])
+    // graphify's own (expected) pack activity never surfaces as contamination on itself.
+    expect(graphifyAgg.contaminationSignals).toEqual([])
+    expect(astgrepAgg.contaminationSignals).toEqual([])
+    // graphify's own pack activity DOES surface under packUses.
+    expect(graphifyAgg.packUses).toEqual([expect.objectContaining({ pack: 'graphify', calls: 3 })])
+
+    const report = computeMetricsReport('base', [baseAgg, graphifyAgg, astgrepAgg])
+    expect(report.variants.map((v) => v.variant)).toEqual(['base', 'graphify', 'astgrep'])
+    expect(report.deltas).toHaveLength(2)
+    expect(report.deltas.map((d) => d.variant)).toEqual(['graphify', 'astgrep'])
+    expect(report.allFailed).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// computeVariantDelta — taskDeltas/initDeltas (metric-split spec §5.5, §6, §9)
+// ---------------------------------------------------------------------------
+
+describe('computeVariantDelta — taskDeltas/initDeltas', () => {
   const runWith = (p: ExtractedPhases): ExtractedMetrics => ({
     primary: primary({}),
     secondary: emptySecondary(),
@@ -811,13 +1115,13 @@ describe('computeDelta — taskDeltas/initDeltas', () => {
     phases: p,
   })
 
-  const sideWithPhases = (
-    side: 'old' | 'new',
+  const variantWithPhases = (
+    variant: string,
     entries: readonly ExtractedPhases[],
     initRanFlags: readonly boolean[] = entries.map(() => false),
-  ): SideAggregates =>
-    buildSideAggregates({
-      side,
+  ): VariantAggregates =>
+    buildVariantAggregates({
+      variant,
       extracted: entries.map(runWith),
       failedRuns: [],
       rawRunIds: entries.map((_, i) => `s${String(i + 1)}`),
@@ -826,36 +1130,36 @@ describe('computeDelta — taskDeltas/initDeltas', () => {
       eventsProfiles: [],
       initRanFlags,
       setupWallMsList: [],
-      canDetect: false,
-      visibilityConfirmed: false,
+      packs: [],
+      foreignPacks: [],
     })
 
-  it('taskDeltas present whenever both sides carry phaseSplit — even one-sided init (decided: task basis always, spec §6)', () => {
-    const oldAgg = sideWithPhases('old', [
+  it('taskDeltas present whenever both variants carry phaseSplit — even one-sided init (decided: task basis always, spec §6)', () => {
+    const base = variantWithPhases('base', [
       phases({ task: { totalTokens: 100 } }),
       phases({ task: { totalTokens: 100 } }),
       phases({ task: { totalTokens: 100 } }),
       phases({ task: { totalTokens: 100 } }),
     ])
-    const newAgg = sideWithPhases(
-      'new',
+    const v = variantWithPhases(
+      'graphify',
       [
         phases({ init: { totalTokens: 500 }, task: { totalTokens: 120 } }),
         phases({ init: { totalTokens: 500 }, task: { totalTokens: 120 } }),
       ],
       [true, true],
     )
-    const diff = computeDelta(oldAgg, newAgg)
-    expect(diff.taskDeltas).toBeDefined()
-    // task-only: the 500 init tokens on the new side never enter this delta.
-    expect(diff.taskDeltas?.totalTokens.absolute).toBe(20) // 120 - 100
-    // old never ran init (runsWithInit === 0) -> one-sided, never a delta.
-    expect(diff.initDeltas).toBeUndefined()
+    const delta = computeVariantDelta(base, v)
+    expect(delta.taskDeltas).toBeDefined()
+    // task-only: the 500 init tokens on the variant never enter this delta.
+    expect(delta.taskDeltas?.totalTokens.absolute).toBe(20) // 120 - 100
+    // baseline never ran init (runsWithInit === 0) -> one-sided, never a delta.
+    expect(delta.initDeltas).toBeUndefined()
   })
 
-  it('initDeltas present only when BOTH sides have runsWithInit > 0 (--init-side both)', () => {
-    const oldAgg = sideWithPhases(
-      'old',
+  it('initDeltas present only when BOTH variants have runsWithInit > 0 (--init-side both)', () => {
+    const base = variantWithPhases(
+      'base',
       [
         phases({ init: { totalTokens: 50 }, task: { totalTokens: 10 } }),
         phases({ init: { totalTokens: 50 }, task: { totalTokens: 10 } }),
@@ -864,37 +1168,61 @@ describe('computeDelta — taskDeltas/initDeltas', () => {
       ],
       [true, true, true, true],
     )
-    const newAgg = sideWithPhases(
-      'new',
+    const v = variantWithPhases(
+      'graphify',
       [
         phases({ init: { totalTokens: 80 }, task: { totalTokens: 15 } }),
         phases({ init: { totalTokens: 80 }, task: { totalTokens: 15 } }),
       ],
       [true, true],
     )
-    const diff = computeDelta(oldAgg, newAgg)
-    expect(diff.initDeltas).toBeDefined()
-    expect(diff.initDeltas?.totalTokens.absolute).toBe(30) // 80 - 50
+    const delta = computeVariantDelta(base, v)
+    expect(delta.initDeltas).toBeDefined()
+    expect(delta.initDeltas?.totalTokens.absolute).toBe(30) // 80 - 50
   })
 
-  it('taskDeltas/initDeltas both absent when a side has no phaseSplit at all (no successful runs)', () => {
-    const oldAgg = sideWithPhases('old', [])
-    const newAgg = sideWithPhases('new', [phases({ task: { totalTokens: 10 } })])
-    const diff = computeDelta(oldAgg, newAgg)
-    expect(diff.taskDeltas).toBeUndefined()
-    expect(diff.initDeltas).toBeUndefined()
+  it('taskDeltas/initDeltas both absent when a variant has no phaseSplit at all (no successful runs)', () => {
+    const base = variantWithPhases('base', [])
+    const v = variantWithPhases('graphify', [phases({ task: { totalTokens: 10 } })])
+    const delta = computeVariantDelta(base, v)
+    expect(delta.taskDeltas).toBeUndefined()
+    expect(delta.initDeltas).toBeUndefined()
   })
 
-  it('taskDeltas significance is judged against the OLD side task IQR, computed independently of the whole-run IQR', () => {
-    const oldAgg = sideWithPhases('old', [
+  it('taskDeltas significance is judged against the BASELINE task IQR, computed independently of the whole-run IQR', () => {
+    const base = variantWithPhases('base', [
       phases({ task: { totalTokens: 100 } }),
       phases({ task: { totalTokens: 101 } }),
       phases({ task: { totalTokens: 99 } }),
       phases({ task: { totalTokens: 100 } }),
     ])
-    const newAgg = sideWithPhases('new', [phases({ task: { totalTokens: 200 } })])
-    const diff = computeDelta(oldAgg, newAgg)
-    expect(diff.taskDeltas?.totalTokens.significant).toBe(true)
-    expect(diff.taskDeltas?.totalTokens.better).toBe('worse') // lower-is-better direction
+    const v = variantWithPhases('graphify', [phases({ task: { totalTokens: 200 } })])
+    const delta = computeVariantDelta(base, v)
+    expect(delta.taskDeltas?.totalTokens.significant).toBe(true)
+    expect(delta.taskDeltas?.totalTokens.better).toBe('worse') // lower-is-better direction
+  })
+
+  it('pairIncomplete forces task deltas neutral too, not just primary deltas — defends a caller-supplied VariantAggregates where phaseSplit is defined but stats.totalTokens.samples is empty (computeVariantDelta is a public export, not gated to objects buildVariantAggregates itself produced)', () => {
+    const base = variantWithPhases('base', [
+      phases({ task: { totalTokens: 100 } }),
+      phases({ task: { totalTokens: 101 } }),
+      phases({ task: { totalTokens: 99 } }),
+      phases({ task: { totalTokens: 100 } }),
+    ])
+    const realV = variantWithPhases('graphify', [phases({ task: { totalTokens: 200 } })])
+    // Same shape a hand-edited or partially-migrated disk report could carry:
+    // phaseSplit still has real numbers, but the whole-run sample count says
+    // "no data" — pairIncomplete must still win over the raw phase math
+    // (without the fix this would report significant:true/better:'worse',
+    // same as the identically-shaped base in the test right above).
+    const brokenV: VariantAggregates = {
+      ...realV,
+      stats: { ...realV.stats, totalTokens: { ...realV.stats.totalTokens, samples: [] } },
+    }
+    const delta = computeVariantDelta(base, brokenV)
+    expect(delta.pairIncomplete).toBe(true)
+    expect(delta.taskDeltas).toBeDefined()
+    expect(delta.taskDeltas?.totalTokens.significant).toBe(false)
+    expect(delta.taskDeltas?.totalTokens.better).toBe('neutral')
   })
 })

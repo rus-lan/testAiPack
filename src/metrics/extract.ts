@@ -1,7 +1,7 @@
 /**
  * Metrics: extract — turns a single opencode export into a PrimaryMetrics +
  * SecondaryMetrics snapshot. Pure function: pricing table (already loaded) is
- * passed in, successRank comes from the RunSideResult produced in phase 06.
+ * passed in, successRank comes from the RunResult produced in phase 06.
  *
  * int64 wire fields are serialised as strings (see generated/types.ts); we
  * compute on numbers and stringify at the boundary.
@@ -36,21 +36,24 @@ import { percentile, toNum } from './stats.js'
  * lives in `metrics/aggregate.ts`.
  */
 export interface ExtractedExtras {
-  readonly packCalls: number
-  readonly packErrors: number
-  readonly firstPackCallMs: number | undefined
+  /** Keyed by pack name — one entry per name in the `packNames` option this run was extracted with. */
+  readonly packCalls: Readonly<Record<string, number>>
+  readonly packErrors: Readonly<Record<string, number>>
+  /** Keyed by pack name; a name with no call at all has no key (mirrors the old single-pack `undefined`). */
+  readonly firstPackCallMs: Readonly<Record<string, number>>
   readonly invalidToolCalls: number
   readonly duplicateToolCalls: number
   readonly bashFailCount: number
   readonly toolErrorTexts: readonly string[]
   readonly riskyCommands: readonly Omit<RiskyCommand, 'runIndex'>[]
   /**
-   * Side-neutral: whether this counts as baseline contamination depends on
-   * which side the run is on, a judgment `metrics/aggregate.ts` makes (only
-   * the baseline side surfaces these as `contaminationSignals`) — see
-   * `baseline-contamination.ts`.
+   * Keyed by pack name — variant-neutral: this module scans for every pack
+   * name it is given, regardless of which (if any) that variant declares.
+   * Whether a name's signals count as contamination for a given variant is
+   * a judgment `metrics/aggregate.ts` makes from that variant's foreign set
+   * — see `baseline-contamination.ts`.
    */
-  readonly packActivitySignals: readonly UnindexedSignal[]
+  readonly packActivitySignals: Readonly<Record<string, readonly UnindexedSignal[]>>
   readonly opencodeVersion: string
   readonly firstStepInputTokens: number | undefined
   readonly lastStepInputTokens: number | undefined
@@ -75,7 +78,14 @@ export interface ExtractedMetrics {
 }
 
 export interface ExtractOptions {
-  readonly packName?: string
+  /**
+   * The full pack registry for this run (every pack any variant declares,
+   * not just this run's own variant) — extraction stays variant-neutral, so
+   * it scans for every name it is given; `aggregate.ts` later decides which
+   * names are this variant's own vs. foreign. Absent/empty for the
+   * degenerate no-pack case (smoke test, `03-hard-problems.md §3.3`).
+   */
+  readonly packNames?: readonly string[]
 }
 
 /**
@@ -311,12 +321,13 @@ const metadataExit = (state: ExportToolPart['state']): number | undefined => {
 const isSkillCall = (p: ExportToolPart, packName: string): boolean =>
   p.tool === 'skill' && isRecord(p.state.input) && p.state.input['name'] === packName
 
-const packUseOf = (
-  exp: OpencodeExport,
-  tools: readonly ExportToolPart[],
-  packName: string | undefined,
-): { readonly calls: number; readonly errors: number; readonly firstMs: number | undefined } => {
-  if (packName === undefined) return { calls: 0, errors: 0, firstMs: undefined }
+interface PackUseRaw {
+  readonly calls: number
+  readonly errors: number
+  readonly firstMs: number | undefined
+}
+
+const packUseOfName = (exp: OpencodeExport, tools: readonly ExportToolPart[], packName: string): PackUseRaw => {
   const matches = tools.filter((p) => isSkillCall(p, packName))
   const first = matches[0]
   const firstMs =
@@ -325,6 +336,26 @@ const packUseOf = (
     calls: matches.length,
     errors: matches.filter((p) => p.state.status === 'error').length,
     firstMs,
+  }
+}
+
+/** One pass per pack name in the registry — extraction itself stays variant-neutral (see `ExtractOptions.packNames`). */
+const packUsesOf = (
+  exp: OpencodeExport,
+  tools: readonly ExportToolPart[],
+  packNames: readonly string[],
+): {
+  readonly calls: Readonly<Record<string, number>>
+  readonly errors: Readonly<Record<string, number>>
+  readonly firstMs: Readonly<Record<string, number>>
+} => {
+  const perName = packNames.map((name) => ({ name, raw: packUseOfName(exp, tools, name) }))
+  return {
+    calls: Object.fromEntries(perName.map(({ name, raw }) => [name, raw.calls])),
+    errors: Object.fromEntries(perName.map(({ name, raw }) => [name, raw.errors])),
+    firstMs: Object.fromEntries(
+      perName.flatMap(({ name, raw }) => (raw.firstMs === undefined ? [] : [[name, raw.firstMs] as const])),
+    ),
   }
 }
 
@@ -560,7 +591,8 @@ const buildPhaseSlices = (exp: OpencodeExport, pricing: PricingTable | null): Ex
 
 const extractExtras = (exp: OpencodeExport, opts: ExtractOptions): ExtractedExtras => {
   const tools = toolPartsOf(exp)
-  const pack = packUseOf(exp, tools, opts.packName)
+  const packNames = opts.packNames ?? []
+  const pack = packUsesOf(exp, tools, packNames)
   const { first: firstStepInputTokens, last: lastStepInputTokens } = stepInputTokensOf(exp)
   const parts = allParts(exp)
   return {
@@ -576,7 +608,7 @@ const extractExtras = (exp: OpencodeExport, opts: ExtractOptions): ExtractedExtr
       typeof p.state.error === 'string' ? [p.state.error.slice(0, TOOL_ERROR_TEXT_MAX)] : [],
     ),
     riskyCommands: riskyCommandsOf(tools),
-    packActivitySignals: findPackActivitySignals(tools, opts.packName),
+    packActivitySignals: Object.fromEntries(packNames.map((name) => [name, findPackActivitySignals(tools, name)])),
     opencodeVersion: exp.info.version,
     firstStepInputTokens,
     lastStepInputTokens,
@@ -728,15 +760,15 @@ const mergeSecondaryAcrossNodes = (list: readonly SecondaryMetrics[]): Secondary
 }
 
 const emptyExtras = (): ExtractedExtras => ({
-  packCalls: 0,
-  packErrors: 0,
-  firstPackCallMs: undefined,
+  packCalls: {},
+  packErrors: {},
+  firstPackCallMs: {},
   invalidToolCalls: 0,
   duplicateToolCalls: 0,
   bashFailCount: 0,
   toolErrorTexts: [],
   riskyCommands: [],
-  packActivitySignals: [],
+  packActivitySignals: {},
   opencodeVersion: '',
   firstStepInputTokens: undefined,
   lastStepInputTokens: undefined,
@@ -744,6 +776,38 @@ const emptyExtras = (): ExtractedExtras => ({
   reasoningChars: 0,
   cacheWriteTokens: 0,
 })
+
+/** Sums same-named entries across records — used to fold per-pack call/error counts across tree nodes. */
+const sumRecordsByKey = (records: readonly Readonly<Record<string, number>>[]): Readonly<Record<string, number>> =>
+  records.reduce<Record<string, number>>(
+    (out, rec) =>
+      Object.entries(rec).reduce<Record<string, number>>((inner, [k, v]) => ({ ...inner, [k]: (inner[k] ?? 0) + v }), out),
+    {},
+  )
+
+/** Earliest same-named entry across records — used for `firstPackCallMs` per pack name across tree nodes. */
+const minRecordsByKey = (records: readonly Readonly<Record<string, number>>[]): Readonly<Record<string, number>> =>
+  records.reduce<Record<string, number>>(
+    (out, rec) =>
+      Object.entries(rec).reduce<Record<string, number>>(
+        (inner, [k, v]) => ({ ...inner, [k]: inner[k] === undefined ? v : Math.min(inner[k], v) }),
+        out,
+      ),
+    {},
+  )
+
+/** Concatenates same-named signal lists across records — used to fold `packActivitySignals` per pack name across tree nodes. */
+const concatSignalsByKey = (
+  records: readonly Readonly<Record<string, readonly UnindexedSignal[]>>[],
+): Readonly<Record<string, readonly UnindexedSignal[]>> =>
+  records.reduce<Record<string, readonly UnindexedSignal[]>>(
+    (out, rec) =>
+      Object.entries(rec).reduce<Record<string, readonly UnindexedSignal[]>>(
+        (inner, [k, v]) => ({ ...inner, [k]: [...(inner[k] ?? []), ...v] }),
+        out,
+      ),
+    {},
+  )
 
 /**
  * Folds extras over a session tree. Count-like fields (pack/invalid/duplicate/
@@ -763,17 +827,16 @@ const mergeExtrasAcrossNodes = (
   const rootIndex = tree.findIndex((n) => n.parentId === null)
   const root = list[rootIndex === -1 ? 0 : rootIndex] ?? emptyExtras()
   const sumOf = (sel: (e: ExtractedExtras) => number): number => list.reduce((a, e) => a + sel(e), 0)
-  const firstPackTimes = list.flatMap((e) => (e.firstPackCallMs === undefined ? [] : [e.firstPackCallMs]))
   return {
-    packCalls: sumOf((e) => e.packCalls),
-    packErrors: sumOf((e) => e.packErrors),
-    firstPackCallMs: firstPackTimes.length === 0 ? undefined : Math.min(...firstPackTimes),
+    packCalls: sumRecordsByKey(list.map((e) => e.packCalls)),
+    packErrors: sumRecordsByKey(list.map((e) => e.packErrors)),
+    firstPackCallMs: minRecordsByKey(list.map((e) => e.firstPackCallMs)),
     invalidToolCalls: sumOf((e) => e.invalidToolCalls),
     duplicateToolCalls: sumOf((e) => e.duplicateToolCalls),
     bashFailCount: sumOf((e) => e.bashFailCount),
     toolErrorTexts: list.flatMap((e) => e.toolErrorTexts),
     riskyCommands: list.flatMap((e) => e.riskyCommands),
-    packActivitySignals: list.flatMap((e) => e.packActivitySignals),
+    packActivitySignals: concatSignalsByKey(list.map((e) => e.packActivitySignals)),
     opencodeVersion: root.opencodeVersion,
     firstStepInputTokens: root.firstStepInputTokens,
     lastStepInputTokens: root.lastStepInputTokens,

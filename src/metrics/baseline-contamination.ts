@@ -1,10 +1,10 @@
 /**
- * Metrics: baseline contamination — detects observable signs that the
- * BASELINE side (`old` — see 07-aggregate.ts's "the pack is only ever
- * installed on the new side" convention) acquired or used the pack under
- * test. If it did, the whole A/B comparison is silently invalid: both sides
- * end up testing "with pack", and every delta in the report compares two
- * contaminated runs instead of a baseline against a treatment.
+ * Metrics: baseline contamination — detects observable signs that a variant
+ * acquired or used a pack it did NOT declare (any variant vs its foreign
+ * set — see `aggregate.ts`'s `foreignPacks` parameter). If it did, the whole
+ * N-way comparison is silently invalid for that pair: both variants end up
+ * testing "with pack", and every delta involving this variant compares two
+ * contaminated runs instead of a clean baseline against a treatment.
  *
  * This is a heuristic tripwire over observable actions in artifacts already
  * captured (tool calls, bash commands, the config-capture drift snapshot) —
@@ -23,9 +23,20 @@ import { skipPrefix, splitSegments, tokenize } from './risky-commands.js'
  * which run a signal came from, and this module only ever sees one run's
  * tools/inventory at a time. The caller (`metrics/aggregate.ts`) attaches it
  * once signals are zipped against their run indexes; the `install-drift`
- * signal stays without one since it is side-level, not per-run.
+ * signal stays without one since it is variant-level, not per-run.
  */
 export type UnindexedSignal = Omit<ContaminationSignal, 'runIndex'>
+
+/**
+ * `findConfigDriftSignal`'s output, before the caller (`metrics/aggregate.ts`)
+ * folds it into a variant's `contaminationSignals`. Config drift is a
+ * variant-level observation (this variant's own captured config differed
+ * across its own runs) — it names no single pack, unlike a skill-call/
+ * bash-install signal, so it excludes `UnindexedSignal`'s `pack` field. The
+ * caller stamps `pack: ''` on it (see `aggregate.ts`'s `buildContaminationSignals`)
+ * to satisfy the contract's `ContaminationSignal.pack: string`.
+ */
+export type ConfigDriftSignal = Omit<UnindexedSignal, 'pack'>
 
 const isSuccessfulSkillCall = (p: ExportToolPart, packName: string): boolean =>
   p.tool === 'skill' &&
@@ -81,10 +92,14 @@ export const isInstallShapedCommand = (command: string, packName: string): boole
 const DETAIL_MAX = 300
 
 /**
- * Per-run signals from one export's tool calls: a `skill` call that
- * succeeded for the pack's resolved name (on a baseline it should fail with
- * "not found" — succeeding means the pack is actually reachable there), or
- * a bash command that looks like it installed the pack.
+ * Per-run signals from one export's tool calls, for ONE pack name: a `skill`
+ * call that succeeded for that pack's resolved name (on a variant that
+ * doesn't declare it, this should fail with "not found" — succeeding means
+ * the pack is actually reachable there), or a bash command that looks like
+ * it installed the pack. Every produced signal is stamped with the pack
+ * name it was found for — the caller (`extract.ts`) runs this once per pack
+ * name in the whole run's registry, and `aggregate.ts` later selects which
+ * of those names are foreign to a given variant.
  */
 export const findPackActivitySignals = (
   tools: readonly ExportToolPart[],
@@ -93,12 +108,12 @@ export const findPackActivitySignals = (
   if (packName === undefined || packName === '') return []
   return tools.flatMap((p): readonly UnindexedSignal[] => {
     if (isSuccessfulSkillCall(p, packName)) {
-      return [{ kind: 'skill-call', detail: `skill tool call succeeded for "${packName}"` }]
+      return [{ kind: 'skill-call', pack: packName, detail: `skill tool call succeeded for "${packName}"` }]
     }
     if (p.tool === 'bash' && isRecord(p.state.input)) {
       const command = p.state.input['command']
       if (typeof command === 'string' && isInstallShapedCommand(command, packName)) {
-        return [{ kind: 'bash-install', detail: command.slice(0, DETAIL_MAX) }]
+        return [{ kind: 'bash-install', pack: packName, detail: command.slice(0, DETAIL_MAX) }]
       }
     }
     return []
@@ -156,22 +171,24 @@ const DRIFT_INSTALL_FILES = new Set([
 ])
 
 /**
- * On a baseline, nothing installs anything mid-run, so its captured config
+ * On any variant, nothing installs anything mid-run, so its captured config
  * should be identical across all its own runs. Drift in any file/listing
  * phase 06 tracks is the same "something showed up that shouldn't have"
  * shape as the incident that motivated this module — one snapshot showed
  * `skills: []` while `driftFiles: ["skills"]` meant another run's skills
  * differed. Named `install-drift`, not `config-drift`: this only fires on
- * the fields above, which do mean something was acquired/registered.
+ * the fields above, which do mean something was acquired/registered. Fires
+ * for every variant now (not baseline-only) — logic and fields checked are
+ * unchanged, only the wording says "variant" instead of "side".
  */
 export const findConfigDriftSignal = (
   snapshot: InstalledInventorySnapshot | undefined,
-): UnindexedSignal | undefined => {
+): ConfigDriftSignal | undefined => {
   if (snapshot === undefined || snapshot.identicalAcrossRuns) return undefined
   const relevant = snapshot.driftFiles.filter((f) => DRIFT_INSTALL_FILES.has(f))
   if (relevant.length === 0) return undefined
   return {
     kind: 'install-drift',
-    detail: `captured config differs across this side's own runs in: ${relevant.join(', ')}`,
+    detail: `captured config differs across this variant's own runs in: ${relevant.join(', ')}`,
   }
 }

@@ -1,9 +1,10 @@
 /**
  * Metrics: aggregate — median / min / max / IQR across the successful runs of
- * one side, and the new-minus-old delta (MetricsDiff). All pure.
+ * one variant, and the per-variant delta vs the baseline (VariantDelta). All
+ * pure.
  *
  * @see docs/phases/07-aggregate.ru.md
- * @see contract/main.tsp (SideAggregates, MetricsDiff, MetricDistribution)
+ * @see contract/main.tsp (VariantAggregates, VariantDelta, MetricsReport, MetricDistribution)
  */
 import type {
   AggregateStats,
@@ -11,23 +12,24 @@ import type {
   FailedRun,
   MetricDelta,
   MetricDistribution,
-  MetricsDiff,
+  MetricsReport,
   PackUse,
   PhaseDeltas,
   PhaseSlice,
   PhaseSliceStats,
+  PhaseSplit,
+  PrimaryDeltas,
   PrimaryMetrics,
   RiskyCommand,
   SecondaryMetrics,
-  Side,
-  SideAggregates,
-  SidePhaseSplit,
   ToolStat,
+  VariantAggregates,
+  VariantDelta,
   VerifyStats,
 } from '@generated/types'
 import type { EventsProfile } from './events-profile.js'
 import type { ExtractedExtras, ExtractedMetrics, ExtractedPhases, PhaseSliceNum } from './extract.js'
-import type { UnindexedSignal } from './baseline-contamination.js'
+import type { ConfigDriftSignal } from './baseline-contamination.js'
 import { interquartileRange, maximum, median, minimum, percentile, toNum } from './stats.js'
 import { isSignificant } from './significance.js'
 
@@ -259,24 +261,35 @@ export const aggregateSecondary = (
   }
 }
 
+/** A pack this variant declares — one entry per pack, feeding one `buildPackUse` call each. */
+export interface DeclaredPack {
+  readonly name: string
+  /** Whether the pack type can be seen in exports at all (false for plugin/mcp/agent/command). */
+  readonly canDetect: boolean
+  /** Whether phase 05's pack-visibility gate proved this pack was present in this variant's run-1 HOME before any run started. */
+  readonly visibilityConfirmed: boolean
+}
+
 const buildPackUse = (
   extras: readonly ExtractedExtras[],
   runIndexes: readonly number[],
-  packName: string | undefined,
-  canDetect: boolean,
-  visibilityConfirmed: boolean,
-): PackUse | undefined => {
-  if (packName === undefined) return undefined
-  const firstTimes = extras.flatMap((e) => (e.firstPackCallMs === undefined ? [] : [e.firstPackCallMs]))
+  pack: DeclaredPack,
+): PackUse => {
+  const callsOf = (e: ExtractedExtras): number => e.packCalls[pack.name] ?? 0
+  const firstTimes = extras.flatMap((e) => {
+    const t = e.firstPackCallMs[pack.name]
+    return t === undefined ? [] : [t]
+  })
   const firstCallMsMedian = firstTimes.length === 0 ? undefined : String(round(median(firstTimes)))
-  const runsWithoutCall = extras.flatMap((e, i) => (e.packCalls === 0 ? [runIndexes[i] ?? 0] : []))
+  const runsWithoutCall = extras.flatMap((e, i) => (callsOf(e) === 0 ? [runIndexes[i] ?? 0] : []))
   return {
-    calls: extras.reduce((a, e) => a + e.packCalls, 0),
-    errors: extras.reduce((a, e) => a + e.packErrors, 0),
-    runsWithCall: extras.filter((e) => e.packCalls > 0).length,
+    pack: pack.name,
+    calls: extras.reduce((a, e) => a + callsOf(e), 0),
+    errors: extras.reduce((a, e) => a + (e.packErrors[pack.name] ?? 0), 0),
+    runsWithCall: extras.filter((e) => callsOf(e) > 0).length,
     runCount: extras.length,
-    canDetect,
-    visibilityConfirmed,
+    canDetect: pack.canDetect,
+    visibilityConfirmed: pack.visibilityConfirmed,
     ...(firstCallMsMedian === undefined ? {} : { firstCallMsMedian }),
     // Present (possibly empty) whenever runCount > 0 — measured and clean is
     // different from never checked. Omitted only when there was nothing to
@@ -296,18 +309,29 @@ const buildOpencodeVersions = (extras: readonly ExtractedExtras[]): readonly str
 
 /**
  * Per-run activity signals (attach `runIndex`, same as `buildRiskyCommands`)
- * plus the side-level config-drift signal, if any. Only ever called for the
- * `old` (baseline) side — see `buildSideAggregates`.
+ * for every pack foreign to this variant, plus this variant's own config-
+ * drift signal, if any. Computed for EVERY variant now — `03-hard-problems.md`
+ * §1: the pack under test is only ever foreign to the variants that don't
+ * declare it, so a shared pack never contaminates either of its own
+ * declarers. Grouped by foreign pack (declaration order), then by run.
  */
 const buildContaminationSignals = (
   extras: readonly ExtractedExtras[],
   runIndexes: readonly number[],
-  configDrift: UnindexedSignal | undefined,
+  foreignPacks: readonly string[],
+  configDrift: ConfigDriftSignal | undefined,
 ): readonly ContaminationSignal[] => [
-  ...extras.flatMap((e, i) =>
-    e.packActivitySignals.map((s): ContaminationSignal => ({ ...s, runIndex: runIndexes[i] ?? 0 })),
+  ...foreignPacks.flatMap((foreignName) =>
+    extras.flatMap((e, i) =>
+      (e.packActivitySignals[foreignName] ?? []).map(
+        (s): ContaminationSignal => ({ ...s, runIndex: runIndexes[i] ?? 0 }),
+      ),
+    ),
   ),
-  ...(configDrift === undefined ? [] : [configDrift]),
+  // install-drift names no single pack (it is variant-level) — stamped with
+  // an empty pack to satisfy the contract's required `pack: string` field;
+  // see `ConfigDriftSignal`'s doc comment in baseline-contamination.ts.
+  ...(configDrift === undefined ? [] : [{ ...configDrift, pack: '' }]),
 ]
 
 const emptyPrimary = (): PrimaryMetrics => ({
@@ -361,8 +385,8 @@ const phaseSliceDist = (
 }
 
 /**
- * Builds `SidePhaseSplit` from per-run phase slices (parallel to `extracted`
- * in `SideAggregationInput`): `task` medians over every successful run
+ * Builds `PhaseSplit` from per-run phase slices (parallel to `extracted`
+ * in `VariantAggregationInput`): `task` medians over every successful run
  * (a run with no init IS the task, whole); `init` only over runs whose
  * export carried a boundary. `runsWithLostInit` catches phase 06 recording
  * that `--init` ran (`initRanFlags`) while the export shows no boundary at
@@ -375,7 +399,7 @@ const buildPhaseSplit = (
   phasesList: readonly ExtractedPhases[],
   initRanFlags: readonly boolean[],
   setupWallMsList: readonly (number | undefined)[],
-): SidePhaseSplit | undefined => {
+): PhaseSplit | undefined => {
   if (phasesList.length === 0) return undefined
   const initSlices = phasesList.flatMap((p) => (p.init === undefined ? [] : [p.init]))
   const taskSlices = phasesList.map((p) => p.task)
@@ -405,8 +429,8 @@ const buildPhaseSplit = (
   }
 }
 
-export interface SideAggregationInput {
-  readonly side: Side
+export interface VariantAggregationInput {
+  readonly variant: string
   readonly extracted: readonly ExtractedMetrics[]
   readonly failedRuns: readonly FailedRun[]
   readonly rawRunIds: readonly string[]
@@ -414,30 +438,28 @@ export interface SideAggregationInput {
   readonly extras: readonly ExtractedExtras[]
   /** Parallel to `extracted` — the run index each entry came from. */
   readonly runIndexes: readonly number[]
-  /** Parallel to `extracted` — P5 latency profile of the run's events.ndjson. */
+  /** One entry per successfully-profiled run — NOT parallel to `extracted`; runs with no readable events.ndjson are absent. */
   readonly eventsProfiles: readonly EventsProfile[]
-  /** The skill pack name to match, when `--pack` resolved to a skill. Absent -> packUse omitted. */
-  readonly packName?: string
-  /** Whether the pack type can be seen in exports at all (false for plugin/mcp/agent/command). */
-  readonly canDetect: boolean
+  /** Packs this variant declares — one `PackUse` built per entry (empty when the variant declares no packs). */
+  readonly packs: readonly DeclaredPack[]
   /**
-   * Whether phase 05's pack-visibility gate proved the pack was present in
-   * this side's HOME before any run started. Always false for the old side —
-   * the pack is deliberately never installed there.
+   * Packs OTHER variants declare that this one does NOT — contamination is
+   * checked against this set for every variant now (`03-hard-problems.md`
+   * §1; a pack shared by two variants is in neither's foreign set).
    */
-  readonly visibilityConfirmed: boolean
-  /** Computed by phase 07 from side results (§1.6); passed through unchanged. */
+  readonly foreignPacks: readonly string[]
+  /** Computed by phase 07 from this variant's results (§1.6); passed through unchanged. */
   readonly verifyStats?: VerifyStats
   /**
-   * The captured-config drift signal for this side (from `installed.json`,
-   * read by phase 07) — only surfaced when `side === 'old'`; see
+   * This variant's own captured-config drift signal (from `installed.json`,
+   * read by phase 07) — computed for every variant now; see
    * `baseline-contamination.ts`.
    */
-  readonly configDriftSignal?: UnindexedSignal
+  readonly configDriftSignal?: ConfigDriftSignal
   /** Parallel to `extracted` — true when `RunSideResultExt.initRan === true` for that run (spec §5.4). */
   readonly initRanFlags: readonly boolean[]
   /**
-   * Every attempted run's `RunSideResult.setupWallMs` (successful AND
+   * Every attempted run's `RunResult.setupWallMs` (successful AND
    * failed — the pack-exercise segment runs before the agent session, so a
    * later agent crash doesn't invalidate its own wall-clock reading);
    * `undefined` entries are runs with no setup segment.
@@ -445,24 +467,26 @@ export interface SideAggregationInput {
   readonly setupWallMsList: readonly (number | undefined)[]
 }
 
-export const buildSideAggregates = (input: SideAggregationInput): SideAggregates => {
-  const packUse = buildPackUse(
-    input.extras,
-    input.runIndexes,
-    input.packName,
-    input.canDetect,
-    input.visibilityConfirmed,
-  )
+export const buildVariantAggregates = (input: VariantAggregationInput): VariantAggregates => {
+  const packUses = input.packs.map((p) => buildPackUse(input.extras, input.runIndexes, p))
   if (input.extracted.length === 0) {
     return {
-      side: input.side,
+      variant: input.variant,
       primary: emptyPrimary(),
       secondary: emptySecondary(),
       stats: emptyStats(),
       failedRuns: [...input.failedRuns],
       rawRunIds: [...input.rawRunIds],
-      ...(packUse === undefined ? {} : { packUse }),
+      ...(packUses.length === 0 ? {} : { packUses: [...packUses] }),
       ...(input.verifyStats === undefined ? {} : { verifyStats: input.verifyStats }),
+      // The config-drift signal comes from installed.json, not from any
+      // successful run — it survives even when every run failed (a variant
+      // whose runs all crashed can still show config drift, and dropping the
+      // signal here would silently hide it). Foreign-pack activity signals
+      // ARE omitted: there is no successful export left to have scanned.
+      ...(input.configDriftSignal === undefined
+        ? {}
+        : { contaminationSignals: [{ ...input.configDriftSignal, pack: '' }] }),
       // riskyCommands / opencodeVersions / phaseSplit omitted — no successful run was ever inspected.
     }
   }
@@ -474,21 +498,19 @@ export const buildSideAggregates = (input: SideAggregationInput): SideAggregates
     input.setupWallMsList,
   )
   return {
-    side: input.side,
+    variant: input.variant,
     primary,
     secondary,
     stats,
     failedRuns: [...input.failedRuns],
     rawRunIds: [...input.rawRunIds],
-    ...(packUse === undefined ? {} : { packUse }),
+    ...(packUses.length === 0 ? {} : { packUses: [...packUses] }),
     riskyCommands: [...buildRiskyCommands(input.extras, input.runIndexes)],
     opencodeVersions: [...buildOpencodeVersions(input.extras)],
     ...(input.verifyStats === undefined ? {} : { verifyStats: input.verifyStats }),
-    // Contamination only means anything on the baseline — the pack side is
-    // SUPPOSED to show pack activity, so the signal is never computed there.
-    ...(input.side === 'old'
-      ? { contaminationSignals: [...buildContaminationSignals(input.extras, input.runIndexes, input.configDriftSignal)] }
-      : {}),
+    contaminationSignals: [
+      ...buildContaminationSignals(input.extras, input.runIndexes, input.foreignPacks, input.configDriftSignal),
+    ],
     ...(phaseSplit === undefined ? {} : { phaseSplit }),
   }
 }
@@ -513,8 +535,8 @@ const percentDelta = (oldValue: number, absolute: number): number | undefined =>
 }
 
 /**
- * Single-metric delta. Exposed for table testing; `computeDelta` wires the
- * side-aggregate values + old-side IQR into it.
+ * Single-metric delta. Exposed for table testing; `computeVariantDelta`
+ * wires the variant-aggregate values + baseline IQR into it.
  */
 export const computeMetricDelta = (
   oldValue: number,
@@ -532,51 +554,76 @@ export const computeMetricDelta = (
   }
 }
 
-const sideHasSamples = (agg: SideAggregates): boolean =>
+const variantHasSamples = (agg: VariantAggregates): boolean =>
   agg.stats.totalTokens.samples.length > 0
 
+/** Same shape as `computeMetricDelta` — injected so phase deltas go through the caller's `pairIncomplete` neutralization instead of always computing a real (possibly misleadingly "significant") delta. */
+type MetricDeltaFn = (
+  baseValue: number,
+  vValue: number,
+  iqrVal: number | undefined,
+  direction: DeltaDirection,
+) => MetricDelta
+
 /**
- * Five `computeMetricDelta` calls over a phase slice pair — same
- * lower-is-better direction as the matching `PrimaryDeltas` entries (spec
- * §5.5); significance is judged against the OLD side's own distribution for
- * that phase, same convention `computeDelta` uses for the whole-run deltas.
+ * Five metric-delta calls over a phase slice pair — same lower-is-better
+ * direction as the matching `PrimaryDeltas` entries (spec §5.5); significance
+ * is judged against the BASELINE's own distribution for that phase, same
+ * convention `computeVariantDelta` uses for the whole-run deltas.
+ * `deltaFor` is `computeVariantDelta`'s own pairIncomplete-aware wrapper —
+ * threading it through here (rather than calling `computeMetricDelta`
+ * directly) means an incomplete pair renders neutral task/init deltas too,
+ * not just neutral primary deltas.
  */
-const computePhaseDeltas = (oldSlice: PhaseSlice, newSlice: PhaseSlice, oldStats: PhaseSliceStats): PhaseDeltas => ({
-  totalTokens: computeMetricDelta(
-    toNum(oldSlice.totalTokens),
-    toNum(newSlice.totalTokens),
-    oldStats.totalTokens.iqr,
+const computePhaseDeltas = (
+  baseSlice: PhaseSlice,
+  vSlice: PhaseSlice,
+  baseStats: PhaseSliceStats,
+  deltaFor: MetricDeltaFn,
+): PhaseDeltas => ({
+  totalTokens: deltaFor(
+    toNum(baseSlice.totalTokens),
+    toNum(vSlice.totalTokens),
+    baseStats.totalTokens.iqr,
     'lower-is-better',
   ),
-  wallClockMs: computeMetricDelta(
-    toNum(oldSlice.wallClockMs),
-    toNum(newSlice.wallClockMs),
-    oldStats.wallClockMs.iqr,
+  wallClockMs: deltaFor(
+    toNum(baseSlice.wallClockMs),
+    toNum(vSlice.wallClockMs),
+    baseStats.wallClockMs.iqr,
     'lower-is-better',
   ),
-  costUsd: computeMetricDelta(oldSlice.costUsd, newSlice.costUsd, oldStats.costUsd.iqr, 'lower-is-better'),
-  stepCount: computeMetricDelta(oldSlice.stepCount, newSlice.stepCount, oldStats.stepCount.iqr, 'lower-is-better'),
-  toolCallCount: computeMetricDelta(
-    oldSlice.toolCallCount,
-    newSlice.toolCallCount,
-    oldStats.toolCallCount.iqr,
+  costUsd: deltaFor(baseSlice.costUsd, vSlice.costUsd, baseStats.costUsd.iqr, 'lower-is-better'),
+  stepCount: deltaFor(baseSlice.stepCount, vSlice.stepCount, baseStats.stepCount.iqr, 'lower-is-better'),
+  toolCallCount: deltaFor(
+    baseSlice.toolCallCount,
+    vSlice.toolCallCount,
+    baseStats.toolCallCount.iqr,
     'lower-is-better',
   ),
 })
 
-export const computeDelta = (oldAgg: SideAggregates, newAgg: SideAggregates): MetricsDiff => {
-  const bothFailed = !sideHasSamples(oldAgg) && !sideHasSamples(newAgg)
-  const anyFailed = !sideHasSamples(oldAgg) || !sideHasSamples(newAgg)
+/**
+ * Reference distribution = the baseline variant (`03-hard-problems.md` §1.2):
+ * for every non-baseline variant V, `Δ = V.median − base.median`, judged
+ * significant against `1.5 × IQR(base)` — the baseline's spread is the
+ * shared yardstick, not either side's own. `pairIncomplete` generalizes the
+ * old `anyFailed` containment: deltas still compute (absolute/percent
+ * render) but are forced non-significant/neutral whenever either side of
+ * THIS pair has zero samples.
+ */
+export const computeVariantDelta = (base: VariantAggregates, v: VariantAggregates): VariantDelta => {
+  const pairIncomplete = !variantHasSamples(base) || !variantHasSamples(v)
 
   const deltaFor = (
-    oldValue: number,
-    newValue: number,
+    baseValue: number,
+    vValue: number,
     iqrVal: number | undefined,
     direction: DeltaDirection,
   ): MetricDelta => {
-    if (anyFailed) {
-      const absolute = newValue - oldValue
-      const percent = percentDelta(oldValue, absolute)
+    if (pairIncomplete) {
+      const absolute = vValue - baseValue
+      const percent = percentDelta(baseValue, absolute)
       return {
         absolute,
         ...(percent === undefined ? {} : { percent }),
@@ -584,49 +631,49 @@ export const computeDelta = (oldAgg: SideAggregates, newAgg: SideAggregates): Me
         better: 'neutral',
       }
     }
-    return computeMetricDelta(oldValue, newValue, iqrVal, direction)
+    return computeMetricDelta(baseValue, vValue, iqrVal, direction)
   }
 
-  const deltas = {
+  const deltas: PrimaryDeltas = {
     totalTokens: deltaFor(
-      toNum(oldAgg.primary.totalTokens),
-      toNum(newAgg.primary.totalTokens),
-      oldAgg.stats.totalTokens.iqr,
+      toNum(base.primary.totalTokens),
+      toNum(v.primary.totalTokens),
+      base.stats.totalTokens.iqr,
       'lower-is-better',
     ),
     wallClockMs: deltaFor(
-      toNum(oldAgg.primary.wallClockMs),
-      toNum(newAgg.primary.wallClockMs),
-      oldAgg.stats.wallClockMs.iqr,
+      toNum(base.primary.wallClockMs),
+      toNum(v.primary.wallClockMs),
+      base.stats.wallClockMs.iqr,
       'lower-is-better',
     ),
     costUsd: deltaFor(
-      oldAgg.primary.costUsd,
-      newAgg.primary.costUsd,
-      oldAgg.stats.costUsd.iqr,
+      base.primary.costUsd,
+      v.primary.costUsd,
+      base.stats.costUsd.iqr,
       'lower-is-better',
     ),
     stepCount: deltaFor(
-      oldAgg.primary.stepCount,
-      newAgg.primary.stepCount,
-      oldAgg.stats.stepCount.iqr,
+      base.primary.stepCount,
+      v.primary.stepCount,
+      base.stats.stepCount.iqr,
       'lower-is-better',
     ),
     toolCallCount: deltaFor(
-      oldAgg.primary.toolCallCount,
-      newAgg.primary.toolCallCount,
-      oldAgg.stats.toolCallCount.iqr,
+      base.primary.toolCallCount,
+      v.primary.toolCallCount,
+      base.stats.toolCallCount.iqr,
       'lower-is-better',
     ),
     successRank: deltaFor(
-      oldAgg.primary.successRank,
-      newAgg.primary.successRank,
-      oldAgg.stats.successRank.iqr,
+      base.primary.successRank,
+      v.primary.successRank,
+      base.stats.successRank.iqr,
       'higher-is-better',
     ),
     maxParallelism: deltaFor(
-      oldAgg.primary.maxParallelism,
-      newAgg.primary.maxParallelism,
+      base.primary.maxParallelism,
+      v.primary.maxParallelism,
       undefined,
       'context-dependent',
     ),
@@ -637,26 +684,49 @@ export const computeDelta = (oldAgg: SideAggregates, newAgg: SideAggregates): Me
   // additionally requires runsWithInit > 0 on BOTH sides (--init-side both),
   // never rendered when init is one-sided (that is a cost figure, not a delta).
   const taskDeltas =
-    oldAgg.phaseSplit !== undefined && newAgg.phaseSplit !== undefined
-      ? computePhaseDeltas(oldAgg.phaseSplit.task, newAgg.phaseSplit.task, oldAgg.phaseSplit.taskStats)
+    base.phaseSplit !== undefined && v.phaseSplit !== undefined
+      ? computePhaseDeltas(base.phaseSplit.task, v.phaseSplit.task, base.phaseSplit.taskStats, deltaFor)
       : undefined
 
-  const bothHaveInit = (oldAgg.phaseSplit?.runsWithInit ?? 0) > 0 && (newAgg.phaseSplit?.runsWithInit ?? 0) > 0
-  const oldInit = oldAgg.phaseSplit?.init
-  const newInit = newAgg.phaseSplit?.init
-  const oldInitStats = oldAgg.phaseSplit?.initStats
+  const bothHaveInit = (base.phaseSplit?.runsWithInit ?? 0) > 0 && (v.phaseSplit?.runsWithInit ?? 0) > 0
+  const baseInit = base.phaseSplit?.init
+  const vInit = v.phaseSplit?.init
+  const baseInitStats = base.phaseSplit?.initStats
   const initDeltas =
-    bothHaveInit && oldInit !== undefined && newInit !== undefined && oldInitStats !== undefined
-      ? computePhaseDeltas(oldInit, newInit, oldInitStats)
+    bothHaveInit && baseInit !== undefined && vInit !== undefined && baseInitStats !== undefined
+      ? computePhaseDeltas(baseInit, vInit, baseInitStats, deltaFor)
       : undefined
 
   return {
-    old: oldAgg,
-    new: newAgg,
+    variant: v.variant,
     deltas,
-    bothFailed,
+    pairIncomplete,
     ...(taskDeltas === undefined ? {} : { taskDeltas }),
     ...(initDeltas === undefined ? {} : { initDeltas }),
+  }
+}
+
+/**
+ * Assembles the N-1 per-variant deltas vs the baseline (config order,
+ * baseline excluded) plus `allFailed` = every variant empty (generalizes the
+ * old `bothFailed`, `03-hard-problems.md` §1.2). `baseline` naming a variant
+ * absent from `all` is a caller error (validated upstream by phase 00/05) —
+ * throws rather than silently returning a report that renders as "complete,
+ * zero comparisons".
+ */
+export const computeMetricsReport = (baseline: string, all: readonly VariantAggregates[]): MetricsReport => {
+  const baseAgg = all.find((a) => a.variant === baseline)
+  if (baseAgg === undefined) {
+    throw new Error(`computeMetricsReport: baseline variant "${baseline}" not found among [${all.map((a) => a.variant).join(', ')}]`)
+  }
+  const others = all.filter((a) => a.variant !== baseline)
+  const deltas = others.map((v) => computeVariantDelta(baseAgg, v))
+  const allFailed = all.length > 0 && all.every((a) => !variantHasSamples(a))
+  return {
+    baseline,
+    variants: [...all],
+    deltas,
+    allFailed,
   }
 }
 

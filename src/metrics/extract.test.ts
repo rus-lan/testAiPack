@@ -34,6 +34,31 @@ const reasoningPart = (start: number, end: number, id = 'r1') => ({
 const stepStart = (id = 'ss1') => ({ type: 'step-start' as const, id })
 const stepFinish = (id = 'sf1') => ({ type: 'step-finish' as const, id })
 
+const skillPart = (
+  name: string,
+  opts: { readonly status?: 'completed' | 'error'; readonly start?: number; readonly end?: number; readonly id?: string } = {},
+) => ({
+  type: 'tool' as const,
+  tool: 'skill' as const,
+  callID: `call-${opts.id ?? name}`,
+  state: {
+    status: opts.status ?? 'completed',
+    input: { name },
+    ...(opts.start === undefined || opts.end === undefined
+      ? {}
+      : { time: { start: opts.start, end: opts.end } }),
+  },
+  id: opts.id ?? `id-skill-${name}`,
+})
+
+const bashPart = (command: string, opts: { readonly id?: string } = {}) => ({
+  type: 'tool' as const,
+  tool: 'bash' as const,
+  callID: `call-${opts.id ?? 'bash'}`,
+  state: { status: 'completed' as const, input: { command } },
+  id: opts.id ?? 'id-bash',
+})
+
 /**
  * Message builder for phase-split tests: unlike {@link message}, this one
  * controls `role` and `time.created` (the boundary marker inputs) and an
@@ -633,6 +658,96 @@ describe('extractMetricsFromTree', () => {
     // bash: 2 calls, 1 error -> 0.5
     expect(secondary.perTool['bash']?.count).toBe(2)
     expect(secondary.perTool['bash']?.errorRate).toBeCloseTo(0.5, 3)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// extras: per-pack maps (ExtractOptions.packNames, N-way v2) — extraction
+// stays variant-neutral: it scans for every name it is given, regardless of
+// which (if any) that variant declares; aggregate.ts later decides which
+// names are this variant's own vs. foreign.
+// ---------------------------------------------------------------------------
+
+describe('extractMetrics — extras: per-pack maps (packNames)', () => {
+  it('no packNames given -> packCalls/packErrors/firstPackCallMs/packActivitySignals are all empty records', () => {
+    const exp = makeExport({ messages: [message([skillPart('graphify', { start: 0, end: 10 })])] })
+    const { extras } = extractMetrics(exp, null, 4)
+    expect(extras.packCalls).toEqual({})
+    expect(extras.packErrors).toEqual({})
+    expect(extras.firstPackCallMs).toEqual({})
+    expect(extras.packActivitySignals).toEqual({})
+  })
+
+  it('one packName -> calls/errors/firstMs computed for that name only', () => {
+    const exp = makeExport({
+      tStart: 1000,
+      messages: [
+        message([
+          skillPart('graphify', { start: 1100, end: 1150, id: 'a' }),
+          skillPart('graphify', { start: 1200, end: 1250, id: 'b', status: 'error' }),
+        ]),
+      ],
+    })
+    const { extras } = extractMetrics(exp, null, 4, { packNames: ['graphify'] })
+    expect(extras.packCalls).toEqual({ graphify: 2 })
+    expect(extras.packErrors).toEqual({ graphify: 1 })
+    expect(extras.firstPackCallMs).toEqual({ graphify: 100 }) // 1100 - 1000
+  })
+
+  it('multiple packNames -> each keyed independently; a name with no calls has 0 calls and no firstPackCallMs entry', () => {
+    const exp = makeExport({
+      tStart: 0,
+      messages: [message([skillPart('graphify', { start: 10, end: 20 })])],
+    })
+    const { extras } = extractMetrics(exp, null, 4, { packNames: ['graphify', 'astgrep'] })
+    expect(extras.packCalls).toEqual({ graphify: 1, astgrep: 0 })
+    expect(extras.packErrors).toEqual({ graphify: 0, astgrep: 0 })
+    expect(extras.firstPackCallMs).toEqual({ graphify: 10 })
+    expect('astgrep' in extras.firstPackCallMs).toBe(false)
+  })
+
+  it('packActivitySignals: keyed per packName, only matching-name calls populate a name entry', () => {
+    const exp = makeExport({
+      messages: [
+        message([
+          skillPart('graphify', { id: 'g1' }),
+          bashPart('npm install -g astgrep', { id: 'b1' }),
+        ]),
+      ],
+    })
+    const { extras } = extractMetrics(exp, null, 4, { packNames: ['graphify', 'astgrep'] })
+    expect(extras.packActivitySignals['graphify']).toEqual([
+      { kind: 'skill-call', pack: 'graphify', detail: 'skill tool call succeeded for "graphify"' },
+    ])
+    expect(extras.packActivitySignals['astgrep']).toEqual([
+      { kind: 'bash-install', pack: 'astgrep', detail: 'npm install -g astgrep' },
+    ])
+  })
+})
+
+describe('extractMetricsFromTree — per-pack maps fold across nodes', () => {
+  it('sums packCalls/packErrors per name, takes the earliest firstPackCallMs per name, concatenates packActivitySignals per name', () => {
+    const root = makeExport({
+      id: 'root',
+      tStart: 0,
+      messages: [message([skillPart('graphify', { start: 50, end: 60 })])],
+    })
+    const child = makeExport({
+      id: 'child',
+      tStart: 0,
+      messages: [
+        message([
+          skillPart('graphify', { start: 20, end: 30 }),
+          skillPart('astgrep', { start: 40, end: 45 }),
+        ]),
+      ],
+    })
+    const tree = [node(root, 0, null), node(child, 1, 'root')]
+    const { extras } = extractMetricsFromTree(tree, null, 4, { packNames: ['graphify', 'astgrep'] })
+    expect(extras.packCalls).toEqual({ graphify: 2, astgrep: 1 })
+    expect(extras.firstPackCallMs).toEqual({ graphify: 20, astgrep: 40 }) // earliest across the tree, per name
+    expect(extras.packActivitySignals['graphify']).toHaveLength(2)
+    expect(extras.packActivitySignals['astgrep']).toHaveLength(1)
   })
 })
 
