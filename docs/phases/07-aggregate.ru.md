@@ -69,9 +69,9 @@ Namespace: `TestAiPack.Aggregate` (см. `contract/phases/07-aggregate.tsp`).
   список по всем вариантам, атрибуция обязана быть на самой записи).
 - `rawRunIds: string[]` — `sessionId` прогонов, вошедших в агрегацию.
 - `packUses?: PackUse[]` — **одна запись на каждый пак, объявленный этим
-  вариантом** (было: единственный опциональный `packUse`) —
-  `variant.packs` может расти в Stage 2, контракт уже массив. Каждая запись
-  несёт `pack: string` (имя пака).
+  вариантом** (было: единственный опциональный `packUse`) — `variant.packs`
+  не ограничен числом (Stage 2 снял guard `≤1`), контракт был массивом с
+  самого начала. Каждая запись несёт `pack: string` (имя пака).
 - `riskyCommands?: RiskyCommand[]` — опасные bash-команды, найденные во всех
   прогонах варианта.
 - `opencodeVersions?: string[]` — различные значения `export.info.version`,

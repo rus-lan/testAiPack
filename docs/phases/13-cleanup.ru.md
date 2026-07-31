@@ -75,10 +75,16 @@ Namespace: `TestAiPack.Cleanup` (см. `contract/phases/13-cleanup.tsp`).
      `timestamp < now − 7d`.
 5. Для **полного удаления** — убрать весь `<runId>/` каталог целиком.
 6. Если `--aggressive` (без полного удаления, или дополнительно к нему) —
-   во **всех оставшихся** прогонах удалить `home/` (`apps/` и `results/`
-   остаются) — тот же корневой путь, что и в ephemeral-режиме, не
-   по-вариантно. Это экономит место, сохраняя возможность открыть review
-   workspace и посмотреть diff.
+   во **всех оставшихся** прогонах удалить `home/`, `apps/` и `gitdirs/`
+   (`planGc`, `src/cli/workspace-runs.ts` — `pruneHome` несёт все три корня,
+   не только `home/`). `results/`, `manifest.json` и `config/` остаются.
+   `gitdirs/` включён намеренно: это перенесённые `--protect-git` клоны
+   (полная копия репо на прогон) — без их прунинга агрессивный gc не
+   освобождал бы почти ничего из того, ради чего он вообще существует.
+   **Рабочие копии агента (`apps/`) при этом ТОЖЕ удаляются** — после
+   `--aggressive` открыть `review.code-workspace` для этого прогона больше
+   нельзя (папки `apps/<variant>/run-N` не существуют), сравнение доступно
+   только через сохранённый `diff/` внутри `results/`.
 7. Логировать все операции в `.testaipack/gc.log` (общий для всех прогонов).
 8. Сбой удаления → warning в логе, субкоманда продолжается (идемпотентна —
    повторный запуск добьёт остатки).
@@ -106,7 +112,7 @@ Namespace: `TestAiPack.Cleanup` (см. `contract/phases/13-cleanup.tsp`).
 | `gc --older-than xyz` (невалидный формат)           | warning, отказ                                     | —                    |
 | `gc --keep-last 100` при 10 прогонах                | ничего не удаляется                                | —                    |
 | `gc --older-than 365d` при свежих прогонах           | ничего не удаётся                                  | —                    |
-| `gc --aggressive` без других опций                  | во всех прогонах удаляется только `home/`          | —                    |
+| `gc --aggressive` без других опций                  | во всех прогонах удаляются `home/`, `apps/` и `gitdirs/`; остаются только `results/`, `manifest.json`, `config/` | — |
 | ROFS / нет прав                                     | warning в `gc.log`, фаза не падает                 | —                    |
 | `manifest.json` повреждён у какого-то прогона        | warning, прогон пропускается (не участвует в keep) | —                    |
 | Удаление прервано на середине                        | gc идемпотентен, повторный запуск добьёт           | —                    |
@@ -144,8 +150,10 @@ Namespace: `TestAiPack.Cleanup` (см. `contract/phases/13-cleanup.tsp`).
   отчёты, timeline, diff, judge, install.log, pack-setup.log, preflight.log,
   prep.json, review.code-workspace) — независимо от числа вариантов.
 - `gc` без `--aggressive` удаляет прогоны **целиком** или не трогает их вовсе.
-- `gc --aggressive` в оставшихся прогонах удаляет **только** `home/`, оставляя
-  `apps/` (для review workspace) и `results/`.
+- `gc --aggressive` в оставшихся прогонах удаляет `home/`, `apps/` и
+  `gitdirs/` — **включая рабочие копии агента**, так что `review.code-
+  workspace` для такого прогона больше не открыть; оставляет только
+  `results/`, `manifest.json` и `config/`.
 - `gcLogPath` указывает на `results/gc.log` (а в режиме субкоманды gc — также
   на `.testaipack/gc.log` с аудитным следом всех прогонов).
 - gc идемпотентен: повторный запуск с теми же опциями не делает ничего сверх

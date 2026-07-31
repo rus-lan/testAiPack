@@ -6,9 +6,11 @@
 ## 1. Назначение
 
 Доставить **каждый** пак из реестра эксперимента (`runInput.packs`) в
-собственный каталог `pack/<packName>/` (`skill`/`agent`/`command`/`all`; для
-`plugin`/`mcp` файловая доставка не нужна — регистрация целиком происходит в
-фазе 04), определить финальный тип (`detectedType`) и сформировать
+собственную подпапку `pack/<packName>/` (сам контент — как правило ещё на
+уровень глубже, `pack/<packName>/<refName>/`, см. §2/§3; `skill`/`agent`/
+`command`/`all`; для `plugin`/`mcp` файловая доставка не нужна — регистрация
+целиком происходит в фазе 04), определить финальный тип (`detectedType`) и
+сформировать
 `registeredIn` — список секций opencode-config, куда пак должен быть
 зарегистрирован (`skills`, `plugins`, `agents`, `commands`, `mcp`), плюс
 декларативный список `instructions`, которым фаза 04 физически применяет пак
@@ -39,8 +41,15 @@ Namespace: `TestAiPack.PackInstall` (см.
   RegistrationInstruction[]` — та же внутренняя связка 03↔04, что была раньше,
   теперь per-pack, а не единственная запись):
   - `pack` — имя пака из реестра (`PackSpec.name`).
-  - `packPath` — абсолютный путь к `pack/<name>/` (для skill/agent/command/all)
-    или пустая строка для plugin/mcp, где клон/копия не требуется.
+  - `packPath` — абсолютный путь к доставленному контенту. Для
+    skill/agent(dir)/command(dir)/all — на уровень ГЛУБЖЕ, чем каталог пака:
+    `pack/<packName>/<refName>/` (`<refName>` — имя, произведённое из `ref`,
+    например basename URL или локального пути — НЕ то же самое, что
+    `packName`, ключ реестра). Для agent/command, доставленного из
+    ОДИНОЧНОГО локального `.md`-файла (без клона директории) — путь к самому
+    файлу, `pack/<packName>/<refName>.md`, без дополнительной вложенности
+    (копировать нечего кроме файла). Пустая строка — для plugin/mcp, где
+    клон/копия не требуется.
   - `detectedType` — финальный `PackType` после детекции.
   - `registeredIn` — список секций opencode-config, куда этот пак
     зарегистрирован (например `["skills"]`, `["plugins"]`,
@@ -93,7 +102,10 @@ Namespace: `TestAiPack.PackInstall` (см.
 2. Иначе, **для каждого `PackSpec` в `runInput.packs` независимо**
    (`Effect.forEach`, порядок реестра сохраняется в результате):
    a. `packDir = path.join(workspace.pack, pack.name)` — своя подпапка на
-      КАЖДЫЙ пак, `ensureDir`.
+      КАЖДЫЙ пак (`pack/<packName>/`), `ensureDir`. **Это не финальный путь
+      контента** для skill/agent(dir)/command(dir)/all — реальная доставка
+      идёт ещё на уровень глубже, в `packDir/<refName>/` (`<refName>` —
+      имя, произведённое из `ref`, не из `pack.name`; см. `packPath` в §2).
    b. Определить финальный `detectedType`:
       - если `pack.type` задан явно (уже продетектирован фазой 00 для тех
         паков, у которых `type` не был указан пользователем — см.
@@ -101,28 +113,39 @@ Namespace: `TestAiPack.PackInstall` (см.
       - иначе — `detectPack(pack.ref)` по префиксу `ref` (тот же алгоритм,
         что и в фазе 00, `src/pack/detector.ts`). Невалидный ref → throw
         `PackInstallError({ code: "E_PACK_INVALID_REF", packRef, pack: pack.name })`.
-   c. По типу — **доставка пака в `pack/<name>/`** (только этот шаг пишет на
-      диск внутри фазы 03; регистрация в `home/<variant>/` делается фазой 04):
-      - **skill (git)**: `git clone --depth 1 <ref> pack/<name>/`.
+   c. По типу — **доставка пака в `pack/<packName>/…`** (только этот шаг
+      пишет на диск внутри фазы 03; регистрация в `home/<variant>/` делается
+      фазой 04). Везде ниже `<refName>` — имя, произведённое из `ref.name`
+      (basename URL/локального пути), а не `pack.name` (ключ реестра) —
+      совпадают только когда basename ref-а случайно равен имени в реестре:
+      - **skill (git)**: `git clone --depth 1 <ref> pack/<packName>/<refName>/`.
         Таймаут `runInput.timeouts.installSeconds`. Сбой clone по таймауту →
         `E_INSTALL_TIMEOUT`; по exit code → `E_INSTALL_FAILED`.
-        `registeredIn = ["skills"]`, `packPath = <abs>/pack/<name>/`.
-      - **skill (local)**: копирование каталога в `pack/<name>/`. Путь не
-        существует → throw `E_PACK_INVALID_REF`. `registeredIn = ["skills"]`.
+        `registeredIn = ["skills"]`, `packPath = <abs>/pack/<packName>/<refName>/`.
+      - **skill (local)**: копирование каталога в `pack/<packName>/<refName>/`
+        (`<refName>` = basename локального пути). Путь не существует → throw
+        `E_PACK_INVALID_REF`. `registeredIn = ["skills"]`.
       - **plugin (npm)**: в `pack/` ничего не клонируем (`packPath` остаётся
         пустым). `registeredIn = ["plugins"]` — фаза 04 запустит
         `opencode plugin <ref>` внутри HOME каждого объявившего его варианта.
-      - **agent / command**: если это URL или путь — клон/копия одного `.md`
-        файла в `pack/<name>/<basename>.md`. Файл не найден → `E_PACK_INVALID_REF`.
-        `registeredIn = ["agents"]` (или `["commands"]`).
+      - **agent / command, git или локальная директория**: клон/копия
+        каталога в `pack/<packName>/<refName>/`, внутри него ищется
+        `<refName>.md` → `pack/<packName>/<refName>/<refName>.md`. Файл не
+        найден → `E_PACK_INVALID_REF`. `registeredIn = ["agents"]` (или
+        `["commands"]`).
+      - **agent / command, ОДИНОЧНЫЙ локальный `.md`-файл** (не директория):
+        просто копия файла — `pack/<packName>/<refName>.md`, БЕЗ
+        дополнительной вложенности (копировать директорию не из чего).
+        `packPath` указывает прямо на этот файл.
       - **mcp**: в `pack/` не клонируем. `registeredIn = ["mcp"]` — фаза 04
         впишет блок в конфиг каждого объявившего его варианта.
-      - **all**: клонировать репо в `pack/<name>/`, обойти стандартные
-        подпапки `skills/`, `agents/`, `commands/`, `plugins/`; для каждого
-        найденного элемента добавить соответствующую секцию в `registeredIn`.
-        `plugins/` сканируется **по расширению файла** — только записи вида
-        `<name>.js` / `.mjs` / `.ts` / `.mts` / `.cjs`, и только реальные файлы
-        (не подкаталоги); имя плагина — та же запись без расширения.
+      - **all**: клонировать репо в `pack/<packName>/<refName>/`, обойти
+        стандартные подпапки `skills/`, `agents/`, `commands/`, `plugins/`
+        ВНУТРИ него; для каждого найденного элемента добавить
+        соответствующую секцию в `registeredIn`. `plugins/` сканируется **по
+        расширению файла** — только записи вида `<name>.js` / `.mjs` / `.ts`
+        / `.mts` / `.cjs`, и только реальные файлы (не подкаталоги); имя
+        плагина — та же запись без расширения.
    d. Дописать в `results/install.log` итог доставки этого пака: `[<pack.name>]
       installed <type> <detected.name> via <source>; sections=[...]`. Строк
       про plugin-установку здесь ещё нет — их добавит фаза 04 после
@@ -172,7 +195,8 @@ config в `home/<variant>/run-N/`) выполняется **фазой 04**, д�
 ## 6. Тест-кейсы (по одному на ветку контракта)
 
 - ✅ happy-path skill git: реестр из одного пака, ref = `github:owner/skill`
-  → клон в `pack/<name>/`, `detectedType = "skill"`, `registeredIn =
+  → клон в `pack/<packName>/skill/` (`skill` — `<refName>`, одним уровнем
+  глубже каталога пака), `detectedType = "skill"`, `registeredIn =
   ["skills"]`.
 - ✅ happy-path plugin npm: `ref = "npm:myplugin"` → в `pack/<name>/` ничего
   не клонируется, `detectedType = "plugin"`, `registeredIn = ["plugins"]`
