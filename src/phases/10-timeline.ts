@@ -536,15 +536,15 @@ const renderLaneCss = (lanes: readonly VariantTimeline[], baseline: string): str
 
 const renderLegend = (mode: TimelineMode): string =>
   '<div class="legend">' +
-  '<span class="event reasoning">reasoning</span>' +
-  '<span class="event tool-call bash">bash</span>' +
-  '<span class="event tool-call skill">skill</span>' +
-  '<span class="event tool-call edit">edit/write</span>' +
-  '<span class="event tool-call read">read</span>' +
-  '<span class="event tool-call">other tool</span>' +
-  '<span class="event step-finish">step-finish</span>' +
+  '<span class="event reasoning">рассуждение</span>' +
+  '<span class="event tool-call bash">команда</span>' +
+  '<span class="event tool-call skill">навык</span>' +
+  '<span class="event tool-call edit">правка/запись</span>' +
+  '<span class="event tool-call read">чтение</span>' +
+  '<span class="event tool-call">другой инструмент</span>' +
+  '<span class="event step-finish">завершение шага</span>' +
   (mode === 'tree-diff'
-    ? '<span class="event vs-baseline">only vs baseline</span><span class="event baseline-only">baseline only</span>'
+    ? '<span class="event vs-baseline">нет в базе</span><span class="event baseline-only">только в базе</span>'
     : '') +
   '</div>'
 
@@ -585,7 +585,7 @@ const groupSwimlanes = (events: readonly TimelineEvent[]): readonly Swimlane[] =
 }
 
 const swimlaneLabel = (lane: Swimlane): string =>
-  lane.depth === 0 ? 'main' : `depth ${String(lane.depth)}`
+  lane.depth === 0 ? 'главная' : `глубина ${String(lane.depth)}`
 
 const renderSwimlane = (lane: Swimlane, flagFor?: (key: string) => DiffFlag): string =>
   `<div class="swimlane" data-depth="${String(lane.depth)}">` +
@@ -608,7 +608,7 @@ const renderLaneBlock = (
   baseline: string,
   flagFor?: (key: string) => DiffFlag,
 ): string => {
-  const header = escapeHtml(lane.variant) + (lane.variant === baseline ? ' (baseline)' : '')
+  const header = escapeHtml(lane.variant) + (lane.variant === baseline ? ' (база)' : '')
   return `<div class="side" data-vi="${String(index)}"><h2>${header}</h2>${renderSideLanes(lane.events, flagFor)}</div>`
 }
 
@@ -653,7 +653,7 @@ const renderPaletteChips = (lanes: readonly VariantTimeline[], baseline: string)
   const colors = assignLaneColors(lanes, baseline)
   return lanes
     .map((lane, i) => {
-      const label = escapeHtml(lane.variant) + (lane.variant === baseline ? ' (baseline)' : '')
+      const label = escapeHtml(lane.variant) + (lane.variant === baseline ? ' (база)' : '')
       return `<span class="chip" style="background:${colors[i] ?? BASELINE_COLOR}">${label}</span>`
     })
     .join('')
@@ -663,7 +663,7 @@ const renderMerged = (tl: Timeline, baseline: string): string => {
   const all = [...tl.lanes.flatMap((l) => l.events)].sort((a, b) => Number(a.tStart) - Number(b.tStart))
   return (
     `<div class="timeline"><div class="side merged">` +
-    `<h2>MERGED</h2><div class="chips">${renderPaletteChips(tl.lanes, baseline)}</div>` +
+    `<h2>ОБЪЕДИНЕНО</h2><div class="chips">${renderPaletteChips(tl.lanes, baseline)}</div>` +
     `<div class="events">${renderEventRow(all)}</div>` +
     `</div></div>`
   )
@@ -704,15 +704,15 @@ export const renderTimelineHtml = (tl: Timeline, baseline: string): string => {
   const dataJson = toScriptJson(tl)
   const laneCss = renderLaneCss(tl.lanes, resolvedBaseline)
   return `<!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>testaipack timeline</title>
+<title>testaipack таймлайн</title>
 <style>${TIMELINE_CSS}
 ${laneCss}</style>
 </head>
 <body>
-<h1>testaipack timeline<span class="mode-badge">${escapeHtml(tl.mode)}</span></h1>
+<h1>testaipack таймлайн<span class="mode-badge">${escapeHtml(tl.mode)}</span></h1>
 ${renderLegend(tl.mode)}
 ${body}
 <!-- schemaVersion: 2 — Timeline.lanes: VariantTimeline[] (replaces the v1 {old,new} shape); external tooling reading this JSON must migrate -->

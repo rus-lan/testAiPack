@@ -521,7 +521,7 @@ describe('renderTimelineHtml', () => {
   it('renders one .side block per variant, headers show name + baseline suffix', () => {
     const html = renderTimelineHtml(sampleTimeline('side-by-side'), BASELINE)
     expect(html.match(/class="side" data-vi="\d+"/g)).toHaveLength(3)
-    expect(html).toContain('<h2>base (baseline)</h2>')
+    expect(html).toContain('<h2>base (база)</h2>')
     expect(html).toContain('<h2>graphify</h2>')
     expect(html).toContain('<h2>astgrep</h2>')
   })
@@ -631,9 +631,9 @@ describe('renderTimelineHtml', () => {
 
   it('merged mode renders a single combined block with variant palette chips', () => {
     const html = renderTimelineHtml(sampleTimeline('merged'), BASELINE)
-    expect(html).toContain('MERGED')
+    expect(html).toContain('ОБЪЕДИНЕНО')
     expect(html.match(/class="chip"/g)).toHaveLength(3)
-    expect(html).toContain('>base (baseline)<')
+    expect(html).toContain('>base (база)<')
     expect(html).toContain('>graphify<')
     expect(html).toContain('>astgrep<')
   })
@@ -647,11 +647,11 @@ describe('renderTimelineHtml', () => {
 
   it('legend shows the tree-diff swatches only in tree-diff mode', () => {
     const treeDiffHtml = renderTimelineHtml(sampleTimeline('tree-diff'), BASELINE)
-    expect(treeDiffHtml).toContain('only vs baseline')
-    expect(treeDiffHtml).toContain('baseline only')
+    expect(treeDiffHtml).toContain('нет в базе')
+    expect(treeDiffHtml).toContain('только в базе')
     const sideHtml = renderTimelineHtml(sampleTimeline('side-by-side'), BASELINE)
-    expect(sideHtml).not.toContain('only vs baseline')
-    expect(sideHtml).not.toContain('baseline only')
+    expect(sideHtml).not.toContain('нет в базе')
+    expect(sideHtml).not.toContain('только в базе')
   })
 
   it('baseline lane always gets #fafafa, and non-baseline lanes never collide with it or each other', () => {
@@ -735,7 +735,7 @@ describe('renderTimelineHtml', () => {
     const html = renderTimelineHtml(tl, 'base')
     expect(html).not.toMatch(/event \w+[^"]* vs-baseline/)
     expect(html).not.toMatch(/event \w+[^"]* baseline-only/)
-    expect(html).toContain('<h2>base (baseline)</h2>')
+    expect(html).toContain('<h2>base (база)</h2>')
   })
 
   it('a baseline name matching no lane falls back to the first lane (e.g. rebuild drift)', () => {
@@ -747,7 +747,7 @@ describe('renderTimelineHtml', () => {
       mode: 'tree-diff',
     }
     const html = renderTimelineHtml(tl, 'does-not-exist')
-    expect(html).toContain('<h2>first (baseline)</h2>')
+    expect(html).toContain('<h2>first (база)</h2>')
     expect(html).not.toContain('does-not-exist')
     // grep is now diffed against the resolved baseline ('first') -> flagged
     expect(html).toMatch(/tool-call grep vs-baseline/)
@@ -1107,8 +1107,8 @@ describe('renderTimelineHtml — swimlanes', () => {
     expect(html).toContain('data-depth="0"')
     expect(html).toContain('data-depth="1"')
     expect(html).toContain('swimlane-label')
-    expect(html).toContain('>main<')
-    expect(html).toContain('>depth 1<')
+    expect(html).toContain('>главная<')
+    expect(html).toContain('>глубина 1<')
   })
 
   it('indents depth-1 swimlane via its CSS data attribute', () => {
