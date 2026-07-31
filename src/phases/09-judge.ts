@@ -1,12 +1,20 @@
 /**
  * Phase 09: judge (optional)
  *
- * If `--judge` is set, run an LLM judge over the old/new diffs and return a
- * `JudgeResult` (verdict ok/fail/unclear, quality scores, explanation). Without
- * `--judge` the phase is a no-op returning `{ judge: null }`. No judge failure
- * aborts the phase: model-unavailable, timeout, crash and rate-limit all
- * degrade to `verdict: "unclear"` with `ran: false` — `JudgeResult.ran`
- * distinguishes "judge could not run" from "judge ran and was unsure".
+ * If `--judge` is set, run an LLM judge over every variant's diffs and
+ * return a `JudgeResult` (verdict ok/fail/unclear, per-variant quality
+ * scores, ranking, explanation). Without `--judge` the phase is a no-op
+ * returning `{ judge: null }`. No judge failure aborts the phase:
+ * model-unavailable, timeout, crash and rate-limit all degrade to
+ * `verdict: "unclear"` with `ran: false` — `JudgeResult.ran` distinguishes
+ * "judge could not run" from "judge ran and was unsure".
+ *
+ * For N variants everything goes in one call (baseline first, packs
+ * disclosed per variant) as long as the assembled prompt fits
+ * `JUDGE_SINGLE_CALL_BUDGET_CHARS`; over budget it falls back to one
+ * pairwise-vs-baseline call per non-baseline variant and assembles the
+ * combined result (baseline quality = median of its per-pair scores).
+ * See `.research/n-way-variants/03-hard-problems.md` §2.
  *
  * @see docs/phases/09-judge.ru.md
  * @see contract/phases/09-judge.tsp
@@ -16,20 +24,20 @@ import path from 'node:path'
 import os from 'node:os'
 import type {
   DiffResult,
-  DiffRunResult,
   JudgeInput,
   JudgeResult,
   JudgeResultOutput,
   JudgeVerdict,
+  Manifest,
   RunInput,
+  VariantScore,
 } from '@generated/types'
 import { run as opencodeRun } from '../opencode/cli.js'
 import type { OpencodeRunOptions } from '../opencode/cli.js'
 import { ensureDir, removeDir, writeFile, writeJson } from '../util/fs.js'
 import { isRecord } from '../util/types.js'
+import { median } from '../metrics/stats.js'
 import type { PhaseError } from '../errors.js'
-import { safeRefDisplay } from '../pack/detector.js'
-import { redactUrlCredentials } from '../util/redact.js'
 
 const VERDICTS: readonly JudgeVerdict[] = ['ok', 'fail', 'unclear']
 
@@ -81,7 +89,7 @@ const firstNonEmptyPatch = (
 /** A run with more changed files than this lists only the count, not every path. */
 const PER_FILE_LIST_MAX = 20
 
-const runSummaryLine = (r: DiffRunResult): string => {
+const runSummaryLine = (r: DiffResult['runs'][number]): string => {
   if (r.state === 'failed') {
     return `run-${String(r.runIndex)}: failed${r.error === undefined ? '' : ` (${r.error.message})`}`
   }
@@ -129,10 +137,38 @@ const REPORT_FILE_RE = /\breport\.(?:md|json|html|yaml)\b/i
 export const judgeInstructionMentionsReportFile = (judgeText: string): boolean =>
   REPORT_FILE_RE.test(judgeText)
 
-export interface JudgeSideDiff {
-  readonly patch: string
+/** One variant's material for the judge prompt — built once per call from `JudgeInput` + `RunInput`. */
+export interface JudgeVariantDiff {
+  readonly name: string
+  readonly packs: readonly string[]
+  readonly isBaseline: boolean
+  /** This variant's effective task prompt (own `prompt` override, else the global). */
+  readonly taskPrompt: string
+  /** `null` when every run of this variant produced no changes — the variant still gets a block, just no patch to show. */
+  readonly patch: string | null
   readonly summary: string
 }
+
+const packsListLabel = (packs: readonly string[]): string =>
+  packs.length === 0 ? 'no packs' : `packs: ${packs.join(', ')}`
+
+const packsTagLabel = (packs: readonly string[]): string =>
+  packs.length === 0 ? 'packs: none' : `packs: ${packs.join(', ')}`
+
+const variantOpenTag = (v: JudgeVariantDiff): string =>
+  v.isBaseline
+    ? `<variant "${v.name}" (BASELINE, ${packsTagLabel(v.packs)})>`
+    : `<variant "${v.name}" (${packsTagLabel(v.packs)})>`
+
+const variantCloseTag = (v: JudgeVariantDiff): string => `</variant "${v.name}">`
+
+/**
+ * The response format is a single exported constant so a post-ship prompt
+ * tweak (e.g. asking for more/less structure) is a one-line change instead
+ * of a hunt through `buildJudgePrompt`.
+ */
+export const JUDGE_RESPONSE_FORMAT =
+  'Respond as JSON: { "verdict": "ok" | "fail" | "unclear", "scores": { "<variant name>": 0-10, ... one entry per variant ... }, "ranking": ["best variant name", ..., "worst"], "explanation": "..." }'
 
 /**
  * Phase 09 runs before phase 11 (report-render) even exists, and always in an
@@ -142,46 +178,43 @@ export interface JudgeSideDiff {
  * prompt states plainly what material it does and does not have, and a
  * `--judge` instruction that names a report file gets an explicit, louder
  * call-out — see `judgeInstructionMentionsReportFile`.
+ *
+ * Used for both the single N-way call and each pairwise-vs-baseline fallback
+ * call — `variants` is whatever subset (all N, or exactly baseline+one) the
+ * caller is assembling a prompt for, baseline always first.
  */
 export const buildJudgePrompt = (
   runInput: RunInput,
-  old: JudgeSideDiff,
-  nw: JudgeSideDiff,
+  variants: readonly JudgeVariantDiff[],
 ): string => {
-  // packRef reaches the judge model verbatim below — an inline mcp: ref can
-  // carry a provider secret in its config payload, so it goes through the
-  // same redaction as the on-disk manifest before it is embedded.
-  const packRef =
-    runInput.packRef === undefined ? 'n/a' : safeRefDisplay(redactUrlCredentials(runInput.packRef))
-  const oldTrunc = truncatePatch(old.patch)
-  const newTrunc = truncatePatch(nw.patch)
+  const baseline = variants.find((v) => v.isBaseline)
+  const packsLine = variants.map((v) => `${v.name} (${packsListLabel(v.packs)})`).join('; ')
+  const promptsDiffer = new Set(variants.map((v) => v.taskPrompt)).size > 1
   const judgeInstruction = runInput.judge ?? ''
   const mentionsReportFile = judgeInstructionMentionsReportFile(judgeInstruction)
+
+  const variantBlocks = variants.flatMap((v) => [
+    variantOpenTag(v),
+    ...(promptsDiffer ? [`task prompt: ${v.taskPrompt}`] : []),
+    'per-run summary:',
+    v.summary,
+    'representative patch:',
+    ...(v.patch === null ? ['(no changes on any run)'] : ['```diff', truncatePatch(v.patch), '```']),
+    variantCloseTag(v),
+    '',
+  ])
+
   return [
     '<system context>',
-    'You are judging an A/B test of an opencode integration.',
-    'You have NO file-system access: no report.md/json/html, no repository worktree, no results directory. Your only inputs are exactly what appears below — the task prompt, a per-run diff summary for each side, one representative patch per side, and the instruction that follows. If an instruction asks you to read or analyse a file, you cannot: say so plainly in your explanation instead of guessing what it might contain.',
-    `Task prompt was: ${runInput.prompt}`,
+    `You are judging an N-way experiment comparing ${String(variants.length)} configurations ("variants") of an opencode agent on the same task.`,
+    `Variant "${baseline?.name ?? ''}" is the BASELINE. Variants and their packs: ${packsLine}.`,
+    'You have NO file-system access: no report.md/json/html, no repository worktree, no results directory. Your only inputs are exactly what appears below — the task prompt, a per-run diff summary for each variant, one representative patch per variant, and the instruction that follows. If an instruction asks you to read or analyse a file, you cannot: say so plainly in your explanation instead of guessing what it might contain.',
+    promptsDiffer
+      ? 'Task prompts differ across variants — see each variant\'s "task prompt:" line below.'
+      : `Task prompt was: ${variants[0]?.taskPrompt ?? ''}`,
     '</system context>',
     '',
-    '<old side diff (baseline, no pack)>',
-    'per-run summary:',
-    old.summary,
-    'representative patch:',
-    '```diff',
-    oldTrunc,
-    '```',
-    '</old side>',
-    '',
-    `<new side diff (with pack: ${packRef})>`,
-    'per-run summary:',
-    nw.summary,
-    'representative patch:',
-    '```diff',
-    newTrunc,
-    '```',
-    '</new side>',
-    '',
+    ...variantBlocks,
     ...(mentionsReportFile
       ? [
           '<note>',
@@ -193,7 +226,7 @@ export const buildJudgePrompt = (
     '<judge instruction>',
     judgeInstruction,
     '',
-    'Respond as JSON: { "verdict": "ok" | "fail" | "unclear", "oldQuality": 0-10, "newQuality": 0-10, "explanation": "..." }',
+    JUDGE_RESPONSE_FORMAT,
     '</judge instruction>',
   ].join('\n')
 }
@@ -204,8 +237,10 @@ export const buildJudgePrompt = (
 
 export interface ParsedJudge {
   readonly verdict: JudgeVerdict
-  readonly oldQuality: number
-  readonly newQuality: number
+  /** Keyed by canonical variant name (case-corrected against `variantNames`), one entry per name. */
+  readonly scores: Record<string, number>
+  /** A full permutation of `variantNames` — model-provided if valid, else derived from `scores` (tie → config order). */
+  readonly ranking: readonly string[]
   readonly explanation: string
 }
 
@@ -284,31 +319,93 @@ const extractJsonObject = (raw: string): string | null => {
   return balancedJsonObject(trimmed)
 }
 
-/** Case-insensitive key lookup — a small local model is not consistent about `verdict` vs `Verdict` vs `VERDICT`. */
+/**
+ * Case-insensitive key lookup — a small local model is not consistent about
+ * `verdict` vs `Verdict` vs `VERDICT`. `Object.hasOwn` (not `key in obj`):
+ * `in` walks the prototype chain, so a variant legitimately named
+ * `constructor` (a valid name under `VARIANT_NAME_RE`) would otherwise read
+ * `Object.prototype.constructor` instead of reporting the key as absent.
+ */
 const getField = (obj: Record<string, unknown>, key: string): unknown => {
-  if (key in obj) return obj[key]
+  if (Object.hasOwn(obj, key)) return obj[key]
   const lower = key.toLowerCase()
   const found = Object.keys(obj).find((k) => k.toLowerCase() === lower)
   return found === undefined ? undefined : obj[found]
 }
 
-export const parseJudgeResponse = (raw: string): ParsedJudge | null => {
+/** `variantNames` is exactly `{'old', 'new'}` — the shim's legacy pair, the only case the old `oldQuality`/`newQuality` keys are accepted for. */
+const isShimVariantSet = (variantNames: readonly string[]): boolean => {
+  const set = new Set(variantNames)
+  return set.size === 2 && set.has('old') && set.has('new')
+}
+
+/**
+ * `scores` as a record keyed by variant name (case-insensitive) is what a
+ * model reliably produces — decision 12's array-over-record rule governs the
+ * wire CONTRACT, not model output. Every declared variant name must be
+ * present with a finite number, or the whole response is treated as
+ * unparseable (falls into 'Failed to parse judge response' containment) —
+ * except the legacy `oldQuality`/`newQuality` pair a model still latched onto
+ * the old shim format might produce.
+ */
+const extractScores = (
+  obj: Record<string, unknown>,
+  variantNames: readonly string[],
+): Record<string, number> | null => {
+  const scoresField = getField(obj, 'scores')
+  if (isRecord(scoresField)) {
+    const scored = variantNames
+      .map((name) => {
+        const raw = getField(scoresField, name)
+        return isFiniteNumber(raw) ? ([name, clampQuality(raw)] as const) : null
+      })
+      .filter((entry): entry is readonly [string, number] => entry !== null)
+    return scored.length === variantNames.length ? Object.fromEntries(scored) : null
+  }
+  if (isShimVariantSet(variantNames)) {
+    const oldQuality = getField(obj, 'oldQuality')
+    const newQuality = getField(obj, 'newQuality')
+    if (isFiniteNumber(oldQuality) && isFiniteNumber(newQuality)) {
+      return { old: clampQuality(oldQuality), new: clampQuality(newQuality) }
+    }
+  }
+  return null
+}
+
+const asStringArray = (u: unknown): readonly string[] | null =>
+  Array.isArray(u) && u.every((x): x is string => typeof x === 'string') ? u : null
+
+/** A valid `ranking` is a permutation of `variantNames` (case-insensitive) — mapped back to canonical casing. */
+const canonicalRanking = (raw: readonly string[], variantNames: readonly string[]): readonly string[] | null => {
+  const byLower = new Map(variantNames.map((n) => [n.toLowerCase(), n]))
+  const mapped = raw
+    .map((entry) => byLower.get(entry.toLowerCase()) ?? null)
+    .filter((canon): canon is string => canon !== null)
+  const noDuplicates = new Set(mapped).size === mapped.length
+  return mapped.length === raw.length && noDuplicates && mapped.length === variantNames.length ? mapped : null
+}
+
+/** `variantNames` is already in config order, so a stable sort ties → config order for free. */
+const deriveRanking = (variantNames: readonly string[], scores: Record<string, number>): readonly string[] =>
+  [...variantNames].sort((a, b) => (scores[b] ?? 0) - (scores[a] ?? 0))
+
+export const parseJudgeResponse = (raw: string, variantNames: readonly string[]): ParsedJudge | null => {
   const extracted = extractJsonObject(raw)
   if (extracted === null) return null
   const obj = safeJsonParse(extracted)
   if (!isRecord(obj)) return null
   const verdict = getField(obj, 'verdict')
   if (!isVerdict(verdict)) return null
-  const oldQuality = getField(obj, 'oldQuality')
-  const newQuality = getField(obj, 'newQuality')
-  if (!isFiniteNumber(oldQuality) || !isFiniteNumber(newQuality)) return null
-  // Quality out of [0, 10] is clamped rather than rejected (spec step 7).
+  const scores = extractScores(obj, variantNames)
+  if (scores === null) return null
   const explanation = getField(obj, 'explanation')
   if (typeof explanation !== 'string') return null
+  const rankingRaw = asStringArray(getField(obj, 'ranking'))
+  const ranking = rankingRaw === null ? null : canonicalRanking(rankingRaw, variantNames)
   return {
     verdict,
-    oldQuality: clampQuality(oldQuality),
-    newQuality: clampQuality(newQuality),
+    scores,
+    ranking: ranking ?? deriveRanking(variantNames, scores),
     explanation,
   }
 }
@@ -374,25 +471,29 @@ export const extractAssistantText = (stdout: string): string =>
 
 const nowIso = (): string => new Date().toISOString()
 
-const bothEmptyResult = (): JudgeResult => ({
+const zeroScores = (variantNames: readonly string[]) =>
+  variantNames.map((variant): VariantScore => ({ variant, quality: 0 }))
+
+const allEmptyResult = (variantNames: readonly string[]): JudgeResult => ({
   verdict: 'unclear',
-  oldQuality: 0,
-  newQuality: 0,
-  explanation: 'Both sides produced no changes',
+  scores: zeroScores(variantNames),
+  ranking: [...variantNames],
+  explanation: 'all variants produced no changes',
   modelUsed: '',
   timestamp: nowIso(),
   ran: false,
 })
 
 const unclearFromFailure = (
+  variantNames: readonly string[],
   explanation: string,
   rawResponse: string,
   modelUsed: string,
   ran: boolean,
 ): JudgeResult => ({
   verdict: 'unclear',
-  oldQuality: 0,
-  newQuality: 0,
+  scores: zeroScores(variantNames),
+  ranking: [...variantNames],
   explanation,
   ...(rawResponse === '' ? {} : { rawResponse }),
   modelUsed,
@@ -433,60 +534,60 @@ const buildJudgeLog = (model: string, outcome: JudgeRunOutcome): string =>
   ].join('\n')
 
 // ---------------------------------------------------------------------------
-// Phase entry point
+// One opencode call, attempted and classified — shared by the single N-way
+// call and each pairwise-vs-baseline fallback call.
 // ---------------------------------------------------------------------------
 
-/** `computeJudge`'s result plus the full opencode transcript for `results/judge.log` (null when opencode was never invoked). */
-interface JudgeCompute {
-  readonly result: JudgeResult | null
+interface JudgeCallAttempt {
+  /** Non-null only when the call ran AND its response parsed. */
+  readonly parsed: ParsedJudge | null
+  /** `parsed.explanation` on success; a failure/parse-failure message otherwise. */
+  readonly explanation: string
+  readonly raw: string
+  /** Full transcript for `judge.log`; null only when opencode was never invoked (scratch dir blocked). */
   readonly log: string | null
+  /**
+   * Whether the opencode call itself executed and returned a response — true
+   * even when that response was unparseable prose, false only when the call
+   * never completed at all (scratch dir blocked, crash, timeout,
+   * model-unavailable). Distinct from `parsed !== null`: the single-call path
+   * reports `ran: true` for an unparseable-but-executed call (matching the
+   * pre-N-way behavior), while the pairwise fallback's own "did this pair
+   * contribute a usable score" bar is `parsed !== null`, checked separately.
+   *
+   * This is a deliberate asymmetry, not a bug: the same event — opencode ran,
+   * response came back, parsing failed — yields `ran: true` on the
+   * single-call path but contributes to `ran: false` on the pairwise path if
+   * EVERY pair fails to parse (`runPairwiseFallback`'s `anySucceeded` keys on
+   * `parsed`, not on this field). The single-call `ran` answers "did the
+   * model respond at all"; the pairwise result's `ran` answers "did at least
+   * one pair produce a usable score" — a stricter bar, because the pairwise
+   * result is itself a synthesized aggregate (median baseline, derived
+   * ranking) that needs at least one real number to synthesize from.
+   */
+  readonly ran: boolean
 }
 
 /**
- * Computes the judge result (or null when the judge was not requested). Does
- * not touch disk beyond the one console warning below. Never fails:
- * model-unavailable, timeout, crash and 429 all return a `JudgeResult` with
- * verdict "unclear" and `ran: false`.
+ * `homeDir` must stay the real HOME: opencode keeps the provider credentials
+ * there that the judge needs to call the model. `cwd` is a disposable scratch
+ * dir instead, since the prompt embeds diff content from the run under
+ * judgment — acquire/release so it is always cleaned up (including on
+ * interruption), and never falls back to a shared tmp dir if it can't be
+ * created. `callId` disambiguates the scratch path across the several calls
+ * a pairwise fallback makes for one run (`single`, `pair-<variant>`).
  */
-const computeJudge = (
-  input: JudgeInput,
-): Effect.Effect<JudgeCompute> =>
+const attemptJudgeCall = (
+  runInput: RunInput,
+  manifest: Manifest,
+  prompt: string,
+  variantNames: readonly string[],
+  callId: string,
+): Effect.Effect<JudgeCallAttempt> =>
   Effect.gen(function* () {
-    const { runInput, diff } = input
-
-    if (runInput.judge === undefined || runInput.judge === '') {
-      return { result: null, log: null }
-    }
-
-    if (judgeInstructionMentionsReportFile(runInput.judge)) {
-      yield* Effect.sync(() => {
-        console.warn(
-          'judge: --judge instruction references a report file (report.md/json/html), which this judge cannot see — phase 09 runs before the report is rendered, in an isolated scratch dir with no repository access. The model has been told this plainly in its prompt; consider rewriting the instruction to work from the diff/summary instead.',
-        )
-      })
-    }
-
-    const oldPatch = firstNonEmptyPatch(diff.old)
-    const newPatch = firstNonEmptyPatch(diff.new)
-    if (oldPatch === null && newPatch === null) {
-      return { result: bothEmptyResult(), log: null }
-    }
-
-    const prompt = buildJudgePrompt(
-      runInput,
-      { patch: oldPatch?.patch ?? '', summary: summarizeDiffRuns(diff.old) },
-      { patch: newPatch?.patch ?? '', summary: summarizeDiffRuns(diff.new) },
-    )
-
     const model = runInput.preflightModel
-    // homeDir must stay the real HOME: opencode keeps the provider
-    // credentials there that the judge needs to call the model. cwd is a
-    // disposable scratch dir instead, since the prompt embeds diff content
-    // from the run under judgment — acquire/release so it is always cleaned
-    // up (including on interruption), and never falls back to a shared tmp
-    // dir if it can't be created.
     const homeDir = process.env['HOME'] ?? '/tmp'
-    const scratchDir = path.join(os.tmpdir(), 'testaipack-judge', input.manifest.runId)
+    const scratchDir = path.join(os.tmpdir(), 'testaipack-judge', manifest.runId, callId)
 
     const acquireOutcome = yield* Effect.acquireUseRelease(
       ensureDir(scratchDir),
@@ -505,8 +606,11 @@ const computeJudge = (
 
     if (acquireOutcome._tag === 'Left') {
       return {
-        result: unclearFromFailure('could not create scratch directory for judge', '', model ?? '', false),
+        parsed: null,
+        explanation: 'could not create scratch directory for judge',
+        raw: '',
         log: null,
+        ran: false,
       }
     }
     const outcome = acquireOutcome.right
@@ -516,41 +620,234 @@ const computeJudge = (
       const log = buildJudgeLog(model ?? '', err)
       if (isModelUnavailable(err.stderr)) {
         return {
-          result: unclearFromFailure(
-            `judge model unavailable${model === undefined ? '' : ` (${model})`}: ${err.stderr.slice(0, STDERR_TAIL_CHARS)}`,
-            '',
-            model ?? '',
-            false,
-          ),
+          parsed: null,
+          explanation: `judge model unavailable${model === undefined ? '' : ` (${model})`}: ${err.stderr.slice(0, STDERR_TAIL_CHARS)}`,
+          raw: '',
           log,
+          ran: false,
         }
       }
       const explanation = err.timedOut
         ? `judge timeout after ${String(runInput.timeouts.runSeconds)}s: ${err.stderr.slice(0, STDERR_TAIL_CHARS)}`
         : `judge crashed (exit ${err.exitCode === null ? 'unknown' : String(err.exitCode)}): ${err.stderr.slice(0, STDERR_TAIL_CHARS)}`
-      return { result: unclearFromFailure(explanation, '', model ?? '', false), log }
+      return { parsed: null, explanation, raw: '', log, ran: false }
     }
 
     const log = buildJudgeLog(model ?? '', outcome.right)
     const raw = extractAssistantText(outcome.right.stdout)
-    const parsed = parseJudgeResponse(raw)
+    const parsed = parseJudgeResponse(raw, variantNames)
     if (parsed === null) {
-      return { result: unclearFromFailure('Failed to parse judge response', raw, model ?? '', true), log }
+      return { parsed: null, explanation: 'Failed to parse judge response', raw, log, ran: true }
     }
+    return { parsed, explanation: parsed.explanation, raw, log, ran: true }
+  })
+
+// ---------------------------------------------------------------------------
+// Phase entry point
+// ---------------------------------------------------------------------------
+
+/** `computeJudge`'s result plus the full opencode transcript(s) for `results/judge.log` (null when opencode was never invoked). */
+interface JudgeCompute {
+  readonly result: JudgeResult | null
+  readonly log: string | null
+}
+
+/**
+ * One call per non-baseline variant, each a 2-variant prompt (baseline + V)
+ * built with the exact same `buildJudgePrompt` used for the single-call
+ * path — every pair prompt is therefore ≤ the old 2-sided worst case by
+ * construction, which is what keeps the fallback itself under budget.
+ * Assembly per `03-hard-problems.md` §2.3: baseline quality = median of its
+ * per-pair scores; a single pair-call failure degrades only that variant's
+ * score (quality 0 + a note), not the whole result — `ran` stays true as
+ * long as at least one pair produced usable scores.
+ */
+const runPairwiseFallback = (
+  runInput: RunInput,
+  manifest: Manifest,
+  configOrder: readonly string[],
+  baseline: string,
+  variantDiffsByName: ReadonlyMap<string, JudgeVariantDiff>,
+): Effect.Effect<JudgeCompute> =>
+  Effect.gen(function* () {
+    const nonBaseline = configOrder.filter((n) => n !== baseline)
+    const pairResults = yield* Effect.forEach(
+      nonBaseline,
+      (v) => {
+        // `pairNames` (config order) is only for `attemptJudgeCall`'s parse/
+        // tie-break order — the PROMPT itself must put the baseline first
+        // (§2.2/§2.3), same as the single-call path's `promptOrder` below;
+        // config order would silently put a baseline declared later in
+        // `variants` second, inverting the position cue for exactly the
+        // pairs where the baseline isn't already first in config order.
+        const pairNames = configOrder.filter((n) => n === baseline || n === v)
+        const promptDiffs = [baseline, v].map((n) => variantDiffsByName.get(n)).filter((d): d is JudgeVariantDiff => d !== undefined)
+        const prompt = buildJudgePrompt(runInput, promptDiffs)
+        return attemptJudgeCall(runInput, manifest, prompt, pairNames, `pair-${v}`).pipe(
+          Effect.map((attempt) => ({ variant: v, attempt })),
+        )
+      },
+      { concurrency: 1 },
+    )
+
+    const model = runInput.preflightModel ?? ''
+
+    // One outcome record per pair, derived without mutation — everything
+    // below (logs, scores, explanation, verdict) is folded from this array
+    // rather than accumulated in a loop.
+    const outcomes = pairResults.map(({ variant, attempt }) =>
+      attempt.parsed === null
+        ? {
+            variant,
+            succeeded: false as const,
+            verdict: null,
+            quality: 0,
+            baselineQuality: null,
+            explanationPart: `vs ${variant}: ${attempt.explanation}`,
+            rawPart: null,
+            log: attempt.log,
+          }
+        : {
+            variant,
+            succeeded: true as const,
+            verdict: attempt.parsed.verdict,
+            quality: attempt.parsed.scores[variant] ?? 0,
+            baselineQuality: attempt.parsed.scores[baseline] ?? 0,
+            explanationPart: `vs ${variant}: ${attempt.parsed.explanation}`,
+            rawPart: attempt.raw === '' ? null : `vs ${variant}: ${attempt.raw}`,
+            log: attempt.log,
+          },
+    )
+
+    const logs = outcomes.map((o) => o.log).filter((l): l is string => l !== null)
+    const combinedLog = logs.length === 0 ? null : logs.join('\n')
+    const explanationParts = outcomes.map((o) => o.explanationPart)
+    const rawParts = outcomes.map((o) => o.rawPart).filter((r): r is string => r !== null)
+    const anySucceeded = outcomes.some((o) => o.succeeded)
+
+    if (!anySucceeded) {
+      // Still `pairwiseFallback: true`: the run genuinely took the fallback
+      // path (N-1 opencode calls, N-1 transcripts in judge.log below) even
+      // though none of them produced a usable score — the artifact should
+      // say so, not look like an ordinary single-call containment.
+      return {
+        result: {
+          ...unclearFromFailure(configOrder, explanationParts.join(' '), rawParts.join('\n---\n'), model, false),
+          pairwiseFallback: true,
+        },
+        log: combinedLog,
+      }
+    }
+
+    const baselineScores = outcomes.map((o) => o.baselineQuality).filter((q): q is number => q !== null)
+    const scoresRecord = {
+      ...Object.fromEntries(outcomes.map((o) => [o.variant, o.quality])),
+      [baseline]: clampQuality(median(baselineScores)),
+    }
+    const scores = configOrder.map((name) => ({ variant: name, quality: scoresRecord[name] ?? 0 }))
+    const ranking = [...deriveRanking(configOrder, scoresRecord)]
+
+    const anyOk = outcomes.some((o) => o.verdict === 'ok')
+    const allFail = outcomes.every((o) => o.verdict === 'fail')
+    const verdict: JudgeVerdict = anyOk ? 'ok' : allFail ? 'fail' : 'unclear'
 
     return {
       result: {
-        verdict: parsed.verdict,
-        oldQuality: parsed.oldQuality,
-        newQuality: parsed.newQuality,
-        explanation: parsed.explanation,
-        ...(raw === '' ? {} : { rawResponse: raw }),
-        modelUsed: model ?? '',
+        verdict,
+        scores,
+        ranking,
+        explanation: `baseline score = median of ${String(baselineScores.length)} pairwise scores. ${explanationParts.join(' ')}`.trim(),
+        ...(rawParts.length === 0 ? {} : { rawResponse: rawParts.join('\n---\n') }),
+        modelUsed: model,
         timestamp: nowIso(),
         ran: true,
-      } satisfies JudgeResult,
-      log,
+        pairwiseFallback: true,
+      },
+      log: combinedLog,
     }
+  })
+
+/** Budget for the fully assembled single-call prompt (chars, measured after per-patch truncation). Above this, pairwise-vs-baseline fallback. */
+export const JUDGE_SINGLE_CALL_BUDGET_CHARS = 260_000
+
+/**
+ * Computes the judge result (or null when the judge was not requested). Does
+ * not touch disk beyond the one console warning below. Never fails:
+ * model-unavailable, timeout, crash and 429 all return a `JudgeResult` with
+ * verdict "unclear" and `ran: false`.
+ */
+const computeJudge = (
+  input: JudgeInput,
+): Effect.Effect<JudgeCompute> =>
+  Effect.gen(function* () {
+    const { runInput, manifest, diffs } = input
+
+    if (runInput.judge === undefined || runInput.judge === '') {
+      return { result: null, log: null }
+    }
+
+    if (judgeInstructionMentionsReportFile(runInput.judge)) {
+      yield* Effect.sync(() => {
+        console.warn(
+          'judge: --judge instruction references a report file (report.md/json/html), which this judge cannot see — phase 09 runs before the report is rendered, in an isolated scratch dir with no repository access. The model has been told this plainly in its prompt; consider rewriting the instruction to work from the diff/summary instead.',
+        )
+      })
+    }
+
+    const configOrder = runInput.variants.map((v) => v.name)
+    const baseline = runInput.baseline
+    const diffsByName = new Map(diffs.map((d) => [d.variant, d] as const))
+
+    const variantDiffsByName = new Map<string, JudgeVariantDiff>(
+      runInput.variants.map((v) => {
+        const d = diffsByName.get(v.name)
+        const rep = d === undefined ? null : firstNonEmptyPatch(d)
+        return [
+          v.name,
+          {
+            name: v.name,
+            packs: v.packs,
+            isBaseline: v.name === baseline,
+            taskPrompt: v.prompt ?? runInput.prompt ?? '',
+            patch: rep === null ? null : rep.patch,
+            summary: d === undefined ? '(no runs)' : summarizeDiffRuns(d),
+          },
+        ] as const
+      }),
+    )
+
+    const allEmpty = [...variantDiffsByName.values()].every((vd) => vd.patch === null)
+    if (allEmpty) {
+      return { result: allEmptyResult(configOrder), log: null }
+    }
+
+    const promptOrder = [baseline, ...configOrder.filter((n) => n !== baseline)]
+    const orderedDiffs = promptOrder.map((n) => variantDiffsByName.get(n)).filter((d): d is JudgeVariantDiff => d !== undefined)
+    const fullPrompt = buildJudgePrompt(runInput, orderedDiffs)
+
+    if (fullPrompt.length <= JUDGE_SINGLE_CALL_BUDGET_CHARS) {
+      const attempt = yield* attemptJudgeCall(runInput, manifest, fullPrompt, configOrder, 'single')
+      const model = runInput.preflightModel ?? ''
+      if (attempt.parsed === null) {
+        return { result: unclearFromFailure(configOrder, attempt.explanation, attempt.raw, model, attempt.ran), log: attempt.log }
+      }
+      const parsed = attempt.parsed
+      return {
+        result: {
+          verdict: parsed.verdict,
+          scores: configOrder.map((name): VariantScore => ({ variant: name, quality: parsed.scores[name] ?? 0 })),
+          ranking: [...parsed.ranking],
+          explanation: parsed.explanation,
+          ...(attempt.raw === '' ? {} : { rawResponse: attempt.raw }),
+          modelUsed: model,
+          timestamp: nowIso(),
+          ran: true,
+        },
+        log: attempt.log,
+      }
+    }
+
+    return yield* runPairwiseFallback(runInput, manifest, configOrder, baseline, variantDiffsByName)
   })
 
 /**
@@ -584,10 +881,12 @@ const writeJudgeJson = (
   })
 
 /**
- * Writes `results/judge.log` with the full opencode stdout/stderr for the
- * judge call, so a crash/timeout/parse-failure is diagnosable after the fact
- * without re-running the judge (`JudgeResult.explanation` only carries a
- * short stderr tail). Best-effort, same as `writeJudgeJson`.
+ * Writes `results/judge.log` with the full opencode stdout/stderr for every
+ * call the judge made (one for the single-call path, several concatenated
+ * for the pairwise fallback), so a crash/timeout/parse-failure is
+ * diagnosable after the fact without re-running the judge
+ * (`JudgeResult.explanation` only carries a short stderr tail). Best-effort,
+ * same as `writeJudgeJson`.
  */
 const writeJudgeLog = (
   resultsDir: string,

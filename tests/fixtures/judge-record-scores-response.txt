@@ -1,0 +1,12 @@
+=== testaipack judge log ===
+model: cheap/judge-model
+timestamp: 2026-07-31T10:05:00.000Z
+exitCode: 0
+timedOut: false
+
+--- stdout ---
+{"type":"text","timestamp":1785500100000,"sessionID":"ses_recscore0001bbbbbbbbbbbbbb","part":{"id":"prt_recscore0001b0001","messageID":"msg_recscore0001m0001","sessionID":"ses_recscore0001bbbbbbbbbbbbbb","type":"text","text":"{\"verdict\":\"ok\",\"scores\":{\"a\":7,\"b\":5,\"base\":4},\"ranking\":[\"a\",\"b\",\"base\"],\"explanation\":\"a wins on every metric, b is a small regression, base is unchanged.\"}"}}
+
+
+--- stderr ---
+

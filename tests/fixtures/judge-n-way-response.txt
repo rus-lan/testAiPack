@@ -1,0 +1,14 @@
+=== testaipack judge log ===
+model: ollama/qwen3.5-9b-32k
+timestamp: 2026-07-31T10:00:00.000Z
+exitCode: 0
+timedOut: false
+
+--- stdout ---
+{"type":"step_start","timestamp":1785500000000,"sessionID":"ses_nway0001aaaaaaaaaaaaaaaaaa","part":{"id":"prt_nway0001a0001","messageID":"msg_nway0001m0001","sessionID":"ses_nway0001aaaaaaaaaaaaaaaaaa","type":"step-start"}}
+{"type":"text","timestamp":1785500003000,"sessionID":"ses_nway0001aaaaaaaaaaaaaaaaaa","part":{"id":"prt_nway0001a0002","messageID":"msg_nway0001m0001","sessionID":"ses_nway0001aaaaaaaaaaaaaaaaaa","type":"text","text":"```json\n{\n  \"verdict\": \"ok\",\n  \"scores\": {\"base\": 5, \"graphify\": 8, \"astgrep\": 6},\n  \"ranking\": [\"graphify\", \"astgrep\", \"base\"],\n  \"explanation\": \"graphify produces the cleanest fix and adds a regression test; astgrep is a modest improvement over base; base leaves the reported bug in place.\"\n}\n```","time":{"start":1785500002500,"end":1785500002990}}}
+{"type":"step_finish","timestamp":1785500003000,"sessionID":"ses_nway0001aaaaaaaaaaaaaaaaaa","part":{"id":"prt_nway0001a0003","reason":"stop","messageID":"msg_nway0001m0001","sessionID":"ses_nway0001aaaaaaaaaaaaaaaaaa","type":"step-finish","tokens":{"total":18120,"input":17800,"output":320,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}
+
+
+--- stderr ---
+
