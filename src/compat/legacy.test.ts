@@ -439,6 +439,31 @@ describe('mapReportV1ToV2', () => {
     expect(v2.summary.failures.find((f) => f.errorMessage === 'new boom')?.variant).toBe('new')
   })
 
+  it('the ORDINARY correlated-failure case (same runIndex, same errorCode, same manifest timestamp — v1 stamps every failedRun with manifest.timestamp, never a per-failure one) is still attributed correctly, disambiguated by errorMessage alone', () => {
+    const sharedTimestamp = '2025-01-01T00:00:00.000Z'
+    const oldFailure = { runIndex: 2, errorCode: 'E_RUN_TIMEOUT' as const, errorMessage: 'run old/2 failed: finishCause=error exitCode=-1 watchdog=true', timestamp: sharedTimestamp }
+    const newFailure = { runIndex: 2, errorCode: 'E_RUN_TIMEOUT' as const, errorMessage: 'run new/2 failed: finishCause=error exitCode=-1 watchdog=true', timestamp: sharedTimestamp }
+    const v1 = v1Report({
+      metricsDiff: {
+        old: v1SideAggregates('old', { failedRuns: [oldFailure] }),
+        new: v1SideAggregates('new', { failedRuns: [newFailure] }),
+        deltas: primaryDeltas,
+        bothFailed: false,
+      },
+      summary: {
+        headlineResult: 'both timed out',
+        improvements: [],
+        regressions: [],
+        neutral: [],
+        failures: [oldFailure, newFailure],
+      },
+    })
+    const v2 = mapReportV1ToV2(reportOf(v1))
+    expect(v2.summary.failures).toHaveLength(2)
+    expect(v2.summary.failures.find((f) => f.errorMessage === oldFailure.errorMessage)?.variant).toBe('old')
+    expect(v2.summary.failures.find((f) => f.errorMessage === newFailure.errorMessage)?.variant).toBe('new')
+  })
+
   it('pairIncomplete true when either side has zero samples', () => {
     const emptyStats = { ...stats, totalTokens: { ...dist(0), samples: [] } }
     const v1 = v1Report({
@@ -524,6 +549,18 @@ describe('parseManifestCompat', () => {
     expect(parseManifestCompat({ nonsense: true })).toBeUndefined()
     expect(parseManifestCompat(null)).toBeUndefined()
   })
+
+  it('a BROKEN v2 manifest (schemaVersion present, one field corrupted) returns undefined — it must never be silently misdetected and remapped as v1', () => {
+    const v2raw = mapManifestV1ToV2(manifestOf(v1Manifest())) as unknown as Record<string, unknown>
+    const variants = v2raw['variants'] as readonly Record<string, unknown>[]
+    // Corrupt variants[1] by dropping its required `packs` field entirely —
+    // a v2 parse failure that has nothing to do with v1/v2 versioning.
+    const { packs: _droppedPacks, ...brokenVariant } = variants[1] as { packs: unknown; [k: string]: unknown }
+    const broken = { ...v2raw, variants: [variants[0], brokenVariant] }
+    expect(manifestSchema.safeParse(broken).success).toBe(false) // sanity: this really is a broken v2 doc
+    const result = parseManifestCompat(broken)
+    expect(result).toBeUndefined()
+  })
 })
 
 describe('parseRunInputCompat', () => {
@@ -533,6 +570,13 @@ describe('parseRunInputCompat', () => {
     const v1 = parseRunInputCompat(v1RunInput())
     expect(v1?.schemaVersion).toBe(1)
     expect(v1?.runInput.variants.map((v) => v.name)).toEqual(['old', 'new'])
+  })
+
+  it('a BROKEN v2 RunInput (schemaVersion present, auth dropped) returns undefined, never a v1 remap', () => {
+    const v2raw = mapRunInputV1ToV2(runInputOf(v1RunInput())) as unknown as Record<string, unknown>
+    const { auth: _droppedAuth, ...broken } = v2raw as { auth: unknown; [k: string]: unknown }
+    expect(runInputSchema.safeParse(broken).success).toBe(false)
+    expect(parseRunInputCompat(broken)).toBeUndefined()
   })
 })
 
@@ -544,6 +588,13 @@ describe('parseReportCompat', () => {
     expect(v1?.schemaVersion).toBe(1)
     expect(v1?.report.schemaVersion).toBe(2)
   })
+
+  it('a BROKEN v2 report (schemaVersion present, manifest dropped) returns undefined, never a v1 remap', () => {
+    const v2raw = mapReportV1ToV2(reportOf(v1Report())) as unknown as Record<string, unknown>
+    const { manifest: _droppedManifest, ...broken } = v2raw as { manifest: unknown; [k: string]: unknown }
+    expect(reportSchema.safeParse(broken).success).toBe(false)
+    expect(parseReportCompat(broken)).toBeUndefined()
+  })
 })
 
 describe('parseRunResultCompat', () => {
@@ -553,6 +604,13 @@ describe('parseRunResultCompat', () => {
     const v1 = parseRunResultCompat(v1RunResult({ side: 'new' }))
     expect(v1?.variant).toBe('new')
   })
+
+  it('a BROKEN v2 RunResult (variant present, runIndex dropped) returns undefined, never a v1 remap', () => {
+    const v2raw = mapRunResultV1ToV2(runResultOf(v1RunResult())) as unknown as Record<string, unknown>
+    const { runIndex: _droppedRunIndex, ...broken } = v2raw as { runIndex: unknown; [k: string]: unknown }
+    expect(runResultSchema.safeParse(broken).success).toBe(false)
+    expect(parseRunResultCompat(broken)).toBeUndefined()
+  })
 })
 
 describe('parseJudgeResultCompat', () => {
@@ -561,6 +619,13 @@ describe('parseJudgeResultCompat', () => {
     expect(v2?.scores.length).toBe(2)
     const v1 = parseJudgeResultCompat(v1Judge())
     expect(v1?.scores).toEqual([{ variant: 'old', quality: 6 }, { variant: 'new', quality: 8 }])
+  })
+
+  it('a BROKEN v2 JudgeResult (scores present, ranking dropped) returns undefined, never a v1 remap', () => {
+    const v2raw = mapJudgeResultV1ToV2(judgeOf(v1Judge())) as unknown as Record<string, unknown>
+    const { ranking: _droppedRanking, ...broken } = v2raw as { ranking: unknown; [k: string]: unknown }
+    expect(judgeResultSchema.safeParse(broken).success).toBe(false)
+    expect(parseJudgeResultCompat(broken)).toBeUndefined()
   })
 })
 
@@ -573,6 +638,13 @@ describe('parsePrepReportCompat', () => {
   })
   it('v1 fallback with no pack name available -> undefined', () => {
     expect(parsePrepReportCompat(v1PackSetupReport(), undefined)).toBeUndefined()
+  })
+
+  it('a BROKEN v2 PrepReport (packs present, variants dropped) returns undefined, never a v1 remap even when a pack name is available', () => {
+    const v2raw = mapPackSetupReportV1ToV2(packSetupOf(v1PackSetupReport()), 'graphify') as unknown as Record<string, unknown>
+    const { variants: _droppedVariants, ...broken } = v2raw as { variants: unknown; [k: string]: unknown }
+    expect(prepReportSchema.safeParse(broken).success).toBe(false)
+    expect(parsePrepReportCompat(broken, 'graphify')).toBeUndefined()
   })
 })
 

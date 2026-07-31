@@ -126,6 +126,8 @@ export interface RunProvenance {
   readonly runIndex: number
   readonly source: 'result-json' | 'log-recovery'
   readonly defaultedFields: readonly string[]
+  /** Only present when `source` is `'log-recovery'`: why `run-N.result.json` wasn't used — genuinely absent, or on disk but unreadable/unparseable/schema-invalid ("corrupt"). */
+  readonly resultJsonState?: 'missing' | 'corrupt'
 }
 
 export type JudgeDisclosureState =
@@ -350,16 +352,26 @@ const applyOverrides = (
 // Per-run RunResult resolution
 // ---------------------------------------------------------------------------
 
+interface ResultJsonOutcome {
+  readonly result: RunSideResultExt | undefined
+  /** Only set when `result` is undefined: distinguishes "never wrote one" from "wrote one, but it's unreadable/unparseable/schema-invalid" for the rebuild-provenance disclosure. */
+  readonly fileState: 'missing' | 'corrupt' | undefined
+}
+
 /** `parseRunResultCompat` handles both a v2 `run-N.result.json` (passthrough) and a v1 one (`side` field, mapped). */
 const readResultJson = (
   rawDir: string,
   variant: string,
   runIndex: number,
-): Effect.Effect<RunSideResultExt | undefined> =>
+): Effect.Effect<ResultJsonOutcome> =>
   Effect.gen(function* () {
-    const parsed = yield* readJsonOrUndefined(path.join(rawDir, variant, `run-${String(runIndex)}.result.json`))
-    if (parsed === undefined) return undefined
-    return parseRunResultCompat(parsed)
+    const filePath = path.join(rawDir, variant, `run-${String(runIndex)}.result.json`)
+    const has = yield* exists(filePath)
+    if (!has) return { result: undefined, fileState: 'missing' }
+    const parsed = yield* readJsonOrUndefined(filePath)
+    if (parsed === undefined) return { result: undefined, fileState: 'corrupt' }
+    const mapped = parseRunResultCompat(parsed)
+    return mapped === undefined ? { result: undefined, fileState: 'corrupt' } : { result: mapped, fileState: undefined }
   })
 
 const RECOVERABLE_RESULT_FIELDS: readonly (keyof RecoveredRunResult)[] = [
@@ -407,15 +419,24 @@ const resolveVariantRunResult = (
 ): Effect.Effect<{ readonly result: RunSideResultExt; readonly provenance: RunProvenance }> =>
   Effect.gen(function* () {
     const fromResultJson = yield* readResultJson(rawDir, variant, runIndex)
-    if (fromResultJson !== undefined) {
+    if (fromResultJson.result !== undefined) {
       return {
-        result: fromResultJson,
+        result: fromResultJson.result,
         provenance: { variant, runIndex, source: 'result-json' as const, defaultedFields: [] },
       }
     }
     const recovered = yield* recoverRunResult(rawDir, variant, runIndex, opencodeExportSchema)
     const { result, defaultedFields } = bridgeRecovered(recovered)
-    return { result, provenance: { variant, runIndex, source: 'log-recovery' as const, defaultedFields } }
+    return {
+      result,
+      provenance: {
+        variant,
+        runIndex,
+        source: 'log-recovery' as const,
+        defaultedFields,
+        ...(fromResultJson.fileState === undefined ? {} : { resultJsonState: fromResultJson.fileState }),
+      },
+    }
   })
 
 const resolveVariantRunResults = (
@@ -645,7 +666,7 @@ const renderProvenanceMd = (p: RebuildProvenance): string => {
     .filter((r) => r.source === 'log-recovery')
     .map(
       (r) =>
-        `> - ${r.variant}/run-${String(r.runIndex)}: recovered from its \`.log\`/\`.events.ndjson\`${r.defaultedFields.length === 0 ? '' : `, defaulted: ${r.defaultedFields.join(', ')}${r.defaultedFields.includes('successRank') ? ' — **outcome unrecoverable** (no [STOP] line found; rank/finishCause below are placeholders, not a real failure)' : ' (no [STOP] line found)'}`}`,
+        `> - ${r.variant}/run-${String(r.runIndex)}: recovered from its \`.log\`/\`.events.ndjson\` (run-${String(r.runIndex)}.result.json was ${r.resultJsonState === 'corrupt' ? 'present but unreadable/invalid — treated as corrupt' : 'missing'})${r.defaultedFields.length === 0 ? '' : `, defaulted: ${r.defaultedFields.join(', ')}${r.defaultedFields.includes('successRank') ? ' — **outcome unrecoverable** (no [STOP] line found; rank/finishCause below are placeholders, not a real failure)' : ' (no [STOP] line found)'}`}`,
     )
   const pricingLine = p.pricingWarning === undefined ? [] : [`> ⚠ ${p.pricingWarning}`]
   const body = [

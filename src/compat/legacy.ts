@@ -6,11 +6,15 @@
  * into the current (v2) generated types. This is the only module that
  * imports `v1-schemas.ts`.
  *
- * Every `parse*Compat` function tries the v2 schema first (a genuine v1
- * artifact always fails it — v2 requires `schemaVersion`, v1 never has it)
- * and falls back to the v1 schema + mapping. Callers that need to know
- * whether a workspace predates the contract (e.g. to pick the right
- * on-disk path layout) read the returned `schemaVersion`.
+ * Every `parse*Compat` function tries the v2 schema first, then falls back
+ * to the v1 schema + mapping ONLY when the artifact's v2-defining field is
+ * genuinely absent (`hasOwnKey`, per artifact below) — never merely because
+ * v2 validation failed. A v2-shaped document with an unrelated broken field
+ * would otherwise parse cleanly as v1 (v1's required fields are a strict
+ * subset of v2's, and zod drops unknown keys), silently discarding
+ * everything v1 has no slot for. Callers that need to know whether a
+ * workspace predates the contract (e.g. to pick the right on-disk path
+ * layout) read the returned `schemaVersion`.
  */
 import type { z } from 'zod'
 import type {
@@ -298,7 +302,19 @@ const mapTimelineEventV1ToV2 = (e: TimelineEventV1, variant: 'old' | 'new'): Tim
   ...(e.status === undefined ? {} : { status: e.status }),
 })
 
-const failedRunKeyV1 = (f: FailedRunV1): string => `${String(f.runIndex)}|${f.errorCode}|${f.timestamp}`
+/**
+ * `timestamp` alone is NOT a reliable disambiguator: v1 stamped every
+ * `FailedRun` with the whole run's `manifest.timestamp`
+ * (`aggregateSide('old'|'new')` both received the same `timestamp` — the v2
+ * source keeps the identical rule, `07-aggregate.ts:346`), so old/run-N and
+ * new/run-N failing the SAME way (e.g. both `E_RUN_TIMEOUT`) collapses to
+ * the same `runIndex|errorCode|timestamp` key — the ordinary correlated-
+ * failure case, not a corner case. `errorMessage` closes it: it embeds the
+ * side (`run ${side}/${n} failed: ...`, `failedRunMarker`), so it always
+ * disambiguates even when every other field ties.
+ */
+const failedRunKeyV1 = (f: FailedRunV1): string =>
+  `${String(f.runIndex)}|${f.errorCode}|${f.timestamp}|${f.errorMessage}`
 
 /**
  * `summary.failures` (v1) is the concatenation of `metricsDiff.old.failedRuns`
@@ -445,10 +461,22 @@ export const mapReportV1ToV2 = (v1: ReportV1): Report => {
 }
 
 // ---------------------------------------------------------------------------
-// Try-v2-then-v1 parse wrappers. A genuine v1 artifact always fails the v2
-// schema (schemaVersion is required in v2, never present in v1), so trying
-// v2 first is unambiguous, not a guess.
+// Try-v2-then-v1 parse wrappers.
+//
+// The v1 fallback is gated on the artifact's v2-defining field being
+// ABSENT, never merely on "v2 parsing failed" (01-contract.md §7: "field
+// absent -> parse with v1-schemas.ts"). Those are NOT the same test: a v1
+// schema's required fields are a strict subset of its v2 counterpart's, and
+// zod silently drops unknown keys — so a genuinely v2 document that fails
+// v2 validation for an unrelated reason (a corrupted/truncated field deep
+// inside it) can still parse cleanly as v1, silently discarding everything
+// v1 never had a slot for (extra variants, real pack sets, ...) and
+// reporting `schemaVersion: 1`. That is a v2 ERROR, not a v1 document, and
+// must come back `undefined`, not a fabricated old/new remap.
 // ---------------------------------------------------------------------------
+
+const hasOwnKey = (raw: unknown, key: string): boolean =>
+  typeof raw === 'object' && raw !== null && key in raw
 
 export interface ManifestParseResult {
   readonly manifest: Manifest
@@ -458,6 +486,7 @@ export interface ManifestParseResult {
 export const parseManifestCompat = (raw: unknown): ManifestParseResult | undefined => {
   const v2 = manifestSchema.safeParse(raw)
   if (v2.success) return { manifest: v2.data as Manifest, schemaVersion: 2 }
+  if (hasOwnKey(raw, 'schemaVersion')) return undefined
   const v1 = manifestV1Schema.safeParse(raw)
   return v1.success ? { manifest: mapManifestV1ToV2(v1.data), schemaVersion: 1 } : undefined
 }
@@ -470,6 +499,7 @@ export interface RunInputParseResult {
 export const parseRunInputCompat = (raw: unknown): RunInputParseResult | undefined => {
   const v2 = runInputSchema.safeParse(raw)
   if (v2.success) return { runInput: v2.data as RunInput, schemaVersion: 2 }
+  if (hasOwnKey(raw, 'schemaVersion')) return undefined
   const v1 = runInputV1Schema.safeParse(raw)
   return v1.success ? { runInput: mapRunInputV1ToV2(v1.data), schemaVersion: 1 } : undefined
 }
@@ -482,28 +512,39 @@ export interface ReportParseResult {
 export const parseReportCompat = (raw: unknown): ReportParseResult | undefined => {
   const v2 = reportSchema.safeParse(raw)
   if (v2.success) return { report: v2.data as Report, schemaVersion: 2 }
+  if (hasOwnKey(raw, 'schemaVersion')) return undefined
   const v1 = reportV1Schema.safeParse(raw)
   return v1.success ? { report: mapReportV1ToV2(v1.data), schemaVersion: 1 } : undefined
 }
 
+/** RunResult carries no `schemaVersion` of its own (it's a per-run file, not independently versioned) — `variant` (v2-only; v1 has `side` instead) is its v2-defining field. */
 export const parseRunResultCompat = (raw: unknown): RunResult | undefined => {
   const v2 = runResultSchema.safeParse(raw)
   if (v2.success) return v2.data as RunResult
+  if (hasOwnKey(raw, 'variant')) return undefined
   const v1 = runSideResultV1Schema.safeParse(raw)
   return v1.success ? mapRunResultV1ToV2(v1.data) : undefined
 }
 
+/** JudgeResult's v2-defining field is `scores` (v1 has `oldQuality`/`newQuality` instead). */
 export const parseJudgeResultCompat = (raw: unknown): JudgeResult | undefined => {
   const v2 = judgeResultSchema.safeParse(raw)
   if (v2.success) return v2.data as JudgeResult
+  if (hasOwnKey(raw, 'scores')) return undefined
   const v1 = judgeResultV1Schema.safeParse(raw)
   return v1.success ? mapJudgeResultV1ToV2(v1.data) : undefined
 }
 
-/** `packName` is the run's single (Stage 1) pack name, when any — needed only for the v1 fallback mapping. */
+/**
+ * `packName` is the run's single (Stage 1) pack name, when any — needed
+ * only for the v1 fallback mapping. PrepReport's v2-defining field is
+ * `packs` (top-level array; v1's PackSetupReport is a flat single-pack
+ * shape with no `packs`/`variants` fields at all).
+ */
 export const parsePrepReportCompat = (raw: unknown, packName: string | undefined): PrepReport | undefined => {
   const v2 = prepReportSchema.safeParse(raw)
   if (v2.success) return v2.data as PrepReport
+  if (hasOwnKey(raw, 'packs')) return undefined
   if (packName === undefined) return undefined
   const v1 = packSetupReportV1Schema.safeParse(raw)
   return v1.success ? mapPackSetupReportV1ToV2(v1.data, packName) : undefined

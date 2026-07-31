@@ -815,6 +815,29 @@ describe('rebuild — per-run result recovery', () => {
     expect(line2).not.toContain('outcome unrecoverable')
     expect(line1).not.toBe(line2)
   })
+
+  it('distinguishes a CORRUPT run-N.result.json from a genuinely MISSING one in provenance', async () => {
+    const { workspace, tree } = await setupRun({
+      runs: 1,
+      withRunInput: true,
+      runPersist: { withResultJson: [] },
+    })
+    await runP(writeFile(path.join(tree.raw, 'old', 'run-1.result.json'), '{not valid json'))
+    const code = await executeRebuild(baseFlags(workspace))
+    expect(code).toBe(0)
+    const prov = JSON.parse(
+      await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
+    ) as { runs: readonly { variant: string; runIndex: number; source: string; resultJsonState?: string }[] }
+    const oldRun1 = prov.runs.find((r) => r.variant === 'old' && r.runIndex === 1)
+    const newRun1 = prov.runs.find((r) => r.variant === 'new' && r.runIndex === 1)
+    expect(oldRun1?.source).toBe('log-recovery')
+    expect(oldRun1?.resultJsonState).toBe('corrupt')
+    expect(newRun1?.source).toBe('log-recovery')
+    expect(newRun1?.resultJsonState).toBe('missing')
+    const md = await runP(readFile(path.join(tree.results, 'report.md')))
+    expect(md).toContain('run-1.result.json was present but unreadable/invalid — treated as corrupt')
+    expect(md).toContain('run-1.result.json was missing')
+  })
 })
 
 describe('rebuild — refusals', () => {
@@ -918,7 +941,21 @@ describe('rebuild — v1 workspace fixture (report --rebuild on a pre-n-way-vari
     const report = parsed as {
       schemaVersion: number
       manifest: { flagDefaults: Record<string, unknown>; baseline: string; variants: readonly { name: string }[] }
-      metrics: { baseline: string; variants: readonly { variant: string }[] }
+      metrics: {
+        baseline: string
+        variants: readonly { variant: string; stats: { successRank: { median: number } } }[]
+      }
+      diffs: readonly {
+        variant: string
+        runs: readonly {
+          summary: {
+            filesChanged: number
+            additions: number
+            deletions: number
+            perFile: readonly { path: string; additions: number; deletions: number }[]
+          }
+        }[]
+      }[]
     }
     expect(report.schemaVersion).toBe(2)
     expect(report.manifest.flagDefaults['migratedFromV1']).toBe(true)
@@ -926,6 +963,21 @@ describe('rebuild — v1 workspace fixture (report --rebuild on a pre-n-way-vari
     expect(report.manifest.variants.map((v) => v.name)).toEqual(['old', 'new'])
     expect(report.metrics.baseline).toBe('old')
     expect(report.metrics.variants.map((v) => v.variant)).toEqual(['old', 'new'])
+
+    // Proves the fixture's v1 log-recovery -> v2 metrics/diff path end to
+    // end, not just its structure: the fixture's [STOP] log lines both
+    // carry rank=4, and only the "new" worktree carries the seeded edit.
+    expect(report.metrics.variants.find((v) => v.variant === 'old')?.stats.successRank.median).toBe(4)
+    expect(report.metrics.variants.find((v) => v.variant === 'new')?.stats.successRank.median).toBe(4)
+    const oldDiff = report.diffs.find((d) => d.variant === 'old')?.runs[0]?.summary
+    const newDiff = report.diffs.find((d) => d.variant === 'new')?.runs[0]?.summary
+    expect(oldDiff).toEqual({ filesChanged: 0, additions: 0, deletions: 0, perFile: [] })
+    expect(newDiff).toEqual({
+      filesChanged: 1,
+      additions: 1,
+      deletions: 0,
+      perFile: [{ path: 'a.txt', additions: 1, deletions: 0 }],
+    })
 
     const prov = JSON.parse(
       await runP(readFile(path.join(runDir, 'results', 'rebuild-provenance.json'))),
