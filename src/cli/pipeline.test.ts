@@ -8,6 +8,7 @@ import {
   dockerDowngradeWarning,
   excludeFailedExerciseArtifacts,
   initPackContaminationWarnings,
+  legacyShimImpureBaselineWarning,
   packExerciseWithoutCheckWarnings,
   protectGitHomeWarning,
   redactRunInput,
@@ -20,7 +21,7 @@ import type { ProgressReporter } from './progress.js'
 import { FsError, ensureDir, readJson, writeFile } from '../util/fs.js'
 import { addAll, commit, init, lsFilesStage } from '../util/git.js'
 import { makeTempDir } from '../../tests/setup.js'
-import { threeVariants } from '../../tests/helpers/variants.js'
+import { shimPair, threeVariants } from '../../tests/helpers/variants.js'
 import { z } from 'zod'
 import type {
   DiffResult,
@@ -402,6 +403,44 @@ describe('cli/pipeline — protectGitHomeWarning', () => {
 
   it('stays undefined when protectGit is false, regardless of isolation', () => {
     expect(protectGitHomeWarning({ ...base(), protectGit: false, isolation: 'home' })).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// legacyShimImpureBaselineWarning — D2: --no-pure-baseline used to be
+// decorative outside the parser; the legacy shim now makes it real.
+// ---------------------------------------------------------------------------
+
+describe('cli/pipeline — legacyShimImpureBaselineWarning', () => {
+  it('warns on the legacy shim path when --no-pure-baseline made "old" genuinely impure', () => {
+    const { runInput } = shimPair()
+    const impureOld: RunInput = {
+      ...runInput,
+      variants: runInput.variants.map((v) => (v.name === 'old' ? { ...v, pure: false } : v)),
+    }
+    const msg = legacyShimImpureBaselineWarning({ legacyShim: true }, impureOld)
+    expect(msg).toBeDefined()
+    expect(msg).toContain('--no-pure-baseline')
+  })
+
+  it('stays quiet when legacyShim is not set (v2 variant-mode config) even if a variant named "old" is impure', () => {
+    const { runInput } = shimPair()
+    const impureOld: RunInput = {
+      ...runInput,
+      variants: runInput.variants.map((v) => (v.name === 'old' ? { ...v, pure: false } : v)),
+    }
+    expect(legacyShimImpureBaselineWarning({ legacyShim: false }, impureOld)).toBeUndefined()
+    expect(legacyShimImpureBaselineWarning({}, impureOld)).toBeUndefined()
+  })
+
+  it('stays quiet on the legacy shim path when "old" keeps the default pure: true (no --no-pure-baseline)', () => {
+    const { runInput } = shimPair()
+    expect(legacyShimImpureBaselineWarning({ legacyShim: true }, runInput)).toBeUndefined()
+  })
+
+  it('stays quiet when there is no variant named "old" at all', () => {
+    const { runInput } = threeVariants()
+    expect(legacyShimImpureBaselineWarning({ legacyShim: true }, runInput)).toBeUndefined()
   })
 })
 

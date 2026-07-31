@@ -645,6 +645,9 @@ export const runPipeline = (opts: PipelineOptions): Effect.Effect<PipelineOutcom
     const protectGitWarning = protectGitHomeWarning(baseRunInput)
     if (protectGitWarning !== undefined) reporter.log(protectGitWarning)
 
+    const legacyShimWarning = legacyShimImpureBaselineWarning(parsed.flagDefaults, baseRunInput)
+    if (legacyShimWarning !== undefined) reporter.log(legacyShimWarning)
+
     for (const w of initPackContaminationWarnings(baseRunInput)) reporter.log(w)
     for (const w of packExerciseWithoutCheckWarnings(baseRunInput)) reporter.log(w)
 
