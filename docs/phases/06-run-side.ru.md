@@ -285,7 +285,7 @@ finish-tool-calls→stop, `2` length-limit, `1` doom-loop, `0` crash/ошибк�
   `package-lock.json` из `home/<variant>/run-1/.config/opencode/` (каждый —
   только если существует). `node_modules/` не копируется никогда.
 - `installed.json` (`InstalledJson { variant, ... }`) — что реально
-  установлено: skills (имя + цель symlink-а), agents, commands, plugin-файлы
+  установлено: skills (имя + цель symlink-а либо content-хеш копии), agents, commands, plugin-файлы
   и plugin-config-спеки, имена mcp-серверов, npm-зависимости
   (`package.json`), `configMergeOrder`, и `identicalAcrossRuns`/`driftFiles`
   — сверка отслеживаемых файлов run-1 с run-2..run-N ЭТОГО варианта.
