@@ -39,8 +39,10 @@ import { packsOf } from './00-cli-parse.js'
 import type { DockerExec } from '../opencode/cli.js'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import { runShellInHome } from '../isolation/shell-runner.js'
-import { copyDir, ensureDir, exists, readDir, readFile, removeDir, writeFile } from '../util/fs.js'
+import { copyDir, ensureDir, exists, readDir, readFile, removeDir, writeFile, writeJson } from '../util/fs.js'
 import type { FsError } from '../util/fs.js'
+import { appendInfoExclude, statusPorcelain } from '../util/git.js'
+import type { GitError } from '../util/git.js'
 import { isRecord } from '../util/types.js'
 import { packSetupError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
@@ -231,6 +233,14 @@ const rewriteLocalPluginPaths = (
     )
   })
 
+/** `.git` dir for one run's app tree — outside it under `--protect-git`, inside it otherwise. Mirrors `cli/pipeline.ts`'s `gitDirFor`. */
+const gitDirFor = (
+  protectGit: boolean,
+  appDir: string,
+  gitDirsForVariant: readonly string[],
+  idx: number,
+): string => (protectGit ? (gitDirsForVariant[idx] ?? path.join(appDir, '.git')) : path.join(appDir, '.git'))
+
 export const packSetup = (
   input: PackSetupInputExt,
 ): Effect.Effect<PackSetupResultExt, PhaseError> =>
@@ -313,6 +323,13 @@ export const packSetup = (
     const timeoutMs = runInput.timeouts.installSeconds * 1000
 
     const setupsRef = yield* Ref.make<readonly PackCmdResult[]>([])
+    // Per-variant accumulator for paths a `setup` command wrote into run-1's
+    // APP dir (as opposed to its HOME) — merged across every pack that
+    // declares `setup` on the same variant, then persisted once as
+    // `<raw>/<variant>/setup.json` after the loop below. Mirrors
+    // `cli/pipeline.ts`'s `run-N.exercise.json`, but per-variant rather than
+    // per-run: a setup runs once per (variant, pack), not once per run.
+    const appExcludesRef = yield* Ref.make<ReadonlyMap<string, readonly string[]>>(new Map())
     for (const v of runInput.variants) {
       const vt = workspace.variantTrees.find((t) => t.name === v.name)
       const declaredPacks = packsOf(runInput, v)
@@ -402,7 +419,109 @@ export const packSetup = (
             )
           }
         }
+
+        // A setup that writes into the workspace (not just HOME) — e.g. an
+        // install command that drops config into cwd — otherwise contaminates
+        // ONLY run-1's app dir: 08-diff.ts measures every run's app dir
+        // independently, so run-1 and runs 2..N would silently measure
+        // different starting states. `git status --porcelain` on run-1's app
+        // dir is the instrument (the app dir is a git worktree, cloned by
+        // phase 02 before this phase ever runs): a tracked-file modification
+        // means the setup changed the baseline repo itself — that cannot be
+        // fixed by excluding a path after the fact, so it aborts loudly,
+        // mirroring `cli/pipeline.ts`'s `E_PACK_EXERCISE_DIRTY` handling for
+        // `--pack-exercise`. A new untracked path is the setup's own output —
+        // copied onto every other run's app dir and excluded from every run's
+        // OWN `.git/info/exclude` (mirroring `runPackExercise` in
+        // `cli/pipeline.ts`), so no run's measured diff ever sees it.
+        const gitDirsForVariant = vt?.gitDirs ?? []
+        const gitDir0 = gitDirFor(runInput.protectGit, app0, gitDirsForVariant, 0)
+        const statuses = yield* statusPorcelain(app0, gitDir0).pipe(
+          Effect.mapError((e: GitError) =>
+            fail(`cannot verify pack setup diff hygiene (git status failed): ${e.stderr}`, 'E_PACK_SETUP_FAILED', {
+              variant: v.name,
+              pack: pack.name,
+            }),
+          ),
+        )
+        const dirtyTracked = statuses.filter((s) => s.code !== '??' && s.code.trim() !== '')
+        if (dirtyTracked.length > 0) {
+          yield* flushLog()
+          yield* Effect.fail(
+            fail(
+              `pack setup modified tracked file(s): ${dirtyTracked.map((s) => s.path).join(', ')} (variant=${v.name}, pack=${pack.name})`,
+              'E_PACK_SETUP_FAILED',
+              { variant: v.name, pack: pack.name, paths: dirtyTracked.map((s) => s.path) },
+            ),
+          )
+        }
+
+        const setupUntrackedPaths = statuses.filter((s) => s.code === '??').map((s) => s.path)
+        if (setupUntrackedPaths.length > 0) {
+          yield* appendInfoExclude(gitDir0, setupUntrackedPaths).pipe(
+            Effect.mapError((e: FsError) =>
+              fail(`cannot exclude setup artifacts in ${gitDir0}: ${e.path}`, 'E_PACK_SETUP_FAILED', {
+                variant: v.name,
+                pack: pack.name,
+              }),
+            ),
+          )
+
+          const restApps = (vt?.apps ?? []).slice(1)
+          for (const [i, appDir] of restApps.entries()) {
+            for (const relPath of setupUntrackedPaths) {
+              const dst = path.join(appDir, relPath)
+              yield* ensureDir(path.dirname(dst)).pipe(
+                Effect.mapError((e: FsError) =>
+                  fail(`cannot prepare ${dst} for setup artifact copy: ${e.path}`, 'E_PACK_SETUP_FAILED', {
+                    variant: v.name,
+                    pack: pack.name,
+                  }),
+                ),
+              )
+              yield* copyDir(path.join(app0, relPath), dst).pipe(
+                Effect.mapError((e: FsError) =>
+                  fail(`cannot copy setup artifact ${relPath} into ${appDir}: ${e.path}`, 'E_PACK_SETUP_FAILED', {
+                    variant: v.name,
+                    pack: pack.name,
+                  }),
+                ),
+              )
+            }
+            const otherGitDir = gitDirFor(runInput.protectGit, appDir, gitDirsForVariant, i + 1)
+            yield* appendInfoExclude(otherGitDir, setupUntrackedPaths).pipe(
+              Effect.mapError((e: FsError) =>
+                fail(`cannot exclude setup artifacts in ${otherGitDir}: ${e.path}`, 'E_PACK_SETUP_FAILED', {
+                  variant: v.name,
+                  pack: pack.name,
+                }),
+              ),
+            )
+          }
+
+          yield* Ref.update(appExcludesRef, (prev) => {
+            const merged = [...new Set([...(prev.get(v.name) ?? []), ...setupUntrackedPaths])]
+            return new Map(prev).set(v.name, merged)
+          })
+        }
       }
+    }
+
+    // Persist the merged setup-written app-dir paths per variant — one write
+    // per variant, after every one of its packs' setups has run — so
+    // `08-diff.ts` can re-apply the same excludes to any run of this variant
+    // whose `.git` later needs restoring/replacing (`reapplySetupExcludes`),
+    // the same gap `run-N.exercise.json` closes for `--pack-exercise`.
+    // Best-effort like that record: it only matters on the git-restore edge
+    // case, the live `.git/info/exclude` written above is what protects the
+    // ordinary path.
+    const appExcludes = yield* Ref.get(appExcludesRef)
+    for (const [variantName, paths] of appExcludes) {
+      if (paths.length === 0) continue
+      yield* ensureDir(path.join(workspace.raw, variantName)).pipe(Effect.catchAll(() => Effect.void))
+      yield* writeJson(path.join(workspace.raw, variantName, 'setup.json'), { excludedPaths: paths }).pipe(
+        Effect.catchAll(() => Effect.void),
+      )
     }
 
     yield* flushLog()

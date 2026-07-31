@@ -407,6 +407,51 @@ describe('diff — recovery: pack-exercise exclude re-apply after .git restore',
   })
 })
 
+describe('diff — recovery: pack-setup exclude re-apply after .git restore', () => {
+  it('without a setup record, a restored .git loses the exclude and the pack setup artifact leaks into the patch', async () => {
+    const tree = makeWorkspace(1)
+    await buildReposFromSource(tree)
+    const oldDir = appDir(tree, 'old')
+    // `04b-pack-setup.ts` excluded this in the run's own `.git` at setup
+    // time, but that `.git` is gone below and no `setup.json` was left for
+    // phase 08 to re-apply from.
+    await runP(writeFile(path.join(oldDir, 'AGENTS.md'), 'setup output\n'))
+    await rm(path.join(oldDir, '.git'), { recursive: true, force: true })
+
+    const runInput = makeRunInput({ runs: 1 })
+    const result = await runP(diff({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    const r = diffResultFor(result, 'old').runs[0]!
+    expect(r.state).toBe('git-restored')
+    expect(r.fullPatch).toContain('AGENTS.md')
+  })
+
+  it('a setup.json record re-applies its exclude to EVERY run of the variant that needs a .git restore, not just run-1', async () => {
+    const tree = makeWorkspace(2)
+    await buildReposFromSource(tree)
+    // Unlike `run-N.exercise.json`, `setup.json` is written ONCE per variant
+    // (a pack's setup runs once per variant, not once per run) — this is the
+    // fact under test: the SAME record must protect run-1 AND run-2.
+    await runP(ensureDir(path.join(tree.raw, 'old')))
+    await runP(writeJson(path.join(tree.raw, 'old', 'setup.json'), { excludedPaths: ['AGENTS.md'] }))
+    for (const idx of [1, 2]) {
+      const dir = appDir(tree, 'old', idx)
+      await runP(writeFile(path.join(dir, 'AGENTS.md'), 'setup output\n'))
+      await runP(writeFile(path.join(dir, 'a.txt'), 'bb\n'))
+      await rm(path.join(dir, '.git'), { recursive: true, force: true })
+    }
+
+    const runInput = makeRunInput({ runs: 2 })
+    const result = await runP(diff({ runInput, manifest: makeManifest(runInput), workspace: tree }))
+    for (const idx of [0, 1]) {
+      const r = diffResultFor(result, 'old').runs[idx]!
+      expect(r.state).toBe('git-restored')
+      expect(r.fullPatch).not.toContain('AGENTS.md')
+      expect(r.fullPatch).toContain('a.txt')
+      expect(r.summary.filesChanged).toBe(1)
+    }
+  })
+})
+
 describe('diff — one broken run does not kill the others', () => {
   it('old run-1 broken (restore fails) -> old run-2 and both new runs stay ok', async () => {
     const tree = makeWorkspace(2)

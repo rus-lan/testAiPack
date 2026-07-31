@@ -179,6 +179,31 @@ const reapplyExerciseExcludes = (
     yield* appendInfoExclude(destGitDir, record.value.excludedPaths).pipe(Effect.ignore)
   })
 
+/**
+ * `04b-pack-setup.ts` excludes what a pack's `setup` wrote into a variant's
+ * app dir from every run's OWN `.git/info/exclude` up front, but a fresh
+ * `.git` copied in below (agent deleted or replaced it) has none of that —
+ * same gap as `reapplyExerciseExcludes` above, closed the same way. Persisted
+ * once per VARIANT (`<raw>/<variant>/setup.json`), not once per run — a
+ * pack's setup runs once per (variant, pack), not once per run — so this is
+ * read and re-applied for EVERY run of that variant that needs a restore, not
+ * just run-1's.
+ */
+const setupRecordSchema = z.object({ excludedPaths: z.array(z.string()) })
+
+const reapplySetupExcludes = (
+  rawDir: string,
+  variant: string,
+  destGitDir: string,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const recordPath = path.join(rawDir, variant, 'setup.json')
+    if (!(yield* exists(recordPath))) return
+    const record = yield* readJson(recordPath, setupRecordSchema).pipe(Effect.option)
+    if (record._tag === 'None' || record.value.excludedPaths.length === 0) return
+    yield* appendInfoExclude(destGitDir, record.value.excludedPaths).pipe(Effect.ignore)
+  })
+
 /** Copies `apps/source/.git` into `destDir`, restoring a `.git` the agent deleted. */
 const restoreGit = (
   variant: string,
@@ -206,6 +231,7 @@ const restoreGit = (
       }),
     )
     yield* reapplyExerciseExcludes(rawDir, variant, runIndex, destGit)
+    yield* reapplySetupExcludes(rawDir, variant, destGit)
     return 'git-restored' as const
   })
 

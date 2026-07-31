@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Effect } from 'effect'
+import { writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, exists, readFile, writeFile } from '../util/fs.js'
+import { addAll, commit, init } from '../util/git.js'
 import { packSetup, derivePackSetupMode, scanForDependencyMarkers } from './04b-pack-setup.js'
 import type { PackSetupInputExt } from './04b-pack-setup.js'
 import type { RunInput, Manifest, WorkspaceTree, VariantTree, VariantSpec, PackSpec, VariantEnv } from '@generated/types'
@@ -100,18 +102,49 @@ const buildWorkspace = (names: readonly string[], runs: number): WorkspaceTree =
 const homesOf = (workspace: WorkspaceTree, name: string): readonly string[] =>
   workspace.variantTrees.find((t) => t.name === name)?.homes ?? []
 
-const buildInput = (
+const appsOf = (workspace: WorkspaceTree, name: string): readonly string[] =>
+  workspace.variantTrees.find((t) => t.name === name)?.apps ?? []
+
+/**
+ * Real git repo at `appDir` with one committed file (`README.md`) — 04b now
+ * runs `git status --porcelain` against a variant's run-1 app dir after every
+ * successful `setup`, so it must be a genuine git worktree even in tests
+ * where `spawnProcess` (and therefore the setup command itself) is mocked.
+ */
+const initAppRepo = async (appDir: string): Promise<void> => {
+  await runP(ensureDir(appDir))
+  await runP(init(appDir))
+  await runP(writeFile(path.join(appDir, 'README.md'), 'seed\n'))
+  await runP(addAll(appDir))
+  await runP(commit(appDir, 'init'))
+}
+
+const buildInput = async (
   variants: VariantSpec[],
   packs: PackSpec[],
   overrides: Partial<RunInput> = {},
   packInstall?: PackInstallOutcome,
   envVars?: readonly VariantEnv[],
-): { readonly input: PackSetupInputExt; readonly workspace: WorkspaceTree } => {
+): Promise<{ readonly input: PackSetupInputExt; readonly workspace: WorkspaceTree }> => {
   const runs = overrides.runs ?? 1
   const workspace = buildWorkspace(
     variants.map((v) => v.name),
     runs,
   )
+  // Every run's app dir is a real git repo in production (phase 02 clones the
+  // same commit into each) — init all of them, not just run-1's, so a test
+  // asserting "run-2 was never touched" is checking a real starting state
+  // rather than a path nothing ever created.
+  for (const v of variants) {
+    for (const appDir of appsOf(workspace, v.name)) {
+      await initAppRepo(appDir)
+    }
+    // run-1's HOME must exist on disk once setup succeeds and `runs > 1` —
+    // the existing restHomes copy-out (`copyDir(home0, homeDir)`) always
+    // runs after a successful setup, HOME contamination or not.
+    const home0 = homesOf(workspace, v.name)[0]
+    if (home0 !== undefined) await runP(ensureDir(home0))
+  }
   return {
     input: {
       runInput: makeRunInput(variants, packs, overrides),
@@ -139,7 +172,7 @@ describe('phase 04b — pack-setup', () => {
 
   it('empty registry → no-op, empty packs/variants report accordingly, no HOME touched', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: [] }]
-    const { input, workspace } = buildInput(variants, [])
+    const { input, workspace } = await buildInput(variants, [])
     const result = await runP(packSetup(input))
     expect(result.report.packs).toEqual([])
     expect(result.report.variants).toEqual([{ variant: 'a', exerciseDeclared: false, exercises: [] }])
@@ -150,7 +183,7 @@ describe('phase 04b — pack-setup', () => {
   it('registry pack with nothing declared → mode delivered-only, empty checks/exercises', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo' }]
-    const { input } = buildInput(variants, packs)
+    const { input } = await buildInput(variants, packs)
     const result = await runP(packSetup(input))
     expect(result.report.packs).toHaveLength(1)
     const prep = result.report.packs[0]!
@@ -166,7 +199,7 @@ describe('phase 04b — pack-setup', () => {
   it('setup declared and succeeds → setup PackCmdResult recorded (variant, pack, runIndex 0), HOME copied to runs 2..N', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'npm install -g x' }]
-    const { input, workspace } = buildInput(variants, packs, { runs: 3 })
+    const { input, workspace } = await buildInput(variants, packs, { runs: 3 })
     const homes = homesOf(workspace, 'a')
     // seed homes[0] with a marker mimicking what the real install would leave
     // behind — spawnProcess is mocked, so it never touches disk.
@@ -196,7 +229,7 @@ describe('phase 04b — pack-setup', () => {
     )
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'false' }]
-    const { input, workspace } = buildInput(variants, packs, { runs: 2 })
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
     const err = await runFlip(packSetup(input))
     expect(err.code).toBe('E_PACK_SETUP_FAILED')
     expect(err.context?.['variant']).toBe('a')
@@ -210,7 +243,7 @@ describe('phase 04b — pack-setup', () => {
     )
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'sleep 999' }]
-    const { input } = buildInput(variants, packs)
+    const { input } = await buildInput(variants, packs)
     const err = await runFlip(packSetup(input))
     expect(err.code).toBe('E_PACK_SETUP_TIMEOUT')
   })
@@ -218,7 +251,7 @@ describe('phase 04b — pack-setup', () => {
   it('setup + check, no exercise → mode installed-only', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 's', check: 'c' }]
-    const { input } = buildInput(variants, packs)
+    const { input } = await buildInput(variants, packs)
     const result = await runP(packSetup(input))
     const prep = result.report.packs[0]!
     expect(prep.mode).toBe('installed-only')
@@ -229,7 +262,7 @@ describe('phase 04b — pack-setup', () => {
   it('setup + check + exercise (on the declaring variant) → mode exercised', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'], exercise: 'e' }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 's', check: 'c' }]
-    const { input } = buildInput(variants, packs)
+    const { input } = await buildInput(variants, packs)
     const result = await runP(packSetup(input))
     expect(result.report.packs[0]!.mode).toBe('exercised')
   })
@@ -237,7 +270,7 @@ describe('phase 04b — pack-setup', () => {
   it('check declared with preflight disabled, no setup → mode delivered-only, not installed-only (check never ran)', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', check: 'c' }]
-    const { input } = buildInput(variants, packs, { preflightEnabled: false })
+    const { input } = await buildInput(variants, packs, { preflightEnabled: false })
     const result = await runP(packSetup(input))
     const prep = result.report.packs[0]!
     expect(prep.mode).toBe('delivered-only')
@@ -248,7 +281,7 @@ describe('phase 04b — pack-setup', () => {
   it('check declared with preflight disabled BUT setup also declared → mode still installed-only (setup itself always runs, independent of preflight)', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 's', check: 'c' }]
-    const { input } = buildInput(variants, packs, { preflightEnabled: false })
+    const { input } = await buildInput(variants, packs, { preflightEnabled: false })
     const result = await runP(packSetup(input))
     expect(result.report.packs[0]!.mode).toBe('installed-only')
   })
@@ -262,7 +295,7 @@ describe('phase 04b — pack-setup', () => {
     const outcome = makeOutcome([
       { pack: 'demo', packPath: packRoot, detectedType: 'skill', registeredIn: ['skills'], instructions: [] },
     ])
-    const { input } = buildInput(variants, packs, {}, outcome)
+    const { input } = await buildInput(variants, packs, {}, outcome)
     const result = await runP(packSetup(input))
     const prep = result.report.packs[0]!
     expect(prep.mode).toBe('delivered-only')
@@ -279,7 +312,7 @@ describe('phase 04b — pack-setup', () => {
     const outcome = makeOutcome([
       { pack: 'demo', packPath: packRoot, detectedType: 'skill', registeredIn: ['skills'], instructions: [] },
     ])
-    const { input } = buildInput(variants, packs, {}, outcome)
+    const { input } = await buildInput(variants, packs, {}, outcome)
     const result = await runP(packSetup(input))
     expect(result.report.packs[0]!.undeclaredDepWarning).toBeUndefined()
   })
@@ -293,7 +326,7 @@ describe('phase 04b — pack-setup', () => {
     const outcome = makeOutcome([
       { pack: 'demo', packPath: packRoot, detectedType: 'skill', registeredIn: ['skills'], instructions: [] },
     ])
-    const { input } = buildInput(variants, packs, {}, outcome)
+    const { input } = await buildInput(variants, packs, {}, outcome)
     const result = await runP(packSetup(input))
     expect(result.report.packs[0]!.undeclaredDepWarning).toBeUndefined()
   })
@@ -304,7 +337,7 @@ describe('phase 04b — pack-setup', () => {
       { name: 'y', packs: ['shared'] },
     ]
     const packs: PackSpec[] = [{ name: 'shared', ref: 'github:owner/shared', setup: 'npm install -g x' }]
-    const { input, workspace } = buildInput(variants, packs, { runs: 2 })
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
     const xHomes = homesOf(workspace, 'x')
     const yHomes = homesOf(workspace, 'y')
     await runP(ensureDir(path.join(xHomes[0]!, '.local/bin')))
@@ -337,7 +370,7 @@ describe('phase 04b — pack-setup', () => {
       { name: 'pack-a', ref: 'github:owner/a', setup: 's' },
       { name: 'pack-b', ref: 'github:owner/b', setup: 's' },
     ]
-    const { input } = buildInput(variants, packs)
+    const { input } = await buildInput(variants, packs)
     const err = await runFlip(packSetup(input))
     expect(err.code).toBe('E_PACK_SETUP_FAILED')
     expect(err.context?.['variant']).toBe('b')
@@ -359,7 +392,7 @@ describe('phase 04b — pack-setup', () => {
       { name: 'pack-a', ref: 'github:owner/a', setup: 'install-a' },
       { name: 'pack-b', ref: 'github:owner/b', setup: 'install-b' },
     ]
-    const { input } = buildInput(variants, packs)
+    const { input } = await buildInput(variants, packs)
     const result = await runP(packSetup(input))
     expect(calls).toEqual(['install-b', 'install-a'])
     expect(result.report.packs.find((p) => p.pack === 'pack-a')!.setups).toHaveLength(1)
@@ -378,7 +411,7 @@ describe('phase 04b — pack-setup', () => {
       { name: 'pack-a', ref: 'github:owner/a', setup: 'install-a' },
       { name: 'pack-b', ref: 'github:owner/b', setup: 'install-b' },
     ]
-    const { input } = buildInput(variants, packs)
+    const { input } = await buildInput(variants, packs)
     const err = await runFlip(packSetup(input))
     expect(err.code).toBe('E_PACK_SETUP_FAILED')
     expect(err.context?.['variant']).toBe('multi')
@@ -392,7 +425,7 @@ describe('phase 04b — pack-setup', () => {
       { name: 'pack-a', ref: 'github:owner/a', setup: 'install-a' },
       { name: 'pack-b', ref: 'github:owner/b', setup: 'install-b' },
     ]
-    const { input, workspace } = buildInput(variants, packs, { runs: 2 })
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
     const homes = homesOf(workspace, 'multi')
     // Simulate what phase 04 already wrote into EACH run's own HOME before
     // 04b ever runs: two local-plugin registrations, one per pack, each with
@@ -436,7 +469,7 @@ describe('phase 04b — pack-setup', () => {
         ],
       },
     ]
-    const { input } = buildInput(variants, packs, {}, undefined, envVars)
+    const { input } = await buildInput(variants, packs, {}, undefined, envVars)
     await runP(packSetup(input))
     expect(spawnMock).toHaveBeenCalledTimes(1)
     const callArg = spawnMock.mock.calls[0]![0] as { env?: Record<string, string> }
@@ -446,7 +479,7 @@ describe('phase 04b — pack-setup', () => {
   it('N5: absent envVars means no PATH override — the inherited process PATH passes through unchanged, same as no registry pack declaring setup', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'echo hi' }]
-    const { input } = buildInput(variants, packs)
+    const { input } = await buildInput(variants, packs)
     await runP(packSetup(input))
     expect(spawnMock).toHaveBeenCalledTimes(1)
     const callArg = spawnMock.mock.calls[0]![0] as { env?: Record<string, string> }
@@ -456,7 +489,7 @@ describe('phase 04b — pack-setup', () => {
   it('N2: copy-out rewrites a local-plugin absolute path in opencode.json from run-1 to the destination run (HOME mode only)', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 's' }]
-    const { input, workspace } = buildInput(variants, packs, { runs: 2 })
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
     const homes = homesOf(workspace, 'a')
     // Simulate what phase 04 already wrote into EACH run's own HOME before
     // 04b ever runs: a local-plugin registration whose absolute path is
@@ -484,7 +517,7 @@ describe('phase 04b — pack-setup', () => {
   it('N2: docker mode is unaffected — plugin paths are already homeDir-agnostic (/home/opencode/...), copy-out leaves them untouched', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 's' }]
-    const { input, workspace } = buildInput(variants, packs, { runs: 2, isolation: 'docker' })
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2, isolation: 'docker' })
     const homes = homesOf(workspace, 'a')
     const containerPath = '/home/opencode/.config/opencode/plugins/myplugin.js'
     for (const home of homes) {
@@ -497,6 +530,125 @@ describe('phase 04b — pack-setup', () => {
       await runP(readFile(path.join(homes[1]!, '.config', 'opencode', 'opencode.json'))),
     ) as { plugin: string[] }
     expect(run2Cfg.plugin).toEqual([containerPath])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// App-dir contamination: a setup that writes into the workspace (not just
+// HOME) must not silently diverge run-1 from runs 2..N — a setup command like
+// `graphify opencode install`, which writes AGENTS.md/.opencode/plugins into
+// cwd, previously left run-1 the only run to ever see those files.
+// ---------------------------------------------------------------------------
+
+describe('phase 04b — pack-setup: app-dir contamination', () => {
+  beforeEach(() => {
+    spawnMock.mockReset()
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ stdout: 'ok', stderr: '', exitCode: 0, durationMs: 5, timedOut: false }),
+    )
+  })
+
+  it('setup writes an untracked file into run-1 app dir -> present in every run\'s app dir for that variant', async () => {
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
+    const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'graphify opencode install' }]
+    const { input, workspace } = await buildInput(variants, packs, { runs: 3 })
+    const apps = appsOf(workspace, 'a')
+    // seed app0 with a marker mimicking what the real install would leave
+    // behind — spawnProcess is mocked, so it never touches disk.
+    await runP(writeFile(path.join(apps[0]!, 'AGENTS.md'), 'contamination\n'))
+
+    await runP(packSetup(input))
+
+    for (const appDir of [apps[1]!, apps[2]!]) {
+      expect(await runP(exists(path.join(appDir, 'AGENTS.md')))).toBe(true)
+      expect(await runP(readFile(path.join(appDir, 'AGENTS.md')))).toBe('contamination\n')
+    }
+  })
+
+  it('...and is excluded from the measured diff for every run (not just run-1): every run\'s own .git/info/exclude gets it, plus a per-variant record for phase 08', async () => {
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
+    const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'graphify opencode install' }]
+    const { input, workspace } = await buildInput(variants, packs, { runs: 3 })
+    const apps = appsOf(workspace, 'a')
+    await runP(writeFile(path.join(apps[0]!, 'AGENTS.md'), 'contamination\n'))
+
+    await runP(packSetup(input))
+
+    for (const appDir of apps) {
+      const exclude = await runP(readFile(path.join(appDir, '.git', 'info', 'exclude')))
+      expect(exclude).toContain('AGENTS.md')
+    }
+    const record = JSON.parse(
+      await runP(readFile(path.join(workspace.raw, 'a', 'setup.json'))),
+    ) as { excludedPaths: string[] }
+    expect(record.excludedPaths).toEqual(['AGENTS.md'])
+  })
+
+  it('setup that modifies a TRACKED file in the app dir aborts loudly, naming variant + pack + path — no propagation, no exclude', async () => {
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
+    const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'corrupt-tracked-file' }]
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
+    const apps = appsOf(workspace, 'a')
+    // `initAppRepo` committed README.md — simulate the setup command
+    // overwriting it (spawnProcess is mocked, so this stands in for what a
+    // real setup would have done to the working tree).
+    await runP(writeFile(path.join(apps[0]!, 'README.md'), 'clobbered by setup\n'))
+
+    const err = await runFlip(packSetup(input))
+    expect(err.code).toBe('E_PACK_SETUP_FAILED')
+    expect(err.message).toContain('modified tracked file')
+    expect(err.message).toContain('README.md')
+    expect(err.context?.['variant']).toBe('a')
+    expect(err.context?.['pack']).toBe('demo')
+    expect(err.context?.['paths']).toEqual(['README.md'])
+    // run-2's app dir never received anything and was never touched.
+    expect(await runP(exists(path.join(apps[1]!, 'README.md')))).toBe(true)
+    expect(await runP(readFile(path.join(apps[1]!, 'README.md')))).toBe('seed\n')
+  })
+
+  it('setup that writes nothing into the app dir behaves exactly as today — no copy, no exclude, no setup.json (no regression)', async () => {
+    const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
+    const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'npm install -g x' }]
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
+    const apps = appsOf(workspace, 'a')
+    // `git init` (in `initAppRepo`) already leaves a stock, commented-out
+    // `.git/info/exclude` behind — the bar for "no regression" is that
+    // `packSetup` leaves it byte-identical, not that it never existed.
+    const excludeBefore = await runP(readFile(path.join(apps[0]!, '.git', 'info', 'exclude')))
+
+    await runP(packSetup(input))
+
+    expect(await runP(exists(path.join(workspace.raw, 'a', 'setup.json')))).toBe(false)
+    expect(await runP(readFile(path.join(apps[0]!, '.git', 'info', 'exclude')))).toBe(excludeBefore)
+    expect(await runP(exists(path.join(apps[1]!, 'AGENTS.md')))).toBe(false)
+  })
+
+  it('multi-pack: two packs with setup on ONE variant, both writing into the app dir, both propagated to run-2', async () => {
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-a', 'pack-b'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a', setup: 'install-a' },
+      { name: 'pack-b', ref: 'github:owner/b', setup: 'install-b' },
+    ]
+    const { input, workspace } = await buildInput(variants, packs, { runs: 2 })
+    const apps = appsOf(workspace, 'multi')
+    spawnMock.mockImplementation((opts: { args: readonly string[] }) => {
+      const cmd = opts.args[1] ?? ''
+      if (cmd === 'install-a') writeFileSync(path.join(apps[0]!, 'from-a.txt'), 'a\n')
+      if (cmd === 'install-b') writeFileSync(path.join(apps[0]!, 'from-b.txt'), 'b\n')
+      return Effect.succeed({ stdout: '', stderr: '', exitCode: 0, durationMs: 5, timedOut: false })
+    })
+
+    await runP(packSetup(input))
+
+    expect(await runP(exists(path.join(apps[1]!, 'from-a.txt')))).toBe(true)
+    expect(await runP(exists(path.join(apps[1]!, 'from-b.txt')))).toBe(true)
+    const exclude = await runP(readFile(path.join(apps[1]!, '.git', 'info', 'exclude')))
+    expect(exclude).toContain('from-a.txt')
+    expect(exclude).toContain('from-b.txt')
+    const record = JSON.parse(
+      await runP(readFile(path.join(workspace.raw, 'multi', 'setup.json'))),
+    ) as { excludedPaths: string[] }
+    expect([...record.excludedPaths].sort()).toEqual(['from-a.txt', 'from-b.txt'])
   })
 })
 

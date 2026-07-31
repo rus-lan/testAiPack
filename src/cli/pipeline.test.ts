@@ -1084,6 +1084,20 @@ describe('cli/pipeline — runPipeline data wiring (not just call order)', () =>
     expect(packSetupInput?.envVars?.map((e) => e.name)).toEqual(['base', 'graphify', 'astgrep'])
   })
 
+  it('feeds 04b pack-setup and 08 diff the SAME workspace.raw — 04b persists <raw>/<variant>/setup.json there and diff must read it back from the identical path', async () => {
+    const { runInput } = threeVariants()
+    const root = makeTempDir()
+    configureBaselineMocks(runInput, root)
+    mockRunSideWithLog()
+
+    await run(runPipeline(pipelineOptions()))
+
+    const packSetupInput = vi.mocked(packSetup).mock.calls[0]?.[0]
+    const diffInput = vi.mocked(diff).mock.calls[0]?.[0]
+    expect(packSetupInput?.workspace.raw).toBeDefined()
+    expect(diffInput?.workspace.raw).toBe(packSetupInput?.workspace.raw)
+  })
+
   it('feeds report-render the merged prep report and the diff-escalation-prefixed headline', async () => {
     const { runInput } = threeVariants()
     const root = makeTempDir()
