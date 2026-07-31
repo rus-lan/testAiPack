@@ -56,6 +56,17 @@ const escapeHtml = (s: string): string =>
 
 const capFirst = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1)
 
+const quote = (s: string): string => `«${escapeHtml(s)}»`
+
+/** Russian count agreement: 1 → `one`, 2-4 → `few`, 0/5-20/... → `many` (standard mod-10/mod-100 rule; same pattern as `md.ts`/`cli/summary.ts`). */
+const pluralRu = (n: number, one: string, few: string, many: string): string => {
+  const mod10 = n % 10
+  const mod100 = n % 100
+  if (mod10 === 1 && mod100 !== 11) return one
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few
+  return many
+}
+
 const VERDICT_CLASS: Readonly<Record<string, string>> = {
   better: 'better',
   worse: 'worse',
@@ -90,7 +101,7 @@ const versionDriftWarning = (report: Report): string | undefined => {
   const manifestVersion = report.manifest.opencodeVersion
   if (!versions.some((v) => v !== manifestVersion)) return undefined
   const distinct = [...new Set(versions)].sort()
-  return `opencode version differs from manifest: manifest says ${manifestVersion}, runs used ${distinct.join(', ')} (manifest may record the HOST binary — see root cause below)`
+  return `версия opencode расходится с manifest: manifest указывает ${manifestVersion}, в запусках использовалась ${distinct.join(', ')} (manifest мог зафиксировать HOST-бинарник — см. первопричину ниже)`
 }
 
 /** `pure` is D1: `variant.pure ?? variant.packs.length === 0` — see md.ts's `isPure` for the full rationale. */
@@ -98,8 +109,8 @@ const isPure = (v: VariantSpec): boolean => v.pure ?? v.packs.length === 0
 
 const variantDescriptor = (report: Report, v: VariantSpec): string => {
   const star = v.name === report.metrics.baseline ? '*' : ''
-  const packsPart = v.packs.length === 0 ? 'no packs' : `packs: ${v.packs.join(', ')}`
-  const pureSuffix = isPure(v) ? ', pure' : ''
+  const packsPart = v.packs.length === 0 ? 'без пакетов' : `пакеты: ${v.packs.join(', ')}`
+  const pureSuffix = isPure(v) ? ', чистый' : ''
   return `${v.name}${star} (${packsPart}${pureSuffix})`
 }
 
@@ -111,11 +122,11 @@ const initDisclosureLine = (report: Report): string | undefined => {
   const disabledVariants = variants.filter((v) => v.init === '')
   if (globalGroup.length === 0 && ownVariants.length === 0 && disabledVariants.length === 0) return undefined
   const parts: readonly string[] = [
-    ...(globalGroup.length === 0 ? [] : [`${escapeHtml(globalGroup.map((v) => v.name).join(', '))} — global init`]),
-    ...ownVariants.map((v) => `${escapeHtml(v.name)} — own init (${escapeHtml(`"${v.init ?? ''}"`)})`),
+    ...(globalGroup.length === 0 ? [] : [`${escapeHtml(globalGroup.map((v) => v.name).join(', '))} — глобальный init`]),
+    ...ownVariants.map((v) => `${escapeHtml(v.name)} — свой init (${quote(v.init ?? '')})`),
     ...(disabledVariants.length === 0
       ? []
-      : [`${escapeHtml(disabledVariants.map((v) => v.name).join(', '))} — init disabled`]),
+      : [`${escapeHtml(disabledVariants.map((v) => v.name).join(', '))} — init отключён`]),
   ]
   return `<strong>Init:</strong> ${parts.join('; ')}`
 }
@@ -135,15 +146,15 @@ const groupedDisclosureLine = (report: Report, label: string, key: 'hint' | 'pro
   const distinctSet = [...new Set(withValue.map((e) => e.value))]
   const parts = distinctSet.map(
     (value) =>
-      `${escapeHtml(withValue.filter((e) => e.value === value).map((e) => e.name).join(', '))} — ${escapeHtml(`"${value}"`)}`,
+      `${escapeHtml(withValue.filter((e) => e.value === value).map((e) => e.name).join(', '))} — ${quote(value)}`,
   )
   const allValues = new Set(named.map((e) => e.value ?? ''))
-  const differSuffix = allValues.size > 1 ? ' (variants differ — comparison measures prompt+pack together)' : ''
+  const differSuffix = allValues.size > 1 ? ' (варианты отличаются — сравнение измеряет промпт и пакет вместе)' : ''
   return `<strong>${label}:</strong> ${parts.join('; ')}${differSuffix}`
 }
 
-const hintDisclosureLine = (report: Report): string | undefined => groupedDisclosureLine(report, 'Hint', 'hint')
-const promptDisclosureLine = (report: Report): string | undefined => groupedDisclosureLine(report, 'Prompt', 'prompt')
+const hintDisclosureLine = (report: Report): string | undefined => groupedDisclosureLine(report, 'Подсказка', 'hint')
+const promptDisclosureLine = (report: Report): string | undefined => groupedDisclosureLine(report, 'Промпт', 'prompt')
 
 const renderHeader = (report: Report): string => {
   const warn = versionDriftWarning(report)
@@ -155,12 +166,12 @@ const renderHeader = (report: Report): string => {
   const hintLine = hintDisclosureLine(report)
   const hintHtml = hintLine === undefined ? '' : `<br>\n${hintLine}`
   const variantsHtml = report.manifest.variants.map((v) => escapeHtml(variantDescriptor(report, v))).join(', ')
-  return `<h1>testaipack report: ${escapeHtml(report.manifest.runId)}</h1>
-<p class="meta"><strong>Repo:</strong> ${escapeHtml(report.manifest.repoUrl)}<br>
-<strong>Variants:</strong> ${variantsHtml}<br>
-<strong>Runs:</strong> ${escapeHtml(String(report.manifest.runs))} per variant<br>
-<strong>Opencode:</strong> ${escapeHtml(report.manifest.opencodeVersion)}<br>
-<strong>Timestamp:</strong> ${escapeHtml(report.manifest.timestamp)}${promptHtml}${initHtml}${hintHtml}</p>
+  return `<h1>Отчёт testaipack: ${escapeHtml(report.manifest.runId)}</h1>
+<p class="meta"><strong>Репозиторий:</strong> ${escapeHtml(report.manifest.repoUrl)}<br>
+<strong>Варианты:</strong> ${variantsHtml}<br>
+<strong>Запуски:</strong> ${escapeHtml(String(report.manifest.runs))} на вариант<br>
+<strong>Версия opencode:</strong> ${escapeHtml(report.manifest.opencodeVersion)}<br>
+<strong>Время:</strong> ${escapeHtml(report.manifest.timestamp)}${promptHtml}${initHtml}${hintHtml}</p>
 ${warnHtml}`
 }
 
@@ -169,7 +180,7 @@ ${warnHtml}`
 // ---------------------------------------------------------------------------
 
 const allFailedWarning = (report: Report): string | undefined =>
-  report.metrics.allFailed ? 'All variants failed — comparison unavailable.' : undefined
+  report.metrics.allFailed ? 'Все варианты провалились — сравнение недоступно.' : undefined
 
 /** Mirrors md.ts's `pairIncompleteWarnings` (§1.2 `pairIncomplete`). */
 const pairIncompleteWarnings = (report: Report): readonly string[] =>
@@ -177,7 +188,10 @@ const pairIncompleteWarnings = (report: Report): readonly string[] =>
     ? []
     : report.metrics.deltas
         .filter((d) => d.pairIncomplete)
-        .map((d) => `${d.variant} — baseline or this variant produced zero samples; the delta row below is not a meaningful comparison.`)
+        .map(
+          (d) =>
+            `${d.variant} — у базового варианта или у этого варианта получено ноль замеров; строка дельты ниже не является содержательным сравнением.`,
+        )
 
 /** Mirrors md.ts's `variantExercisedFor` — per-variant exercise evidence, not just pack-level mode. */
 const variantExercisedFor = (report: Report, variantName: string, packName: string): boolean => {
@@ -192,10 +206,11 @@ const packNoopWarning = (report: Report, spec: VariantSpec, agg: VariantAggregat
   const declared = (agg.packUses ?? []).filter((p) => spec.packs.includes(p.pack) && p.canDetect)
   if (declared.length === 0 || declared.some((p) => p.calls !== 0)) return undefined
   if (spec.packs.every((p) => variantExercisedFor(report, spec.name, p))) return undefined
+  // Not pre-escaped: this message is escaped once, as a whole, by the `alertsHtml` caller.
   const confirmed = declared.every((p) => p.visibilityConfirmed === true)
   return confirmed
-    ? `Pack never invoked on variant "${spec.name}" — preflight confirmed it was visible, so the model chose not to call it. The pack contributed nothing to this variant's deltas.`
-    : `Pack never invoked on variant "${spec.name}" — the pack contributed nothing to this variant's deltas.`
+    ? `Пакет ни разу не вызван на варианте «${spec.name}» — preflight подтвердил, что он был виден, значит модель сознательно решила его не вызывать. Пакет не внёс никакого вклада в дельты этого варианта.`
+    : `Пакет ни разу не вызван на варианте «${spec.name}» — пакет не внёс никакого вклада в дельты этого варианта.`
 }
 
 const packExercisedZeroCallsNote = (report: Report, spec: VariantSpec, agg: VariantAggregates): string | undefined => {
@@ -203,12 +218,14 @@ const packExercisedZeroCallsNote = (report: Report, spec: VariantSpec, agg: Vari
   const declared = (agg.packUses ?? []).filter((p) => spec.packs.includes(p.pack) && p.canDetect)
   if (declared.length === 0 || declared.some((p) => p.calls !== 0)) return undefined
   if (!spec.packs.every((p) => variantExercisedFor(report, spec.name, p))) return undefined
-  return `Pack was never called directly on variant "${spec.name}" — <code>--pack-exercise</code> already ran its pipeline before the agent started, so there was nothing left to trigger. Expected under exercised mode, not a defect; see Harness preparation.`
+  return `Пакет ни разу не был вызван напрямую на варианте «${spec.name}» — <code>--pack-exercise</code> уже прогнал его пайплайн до старта агента, так что вызывать было нечего. Ожидаемо в режиме exercised, это не дефект; см. раздел «Подготовка пакетов».`
 }
 
 const riskyCommandAlert = (report: Report): string | undefined => {
   const n = report.metrics.variants.reduce((acc, v) => acc + (v.riskyCommands?.length ?? 0), 0)
-  return n === 0 ? undefined : `${String(n)} risky command(s) detected — see Safety`
+  return n === 0
+    ? undefined
+    : `обнаружено: ${String(n)} ${pluralRu(n, 'опасная команда', 'опасные команды', 'опасных команд')} — см. раздел «Безопасность»`
 }
 
 const contaminationAlert = (report: Report): string | undefined => {
@@ -216,13 +233,13 @@ const contaminationAlert = (report: Report): string | undefined => {
   if (affected.length === 0) return undefined
   const total = affected.reduce((acc, v) => acc + (v.contaminationSignals?.length ?? 0), 0)
   const names = affected.map((v) => v.variant).join(', ')
-  return `Contamination: ${names} show(s) ${String(total)} sign(s) of having acquired or used a pack it does not declare — deltas involving ${names} may not compare a clean baseline against a treatment. See Contamination.`
+  return `Контаминация: у ${names} обнаружено ${String(total)} ${pluralRu(total, 'сигнал', 'сигнала', 'сигналов')} того, что вариант получил или использовал пакет, который он не объявляет — дельты с участием ${names} могут оказаться сравнением не чистого базового варианта, а испытуемого. См. «Контаминация».`
 }
 
 const bucketHtml = (heading: string, es: readonly DeltaEntry[]): string => {
   const body =
     es.length === 0
-      ? '<em>none</em>'
+      ? '<em>нет</em>'
       : es
           .map(
             (e) =>
@@ -259,7 +276,7 @@ const renderSummary = (report: Report): string => {
 
   const basisHtml =
     report.summary.basis === 'task'
-      ? '<p class="basis"><em>Basis: task phase only (init excluded); init cost shown in "Init cost" below.</em></p>'
+      ? '<p class="basis"><em>Основа: только фаза task (init исключён); стоимость init показана ниже, в разделе «Стоимость init».</em></p>'
       : ''
 
   const perVariantHtml = nonBaseline
@@ -268,12 +285,12 @@ const renderSummary = (report: Report): string => {
       const improvements = entries.filter((e) => e.d.better === 'better')
       const regressions = entries.filter((e) => e.d.better === 'worse')
       const neutral = entries.filter((e) => e.d.better === 'neutral' || e.d.better === 'context-dependent')
-      return `<div class="vs-base"><h3>vs base: ${escapeHtml(spec.name)}</h3><ul>${bucketHtml('Improvements', improvements)}${bucketHtml('Regressions', regressions)}${bucketHtml('Neutral', neutral)}</ul></div>`
+      return `<div class="vs-base"><h3>vs база: ${escapeHtml(spec.name)}</h3><ul>${bucketHtml('Улучшения', improvements)}${bucketHtml('Регрессии', regressions)}${bucketHtml('Нейтральные', neutral)}</ul></div>`
     })
     .join('')
 
   return `<section id="summary">
-<h2>Summary</h2>
+<h2>Сводка</h2>
 ${alertsHtml}
 ${exercisedHtml}
 <p class="headline">${escapeHtml(report.summary.headlineResult)}</p>
@@ -287,7 +304,7 @@ ${perVariantHtml}
 // ---------------------------------------------------------------------------
 
 const PRIMARY_TABLE_HEAD =
-  '<thead><tr><th>Metric</th><th>Variant</th><th>Median</th><th>[min–max]</th><th>Δ vs base</th><th>Δ%</th><th>Significant</th><th>Verdict</th></tr></thead>'
+  '<thead><tr><th>Метрика</th><th>Вариант</th><th>Медиана</th><th>[мин–макс]</th><th>Δ vs база</th><th>Δ%</th><th>Значимо</th><th>Вердикт</th></tr></thead>'
 
 const hasStats = (key: PrimaryMeta['key']): key is keyof AggregateStats => key !== 'maxParallelism'
 
@@ -332,16 +349,16 @@ const primaryFootnote = (report: Report): string => {
   const k = report.metrics.deltas.length
   const caveat =
     k > 1
-      ? ` N−1 = ${String(k)} comparisons share one baseline; at this sample size expect occasional spurious "significant" flags — treat cross-variant differences in flag count, not any single flag, as the signal.`
+      ? ` N−1 = ${String(k)} ${pluralRu(k, 'сравнение', 'сравнения', 'сравнений')} делят один базовый вариант; при таком размере выборки возможны отдельные случайные пометки «значимо» — сигналом считайте разницу в количестве таких пометок между вариантами, а не единичную пометку.`
       : ''
-  return `<p class="footnote"><em>* baseline.${escapeHtml(caveat)}</em></p>`
+  return `<p class="footnote"><em>* база.${escapeHtml(caveat)}</em></p>`
 }
 
 const rankHistogram = (samples: readonly number[]): string => {
   const counts = samples.reduce<Readonly<Record<number, number>>>((m, r) => ({ ...m, [r]: (m[r] ?? 0) + 1 }), {})
   return Object.entries(counts)
     .sort(([a], [b]) => Number(b) - Number(a))
-    .map(([rank, n]) => `rank ${rank} ×${String(n)}`)
+    .map(([rank, n]) => `ранг ${rank} ×${String(n)}`)
     .join(', ')
 }
 
@@ -356,8 +373,9 @@ const unstableLabels = (agg: VariantAggregates): readonly string[] =>
 
 const verifyPart = (sec: VerifyStats | undefined): string => {
   if (sec === undefined) return ''
-  const detail = sec.failed === 0 && sec.timedOut === 0 ? '' : ` (${String(sec.failed)} failed, ${String(sec.timedOut)} timed out)`
-  return `; verify: ${String(sec.passed)}/${String(sec.runCount)} passed${detail}`
+  const detail =
+    sec.failed === 0 && sec.timedOut === 0 ? '' : ` (${String(sec.failed)} провалено, ${String(sec.timedOut)} по таймауту)`
+  return `; verify: ${String(sec.passed)}/${String(sec.runCount)} пройдено${detail}`
 }
 
 const stabilityLine = (report: Report, spec: VariantSpec, agg: VariantAggregates): string => {
@@ -366,9 +384,9 @@ const stabilityLine = (report: Report, spec: VariantSpec, agg: VariantAggregates
   const okCount = samples.filter((r) => r >= 3).length
   const rate = totalRuns === 0 ? '0%' : `${String(Math.round((100 * okCount) / totalRuns))}%`
   const unstable = unstableLabels(agg)
-  const unstablePart = unstable.length === 0 ? '' : `; unstable: ${unstable.join(', ')}`
+  const unstablePart = unstable.length === 0 ? '' : `; нестабильно: ${unstable.join(', ')}`
   const star = spec.name === report.metrics.baseline ? '*' : ''
-  return `<li><strong>${escapeHtml(spec.name)}${star}</strong>: success rate ${String(okCount)}/${String(totalRuns)} (${rate}); ${escapeHtml(rankHistogram(samples))}${escapeHtml(unstablePart)}${escapeHtml(verifyPart(agg.verifyStats))}</li>`
+  return `<li><strong>${escapeHtml(spec.name)}${star}</strong>: успешность ${String(okCount)}/${String(totalRuns)} (${rate}); ${escapeHtml(rankHistogram(samples))}${escapeHtml(unstablePart)}${escapeHtml(verifyPart(agg.verifyStats))}</li>`
 }
 
 const renderStability = (report: Report): string => {
@@ -378,14 +396,16 @@ const renderStability = (report: Report): string => {
       return agg === undefined ? [] : [stabilityLine(report, spec, agg)]
     })
     .join('')
-  return `<div class="stability"><h3>Stability</h3><ul>${items}</ul></div>`
+  return `<div class="stability"><h3>Стабильность</h3><ul>${items}</ul></div>`
 }
 
 const renderPrimary = (report: Report): string => {
-  const warnHtml = report.metrics.allFailed ? '<p class="warn">⚠ <strong>All variants failed — comparison unreliable.</strong></p>' : ''
+  const warnHtml = report.metrics.allFailed
+    ? '<p class="warn">⚠ <strong>Все варианты провалились — сравнение ненадёжно.</strong></p>'
+    : ''
   const rows = PRIMARY_METRICS.map((m) => primaryRowsFor(report, m)).join('')
   return `<section>
-<h2>Primary metrics — total (init + task)</h2>
+<h2>Основные метрики — итого (init + task)</h2>
 ${warnHtml}
 <table>
 ${PRIMARY_TABLE_HEAD}
@@ -450,7 +470,8 @@ const anyProrated = (report: Report, phase: 'task' | 'init'): boolean =>
     return phase === 'task' || split.init !== undefined
   })
 
-const PRORATED_FOOTNOTE_HTML = '<p class="prorated-note"><em>~ cost prorated from the session total by token share — derived, not measured.</em></p>'
+const PRORATED_FOOTNOTE_HTML =
+  '<p class="prorated-note"><em>~ стоимость распределена от суммарной стоимости сессии пропорционально доле токенов — расчётное значение, не измеренное.</em></p>'
 
 const setupLines = (report: Report): string =>
   report.manifest.variants
@@ -458,7 +479,7 @@ const setupLines = (report: Report): string =>
       const setup = variantAggFor(report.metrics, spec.name)?.phaseSplit?.setup
       return setup === undefined
         ? []
-        : [`<li><strong>${escapeHtml(spec.name)}</strong>: pack setup (harness, no model call) — median ${escapeHtml(fmtInt(setup.wallClockMs))}ms</li>`]
+        : [`<li><strong>${escapeHtml(spec.name)}</strong>: установка пакета (testaipack, без вызова модели) — медиана ${escapeHtml(fmtInt(setup.wallClockMs))}ms</li>`]
     })
     .join('')
 
@@ -469,7 +490,7 @@ const lostInitLines = (report: Report): string =>
       return n === 0
         ? []
         : [
-            `<p class="warn">⚠ ${escapeHtml(spec.name)}: ${String(n)} run(s) ran --init but the export lost the init session — init cost unmeasured.</p>`,
+            `<p class="warn">⚠ ${escapeHtml(spec.name)}: ${String(n)} ${pluralRu(n, 'запуск', 'запуска', 'запусков')} ${n === 1 ? 'прогнал' : 'прогнали'} --init, но экспорт потерял init-сессию — стоимость init не измерена.</p>`,
           ]
     })
     .join('')
@@ -480,12 +501,12 @@ const renderPhaseSplit = (report: Report): string => {
   const initRows = PHASE_METRICS.map((m) => initRowsFor(report, m)).join('')
   const initHtml =
     initRows === ''
-      ? '<h3>Init cost</h3><p><em>No variant ran <code>--init</code>.</em></p>'
-      : `<h3>Init cost</h3><table>${PRIMARY_TABLE_HEAD}<tbody>${initRows}</tbody></table>${anyProrated(report, 'init') ? PRORATED_FOOTNOTE_HTML : ''}`
+      ? '<h3>Стоимость init</h3><p><em>Ни один вариант не запускал <code>--init</code>.</em></p>'
+      : `<h3>Стоимость init</h3><table>${PRIMARY_TABLE_HEAD}<tbody>${initRows}</tbody></table>${anyProrated(report, 'init') ? PRORATED_FOOTNOTE_HTML : ''}`
   const setupsHtml = setupLines(report)
-  return `<section><h2>Phase split (init vs task)</h2>
-<p>The headline compares task vs task — the like-for-like basis. Init cost (the <code>--init</code> invocation, when one ran) and pack setup (harness, before the agent session) are reported separately below.</p>
-<h3>Task phase (like-for-like)</h3><table>${PRIMARY_TABLE_HEAD}<tbody>${taskRows}</tbody></table>${anyProrated(report, 'task') ? PRORATED_FOOTNOTE_HTML : ''}
+  return `<section><h2>Разбивка по фазам (init vs task)</h2>
+<p>Заголовок сравнивает task с task — при равных условиях. Стоимость init (вызов <code>--init</code>, если он был) и установка пакета (testaipack, до сессии агента) показаны отдельно ниже.</p>
+<h3>Фаза task (при равных условиях)</h3><table>${PRIMARY_TABLE_HEAD}<tbody>${taskRows}</tbody></table>${anyProrated(report, 'task') ? PRORATED_FOOTNOTE_HTML : ''}
 ${setupsHtml === '' ? '' : `<ul>${setupsHtml}</ul>`}
 ${initHtml}
 ${lostInitLines(report)}
@@ -498,20 +519,20 @@ ${lostInitLines(report)}
 
 const MODE_BANNER: Readonly<Record<Exclude<PackSetupMode, 'installed-only'>, string>> = {
   exercised:
-    'the harness installed the pack, verified it functional, and ran its pipeline before each measured run. Variants declaring it measure agent performance WITH the dependency present and its output available. This does NOT measure whether an agent would discover or choose this pack on its own.',
+    'testaipack установил пакет, check пройден в изолированном HOME, и пайплайн пакета прогнан перед каждым измеряемым запуском — интеграция на уровне рабочей директории (workspace) этим не проверяется. Варианты, объявляющие пакет, измеряют работу агента с доступной зависимостью и её выводом. Это не измеряет, нашёл бы и выбрал ли этот пакет агент сам.',
   'delivered-only':
-    'the pack was delivered but not installed/verified by the harness; whether the underlying tool worked in a given run depended on the agent. Treat per-run comparability as weak.',
+    'пакет был доставлен, но не установлен и не проверен testaipack; сработал ли лежащий в его основе инструмент в конкретном запуске, зависело от агента. Считайте сравнимость между запусками низкой.',
 }
 
 const installedOnlyBanner = (p: PackPrep): string =>
   p.checkDeclared && p.checks.length > 0
-    ? 'the pack was installed and checked functional; it exposes nothing for the harness to run. Variants declaring it measure agent performance with the dependency installed and confirmed working.'
-    : 'the pack was installed, but the harness never ran --pack-check to confirm it works — copied homes are an unverified copy of the first, so a silently broken install could feed every median below. Variants declaring it measure agent performance with the dependency installed, not verified.'
+    ? 'пакет установлен и его check прошёл; сам пакет не предоставляет ничего, что testaipack мог бы запустить. Варианты, объявляющие его, измеряют работу агента с установленной и подтверждённо рабочей зависимостью.'
+    : 'пакет установлен, но testaipack ни разу не запустил --pack-check, чтобы подтвердить его работоспособность — скопированные HOME являются непроверенной копией первого, поэтому незаметно сломанная установка может исказить каждую медиану ниже. Варианты, объявляющие пакет, измеряют работу агента с установленной, но не проверенной зависимостью.'
 
 const modeBanner = (p: PackPrep): string => (p.mode === 'installed-only' ? installedOnlyBanner(p) : MODE_BANNER[p.mode])
 
 const COMPARISON_LINE =
-  'Comparison: each variant declaring a pack measures agent performance with that dependency installed and its output present; variants that do not declare it are the control for it.'
+  'Сравнение: каждый вариант, объявляющий пакет, измеряет работу агента с установленной зависимостью и её доступным выводом; варианты, не объявляющие его, служат для него контролем.'
 
 const declaresPack = (report: Report, variantName: string, packName: string): boolean =>
   report.manifest.variants.find((v) => v.name === variantName)?.packs.includes(packName) === true
@@ -520,7 +541,7 @@ const cmdStatus = (report: Report, r: PackCmdResult, packName: string): string =
   const wantsZero = declaresPack(report, r.variant, packName)
   const ok = wantsZero ? r.exitCode === 0 : r.exitCode !== 0
   if (ok) return '✓'
-  return wantsZero ? `✗ (exit ${String(r.exitCode)})` : `✗ tool present on foreign variant (exit ${String(r.exitCode)})`
+  return wantsZero ? `✗ (код ${String(r.exitCode)})` : `✗ инструмент присутствует на чужом варианте (код ${String(r.exitCode)})`
 }
 
 const setupRows = (report: Report, p: PackPrep): string =>
@@ -539,7 +560,7 @@ const checkRows = (report: Report, p: PackPrep): string =>
     )
     .join('')
 
-const exerciseStatus = (e: PackCmdResult): string => (e.exitCode === 0 ? '✓' : `✗ (exit ${String(e.exitCode)})`)
+const exerciseStatus = (e: PackCmdResult): string => (e.exitCode === 0 ? '✓' : `✗ (код ${String(e.exitCode)})`)
 
 const exerciseRows = (v: VariantPrep): string =>
   v.exercises
@@ -553,14 +574,14 @@ const artifactDivergenceHtml = (exercises: readonly PackCmdResult[]): string => 
   const hashes = exercises.flatMap((e) => (e.artifactHash === undefined ? [] : [e.artifactHash]))
   const distinct = new Set(hashes)
   if (distinct.size <= 1) return ''
-  return `<p class="warn">⚠ <strong>Exercise output is not deterministic</strong>: ${String(distinct.size)} distinct artifact hash(es) across ${String(hashes.length)} run(s) that recorded one — the pack's own pipeline produced different output on identical input trees.</p>`
+  return `<p class="warn">⚠ <strong>Результат exercise не детерминирован</strong>: ${String(distinct.size)} ${pluralRu(distinct.size, 'разный хеш', 'разных хеша', 'разных хешей')} артефакта среди ${String(hashes.length)} ${pluralRu(hashes.length, 'запуска', 'запусков', 'запусков')}, зафиксировавших хеш, — собственный пайплайн пакета выдал разный результат на одинаковых входных деревьях.</p>`
 }
 
 const noArtifactHtml = (exercises: readonly PackCmdResult[]): string => {
   if (exercises.length === 0) return ''
   const withArtifact = exercises.filter((e) => e.artifactHash !== undefined)
   if (withArtifact.length > 0) return ''
-  return `<p class="warn">⚠ <strong>Exercise produced no artifact on any of ${String(exercises.length)} run(s)</strong>: exit 0 with no tracked output left behind is indistinguishable from a no-op — verify <code>--pack-exercise</code> actually ran the pack's pipeline.</p>`
+  return `<p class="warn">⚠ <strong>Exercise не оставил артефакта ни в одном из ${String(exercises.length)} ${pluralRu(exercises.length, 'запуска', 'запусков', 'запусков')}</strong>: выход 0 без отслеживаемого результата неотличим от no-op — проверьте, что <code>--pack-exercise</code> действительно прогнал пайплайн пакета.</p>`
 }
 
 const declaredCommandItems = (report: Report): string => {
@@ -588,13 +609,13 @@ const renderHarnessPrep = (report: Report): string => {
   const allExercises = prep.variants.flatMap((v) => v.exercises)
   const rows = `${prep.packs.map((p) => setupRows(report, p)).join('')}${prep.packs.map((p) => checkRows(report, p)).join('')}${prep.variants.map((v) => exerciseRows(v)).join('')}`
   const exerciseCaveat = prep.variants.some((v) => v.exerciseDeclared)
-    ? "<p><em>Any API/LLM usage internal to the pack's own CLI during exercise is an external process testaipack does not meter — only its wall-clock is captured.</em></p>"
+    ? '<p><em>Любое использование API/LLM внутри собственного CLI пакета во время exercise — внешний процесс, который testaipack не измеряет; фиксируется только его wall-clock.</em></p>'
     : ''
-  return `<section><h2>Harness preparation</h2>
+  return `<section><h2>Подготовка пакетов</h2>
 ${banners}
 <p>${escapeHtml(COMPARISON_LINE)}</p>
 ${declaredCommandItems(report)}
-<table><thead><tr><th>Step</th><th>Pack</th><th>Variant</th><th>Run</th><th>Result</th><th>Wall-clock</th><th>Artifact hash</th></tr></thead><tbody>${rows}</tbody></table>
+<table><thead><tr><th>Шаг</th><th>Пакет</th><th>Вариант</th><th>Запуск</th><th>Результат</th><th>Wall-clock</th><th>Хеш артефакта</th></tr></thead><tbody>${rows}</tbody></table>
 ${artifactDivergenceHtml(allExercises)}
 ${noArtifactHtml(allExercises)}
 ${exerciseCaveat}
@@ -614,22 +635,22 @@ const packSignalLines = (report: Report): string =>
         const declared = spec.packs.includes(pu.pack)
         if (!declared && pu.calls === 0) return []
         if (!pu.canDetect) {
-          return [`<li><strong>${escapeHtml(pu.pack)}</strong> (variant ${escapeHtml(spec.name)}): <em>pack use is not visible for this pack type</em></li>`]
+          return [`<li><strong>${escapeHtml(pu.pack)}</strong> (вариант ${escapeHtml(spec.name)}): <em>использование пакета не видно для этого типа пакета</em></li>`]
         }
         if (!declared) {
           return [
-            `<li><strong>${escapeHtml(pu.pack)}</strong> (variant ${escapeHtml(spec.name)}): ${String(pu.calls)} call(s) — foreign; any call would be contamination</li>`,
+            `<li><strong>${escapeHtml(pu.pack)}</strong> (вариант ${escapeHtml(spec.name)}): ${String(pu.calls)} ${pluralRu(pu.calls, 'вызов', 'вызова', 'вызовов')} — чужой; любой вызов означал бы контаминацию</li>`,
           ]
         }
-        const first = pu.firstCallMsMedian === undefined ? '' : `, first-call median ${escapeHtml(fmtInt(pu.firstCallMsMedian))}ms`
+        const first = pu.firstCallMsMedian === undefined ? '' : `, медиана первого вызова ${escapeHtml(fmtInt(pu.firstCallMsMedian))}ms`
         const visibility =
-          pu.calls !== 0 ? '' : pu.visibilityConfirmed ? ' (confirmed visible, not called)' : ' (visibility not confirmed)'
+          pu.calls !== 0 ? '' : pu.visibilityConfirmed ? ' (подтверждённо виден, не вызван)' : ' (видимость не подтверждена)'
         const without =
           pu.runsWithoutCall === undefined || pu.runsWithoutCall.length === 0
             ? ''
-            : `; never called on run(s) ${pu.runsWithoutCall.join(', ')}`
+            : `; ни разу не вызван в ${pu.runsWithoutCall.length === 1 ? 'запуске' : 'запусках'} ${pu.runsWithoutCall.join(', ')}`
         return [
-          `<li><strong>${escapeHtml(pu.pack)}</strong> (variant ${escapeHtml(spec.name)}): ${String(pu.calls)} call(s), ${String(pu.errors)} error(s), ${String(pu.runsWithCall)}/${String(pu.runCount)} runs called the pack${first}${escapeHtml(visibility)}${escapeHtml(without)}</li>`,
+          `<li><strong>${escapeHtml(pu.pack)}</strong> (вариант ${escapeHtml(spec.name)}): ${String(pu.calls)} ${pluralRu(pu.calls, 'вызов', 'вызова', 'вызовов')}, ${String(pu.errors)} ${pluralRu(pu.errors, 'ошибка', 'ошибки', 'ошибок')}, ${String(pu.runsWithCall)}/${String(pu.runCount)} запусков вызвали пакет${first}${escapeHtml(visibility)}${escapeHtml(without)}</li>`,
         ]
       })
     })
@@ -639,9 +660,9 @@ const renderPackSignal = (report: Report): string => {
   const lines = packSignalLines(report)
   if (lines === '') return ''
   const footnote = (report.prep?.packs ?? []).some((p) => p.mode !== 'delivered-only')
-    ? '<p><em>Agent-side pack invocations are recorded for context only; under exercise/installed-only mode they are not an outcome measure.</em></p>'
+    ? '<p><em>Вызовы пакета со стороны агента фиксируются только для контекста; в режиме exercise/installed-only они не являются мерой результата.</em></p>'
     : ''
-  return `<section><h2>Pack signal</h2><ul>${lines}</ul>${footnote}</section>`
+  return `<section><h2>Использование пакетов</h2><ul>${lines}</ul>${footnote}</section>`
 }
 
 // ---------------------------------------------------------------------------
@@ -659,7 +680,7 @@ const renderSafety = (report: Report): string => {
     })
     .join('')
   if (rows === '') return ''
-  return `<section><h2>Safety</h2><table><thead><tr><th>Variant</th><th>Run</th><th>Command</th><th>Completed</th><th>Exit</th></tr></thead><tbody>${rows}</tbody></table></section>`
+  return `<section><h2>Безопасность</h2><table><thead><tr><th>Вариант</th><th>Запуск</th><th>Команда</th><th>Завершено</th><th>Выход</th></tr></thead><tbody>${rows}</tbody></table></section>`
 }
 
 // ---------------------------------------------------------------------------
@@ -683,7 +704,7 @@ const contaminationRows = (report: Report): string =>
 const renderContamination = (report: Report): string => {
   const rows = contaminationRows(report)
   if (rows === '') return ''
-  return `<section><h2>Contamination</h2><table><thead><tr><th>Kind</th><th>Variant</th><th>Pack</th><th>Run</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table></section>`
+  return `<section><h2>Контаминация</h2><table><thead><tr><th>Тип</th><th>Вариант</th><th>Пакет</th><th>Запуск</th><th>Детали</th></tr></thead><tbody>${rows}</tbody></table></section>`
 }
 
 // ---------------------------------------------------------------------------
@@ -691,46 +712,48 @@ const renderContamination = (report: Report): string => {
 // ---------------------------------------------------------------------------
 
 const renderRawResponse = (raw: string | undefined): string =>
-  raw === undefined ? '' : `<details><summary>Raw model response</summary><pre>${escapeHtml(raw)}</pre></details>`
+  raw === undefined ? '' : `<details><summary>Исходный ответ модели</summary><pre>${escapeHtml(raw)}</pre></details>`
 
 const renderJudge = (report: Report): string => {
   const j = report.judge
   if (j === undefined) {
-    return '<section><h2>LLM Judge</h2><p><em>Judge was not requested.</em></p></section>'
+    return '<section><h2>LLM-судья</h2><p><em>Судья не запрошен (--judge не задан)</em></p></section>'
   }
   if (j.ran === false) {
-    return `<section><h2>LLM Judge</h2><p><em>Judge did not run: ${escapeHtml(j.explanation)}</em></p></section>`
+    return `<section><h2>LLM-судья</h2><p><em>Судья не был запущен: ${escapeHtml(j.explanation)}</em></p></section>`
   }
-  const note = j.verdict === 'unclear' ? ' <em>(unclear)</em>' : ''
+  const note = j.verdict === 'unclear' ? ' <em>(неясно)</em>' : ''
   const contaminated = report.metrics.variants.filter((v) => (v.contaminationSignals?.length ?? 0) > 0)
   const contaminationWarn =
     contaminated.length === 0
       ? ''
-      : `<p class="warn">⚠ <strong>Contamination detected (${escapeHtml(contaminated.map((v) => v.variant).join(', '))}) — this verdict may be comparing variants that used a pack they do not declare.</strong></p>`
+      : `<p class="warn">⚠ <strong>Контаминация обнаружена (${escapeHtml(contaminated.map((v) => v.variant).join(', '))}) — этот вердикт может сравнивать варианты, использовавшие пакет, который они не объявляют.</strong></p>`
   const quality = report.manifest.variants
     .map((v) => {
       const score = j.scores.find((s) => s.variant === v.name)
-      return `${v.name}=${score === undefined ? 'n/a' : String(score.quality)}`
+      return `${v.name}=${score === undefined ? 'н/д' : String(score.quality)}`
     })
     .join(', ')
   const pairwiseHtml =
     j.pairwiseFallback === true
-      ? '<p class="basis"><em>Scores derived from pairwise-vs-baseline calls (prompt exceeded the single-call budget).</em></p>'
+      ? '<p class="basis"><em>Баллы получены через попарные вызовы каждого варианта против базового варианта (промпт превысил бюджет одного вызова).</em></p>'
       : ''
-  return `<section><h2>LLM Judge</h2>${contaminationWarn}<p>Verdict: <strong>${escapeHtml(j.verdict)}</strong>${note}</p><p>Ranking: ${escapeHtml(j.ranking.join(' > '))}</p><p>Quality: ${escapeHtml(quality)}; model <code>${escapeHtml(j.modelUsed)}</code></p><p>${escapeHtml(j.explanation)}</p>${pairwiseHtml}${renderRawResponse(j.rawResponse)}</section>`
+  return `<section><h2>LLM-судья</h2>${contaminationWarn}<p>Вердикт: <strong>${escapeHtml(j.verdict)}</strong>${note}</p><p>Ранжирование: ${escapeHtml(j.ranking.join(' > '))}</p><p>Качество: ${escapeHtml(quality)}; модель <code>${escapeHtml(j.modelUsed)}</code></p><p>${escapeHtml(j.explanation)}</p>${pairwiseHtml}${renderRawResponse(j.rawResponse)}</section>`
 }
 
 const renderFailures = (report: Report): string => {
   const failures = report.summary.failures
   if (failures.length === 0) return ''
-  const warnHtml = report.metrics.allFailed ? '<p class="warn"><strong>⚠ All variants failed — comparison unreliable.</strong></p>' : ''
+  const warnHtml = report.metrics.allFailed
+    ? '<p class="warn"><strong>⚠ Все варианты провалились — сравнение ненадёжно.</strong></p>'
+    : ''
   const rows = failures
     .map(
       (f) =>
         `<tr><td>${escapeHtml(f.variant)}</td><td>${escapeHtml(String(f.runIndex))}</td><td><code>${escapeHtml(f.errorCode)}</code></td><td>${escapeHtml(f.errorMessage)}</td></tr>`,
     )
     .join('')
-  return `<section><h2>Failed runs</h2>${warnHtml}<table><thead><tr><th>Variant</th><th>Run</th><th>Code</th><th>Message</th></tr></thead><tbody>${rows}</tbody></table></section>`
+  return `<section><h2>Проваленные запуски</h2>${warnHtml}<table><thead><tr><th>Вариант</th><th>Запуск</th><th>Код</th><th>Сообщение</th></tr></thead><tbody>${rows}</tbody></table></section>`
 }
 
 // ---------------------------------------------------------------------------
@@ -739,7 +762,7 @@ const renderFailures = (report: Report): string => {
 
 const toolRows = (perTool: Readonly<Record<string, ToolStat>>): string => {
   const entries = Object.entries(perTool)
-  if (entries.length === 0) return '<li><em>no tools</em></li>'
+  if (entries.length === 0) return '<li><em>нет инструментов</em></li>'
   return [...entries]
     .sort(([, a], [, b]) => b.count - a.count)
     .slice(0, 20)
@@ -770,20 +793,20 @@ const behaviorGroup = (sec: SecondaryMetrics): string => {
     .map(([k, v]) => `${k}=${String(v)}`)
     .join(', ')
   const lines: readonly string[] = [
-    `Finish causes: ${finish || 'none'}`,
-    `Max same-tool streak: ${String(sec.maxConsecutiveSameTool)}`,
+    `Причины завершения: ${finish || 'нет'}`,
+    `Макс. серия одного инструмента подряд: ${String(sec.maxConsecutiveSameTool)}`,
     ...(sec.bashFailCount === undefined
       ? []
-      : [`Bash fails (exit != 0): ${String(sec.bashFailCount)} of ${String(sec.perTool['bash']?.count ?? 0)} calls (sum over runs)`]),
+      : [`Провалы bash (exit != 0): ${String(sec.bashFailCount)} из ${String(sec.perTool['bash']?.count ?? 0)} вызовов (сумма по запускам)`]),
     ...(sec.invalidToolCalls === undefined || sec.duplicateToolCalls === undefined
       ? []
-      : [`Invalid tool calls: ${String(sec.invalidToolCalls)}; duplicate calls: ${String(sec.duplicateToolCalls)} (sums over runs)`]),
+      : [`Невалидные вызовы инструментов: ${String(sec.invalidToolCalls)}; дублирующиеся вызовы: ${String(sec.duplicateToolCalls)} (суммы по запускам)`]),
     ...(sec.toolErrorTexts === undefined || sec.toolErrorTexts.length === 0
       ? []
-      : [`Tool errors (top): ${sec.toolErrorTexts.join('; ')}`]),
+      : [`Ошибки инструментов (топ): ${sec.toolErrorTexts.join('; ')}`]),
   ]
   const items = lines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')
-  return `${items}<li>Tools (top 20):<ul>${toolRows(sec.perTool)}</ul></li>`
+  return `${items}<li>Инструменты (топ 20):<ul>${toolRows(sec.perTool)}</ul></li>`
 }
 
 const STALL_LABEL = `${String(STALL_THRESHOLD_MS / 1000)}s`
@@ -791,20 +814,20 @@ const STALL_LABEL = `${String(STALL_THRESHOLD_MS / 1000)}s`
 const stallSuffix = (sec: SecondaryMetrics): string =>
   sec.stallCount === undefined || sec.stalledRunCount === undefined
     ? ''
-    : `; ${String(sec.stallCount)} stall(s) over ${STALL_LABEL} across ${String(sec.stalledRunCount)} run(s)`
+    : `; ${String(sec.stallCount)} ${pluralRu(sec.stallCount, 'простой', 'простоя', 'простоев')} дольше ${STALL_LABEL} в ${String(sec.stalledRunCount)} ${sec.stalledRunCount === 1 ? 'запуске' : 'запусках'}`
 
 const latencyGroup = (sec: SecondaryMetrics, wallClockMs: string): string => {
-  const share = toNum(wallClockMs) > 0 ? ` (${String(Math.round((100 * toNum(sec.reasoningTimeMs)) / toNum(wallClockMs)))}% of wall-clock)` : ''
+  const share = toNum(wallClockMs) > 0 ? ` (${String(Math.round((100 * toNum(sec.reasoningTimeMs)) / toNum(wallClockMs)))}% от wall-clock)` : ''
   const pieces: readonly string[] = [
-    ...(sec.timeToFirstToolMs === undefined ? [] : [`First tool: +${fmtDurationMs(sec.timeToFirstToolMs)}`]),
-    ...(sec.timeToFirstEditMs === undefined ? [] : [`first edit: +${fmtDurationMs(sec.timeToFirstEditMs)}`]),
+    ...(sec.timeToFirstToolMs === undefined ? [] : [`первый инструмент: +${fmtDurationMs(sec.timeToFirstToolMs)}`]),
+    ...(sec.timeToFirstEditMs === undefined ? [] : [`первое редактирование: +${fmtDurationMs(sec.timeToFirstEditMs)}`]),
     ...(sec.maxEventGapMs === undefined
       ? []
-      : [`worst stall: ${fmtDurationMs(sec.maxEventGapMs)} (max over runs)${stallSuffix(sec)}`]),
+      : [`худший простой: ${fmtDurationMs(sec.maxEventGapMs)} (максимум по запускам)${stallSuffix(sec)}`]),
   ]
   const lines: readonly string[] = [
-    `Step latency: p50=${fmtInt(sec.stepLatencyP50Ms)}ms, p95=${fmtInt(sec.stepLatencyP95Ms)}ms`,
-    `Reasoning time: ${fmtInt(sec.reasoningTimeMs)}ms${share}; tool avg: ${fmtInt(sec.toolLatencyAvgMs)}ms`,
+    `Задержка шага: p50=${fmtInt(sec.stepLatencyP50Ms)}ms, p95=${fmtInt(sec.stepLatencyP95Ms)}ms`,
+    `Время рассуждений: ${fmtInt(sec.reasoningTimeMs)}ms${share}; среднее по инструментам: ${fmtInt(sec.toolLatencyAvgMs)}ms`,
     ...(pieces.length === 0 ? [] : [capFirst(pieces.join('; '))]),
   ]
   return lines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')
@@ -812,13 +835,13 @@ const latencyGroup = (sec: SecondaryMetrics, wallClockMs: string): string => {
 
 const tokensContextGroup = (sec: SecondaryMetrics): string => {
   const cacheWrite = sec.cacheWriteTokens === undefined ? '' : `, cacheWrite=${fmtInt(sec.cacheWriteTokens)}`
-  const first = sec.firstStepInputTokens === undefined ? 'n/a' : `${fmtInt(sec.firstStepInputTokens)} tok`
-  const last = sec.lastStepInputTokens === undefined ? 'n/a' : `${fmtInt(sec.lastStepInputTokens)} tok`
+  const first = sec.firstStepInputTokens === undefined ? 'н/д' : `${fmtInt(sec.firstStepInputTokens)} tok`
+  const last = sec.lastStepInputTokens === undefined ? 'н/д' : `${fmtInt(sec.lastStepInputTokens)} tok`
   const lines: readonly string[] = [
-    `Token breakdown: input=${fmtInt(sec.inputTokens)}, output=${fmtInt(sec.outputTokens)}, reasoning=${fmtInt(sec.reasoningTokens)}, cacheRead=${fmtInt(sec.cacheReadTokens)}${cacheWrite}`,
+    `Разбивка по токенам: input=${fmtInt(sec.inputTokens)}, output=${fmtInt(sec.outputTokens)}, reasoning=${fmtInt(sec.reasoningTokens)}, cacheRead=${fmtInt(sec.cacheReadTokens)}${cacheWrite}`,
     ...(sec.firstStepInputTokens === undefined && sec.lastStepInputTokens === undefined
       ? []
-      : [`Context: first step in=${first}, last step in=${last}`]),
+      : [`Контекст: вход первого шага=${first}, вход последнего шага=${last}`]),
   ]
   return lines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')
 }
@@ -826,10 +849,10 @@ const tokensContextGroup = (sec: SecondaryMetrics): string => {
 const outputVolumeGroup = (report: Report, variant: string, sec: SecondaryMetrics): string => {
   const fds = diffTotalsFor(report, variant)
   const lines: readonly string[] = [
-    `File diff: +${String(fds.add)} -${String(fds.del)} (${String(fds.files)} files)`,
+    `Изменения файлов: +${String(fds.add)} -${String(fds.del)} (${String(fds.files)} ${pluralRu(fds.files, 'файл', 'файла', 'файлов')})`,
     ...(sec.textChars === undefined
       ? []
-      : [`Output: text ${fmtInt(sec.textChars)} ch, reasoning ${fmtInt(sec.reasoningChars ?? '0')} ch`]),
+      : [`Вывод: текст ${fmtInt(sec.textChars)} симв., рассуждения ${fmtInt(sec.reasoningChars ?? '0')} симв.`]),
   ]
   return lines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')
 }
@@ -839,17 +862,17 @@ const group = (label: string, body: string, open: boolean): string =>
 
 const renderSecondaryVariant = (report: Report, spec: VariantSpec, agg: VariantAggregates): string => {
   const groups = [
-    group('Behavior', behaviorGroup(agg.secondary), true),
-    group('Latency', latencyGroup(agg.secondary, agg.primary.wallClockMs), false),
-    group('Tokens & context', tokensContextGroup(agg.secondary), false),
-    group('Output volume', outputVolumeGroup(report, spec.name, agg.secondary), false),
+    group('Поведение', behaviorGroup(agg.secondary), true),
+    group('Задержки', latencyGroup(agg.secondary, agg.primary.wallClockMs), false),
+    group('Токены и контекст', tokensContextGroup(agg.secondary), false),
+    group('Объём вывода', outputVolumeGroup(report, spec.name, agg.secondary), false),
   ].join('')
-  return `<div class="secondary-variant"><h3>${escapeHtml(spec.name)} secondary</h3>${groups}</div>`
+  return `<div class="secondary-variant"><h3>${escapeHtml(spec.name)}: дополнительные метрики</h3>${groups}</div>`
 }
 
 const renderSecondary = (report: Report): string => {
   const note = hasAnyPhaseSplit(report)
-    ? '<p class="whole-run-note"><em>Whole-run (init + task) — not split; see known-unsplit metrics in docs/phases/07-aggregate.ru.md.</em></p>'
+    ? '<p class="whole-run-note"><em>Весь запуск (init + task) — без разбивки; см. неразбиваемые метрики в <code>docs/phases/07-aggregate.ru.md</code>.</em></p>'
     : ''
   const blocks = report.manifest.variants
     .flatMap((spec) => {
@@ -857,7 +880,7 @@ const renderSecondary = (report: Report): string => {
       return agg === undefined ? [] : [renderSecondaryVariant(report, spec, agg)]
     })
     .join('')
-  return `<section><h2>Secondary metrics</h2>${note}${blocks}</section>`
+  return `<section><h2>Дополнительные метрики</h2>${note}${blocks}</section>`
 }
 
 // ---------------------------------------------------------------------------
@@ -866,29 +889,29 @@ const renderSecondary = (report: Report): string => {
 
 const stateSuffix = (state: DiffRunResult['state']): string =>
   state === 'git-restored'
-    ? ' (agent deleted .git, restored from clean clone)'
+    ? ' (агент удалил .git, восстановлено из чистого клона)'
     : state === 'git-replaced'
-      ? ' (agent replaced .git, diff includes agent commits)'
+      ? ' (агент заменил .git, diff включает коммиты агента)'
       : ''
 
 const containedRunSuffix = (report: Report, variant: string, runIndex: number): string => {
   const failed = variantAggFor(report.metrics, variant)?.failedRuns.find((f) => f.runIndex === runIndex)
   return failed === undefined
     ? ''
-    : ` — <strong>contained as failed</strong> (<code>${escapeHtml(failed.errorCode)}</code>; excluded from the Efficiency ratio below — see Failed runs)`
+    : ` — <strong>учтён как проваленный</strong> (<code>${escapeHtml(failed.errorCode)}</code>; исключён из показателя «Эффективность» ниже — см. «Проваленные запуски»)`
 }
 
 const efficiencyItem = (report: Report, variant: string): string => {
   const agg = variantAggFor(report.metrics, variant)
-  if (agg === undefined) return '<li>Efficiency: n/a</li>'
+  if (agg === undefined) return '<li>Эффективность: н/д</li>'
   const t = diffTotalsFor(report, variant)
   const sessionRunCount = agg.stats.totalTokens.samples.length
   const changedLines = t.add + t.del
   const tokensPerRun = toNum(agg.primary.totalTokens)
   const costPerRun = agg.primary.costUsd
-  const tokensPerLine = changedLines === 0 ? 'n/a' : fmtInt((tokensPerRun * sessionRunCount) / changedLines)
-  const costPerFile = t.files === 0 ? 'n/a' : fmtValue((costPerRun * sessionRunCount) / t.files, 'cost')
-  return `<li>Efficiency: tokens per changed line ${escapeHtml(tokensPerLine)}, cost per file ${escapeHtml(costPerFile)} (scaled from the per-run median over ${String(sessionRunCount)} run(s) with an agent session)</li>`
+  const tokensPerLine = changedLines === 0 ? 'н/д' : fmtInt((tokensPerRun * sessionRunCount) / changedLines)
+  const costPerFile = t.files === 0 ? 'н/д' : fmtValue((costPerRun * sessionRunCount) / t.files, 'cost')
+  return `<li>Эффективность: токенов на изменённую строку ${escapeHtml(tokensPerLine)}, стоимость на файл ${escapeHtml(costPerFile)} (пересчитано из медианы на запуск, по ${String(sessionRunCount)} ${sessionRunCount === 1 ? 'запуску' : 'запускам'} с сессией агента)</li>`
 }
 
 const pathsForVariant = (report: Report, variant: string): ReadonlySet<string> =>
@@ -901,28 +924,28 @@ const overlapItem = (report: Report, variant: string): string => {
   const onlyBase = [...basePaths].filter((p) => !vPaths.has(p)).sort()
   const onlyV = [...vPaths].filter((p) => !basePaths.has(p)).sort()
   if (both.length === 0 && onlyBase.length === 0 && onlyV.length === 0) return ''
-  const cap = (list: readonly string[]): string => (list.length === 0 ? '<em>none</em>' : list.slice(0, 15).map(escapeHtml).join(', '))
-  return `<li><strong>Overlap vs base (${escapeHtml(variant)})</strong><ul><li>Both: ${cap(both)}</li><li>Only base: ${cap(onlyBase)}</li><li>Only ${escapeHtml(variant)}: ${cap(onlyV)}</li></ul></li>`
+  const cap = (list: readonly string[]): string => (list.length === 0 ? '<em>нет</em>' : list.slice(0, 15).map(escapeHtml).join(', '))
+  return `<li><strong>Пересечение с базой (${escapeHtml(variant)})</strong><ul><li>Общие: ${cap(both)}</li><li>Только база: ${cap(onlyBase)}</li><li>Только ${escapeHtml(variant)}: ${cap(onlyV)}</li></ul></li>`
 }
 
 const diffItemFor = (report: Report, variant: string): string => {
   const t = diffTotalsFor(report, variant)
   const runs = diffResultFor(report, variant)?.runs ?? []
   const failedCount = runs.filter((r) => r.state === 'failed').length
-  const failedSuffix = failedCount === 0 ? '' : `, ${String(failedCount)} failed`
+  const failedSuffix = failedCount === 0 ? '' : `, из них ${String(failedCount)} ${failedCount === 1 ? 'провалился' : 'провалились'}`
   const items = runs
     .map((r) => {
       const idx = String(r.runIndex)
       if (r.state === 'failed') {
-        return `<li>run-${escapeHtml(idx)}: diff failed — <code>${escapeHtml(r.error?.message ?? 'unknown')}</code></li>`
+        return `<li>run-${escapeHtml(idx)}: diff не удался — <code>${escapeHtml(r.error?.message ?? 'неизвестно')}</code></li>`
       }
       const patchHref = `diff/${variant}/run-${idx}/full.patch`
       const htmlLink =
         r.htmlPath !== undefined ? ` — <a href="${escapeHtml(`diff/${variant}/run-${idx}/side.html`)}">html</a>` : ''
-      return `<li>run-${escapeHtml(idx)}: +${escapeHtml(String(r.summary.additions))} -${escapeHtml(String(r.summary.deletions))} (${escapeHtml(String(r.summary.filesChanged))} files) — <a href="${escapeHtml(patchHref)}">patch</a>${htmlLink}${escapeHtml(stateSuffix(r.state))}${containedRunSuffix(report, variant, r.runIndex)}</li>`
+      return `<li>run-${escapeHtml(idx)}: +${escapeHtml(String(r.summary.additions))} -${escapeHtml(String(r.summary.deletions))} (${escapeHtml(String(r.summary.filesChanged))} ${pluralRu(r.summary.filesChanged, 'файл', 'файла', 'файлов')}) — <a href="${escapeHtml(patchHref)}">патч</a>${htmlLink}${escapeHtml(stateSuffix(r.state))}${containedRunSuffix(report, variant, r.runIndex)}</li>`
     })
     .join('')
-  const totalsLine = `+${String(t.add)} -${String(t.del)} (${String(t.files)} files across ${String(runs.length)} run(s)${failedSuffix})`
+  const totalsLine = `+${String(t.add)} -${String(t.del)} (${String(t.files)} ${pluralRu(t.files, 'файл', 'файла', 'файлов')}, ${String(runs.length)} ${pluralRu(runs.length, 'запуск', 'запуска', 'запусков')}${failedSuffix})`
   return `<li><strong>${escapeHtml(variant)}</strong>: ${escapeHtml(totalsLine)}<ul>${items}${efficiencyItem(report, variant)}</ul></li>`
 }
 
@@ -932,11 +955,11 @@ const renderDiff = (report: Report): string => {
     .filter((spec) => spec.name !== report.metrics.baseline)
     .map((spec) => overlapItem(report, spec.name))
     .join('')
-  return `<section><h2>Diff summary</h2><ul>${items}${overlaps}</ul></section>`
+  return `<section><h2>Сводка по diff</h2><ul>${items}${overlaps}</ul></section>`
 }
 
 export const renderHtml = (report: Report): string => {
-  const title = `testaipack report: ${report.manifest.runId}`
+  const title = `Отчёт testaipack: ${report.manifest.runId}`
 
   const body = [
     renderHeader(report),
@@ -951,13 +974,13 @@ export const renderHtml = (report: Report): string => {
     renderJudge(report),
     renderFailures(report),
     renderDiff(report),
-    '<section><h2>Timeline</h2><iframe src="timeline.html" width="100%" height="480">timeline.html unavailable</iframe></section>',
+    '<section><h2>Сводка по таймлайну</h2><iframe src="timeline.html" width="100%" height="480">timeline.html недоступен</iframe></section>',
   ]
     .filter((s) => s !== '')
     .join('\n')
 
   return `<!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

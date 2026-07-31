@@ -134,9 +134,9 @@ describe('renderHtml — document shape', () => {
   it('self-contained document with headline, table, judge, timeline iframe', () => {
     const html = renderHtml(threeVariantsReport())
     expect(html).toContain('<!doctype html>')
-    expect(html).toContain('Primary metrics')
-    expect(html).toContain('Total tokens')
-    expect(html).toContain('LLM Judge')
+    expect(html).toContain('Основные метрики')
+    expect(html).toContain('Всего токенов')
+    expect(html).toContain('LLM-судья')
     expect(html).toContain('timeline.html')
   })
 
@@ -152,8 +152,8 @@ describe('renderHtml — document shape', () => {
     const html = renderHtml(report)
     expect(html).toContain(report.manifest.runId)
     expect(html).toContain(report.manifest.repoUrl)
-    expect(html).toContain('base* (no packs, pure)')
-    expect(html).toContain('graphify (packs: graphify)')
+    expect(html).toContain('base* (без пакетов, чистый)')
+    expect(html).toContain('graphify (пакеты: graphify)')
   })
 
   it('judge.ran === false renders "did not run" without verdict/quality', () => {
@@ -163,16 +163,16 @@ describe('renderHtml — document shape', () => {
       judge: { verdict: 'unclear', scores: [], ranking: [], explanation: 'judge crashed (exit 1)', modelUsed: '', timestamp: '2025-01-01T00:05:00.000Z', ran: false },
     }
     const html = renderHtml(didNotRun)
-    expect(html).toContain('Judge did not run: judge crashed (exit 1)')
-    expect(html).not.toContain('Verdict:')
+    expect(html).toContain('Судья не был запущен: judge crashed (exit 1)')
+    expect(html).not.toContain('Вердикт:')
   })
 
   it('omits the raw-response block when rawResponse is absent, escapes it when present', () => {
     const report = threeVariantsReport()
-    expect(renderHtml(report)).not.toContain('Raw model response')
+    expect(renderHtml(report)).not.toContain('Исходный ответ модели')
     const withRaw: Report = { ...report, judge: { ...report.judge!, rawResponse: 'I <really> cannot decide.' } }
     const html = renderHtml(withRaw)
-    expect(html).toContain('<details><summary>Raw model response</summary>')
+    expect(html).toContain('<details><summary>Исходный ответ модели</summary>')
     expect(html).toContain('I &lt;really&gt; cannot decide.')
   })
 
@@ -187,37 +187,37 @@ describe('renderHtml — document shape', () => {
       },
     }
     const html = renderHtml(withHint)
-    expect(html).toContain('<strong>Hint:</strong> base, graphify — &quot;use good practices&quot; (variants differ')
+    expect(html).toContain('<strong>Подсказка:</strong> base, graphify — «use good practices» (варианты отличаются')
     expect(html).not.toMatch(/astgrep.*use good practices/)
   })
 
   it('B4 regression: a packless variant with no explicit `pure` still defaults to pure (D1)', () => {
     const html = renderHtml(threeVariantsReport())
-    expect(html).toContain('base* (no packs, pure)')
+    expect(html).toContain('base* (без пакетов, чистый)')
   })
 })
 
 describe('renderHtml — primary metrics table', () => {
   it('metric-major header with Variant column, baseline row uses .baseline-row class', () => {
     const html = renderHtml(threeVariantsReport())
-    expect(html).toContain('<th>Metric</th><th>Variant</th><th>Median</th><th>[min–max]</th><th>Δ vs base</th><th>Δ%</th><th>Significant</th><th>Verdict</th>')
-    expect(html).toMatch(/<tr class="baseline-row"><td>Total tokens<\/td><td>base\*<\/td>/)
+    expect(html).toContain('<th>Метрика</th><th>Вариант</th><th>Медиана</th><th>[мин–макс]</th><th>Δ vs база</th><th>Δ%</th><th>Значимо</th><th>Вердикт</th>')
+    expect(html).toMatch(/<tr class="baseline-row"><td>Всего токенов<\/td><td>base\*<\/td>/)
   })
 
   it('color-codes non-baseline verdict cells (better/worse/neutral)', () => {
     const html = renderHtml(threeVariantsReport())
-    const totalTokensGraphify = html.match(/<tr><td>Total tokens<\/td><td>graphify<\/td>.*?<\/tr>/)
+    const totalTokensGraphify = html.match(/<tr><td>Всего токенов<\/td><td>graphify<\/td>.*?<\/tr>/)
     expect(totalTokensGraphify?.[0]).toMatch(/class="better"/)
   })
 
   it('§1.3 caveat footnote renders for N-1 > 1', () => {
     const html = renderHtml(threeVariantsReport())
-    expect(html).toContain('N−1 = 2 comparisons share one baseline')
+    expect(html).toContain('N−1 = 2 сравнения делят один базовый вариант')
   })
 
   it('shimPair: no caveat for a single comparison', () => {
     const html = renderHtml(shimReport())
-    expect(html).toContain('* baseline.')
+    expect(html).toContain('* база.')
     expect(html).not.toContain('N−1')
   })
 
@@ -225,7 +225,7 @@ describe('renderHtml — primary metrics table', () => {
     const report = threeVariantsReport()
     const rebased: Report = { ...report, metrics: { ...report.metrics, baseline: 'graphify' } }
     const html = renderHtml(rebased)
-    const totalTokensRows = [...html.matchAll(/<tr[^>]*><td>Total tokens<\/td><td>([^<]+)<\/td>/g)].map((m) => m[1])
+    const totalTokensRows = [...html.matchAll(/<tr[^>]*><td>Всего токенов<\/td><td>([^<]+)<\/td>/g)].map((m) => m[1])
     expect(totalTokensRows[0]).toBe('graphify*')
     expect(totalTokensRows[1]).toBe('base')
     expect(totalTokensRows[2]).toBe('astgrep')
@@ -235,18 +235,18 @@ describe('renderHtml — primary metrics table', () => {
 describe('renderHtml — summary', () => {
   it('renders one "vs base" block per non-baseline variant with Improvements/Regressions/Neutral', () => {
     const html = renderHtml(threeVariantsReport())
-    expect(html).toContain('vs base: graphify')
-    expect(html).toContain('vs base: astgrep')
-    expect(html).toContain('Improvements')
-    expect(html).toContain('Regressions')
-    expect(html).toContain('Neutral')
+    expect(html).toContain('vs база: graphify')
+    expect(html).toContain('vs база: astgrep')
+    expect(html).toContain('Улучшения')
+    expect(html).toContain('Регрессии')
+    expect(html).toContain('Нейтральные')
   })
 })
 
 describe('renderHtml — diff summary', () => {
   it('renders a diff section with patch and side.html links per variant', () => {
     const html = renderHtml(shimReport())
-    expect(html).toContain('Diff summary')
+    expect(html).toContain('Сводка по diff')
     expect(html).toContain('diff/old/run-1/full.patch')
     expect(html).toContain('diff/new/run-1/side.html')
     expect(html).not.toContain('/abs/new/side.html')
@@ -286,15 +286,15 @@ describe('renderHtml — diff summary', () => {
       ),
     }
     const html = renderHtml(withFailed)
-    expect(html).toContain('+8 -3 (2 files across 2 run(s), 1 failed)')
+    expect(html).toContain('+8 -3 (2 файла, 2 запуска, из них 1 провалился)')
   })
 
   it('overlap vs baseline renders Both/Only base/Only {v} per non-baseline variant', () => {
     const html = renderHtml(threeVariantsReport())
-    expect(html).toContain('Overlap vs base (graphify)')
-    expect(html).toContain('Overlap vs base (astgrep)')
-    expect(html).toContain('Both:')
-    expect(html).toContain('Only base:')
+    expect(html).toContain('Пересечение с базой (graphify)')
+    expect(html).toContain('Пересечение с базой (astgrep)')
+    expect(html).toContain('Общие:')
+    expect(html).toContain('Только база:')
   })
 })
 
@@ -325,7 +325,7 @@ describe('renderHtml — harness preparation, pack signal, safety, contamination
     const report = threeVariantsReport()
     const withPrep: Report = { ...report, prep: buildPrep() }
     const html = renderHtml(withPrep)
-    expect(html).toContain('<th>Step</th><th>Pack</th><th>Variant</th><th>Run</th><th>Result</th><th>Wall-clock</th><th>Artifact hash</th>')
+    expect(html).toContain('<th>Шаг</th><th>Пакет</th><th>Вариант</th><th>Запуск</th><th>Результат</th><th>Wall-clock</th><th>Хеш артефакта</th>')
     expect(html).toContain('<td>setup</td><td>graphify</td><td>graphify</td>')
   })
 
@@ -341,10 +341,10 @@ describe('renderHtml — harness preparation, pack signal, safety, contamination
     const astgrep = makeVariantAggregates('astgrep')
     const report = makeReportV2({ metrics: makeMetricsReport({ variants: [base, graphify, astgrep] }) })
     const html = renderHtml(report)
-    expect(html).toContain('graphify</strong> (variant graphify): 3 call(s)')
-    expect(html).toContain('graphify</strong> (variant base): 2 call(s) — foreign')
-    expect(html).toContain('<th>Variant</th><th>Run</th><th>Command</th><th>Completed</th><th>Exit</th>')
-    expect(html).toContain('<th>Kind</th><th>Variant</th><th>Pack</th><th>Run</th><th>Detail</th>')
+    expect(html).toContain('graphify</strong> (вариант graphify): 3 вызова')
+    expect(html).toContain('graphify</strong> (вариант base): 2 вызова — чужой')
+    expect(html).toContain('<th>Вариант</th><th>Запуск</th><th>Команда</th><th>Завершено</th><th>Выход</th>')
+    expect(html).toContain('<th>Тип</th><th>Вариант</th><th>Пакет</th><th>Запуск</th><th>Детали</th>')
   })
 
   it('a variant-level install-drift signal (WP7 sentinel pack: "") renders "—" in the Pack cell, not empty', () => {
@@ -385,10 +385,10 @@ describe('renderHtml — harness preparation, pack signal, safety, contamination
     }
     const html = renderHtml(shared)
     // The informational note (`exercisedHtml`) embeds raw `<code>` markup and
-    // is not HTML-escaped; the warning (`alertsHtml`) is — hence the
-    // differing quote encoding below.
-    expect(html).toContain('Pack was never called directly on variant "graphify"')
-    expect(html).toContain('Pack never invoked on variant &quot;astgrep&quot; — the pack contributed nothing')
+    // is never escaped; the warning (`alertsHtml`) is escaped once as a
+    // whole — both now quote the variant name with the same «guillemets».
+    expect(html).toContain('Пакет ни разу не был вызван напрямую на варианте «graphify»')
+    expect(html).toContain('Пакет ни разу не вызван на варианте «astgrep» — пакет не внёс никакого вклада')
   })
 
   it('B7 regression: a pairIncomplete delta gets its own summary banner', () => {
@@ -401,15 +401,15 @@ describe('renderHtml — harness preparation, pack signal, safety, contamination
       },
     }
     const html = renderHtml(broken)
-    expect(html).toContain('astgrep — baseline or this variant produced zero samples')
+    expect(html).toContain('astgrep — у базового варианта или у этого варианта получено ноль замеров')
   })
 })
 
 describe('renderHtml — secondary metrics', () => {
   it('one collapsible block per variant', () => {
     const html = renderHtml(threeVariantsReport())
-    expect(html).toContain('base secondary')
-    expect(html).toContain('graphify secondary')
-    expect(html).toContain('astgrep secondary')
+    expect(html).toContain('base: дополнительные метрики')
+    expect(html).toContain('graphify: дополнительные метрики')
+    expect(html).toContain('astgrep: дополнительные метрики')
   })
 })
