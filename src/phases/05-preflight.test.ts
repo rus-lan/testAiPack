@@ -5,8 +5,17 @@ import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, writeFile, symlink, removeDir } from '../util/fs.js'
 import { preflight } from './05-preflight.js'
 import type { PreflightInputExt } from './05-preflight.js'
-import type { RunInput, Manifest, PreflightCheck } from '@generated/types'
-import type { PackInstallOutcome } from './03-pack-install.js'
+import type {
+  HomeCheckTarget,
+  Manifest,
+  PackSpec,
+  PreflightCheck,
+  RunInput,
+  TimeoutConfig,
+  VariantHomesForCheck,
+  VariantSpec,
+} from '@generated/types'
+import type { PackInstallOutcome, PackDeliveryExt } from './03-pack-install.js'
 
 vi.mock('../opencode/cli.js', () => ({
   OpencodeError: class extends Error {
@@ -69,6 +78,48 @@ vi.mock('../isolation/docker-runner.js', () => ({
   },
 }))
 
+// TODO(WP15): unmock — WP2 owns 00-cli-parse.ts and has not implemented
+// packsOf/foreignPacksOf yet. These stand-ins implement exactly the spec'd
+// signatures from 02-phases.md's shared conveniences (name-resolution over
+// runInput.packs / VariantSpec.packs, foreign = union(others) - own).
+// Default (real) behavior for the mocked helpers below — kept as plain
+// functions so individual tests can override just one via
+// `foreignPacksOfMock.mockReturnValueOnce(...)` etc. to isolate a gate's own
+// logic from what a real WP2 implementation could produce.
+const defaultPacksOf = (runInput: RunInput, v: VariantSpec): readonly PackSpec[] =>
+  v.packs.map((name) => runInput.packs.find((p) => p.name === name)).filter((p): p is PackSpec => p !== undefined)
+
+const defaultForeignPacksOf = (runInput: RunInput, v: VariantSpec): readonly PackSpec[] => {
+  const own = new Set(v.packs)
+  const foreignNames = new Set<string>()
+  for (const other of runInput.variants) {
+    if (other.name === v.name) continue
+    for (const name of other.packs) {
+      if (!own.has(name)) foreignNames.add(name)
+    }
+  }
+  return runInput.packs.filter((p) => foreignNames.has(p.name))
+}
+
+const defaultEffectiveOf = (
+  v: VariantSpec,
+  g: string | undefined,
+  key: 'prompt' | 'init' | 'model' | 'hint' | 'verify',
+): string | undefined => {
+  const local = (v as unknown as Record<string, unknown>)[key]
+  if (local === '') return undefined
+  if (typeof local === 'string') return local
+  return g
+}
+
+vi.mock('./00-cli-parse.js', () => ({
+  // TODO(WP15): unmock — WP2 owns 00-cli-parse.ts and has not implemented
+  // packsOf/foreignPacksOf/effectiveOf yet.
+  packsOf: vi.fn(),
+  foreignPacksOf: vi.fn(),
+  effectiveOf: vi.fn(),
+}))
+
 const { version, run, OpencodeError } = await import('../opencode/cli.js')
 const versionMock = vi.mocked(version)
 const runMock = vi.mocked(run)
@@ -77,11 +128,15 @@ const ensureImageMock = vi.mocked(ensureImage)
 const dockerRunMock = vi.mocked(dockerRun)
 const { spawnProcess } = await import('../opencode/spawn.js')
 const spawnMock = vi.mocked(spawnProcess)
+const { packsOf, foreignPacksOf, effectiveOf } = await import('./00-cli-parse.js')
+const packsOfMock = vi.mocked(packsOf)
+const foreignPacksOfMock = vi.mocked(foreignPacksOf)
+const effectiveOfMock = vi.mocked(effectiveOf)
 
 const runP = <A, E>(fa: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(fa)
 const runFlip = <A, E>(fa: Effect.Effect<A, E>): Promise<E> => Effect.runPromise(Effect.flip(fa))
 
-const baseTimeouts = {
+const baseTimeouts: TimeoutConfig = {
   preflightSeconds: 30,
   runSeconds: 60,
   verifySeconds: 60,
@@ -90,9 +145,14 @@ const baseTimeouts = {
 }
 
 const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
+  schemaVersion: 2,
   repoUrl: 'https://example.com/repo.git',
   prompt: 'do thing',
   runs: 1,
+  parallel: 1,
+  baseline: 'base',
+  packs: [],
+  variants: [{ name: 'base', packs: [] }],
   isolation: 'home',
   auth: {
     opencode: true,
@@ -104,10 +164,7 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
     ssh: false,
     git: false,
   },
-  pureBaseline: true,
   protectGit: false,
-  allowBaselineTool: false,
-  initSide: 'both',
   preflightEnabled: true,
   preflightModel: 'cheap/model',
   formats: ['md'],
@@ -122,100 +179,122 @@ const makeRunInput = (overrides: Partial<RunInput>): RunInput => ({
 })
 
 const fakeManifest: Manifest = {
+  schemaVersion: 2,
   runId: 'rid',
   timestamp: new Date().toISOString(),
   repoUrl: 'https://example.com/repo.git',
   prompt: 'do thing',
   runs: 1,
+  parallel: 1,
+  baseline: 'base',
+  packs: [],
+  variants: [{ name: 'base', packs: [] }],
   isolation: 'home',
   opencodeVersion: '1.0.0',
   flagDefaults: {},
 }
 
-/** Build a real pair of HOMEs with the build agent in place (as phase 04 leaves them). */
-const buildHomes = async (): Promise<{ old: string; new: string; root: string }> => {
-  const root = makeTempDir()
-  const oldHome = path.join(root, 'home', 'old', 'run-1')
-  const newHome = path.join(root, 'home', 'new', 'run-1')
-  for (const h of [oldHome, newHome]) {
-    await runP(ensureDir(path.join(h, '.config', 'opencode', 'skills')))
-    await runP(ensureDir(path.join(h, '.config', 'opencode', 'agents')))
-    await runP(ensureDir(path.join(h, '.config', 'opencode', 'plugins')))
-    await runP(ensureDir(path.join(h, '.config', 'opencode', 'command')))
-    await runP(writeFile(path.join(h, '.config', 'opencode', 'agents', 'build.md'), '# build\n'))
-  }
-  return { old: oldHome, new: newHome, root }
+/** Build one HOME with the build agent in place (as phase 04 leaves it). */
+const buildHome = async (root: string, variant: string, runIndex: number): Promise<string> => {
+  const home = path.join(root, 'home', variant, `run-${String(runIndex)}`)
+  await runP(ensureDir(path.join(home, '.config', 'opencode', 'skills')))
+  await runP(ensureDir(path.join(home, '.config', 'opencode', 'agents')))
+  await runP(ensureDir(path.join(home, '.config', 'opencode', 'plugins')))
+  await runP(ensureDir(path.join(home, '.config', 'opencode', 'command')))
+  await runP(writeFile(path.join(home, '.config', 'opencode', 'agents', 'build.md'), '# build\n'))
+  return home
 }
 
+/** Build `runs` HOMEs for each named variant; returns { variantName: [homeDir, ...] }. */
+const buildVariantHomes = async (
+  root: string,
+  variants: readonly string[],
+  runs = 1,
+): Promise<Record<string, string[]>> => {
+  const result: Record<string, string[]> = {}
+  for (const v of variants) {
+    const dirs: string[] = []
+    for (let i = 1; i <= runs; i++) {
+      dirs.push(await buildHome(root, v, i))
+    }
+    result[v] = dirs
+  }
+  return result
+}
+
+const homesForCheckOf = (
+  homesByVariant: Record<string, string[]>,
+  pathOverrides?: Record<string, string>,
+): VariantHomesForCheck[] =>
+  Object.entries(homesByVariant).map(([name, dirs]) => ({
+    name,
+    homes: dirs.map(
+      (homeDir): HomeCheckTarget => ({
+        homeDir,
+        ...(pathOverrides?.[name] === undefined ? {} : { pathOverride: pathOverrides[name] }),
+      }),
+    ),
+  }))
+
 const buildInput = (
-  homes: { old: string; new: string; root: string },
+  homesByVariant: Record<string, string[]>,
   runInputOverrides: Partial<RunInput>,
-  packInstall: PackInstallOutcome | undefined,
-): PreflightInputExt => ({
-  runInput: makeRunInput({
-    workspacePath: homes.root,
-    outputPath: path.join(homes.root, 'out'),
-    ...runInputOverrides,
-  }),
-  manifest: { ...fakeManifest, ...(packInstall === undefined ? {} : { packRef: 'github:o/myskill', packType: 'skill' }) },
-  homePaths: { old: homes.old, new: homes.new },
-  ...(packInstall === undefined ? {} : { packInstall }),
-})
+  extra: Partial<Pick<PreflightInputExt, 'packInstall' | 'dockerImage' | 'configs'>> = {},
+): PreflightInputExt => {
+  const runInput = makeRunInput(runInputOverrides)
+  return {
+    runInput,
+    manifest: { ...fakeManifest, variants: runInput.variants, packs: runInput.packs, baseline: runInput.baseline },
+    homesForCheck: homesForCheckOf(homesByVariant),
+    // packInstall is required on the contract (phase 03 always produces one,
+    // even an empty-registry smoke test) — default to "nothing delivered",
+    // overridable per test via `extra.packInstall`.
+    packInstall: packInstallOf([]),
+    ...extra,
+  }
+}
 
 const expectedLogPath = (input: PreflightInputExt): string =>
   path.join(input.runInput.outputPath, 'preflight.log')
 
-const skillOutcome = (packDir: string, name = 'myskill'): PackInstallOutcome => ({
+const skillDelivery = (packName: string, packDir: string, skillName = packName): PackDeliveryExt => ({
+  pack: packName,
   packPath: packDir,
   detectedType: 'skill',
-  installLogPath: '/tmp/install.log',
   registeredIn: ['skills'],
-  instructions: [{ kind: 'skill', name, target: packDir }],
+  instructions: [{ kind: 'skill', name: skillName, target: packDir }],
 })
 
-const pluginOutcome = (name = 'myplugin'): PackInstallOutcome => ({
-  packPath: '',
-  detectedType: 'plugin',
+const packInstallOf = (deliveries: readonly PackDeliveryExt[]): PackInstallOutcome => ({
+  deliveries: [...deliveries],
   installLogPath: '/tmp/install.log',
-  registeredIn: ['plugins'],
-  instructions: [{ kind: 'plugin', name }],
 })
 
-const localPluginOutcome = (target: string, name = 'myplugin'): PackInstallOutcome => ({
-  packPath: '',
-  detectedType: 'all',
-  installLogPath: '/tmp/install.log',
-  registeredIn: ['plugins'],
-  instructions: [{ kind: 'plugin', name, target }],
-})
-
-const configOutcome = (name = 'myserver'): PackInstallOutcome => ({
-  packPath: '',
-  detectedType: 'mcp',
-  installLogPath: '/tmp/install.log',
-  registeredIn: ['mcp'],
-  instructions: [{ kind: 'config', section: 'mcp', name, json: { command: 'npx' } }],
-})
-
-const writeMcpConfig = async (homeDir: string, name: string): Promise<void> => {
-  const cfgDir = path.join(homeDir, '.config', 'opencode')
-  await runP(ensureDir(cfgDir))
-  await runP(
-    writeFile(
-      path.join(cfgDir, 'opencode.json'),
-      JSON.stringify({ mcp: { [name]: { command: 'npx' } } }),
-    ),
-  )
+/**
+ * Registers a minimal real 'skill' instruction for `packName`, delivered
+ * AND made visible (a real SKILL.md symlinked in) in `variant`'s run-1 HOME.
+ * Gate 4/5 now fail loud on a declared/foreign pack with zero recorded
+ * instructions (B1 fix), so gate-6-focused tests that only care about the
+ * `check` command flow still need *some* real delivery for any pack a
+ * variant declares, or gate 4 fails before gate 6 ever runs.
+ */
+const withMinimalDelivery = async (
+  homes: Record<string, string[]>,
+  variant: string,
+  packName: string,
+): Promise<PackDeliveryExt> => {
+  const packDir = makeTempDir('testaipack-pack-src-')
+  await runP(ensureDir(packDir))
+  await runP(writeFile(path.join(packDir, 'SKILL.md'), `# ${packName}\n`))
+  await runP(symlink(packDir, path.join(homes[variant]![0]!, '.config', 'opencode', 'skills', packName)))
+  return skillDelivery(packName, packDir, packName)
 }
 
-/** As phase 04's `applyInstruction` would register a local plugin file. */
-const writePluginConfig = async (homeDir: string, registeredPath: string): Promise<void> => {
-  const cfgDir = path.join(homeDir, '.config', 'opencode')
-  await runP(ensureDir(cfgDir))
-  await runP(
-    writeFile(path.join(cfgDir, 'opencode.json'), JSON.stringify({ plugin: [registeredPath] })),
-  )
-}
+const checkByVariant = (
+  result: { readonly checks: readonly PreflightCheck[] },
+  name: string,
+  variant: string,
+): PreflightCheck | undefined => result.checks.find((c) => c.name === name && c.variant === variant)
 
 describe('phase 05 — preflight', () => {
   beforeEach(() => {
@@ -241,11 +320,18 @@ describe('phase 05 — preflight', () => {
         timedOut: false,
       }),
     )
+    packsOfMock.mockReset()
+    packsOfMock.mockImplementation(defaultPacksOf)
+    foreignPacksOfMock.mockReset()
+    foreignPacksOfMock.mockImplementation(defaultForeignPacksOf)
+    effectiveOfMock.mockReset()
+    effectiveOfMock.mockImplementation(defaultEffectiveOf)
   })
 
   it('--no-preflight → checks=[], allPassed=true, exitCode=0', async () => {
-    const homes = await buildHomes()
-    const input = buildInput(homes, { preflightEnabled: false }, undefined)
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['base'])
+    const input = buildInput(homes, { preflightEnabled: false, workspacePath: root, outputPath: path.join(root, 'out') })
     const result = await runP(preflight(input))
     expect(result.checks).toEqual([])
     expect(result.allPassed).toBe(true)
@@ -253,76 +339,66 @@ describe('phase 05 — preflight', () => {
     expect(result.logPath).toBe(expectedLogPath(input))
   })
 
-  it('all-pass (skill pack) → 9 checks (gates 1-3 per side + gate 4 + gate 5 + gate 6 skipped), exitCode=0', async () => {
-    const homes = await buildHomes()
-    const packDir = makeTempDir('testaipack-pack-src-')
-    await runP(ensureDir(packDir))
-    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
-    // skill visible on new side: create the symlink phase 04 would have made
-    await runP(symlink(packDir, path.join(homes.new, '.config', 'opencode', 'skills', 'myskill')))
-    // probe response mentions the pack name
-    runMock.mockImplementation((_opts) =>
-      Effect.succeed({
-        exitCode: 0,
-        stdout: 'Available skills: myskill',
-        stderr: '',
-        durationMs: 5,
-        timedOut: false,
-      }),
-    )
-    const input = buildInput(homes, {}, skillOutcome(packDir))
+  it('smoke variant (no packs anywhere): gates 1-3 per variant + gate 4/5/6 skip lines, exitCode=0', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['base'])
+    const input = buildInput(homes, { workspacePath: root, outputPath: path.join(root, 'out') })
     const result = await runP(preflight(input))
-    expect(result.allPassed).toBe(true)
     expect(result.exitCode).toBe(0)
-    expect(result.checks.length).toBe(9)
-    expect(result.checks.every((c) => c.passed)).toBe(true)
-    const byName = (name: string, side: string): PreflightCheck | undefined =>
-      result.checks.find((c) => c.name === name && c.side === side)
-    expect(byName('opencode-launch', 'old')).toBeDefined()
-    expect(byName('opencode-launch', 'new')).toBeDefined()
-    expect(byName('auth-ping', 'old')).toBeDefined()
-    expect(byName('auth-ping', 'new')).toBeDefined()
-    expect(byName('build-agent', 'old')).toBeDefined()
-    expect(byName('build-agent', 'new')).toBeDefined()
-    expect(byName('pack-visibility', 'new')).toBeDefined()
-    expect(byName('baseline-identical', 'old')).toBeDefined()
-    expect(byName('pack-functional', 'new')).toBeDefined()
+    expect(result.allPassed).toBe(true)
+    expect(result.checks).toHaveLength(6)
+    expect(checkByVariant(result, 'opencode-launch', 'base')).toBeDefined()
+    expect(checkByVariant(result, 'auth-ping', 'base')).toBeDefined()
+    expect(checkByVariant(result, 'build-agent', 'base')).toBeDefined()
+    expect(checkByVariant(result, 'pack-visibility', 'base')?.details).toBe('skipped (no pack)')
+    expect(checkByVariant(result, 'foreign-pack-absent', 'base')?.details).toBe('skipped (no foreign pack)')
+    expect(checkByVariant(result, 'pack-functional', 'base')?.details).toBe('skipped (no check)')
+    expect(result.packChecks).toBeUndefined()
   })
 
-  it('opencode-launch fail → E_PREFLIGHT_FAILED, exitCode=2', async () => {
-    const homes = await buildHomes()
-    versionMock.mockImplementation(() =>
-      Effect.fail(
-        new OpencodeError({
-          command: 'version',
-          exitCode: 1,
-          stderr: 'command not found',
-          stdout: '',
-          timedOut: false,
-        }),
-      ),
+  it('a variant missing from homesForCheck → E_PREFLIGHT_FAILED, exitCode=2 (pipeline wiring guard)', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['base'])
+    const input = buildInput(
+      homes,
+      { variants: [{ name: 'base', packs: [] }, { name: 'ghost', packs: [] }], workspacePath: root, outputPath: path.join(root, 'out') },
     )
-    const input = buildInput(homes, {}, undefined)
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_FAILED')
     expect(err.context?.['exitCode']).toBe(2)
+    expect(err.context?.['variant']).toBe('ghost')
+  })
+
+  it('3 variants, config order: opencode-launch fails for the SECOND variant only', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a', 'b', 'c'])
+    versionMock.mockImplementation((homeDir: string) =>
+      homeDir === homes['b']![0]
+        ? Effect.fail(new OpencodeError({ command: 'version', exitCode: 1, stderr: 'crash in b', stdout: '', timedOut: false }))
+        : Effect.succeed('1.0.0'),
+    )
+    const input = buildInput(
+      homes,
+      {
+        variants: [{ name: 'a', packs: [] }, { name: 'b', packs: [] }, { name: 'c', packs: [] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+    )
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
     expect(err.context?.['check']).toBe('opencode-launch')
+    expect(err.context?.['variant']).toBe('b')
   })
 
   it('auth-ping timeout → E_PREFLIGHT_TIMEOUT, exitCode=2', async () => {
-    const homes = await buildHomes()
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['base'])
     runMock.mockImplementation(() =>
-      Effect.fail(
-        new OpencodeError({
-          command: 'run',
-          exitCode: null,
-          stderr: '',
-          stdout: '',
-          timedOut: true,
-        }),
-      ),
+      Effect.fail(new OpencodeError({ command: 'run', exitCode: null, stderr: '', stdout: '', timedOut: true })),
     )
-    const input = buildInput(homes, {}, undefined)
+    const input = buildInput(homes, { workspacePath: root, outputPath: path.join(root, 'out') })
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_TIMEOUT')
     expect(err.context?.['exitCode']).toBe(2)
@@ -330,27 +406,31 @@ describe('phase 05 — preflight', () => {
   })
 
   it('auth-ping no credentials → E_AUTH_MISSING, exitCode=2', async () => {
-    const homes = await buildHomes()
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['base'])
     runMock.mockImplementation(() =>
-      Effect.fail(
-        new OpencodeError({
-          command: 'run',
-          exitCode: 1,
-          stderr: 'ANTHROPIC_API_KEY is not set',
-          stdout: '',
-          timedOut: false,
-        }),
-      ),
+      Effect.fail(new OpencodeError({ command: 'run', exitCode: 1, stderr: 'ANTHROPIC_API_KEY is not set', stdout: '', timedOut: false })),
     )
-    const input = buildInput(homes, {}, undefined)
+    const input = buildInput(homes, { workspacePath: root, outputPath: path.join(root, 'out') })
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_AUTH_MISSING')
     expect(err.context?.['exitCode']).toBe(2)
   })
 
-  it('gate 2 (auth-ping) targets runInput.model when set, not preflightModel', async () => {
-    const homes = await buildHomes()
-    const input = buildInput(homes, { model: 'x/y', preflightModel: 'a/b' }, undefined)
+  it('auth-ping targets runInput.model, not preflightModel, for every variant', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a', 'b'])
+    const input = buildInput(
+      homes,
+      {
+        model: 'x/y',
+        preflightModel: 'a/b',
+        variants: [{ name: 'a', packs: [] }, { name: 'b', packs: [] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+    )
     await runP(preflight(input))
     expect(runMock.mock.calls.length).toBeGreaterThanOrEqual(2)
     for (const call of runMock.mock.calls) {
@@ -358,283 +438,620 @@ describe('phase 05 — preflight', () => {
     }
   })
 
-  it('gate 2 (auth-ping) passes no explicit model when runInput.model is unset, even with preflightModel set', async () => {
-    const homes = await buildHomes()
-    const input = buildInput(homes, { preflightModel: 'a/b' }, undefined)
+  // N1: a variant's own model must be probed, not the global one — else
+  // preflight can pass while that variant's real model (baked into its
+  // config at phase 04, used with NO --model flag at phase 06) has broken
+  // auth, deferring the failure to the expensive run phase.
+  it('auth-ping targets a variant\'s OWN model when it overrides the global one', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a', 'b'])
+    const seenModels: Record<string, string | undefined> = {}
+    runMock.mockImplementation((opts: { homeDir: string; model?: string }) => {
+      seenModels[opts.homeDir] = opts.model
+      return Effect.succeed({
+        exitCode: 0,
+        stdout: '{"role":"assistant","text":"OK"}',
+        stderr: '',
+        durationMs: 5,
+        timedOut: false,
+      })
+    })
+    const input = buildInput(homes, {
+      model: 'x/y',
+      variants: [{ name: 'a', packs: [], model: 'own/model' }, { name: 'b', packs: [] }],
+      baseline: 'a',
+      workspacePath: root,
+      outputPath: path.join(root, 'out'),
+    })
     await runP(preflight(input))
-    expect(runMock.mock.calls.length).toBeGreaterThanOrEqual(2)
-    for (const call of runMock.mock.calls) {
-      expect(call[0].model).toBeUndefined()
-    }
+    expect(seenModels[homes['a']![0]!]).toBe('own/model')
+    expect(seenModels[homes['b']![0]!]).toBe('x/y')
   })
 
-  it('gate 5 (baseline-identical) re-run also targets runInput.model, not preflightModel', async () => {
-    const homes = await buildHomes()
-    const packDir = makeTempDir('testaipack-pack-src-')
-    await runP(ensureDir(packDir))
-    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
-    await runP(symlink(packDir, path.join(homes.new, '.config', 'opencode', 'skills', 'myskill')))
-    const input = buildInput(homes, { model: 'x/y', preflightModel: 'a/b' }, skillOutcome(packDir))
-    const result = await runP(preflight(input))
-    expect(result.allPassed).toBe(true)
-    // gate 2 pings old+new, gate 5 re-pings old — at least 3 auth-ping calls total.
-    expect(runMock.mock.calls.length).toBeGreaterThanOrEqual(3)
-    for (const call of runMock.mock.calls) {
-      expect(call[0].model).toBe('x/y')
-    }
-  })
-
-  it('build-agent absent → E_PREFLIGHT_FAILED, exitCode=2', async () => {
-    const homes = await buildHomes()
-    await runP(removeDir(path.join(homes.new, '.config', 'opencode', 'agents', 'build.md')))
-    const input = buildInput(homes, {}, undefined)
+  it('build-agent missing in one variant HOME → E_PREFLIGHT_FAILED, exitCode=2', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['base'])
+    await runP(removeDir(path.join(homes['base']![0]!, '.config', 'opencode', 'agents', 'build.md')))
+    const input = buildInput(homes, { workspacePath: root, outputPath: path.join(root, 'out') })
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_FAILED')
     expect(err.context?.['check']).toBe('build-agent')
   })
 
-  it('pack-visibility skill fail (no SKILL.md) → E_PREFLIGHT_PACK_INVISIBLE, exitCode=3', async () => {
-    const homes = await buildHomes()
+  // ---- gate 4: pack-visibility -------------------------------------------
+
+  it('pack-visibility: declared skill visible → pass, details carries "pack-visibility [<variant>/<pack>]"', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
     const packDir = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(packDir))
-    // no SKILL.md created
-    const input = buildInput(homes, {}, skillOutcome(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    await runP(symlink(packDir, path.join(homes['a']![0]!, '.config', 'opencode', 'skills', 'myskill')))
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }],
+        variants: [{ name: 'a', packs: ['pack-a'] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      { packInstall: packInstallOf([skillDelivery('pack-a', packDir, 'myskill')]) },
+    )
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    const check = checkByVariant(result, 'pack-visibility', 'a')
+    expect(check?.passed).toBe(true)
+    expect(check?.details).toBe('pack-visibility [a/pack-a]')
+  })
+
+  it('pack-visibility: declared skill invisible → E_PREFLIGHT_PACK_INVISIBLE, exitCode=3', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
+    const packDir = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    // no symlink created in a's HOME — never actually registered
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }],
+        variants: [{ name: 'a', packs: ['pack-a'] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      { packInstall: packInstallOf([skillDelivery('pack-a', packDir, 'myskill')]) },
+    )
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
     expect(err.context?.['exitCode']).toBe(3)
     expect(err.context?.['check']).toBe('pack-visibility')
+    expect(err.context?.['variant']).toBe('a')
+    expect(err.context?.['pack']).toBe('pack-a')
   })
 
-  it('pack-visibility skill fail when the NEW-home symlink was never created (pack source has SKILL.md)', async () => {
-    const homes = await buildHomes()
-    const packDir = makeTempDir('testaipack-pack-src-')
-    await runP(ensureDir(packDir))
-    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
-    // deliberately skip creating .config/opencode/skills/myskill in homes.new:
-    // the pack source is fine, but registration into the new HOME never happened
-    const input = buildInput(homes, {}, skillOutcome(packDir))
+  it('pack-visibility: variant with zero declared packs → skip line, exitCode=0', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['smoke'])
+    const input = buildInput(homes, { variants: [{ name: 'smoke', packs: [] }], baseline: 'smoke', workspacePath: root, outputPath: path.join(root, 'out') })
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(checkByVariant(result, 'pack-visibility', 'smoke')?.details).toBe('skipped (no pack)')
+  })
+
+  // B1 (review-gate blocking finding): a declared pack whose delivery
+  // recorded ZERO instructions (phase 03 does not fail a pack whose layout
+  // it fails to recognize — it just delivers nothing, 03-pack-install.ts)
+  // must NOT report a vacuous pass. Zero assertions run is not proof of
+  // visibility, and WP12/phase 07 read `passed: true` as confirmation.
+  it('pack-visibility: declared pack with an EMPTY instruction list → E_PREFLIGHT_FAILED, exitCode=2, not a vacuous pass', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }],
+        variants: [{ name: 'a', packs: ['pack-a'] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      {
+        packInstall: packInstallOf([
+          { pack: 'pack-a', packPath: '/nowhere', detectedType: 'skill', registeredIn: [], instructions: [] },
+        ]),
+      },
+    )
     const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
-    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
+    expect(err.context?.['exitCode']).toBe(2)
     expect(err.context?.['check']).toBe('pack-visibility')
+    expect(err.context?.['variant']).toBe('a')
+    expect(err.context?.['pack']).toBe('pack-a')
   })
 
-  it('pack-visibility skill success (SKILL.md present) → visible regardless of LLM output', async () => {
-    const homes = await buildHomes()
+  // ---- gate 5: foreign-pack-absent ---------------------------------------
+
+  it('foreign-pack-absent: pack correctly absent on a non-declaring variant → pass, details carries the tuple', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a', 'smoke'])
     const packDir = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(packDir))
     await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
-    await runP(symlink(packDir, path.join(homes.new, '.config', 'opencode', 'skills', 'myskill')))
-    runMock.mockImplementation((_opts) =>
-      Effect.succeed({
-        exitCode: 0,
-        stdout: 'no skills here',
-        stderr: '',
-        durationMs: 5,
-        timedOut: false,
-      }),
+    await runP(symlink(packDir, path.join(homes['a']![0]!, '.config', 'opencode', 'skills', 'myskill')))
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }],
+        variants: [{ name: 'a', packs: ['pack-a'] }, { name: 'smoke', packs: [] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      { packInstall: packInstallOf([skillDelivery('pack-a', packDir, 'myskill')]) },
     )
-    const input = buildInput(homes, {}, skillOutcome(packDir))
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
-    expect(result.allPassed).toBe(true)
+    const check = checkByVariant(result, 'foreign-pack-absent', 'smoke')
+    expect(check?.passed).toBe(true)
+    expect(check?.details).toBe('foreign-pack-absent [smoke/pack-a]')
   })
 
-  it('pack-visibility plugin success (plugin file present on new side)', async () => {
-    const homes = await buildHomes()
-    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
-    const input = buildInput(homes, {}, pluginOutcome('myplugin'))
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    expect(result.allPassed).toBe(true)
-  })
-
-  it('pack-visibility plugin invisible → E_PREFLIGHT_PACK_INVISIBLE, exitCode=3', async () => {
-    const homes = await buildHomes()
-    const input = buildInput(homes, {}, pluginOutcome('myplugin'))
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
-    expect(err.context?.['exitCode']).toBe(3)
-  })
-
-  it('pack-visibility local plugin (target set) success — checks the exact delivered filename, not <name>.js', async () => {
-    const homes = await buildHomes()
-    // target's basename is myplugin.mjs, not <name>.js — proves the check
-    // uses the delivered filename, not a `${name}.js` guess.
-    const srcFile = path.join(homes.root, 'src', 'myplugin.mjs')
-    const dstFile = path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.mjs')
-    await runP(writeFile(dstFile, 'export default {}'))
-    await writePluginConfig(homes.new, dstFile)
-    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    expect(result.allPassed).toBe(true)
-  })
-
-  it('pack-visibility local plugin: file copied but opencode.json never registered it → E_PREFLIGHT_PACK_INVISIBLE (the file-present-but-unregistered bug)', async () => {
-    const homes = await buildHomes()
-    const srcFile = path.join(homes.root, 'src', 'myplugin.mjs')
-    // file is delivered, but no opencode.json entry points at it — exactly
-    // what a stale/wrong registered path would also look like from gate 4's
-    // point of view: present on disk, never actually loadable.
-    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.mjs'), 'export default {}'))
-    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
-    expect(err.context?.['exitCode']).toBe(3)
-  })
-
-  it('pack-visibility local plugin: opencode.json registers a path that does not resolve (stale/host-only path) → E_PREFLIGHT_PACK_INVISIBLE', async () => {
-    const homes = await buildHomes()
-    const srcFile = path.join(homes.root, 'src', 'myplugin.mjs')
-    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.mjs'), 'export default {}'))
-    // registered entry points somewhere that does not exist — reproduces a
-    // stale or environment-mismatched path (e.g. a host path under docker).
-    await writePluginConfig(homes.new, '/nowhere/myplugin.mjs')
-    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
-    expect(err.context?.['exitCode']).toBe(3)
-  })
-
-  it('pack-visibility local plugin (target set) invisible when the file was never delivered → E_PREFLIGHT_PACK_INVISIBLE', async () => {
-    const homes = await buildHomes()
-    const srcFile = path.join(homes.root, 'src-myplugin.js')
-    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
-    expect(err.context?.['exitCode']).toBe(3)
-  })
-
-  it('pack-visibility mcp visible (opencode.json has mcp.<name> on new side) → exitCode=0', async () => {
-    const homes = await buildHomes()
-    await writeMcpConfig(homes.new, 'myserver')
-    const input = buildInput(homes, {}, configOutcome('myserver'))
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    expect(result.allPassed).toBe(true)
-  })
-
-  it('pack-visibility mcp absent (no opencode.json on new side) → E_PREFLIGHT_PACK_INVISIBLE, exitCode=3', async () => {
-    const homes = await buildHomes()
-    const input = buildInput(homes, {}, configOutcome('myserver'))
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
-    expect(err.context?.['exitCode']).toBe(3)
-    expect(err.context?.['check']).toBe('pack-visibility')
-  })
-
-  it('smoke-test (no packInstall): gate 4 skipped, exitCode=0 if rest ok', async () => {
-    const homes = await buildHomes()
-    const input = buildInput(homes, {}, undefined)
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    const gate4 = result.checks.find((c) => c.name === 'pack-visibility')
-    expect(gate4).toBeDefined()
-    expect(gate4?.details).toContain('skipped')
-  })
-
-  it('baseline-identical leak (pack symlink on old side) → E_PREFLIGHT_FAILED, exitCode=2', async () => {
-    const homes = await buildHomes()
+  it('foreign-pack-absent: planted foreign skill dir leaks → E_PREFLIGHT_FAILED naming variant, pack, and instruction kind', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a', 'smoke'])
     const packDir = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(packDir))
     await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
-    await runP(symlink(packDir, path.join(homes.new, '.config', 'opencode', 'skills', 'myskill')))
-    // leak: same symlink accidentally on old side
-    await runP(symlink(packDir, path.join(homes.old, '.config', 'opencode', 'skills', 'myskill')))
-    runMock.mockImplementation((_opts) =>
-      Effect.succeed({
-        exitCode: 0,
-        stdout: 'myskill',
-        stderr: '',
-        durationMs: 5,
-        timedOut: false,
-      }),
+    await runP(symlink(packDir, path.join(homes['a']![0]!, '.config', 'opencode', 'skills', 'myskill')))
+    // leak: same skill accidentally planted into smoke's HOME
+    await runP(symlink(packDir, path.join(homes['smoke']![0]!, '.config', 'opencode', 'skills', 'myskill')))
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }],
+        variants: [{ name: 'a', packs: ['pack-a'] }, { name: 'smoke', packs: [] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      { packInstall: packInstallOf([skillDelivery('pack-a', packDir, 'myskill')]) },
     )
-    const input = buildInput(homes, {}, skillOutcome(packDir))
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_FAILED')
-    expect(err.context?.['check']).toBe('baseline-identical')
+    expect(err.context?.['check']).toBe('foreign-pack-absent')
     expect(err.context?.['exitCode']).toBe(2)
+    expect(err.context?.['variant']).toBe('smoke')
+    expect(err.context?.['pack']).toBe('pack-a')
+    expect(err.context?.['instruction']).toBe('skill')
   })
 
-  it('baseline-identical leak (plugin .js file on old side) → E_PREFLIGHT_FAILED, exitCode=2', async () => {
-    const homes = await buildHomes()
-    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
-    // leak: same plugin file (with its .js extension) accidentally on old side
-    await runP(writeFile(path.join(homes.old, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
-    runMock.mockImplementation(() =>
-      Effect.succeed({ exitCode: 0, stdout: 'OK', stderr: '', durationMs: 5, timedOut: false }),
+  it('foreign-pack-absent: single-variant run has nothing foreign → skip line', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
+    const input = buildInput(
+      homes,
+      { packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }], variants: [{ name: 'a', packs: ['pack-a'] }], baseline: 'a', workspacePath: root, outputPath: path.join(root, 'out') },
+      { packInstall: packInstallOf([skillDelivery('pack-a', makeTempDir('testaipack-pack-src-'))]) },
     )
-    const input = buildInput(homes, {}, pluginOutcome('myplugin'))
+    // declared pack must still be visible for gate 4, so symlink it too
+    const packDir = (input.packInstall.deliveries[0] as PackDeliveryExt).packPath
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    await runP(symlink(packDir, path.join(homes['a']![0]!, '.config', 'opencode', 'skills', 'pack-a')))
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(checkByVariant(result, 'foreign-pack-absent', 'a')?.details).toBe('skipped (no foreign pack)')
+  })
+
+  // B1, gate 5 side: symmetric defensive fix — a foreign pack whose delivery
+  // recorded ZERO instructions must not report absence as "proven" either.
+  // Unreachable through a normal preflight() call as long as gate 4 (which
+  // runs first and covers every declared pack, including this one's
+  // declaring variant) already rejects the same empty delivery — so this
+  // test overrides foreignPacksOf directly to exercise gate 5's own guard in
+  // isolation, independent of gate 4's coverage.
+  it('foreign-pack-absent: a foreign pack with an EMPTY instruction list → E_PREFLIGHT_FAILED, exitCode=2, not a vacuous pass', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['smoke'])
+    foreignPacksOfMock.mockImplementation((runInput: RunInput, v: VariantSpec) =>
+      v.name === 'smoke' ? runInput.packs.filter((p) => p.name === 'pack-a') : defaultForeignPacksOf(runInput, v),
+    )
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }],
+        variants: [{ name: 'smoke', packs: [] }],
+        baseline: 'smoke',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      {
+        packInstall: packInstallOf([
+          { pack: 'pack-a', packPath: '/nowhere', detectedType: 'skill', registeredIn: [], instructions: [] },
+        ]),
+      },
+    )
     const err = await runFlip(preflight(input))
     expect(err.code).toBe('E_PREFLIGHT_FAILED')
-    expect(err.context?.['check']).toBe('baseline-identical')
     expect(err.context?.['exitCode']).toBe(2)
+    expect(err.context?.['check']).toBe('foreign-pack-absent')
+    expect(err.context?.['variant']).toBe('smoke')
+    expect(err.context?.['pack']).toBe('pack-a')
   })
 
-  it('baseline-identical leak (local plugin file, target set) on old side → E_PREFLIGHT_FAILED, exitCode=2', async () => {
-    const homes = await buildHomes()
-    const srcFile = path.join(homes.root, 'src', 'myplugin.js')
-    const dstFile = path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js')
-    await runP(writeFile(dstFile, 'module.exports={}'))
-    await writePluginConfig(homes.new, dstFile)
-    // leak: same delivered filename accidentally on old side
-    await runP(writeFile(path.join(homes.old, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
-    runMock.mockImplementation(() =>
-      Effect.succeed({ exitCode: 0, stdout: 'OK', stderr: '', durationMs: 5, timedOut: false }),
+  it('docker mode: foreign-pack-absent leak check fails loudly on a docker infra error, not silently "no leak"', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a', 'smoke'])
+    const packDir = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(packDir))
+    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
+    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
+      opts.homeDir === homes['a']![0]
+        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
+        : Effect.fail(new DockerError({ command: 'run', exitCode: 125, stderr: 'Error: No such image', timedOut: false })),
     )
-    const input = buildInput(homes, {}, localPluginOutcome(srcFile, 'myplugin'))
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_FAILED')
-    expect(err.context?.['check']).toBe('baseline-identical')
-    expect(err.context?.['exitCode']).toBe(2)
-  })
-
-  it('agent pack visible on new side → exitCode=0', async () => {
-    const homes = await buildHomes()
-    const mdSrc = makeTempDir('testaipack-pack-src-')
-    await runP(ensureDir(mdSrc))
-    await runP(writeFile(path.join(mdSrc, 'deploy.md'), '# deploy\n'))
-    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'agents', 'deploy.md'), '# deploy\n'))
-    const outcome: PackInstallOutcome = {
-      packPath: path.join(mdSrc, 'deploy.md'),
-      detectedType: 'agent',
-      installLogPath: '/tmp/install.log',
-      registeredIn: ['agents'],
-      instructions: [{ kind: 'file', section: 'agents', name: 'deploy', target: path.join(mdSrc, 'deploy.md') }],
+    const input: PreflightInputExt = {
+      ...buildInput(
+        homes,
+        {
+          isolation: 'docker',
+          packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }],
+          variants: [{ name: 'a', packs: ['pack-a'] }, { name: 'smoke', packs: [] }],
+          baseline: 'a',
+          workspacePath: root,
+          outputPath: path.join(root, 'out'),
+        },
+        { packInstall: packInstallOf([skillDelivery('pack-a', packDir)]) },
+      ),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
     }
-    const input = buildInput(homes, {}, outcome)
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PREFLIGHT_FAILED')
+    expect(err.context?.['check']).toBe('foreign-pack-absent')
+    expect(err.message).toContain('cannot verify')
+  })
+
+  // ---- gate 6: pack-functional -------------------------------------------
+  //
+  // 3-variant matrix: pack-a declared by variant 'a', pack-b declared by
+  // variant 'b', 'smoke' declares neither. Each pack's check is a
+  // marker-file probe (`test -f marker-<pack>.txt` under HOME) — simulated
+  // deterministically here by keying the spawn mock on `cwd` (the exact HOME
+  // dir passed through by `runShellInHome`), the same technique the v1 suite
+  // used for `--pack-check` routing.
+  const matrixVariants = (): VariantSpec[] => [
+    { name: 'a', packs: ['pack-a'] },
+    { name: 'b', packs: ['pack-b'] },
+    { name: 'smoke', packs: [] },
+  ]
+  const matrixPacks = (): PackSpec[] => [
+    { name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker-pack-a.txt' },
+    { name: 'pack-b', ref: 'github:o/pack-b', check: 'test -f marker-pack-b.txt' },
+  ]
+
+  it('gate 6 matrix: declared packs functional, foreign packs absent everywhere → all pass, packChecks = variants × packs-with-check', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a', 'b', 'smoke'])
+    // "marker present" ⇔ this HOME has the given pack's tool: a → pack-a only, b → pack-b only, smoke → neither.
+    const packPresentAtHome: Record<string, string> = {
+      [homes['a']![0]!]: 'pack-a',
+      [homes['b']![0]!]: 'pack-b',
+    }
+    spawnMock.mockImplementation((opts: { cwd: string; args: readonly string[] }) => {
+      const cmd = opts.args[1] ?? ''
+      const wantsPack = cmd.includes('pack-a') ? 'pack-a' : 'pack-b'
+      const present = packPresentAtHome[opts.cwd]
+      return Effect.succeed({
+        exitCode: present === wantsPack ? 0 : 1,
+        stdout: '',
+        stderr: '',
+        durationMs: 2,
+        timedOut: false,
+      })
+    })
+    const input = buildInput(
+      homes,
+      {
+        packs: matrixPacks(),
+        variants: matrixVariants(),
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      {
+        packInstall: packInstallOf([
+          await withMinimalDelivery(homes, 'a', 'pack-a'),
+          await withMinimalDelivery(homes, 'b', 'pack-b'),
+        ]),
+      },
+    )
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
+    expect(result.packChecks).toHaveLength(6) // 3 variants × 2 packs-with-check × 1 HOME
+    expect(result.checks.some((c) => c.variant === 'a' && c.details === 'pack-functional [pack-a @ a] 1/1 HOME(s) verified')).toBe(true)
+    expect(result.checks.some((c) => c.variant === 'a' && c.details === 'pack-functional [pack-b @ a] 1/1 HOME(s) verified')).toBe(true)
+    expect(result.checks.some((c) => c.variant === 'b' && c.details === 'pack-functional [pack-b @ b] 1/1 HOME(s) verified')).toBe(true)
+    expect(result.checks.some((c) => c.variant === 'smoke' && c.details === 'pack-functional [pack-a @ smoke] 1/1 HOME(s) verified')).toBe(true)
   })
+
+  it('gate 6: declared pack not functional → E_PACK_CHECK_FAILED exitCode=3 reason=declared-not-functional', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 1, stdout: '', stderr: '', durationMs: 2, timedOut: false }),
+    )
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker.txt' }],
+        variants: [{ name: 'a', packs: ['pack-a'] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      { packInstall: packInstallOf([await withMinimalDelivery(homes, 'a', 'pack-a')]) },
+    )
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['reason']).toBe('declared-not-functional')
+    expect(err.context?.['variant']).toBe('a')
+    expect(err.context?.['pack']).toBe('pack-a')
+  })
+
+  // N2: pins that allowPacks only ever rescues the FOREIGN direction — a
+  // "simplification" that also checks `allowed` on the declared branch would
+  // keep every other test green while silently letting a broken declared
+  // pack through.
+  it('gate 6: allowPacks does NOT rescue a DECLARED pack that fails its own check', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 1, stdout: '', stderr: '', durationMs: 2, timedOut: false }),
+    )
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker.txt' }],
+        variants: [{ name: 'a', packs: ['pack-a'], allowPacks: ['pack-a'] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      { packInstall: packInstallOf([await withMinimalDelivery(homes, 'a', 'pack-a')]) },
+    )
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['reason']).toBe('declared-not-functional')
+  })
+
+  it('gate 6: foreign pack unexpectedly functional (no allowPacks) → E_PACK_CHECK_FAILED exitCode=3 reason=foreign-tool-present', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['smoke'])
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 2, timedOut: false }),
+    )
+    const input = buildInput(homes, {
+      packs: [{ name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker.txt' }],
+      variants: [{ name: 'smoke', packs: [] }],
+      baseline: 'smoke',
+      workspacePath: root,
+      outputPath: path.join(root, 'out'),
+    })
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(3)
+    expect(err.context?.['reason']).toBe('foreign-tool-present')
+  })
+
+  it('gate 6: allowPacks downgrades an unexpectedly-functional foreign pack to an overridden pass', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['smoke'])
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 2, timedOut: false }),
+    )
+    const input = buildInput(homes, {
+      packs: [{ name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker.txt' }],
+      variants: [{ name: 'smoke', packs: [], allowPacks: ['pack-a'] }],
+      baseline: 'smoke',
+      workspacePath: root,
+      outputPath: path.join(root, 'out'),
+    })
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    const check = checkByVariant(result, 'pack-functional', 'smoke')
+    expect(check?.passed).toBe(true)
+    expect(check?.details).toContain('allowPacks')
+  })
+
+  // Review-gate regression carried over from v1: a missing command exits 127
+  // via the shell (`sh: 1: graphify: not found`), not 1 — on a non-declaring
+  // variant that IS the expected, required outcome, not an infra fault.
+  it('gate 6: non-declaring variant exits 127 (command not found) → PASS, the invariant holds', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['smoke'])
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 127, stdout: '', stderr: 'sh: 1: graphify: not found', durationMs: 2, timedOut: false }),
+    )
+    const input = buildInput(homes, {
+      packs: [{ name: 'pack-a', ref: 'github:o/pack-a', check: 'graphify --version' }],
+      variants: [{ name: 'smoke', packs: [] }],
+      baseline: 'smoke',
+      workspacePath: root,
+      outputPath: path.join(root, 'out'),
+    })
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(result.packChecks?.[0]?.exitCode).toBe(127)
+  })
+
+  it('gate 6: the check itself times out → E_PACK_CHECK_FAILED exitCode=2, infra failure', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
+    spawnMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: -1, stdout: '', stderr: '', durationMs: 2, timedOut: true }),
+    )
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker.txt' }],
+        variants: [{ name: 'a', packs: ['pack-a'] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      { packInstall: packInstallOf([await withMinimalDelivery(homes, 'a', 'pack-a')]) },
+    )
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['exitCode']).toBe(2)
+    expect(err.context?.['timedOut']).toBe(true)
+  })
+
+  it('gate 6: no pack in the registry declares a check → skip line per variant, exitCode=0', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }],
+        variants: [{ name: 'a', packs: ['pack-a'] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      { packInstall: packInstallOf([await withMinimalDelivery(homes, 'a', 'pack-a')]) },
+    )
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    const check = checkByVariant(result, 'pack-functional', 'a')
+    expect(check?.details).toBe('skipped (no check)')
+    expect(result.packChecks).toBeUndefined()
+  })
+
+  it('gate 6 (multi-HOME): run-2 fails while run-1 passes → fails loudly naming runIndex=2 (04b copy-out gap)', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'], 2)
+    spawnMock.mockImplementation((opts: { cwd: string }) =>
+      Effect.succeed({
+        exitCode: opts.cwd === homes['a']![0] ? 0 : 1,
+        stdout: '',
+        stderr: '',
+        durationMs: 2,
+        timedOut: false,
+      }),
+    )
+    const input = buildInput(
+      homes,
+      {
+        packs: [{ name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker.txt' }],
+        variants: [{ name: 'a', packs: ['pack-a'] }],
+        baseline: 'a',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      { packInstall: packInstallOf([await withMinimalDelivery(homes, 'a', 'pack-a')]) },
+    )
+    const err = await runFlip(preflight(input))
+    expect(err.code).toBe('E_PACK_CHECK_FAILED')
+    expect(err.context?.['reason']).toBe('declared-not-functional')
+    expect(err.context?.['runIndex']).toBe(2)
+  })
+
+  it('gate 6 (home mode): forwards each HOME its own pathOverride as PATH', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a', 'smoke'])
+    const seenPaths: Record<string, string | undefined> = {}
+    spawnMock.mockImplementation((opts: { cwd: string; env?: Record<string, string> }) => {
+      seenPaths[opts.cwd] = opts.env?.['PATH']
+      return Effect.succeed({
+        exitCode: opts.cwd === homes['a']![0] ? 0 : 1,
+        stdout: '',
+        stderr: '',
+        durationMs: 2,
+        timedOut: false,
+      })
+    })
+    const pathOverrides = { a: '/a/.local/bin:/usr/bin', smoke: '/smoke/.local/bin:/usr/bin' }
+    const input: PreflightInputExt = {
+      ...buildInput(
+        homes,
+        {
+          packs: [{ name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker.txt' }],
+          variants: [{ name: 'a', packs: ['pack-a'] }, { name: 'smoke', packs: [] }],
+          baseline: 'a',
+          workspacePath: root,
+          outputPath: path.join(root, 'out'),
+        },
+        { packInstall: packInstallOf([await withMinimalDelivery(homes, 'a', 'pack-a')]) },
+      ),
+      homesForCheck: homesForCheckOf(homes, pathOverrides),
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(seenPaths[homes['a']![0]!]).toBe('/a/.local/bin:/usr/bin')
+    expect(seenPaths[homes['smoke']![0]!]).toBe('/smoke/.local/bin:/usr/bin')
+  })
+
+  it('gate 6 (docker mode): runs through dockerRun, same pass/fail semantics', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
+    dockerRunMock.mockImplementation(() =>
+      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 2, timedOut: false }),
+    )
+    const input: PreflightInputExt = {
+      // dockerRunMock above always succeeds, so gate 4's visibility probe
+      // (also routed through dockerRun in docker mode) passes regardless of
+      // real file content — a dummy path is enough here, unlike the home-mode
+      // tests where `withMinimalDelivery` has to create a real symlink.
+      ...buildInput(
+        homes,
+        {
+          isolation: 'docker',
+          packs: [{ name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker.txt' }],
+          variants: [{ name: 'a', packs: ['pack-a'] }],
+          baseline: 'a',
+          workspacePath: root,
+          outputPath: path.join(root, 'out'),
+        },
+        { packInstall: packInstallOf([skillDelivery('pack-a', '/dummy/pack-src', 'pack-a')]) },
+      ),
+      dockerImage: DEFAULT_OPENCODE_IMAGE,
+    }
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+    expect(result.packChecks).toHaveLength(1)
+  })
+
+  // ---- docker mode: gates 1/4 mechanics (kept for regression) -----------
 
   it('docker mode: gate 1 calls ensureImage then version with the image', async () => {
-    const homes = await buildHomes()
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
     const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker' }, undefined),
+      ...buildInput(homes, { isolation: 'docker', variants: [{ name: 'a', packs: [] }], baseline: 'a', workspacePath: root, outputPath: path.join(root, 'out') }),
       dockerImage: DEFAULT_OPENCODE_IMAGE,
     }
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
     expect(ensureImageMock).toHaveBeenCalledWith(DEFAULT_OPENCODE_IMAGE)
-    // version invoked with the docker exec spec for both sides
     const dockerCalls = versionMock.mock.calls.filter(
       (c) => (c[1] as { image?: string } | undefined)?.image !== undefined,
     )
-    expect(dockerCalls.length).toBeGreaterThanOrEqual(2)
-    expect((dockerCalls[0]?.[1] as { image: string }).image).toBe(DEFAULT_OPENCODE_IMAGE)
+    expect(dockerCalls.length).toBeGreaterThanOrEqual(1)
   })
 
   it('docker mode: ensureImage failure → E_PREFLIGHT_FAILED (image unavailable)', async () => {
-    const homes = await buildHomes()
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
     ensureImageMock.mockImplementation(() =>
-      Effect.fail(
-        new DockerError({ command: 'pull', exitCode: 1, stderr: 'manifest unknown', timedOut: false }),
-      ),
+      Effect.fail(new DockerError({ command: 'pull', exitCode: 1, stderr: 'manifest unknown', timedOut: false })),
     )
     const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker' }, undefined),
+      ...buildInput(homes, { isolation: 'docker', variants: [{ name: 'a', packs: [] }], baseline: 'a', workspacePath: root, outputPath: path.join(root, 'out') }),
       dockerImage: 'opencode/missing:latest',
     }
     const err = await runFlip(preflight(input))
@@ -642,603 +1059,32 @@ describe('phase 05 — preflight', () => {
     expect(err.context?.['check']).toBe('opencode-launch')
     expect(err.message).toContain('unavailable')
     expect(err.message).toContain('build-docker-image.sh')
-    expect(err.message).toContain('manifest unknown')
     expect(err.context?.['image']).toBe('opencode/missing:latest')
   })
 
-  it('docker mode: auth-ping runs through the container (run called with docker spec)', async () => {
-    const homes = await buildHomes()
-    runMock.mockImplementation((opts: { docker?: { image: string } }) =>
-      Effect.succeed({
-        exitCode: 0,
-        stdout: opts.docker !== undefined ? 'OK-docker' : 'OK',
-        stderr: '',
-        durationMs: 5,
-        timedOut: false,
-      }),
-    )
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker' }, undefined),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-    }
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    const dockerRunCalls = runMock.mock.calls.filter(
-      (c) => (c[0] as { docker?: { image: string } } | undefined)?.docker !== undefined,
-    )
-    expect(dockerRunCalls.length).toBeGreaterThan(0)
-    expect((dockerRunCalls[0]?.[0] as { docker: { image: string } }).docker.image).toBe(
-      DEFAULT_OPENCODE_IMAGE,
-    )
-  })
-
-  it('docker mode with --docker-network: auth-ping runs with the network in the docker spec', async () => {
-    const homes = await buildHomes()
-    runMock.mockImplementation((opts: { docker?: { image: string; network?: string } }) =>
-      Effect.succeed({
-        exitCode: 0,
-        stdout: opts.docker !== undefined ? 'OK-docker' : 'OK',
-        stderr: '',
-        durationMs: 5,
-        timedOut: false,
-      }),
-    )
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker', dockerNetwork: 'host' }, undefined),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-    }
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    const dockerRunCalls = runMock.mock.calls.filter(
-      (c) => (c[0] as { docker?: { image: string; network?: string } } | undefined)?.docker !== undefined,
-    )
-    expect(dockerRunCalls.length).toBeGreaterThan(0)
-    expect(
-      (dockerRunCalls[0]?.[0] as { docker: { image: string; network?: string } }).docker.network,
-    ).toBe('host')
-  })
-
-  it('docker mode: gate 4 trusts the container, not the host — host has no SKILL.md but the container check succeeds → visible', async () => {
-    const homes = await buildHomes()
+  it('docker mode: gate 4 trusts the container, not the host', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['a'])
     const packDir = makeTempDir('testaipack-pack-src-')
     await runP(ensureDir(packDir))
     await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
-    // deliberately no file under homes.new/.config/opencode/skills/myskill —
-    // the host filesystem alone would say "not visible". Gate 5 also
-    // re-checks the SAME instruction against homes.old (must stay absent
-    // there), so the mock discriminates by which HOME it was asked about.
+    // deliberately no file under homes.a/.config/opencode/skills/myskill —
+    // the host filesystem alone would say "not visible".
     dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
-      opts.homeDir === homes.new
+      opts.homeDir === homes['a']![0]
         ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
         : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false })),
     )
     const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker' }, skillOutcome(packDir)),
+      ...buildInput(
+        homes,
+        { isolation: 'docker', packs: [{ name: 'pack-a', ref: 'github:o/pack-a' }], variants: [{ name: 'a', packs: ['pack-a'] }], baseline: 'a', workspacePath: root, outputPath: path.join(root, 'out') },
+        { packInstall: packInstallOf([skillDelivery('pack-a', packDir, 'myskill')]) },
+      ),
       dockerImage: DEFAULT_OPENCODE_IMAGE,
     }
     const result = await runP(preflight(input))
     expect(result.exitCode).toBe(0)
     expect(dockerRunMock).toHaveBeenCalled()
-  })
-
-  it('docker mode: gate 4 rejects a HOST-only match — file exists on host but the container check fails → E_PREFLIGHT_PACK_INVISIBLE (the exact dangling-symlink-outside-the-mount bug)', async () => {
-    const homes = await buildHomes()
-    const packDir = makeTempDir('testaipack-pack-src-')
-    await runP(ensureDir(packDir))
-    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
-    // present on the host (as a dangling-symlink-outside-any-mount would
-    // resolve pre-fix), but the container itself cannot see it.
-    await runP(ensureDir(path.join(homes.new, '.config', 'opencode', 'skills', 'myskill')))
-    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'skills', 'myskill', 'SKILL.md'), '# myskill\n'))
-    dockerRunMock.mockImplementation(() =>
-      Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false })),
-    )
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker' }, skillOutcome(packDir)),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-    }
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
-    expect(err.context?.['exitCode']).toBe(3)
-    expect(err.context?.['check']).toBe('pack-visibility')
-  })
-
-  it('docker mode: local plugin visible when opencode.json registers a container path (/home/opencode/...), not the host path', async () => {
-    const homes = await buildHomes()
-    const srcFile = path.join(homes.root, 'src', 'myplugin.js')
-    await runP(writeFile(path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js'), 'module.exports={}'))
-    await writePluginConfig(homes.new, '/home/opencode/.config/opencode/plugins/myplugin.js')
-    // only the NEW home has the file; a /home/opencode/... target is only
-    // "real" when the mount backing it is homes.new (the leak-check re-runs
-    // the same relative path against homes.old, which must stay absent).
-    dockerRunMock.mockImplementation((opts: { homeDir: string; command: readonly string[] }) => {
-      const target = opts.command[2] ?? ''
-      return opts.homeDir === homes.new && target.startsWith('/home/opencode/')
-        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
-        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false }))
-    })
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker' }, localPluginOutcome(srcFile, 'myplugin')),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-    }
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-  })
-
-  it('docker mode: local plugin invisible when opencode.json still registers the HOST-absolute path — reproduces the stale-registration bug that survives even after the file is copied correctly', async () => {
-    const homes = await buildHomes()
-    const srcFile = path.join(homes.root, 'src', 'myplugin.js')
-    const hostDstPath = path.join(homes.new, '.config', 'opencode', 'plugins', 'myplugin.js')
-    await runP(writeFile(hostDstPath, 'module.exports={}'))
-    // the bug: registers the path our own process wrote to, not the path
-    // opencode will see when it reads this config from inside the container.
-    await writePluginConfig(homes.new, hostDstPath)
-    dockerRunMock.mockImplementation((opts: { command: readonly string[] }) => {
-      const target = opts.command[2] ?? ''
-      return target.startsWith('/home/opencode/')
-        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
-        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false }))
-    })
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker' }, localPluginOutcome(srcFile, 'myplugin')),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-    }
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_PACK_INVISIBLE')
-  })
-
-  it('docker mode: baseline-leak check fails loudly on a docker infra error (e.g. missing image) instead of silently reporting "no leak"', async () => {
-    const homes = await buildHomes()
-    const packDir = makeTempDir('testaipack-pack-src-')
-    await runP(ensureDir(packDir))
-    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
-    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
-      opts.homeDir === homes.new
-        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
-        // old-side leak check: an infra failure, NOT a legitimate "file
-        // absent" (exitCode 1) — e.g. exitCode 125 "no such image".
-        : Effect.fail(
-            new DockerError({ command: 'run', exitCode: 125, stderr: 'Error: No such image', timedOut: false }),
-          ),
-    )
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker' }, skillOutcome(packDir)),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-    }
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_FAILED')
-    expect(err.context?.['check']).toBe('baseline-identical')
-    expect(err.message).toContain('cannot verify')
-  })
-
-  it('docker mode: baseline-leak check still treats a plain exit-1 "file not found" as no-leak, not an error', async () => {
-    const homes = await buildHomes()
-    const packDir = makeTempDir('testaipack-pack-src-')
-    await runP(ensureDir(packDir))
-    await runP(writeFile(path.join(packDir, 'SKILL.md'), '# myskill\n'))
-    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
-      opts.homeDir === homes.new
-        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false })
-        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false })),
-    )
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker' }, skillOutcome(packDir)),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-    }
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-  })
-
-  it('gate 6: no --pack-check → skipped, exitCode=0', async () => {
-    const homes = await buildHomes()
-    const input = buildInput(homes, {}, undefined)
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    const gate6 = result.checks.find((c) => c.name === 'pack-functional')
-    expect(gate6?.details).toContain('skipped')
-    expect(gate6?.passed).toBe(true)
-  })
-
-  it('gate 6: new side exit 0, old side exit 1 (expected) → passes, exitCode=0, packChecks recorded', async () => {
-    const homes = await buildHomes()
-    spawnMock.mockImplementation((opts: { cwd: string }) =>
-      Effect.succeed({
-        exitCode: opts.cwd === homes.new ? 0 : 1,
-        stdout: '', stderr: '', durationMs: 3, timedOut: false,
-      }),
-    )
-    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    expect(result.packChecks).toHaveLength(2)
-    expect(result.packChecks?.find((c) => c.side === 'new')?.exitCode).toBe(0)
-    expect(result.packChecks?.find((c) => c.side === 'old')?.exitCode).toBe(1)
-  })
-
-  it('gate 6: new side check fails (tool not functional) → E_PACK_CHECK_FAILED, exitCode=3', async () => {
-    const homes = await buildHomes()
-    spawnMock.mockImplementation((opts: { cwd: string }) =>
-      Effect.succeed({
-        exitCode: opts.cwd === homes.new ? 1 : 1,
-        stdout: '', stderr: '', durationMs: 3, timedOut: false,
-      }),
-    )
-    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PACK_CHECK_FAILED')
-    expect(err.context?.['exitCode']).toBe(3)
-    expect(err.context?.['reason']).toBe('new-side-not-functional')
-  })
-
-  it('gate 6: old side unexpectedly has the tool (exit 0) → E_PACK_CHECK_FAILED, exitCode=3, baseline-already-has-tool', async () => {
-    const homes = await buildHomes()
-    spawnMock.mockImplementation(() =>
-      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false }),
-    )
-    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PACK_CHECK_FAILED')
-    expect(err.context?.['exitCode']).toBe(3)
-    expect(err.context?.['reason']).toBe('baseline-already-has-tool')
-  })
-
-  it('gate 6: --allow-baseline-tool overrides the old-side-has-tool hard fail, with a details note', async () => {
-    const homes = await buildHomes()
-    spawnMock.mockImplementation(() =>
-      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false }),
-    )
-    const input = buildInput(homes, { packCheck: 'mytool --version', allowBaselineTool: true }, undefined)
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    const oldCheck = result.checks.find((c) => c.name === 'pack-functional' && c.side === 'old')
-    expect(oldCheck?.passed).toBe(true)
-    expect(oldCheck?.details).toContain('allow-baseline-tool')
-  })
-
-  // Review-gate regression: a missing command exits 127 via the shell
-  // (`sh: 1: graphify: not found`), not 1 — on the OLD side that IS the
-  // expected, required outcome (the baseline correctly lacks the tool), not
-  // an infra fault. This used to abort the whole experiment.
-  it('gate 6: baseline check exits 127 (command not found) → PASS, the invariant holds', async () => {
-    const homes = await buildHomes()
-    spawnMock.mockImplementation((opts: { cwd: string }) =>
-      Effect.succeed({
-        exitCode: opts.cwd === homes.new ? 0 : 127,
-        stdout: '', stderr: 'sh: 1: graphify: not found', durationMs: 3, timedOut: false,
-      }),
-    )
-    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    expect(result.packChecks?.find((c) => c.side === 'old')?.exitCode).toBe(127)
-  })
-
-  it('gate 6: baseline check exits 1 (ordinary absent) → PASS', async () => {
-    const homes = await buildHomes()
-    spawnMock.mockImplementation((opts: { cwd: string }) =>
-      Effect.succeed({
-        exitCode: opts.cwd === homes.new ? 0 : 1,
-        stdout: '', stderr: '', durationMs: 3, timedOut: false,
-      }),
-    )
-    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-  })
-
-  it('gate 6: new side check exits 127 (command not found) → FAIL, new-side-not-functional', async () => {
-    const homes = await buildHomes()
-    spawnMock.mockImplementation((opts: { cwd: string }) =>
-      Effect.succeed({
-        exitCode: opts.cwd === homes.new ? 127 : 1,
-        stdout: '', stderr: 'sh: 1: mytool: not found', durationMs: 3, timedOut: false,
-      }),
-    )
-    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PACK_CHECK_FAILED')
-    expect(err.context?.['exitCode']).toBe(3)
-    expect(err.context?.['reason']).toBe('new-side-not-functional')
-  })
-
-  it('gate 6: the check itself times out (runner-level failure) on either side → fails loudly, exitCode=2', async () => {
-    const homes = await buildHomes()
-    spawnMock.mockImplementation((opts: { cwd: string }) =>
-      Effect.succeed({
-        exitCode: opts.cwd === homes.new ? -1 : 0,
-        stdout: '', stderr: '', durationMs: 3, timedOut: opts.cwd === homes.new,
-      }),
-    )
-    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PACK_CHECK_FAILED')
-    expect(err.context?.['exitCode']).toBe(2)
-    expect(err.context?.['timedOut']).toBe(true)
-  })
-
-  it('gate 6 (docker mode): a docker-level execution error (timeout) on the old side fails loudly, not read as "tool absent"', async () => {
-    const homes = await buildHomes()
-    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
-      opts.homeDir === homes.new
-        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
-        : Effect.fail(new DockerError({ command: 'run', exitCode: null, stderr: 'docker daemon unreachable', timedOut: true })),
-    )
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker', packCheck: 'mytool --version' }, undefined),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-    }
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PACK_CHECK_FAILED')
-    expect(err.context?.['exitCode']).toBe(2)
-  })
-
-  it('gate 6 (docker mode): runs through dockerRun, same pass/fail semantics', async () => {
-    const homes = await buildHomes()
-    dockerRunMock.mockImplementation((opts: { homeDir: string }) =>
-      opts.homeDir === homes.new
-        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
-        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false })),
-    )
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker', packCheck: 'mytool --version' }, undefined),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-    }
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    expect(result.packChecks).toHaveLength(2)
-  })
-
-  it('gate 6 (home mode): forwards homePathEnv.new/.old as PATH to --pack-check, one value per side', async () => {
-    const homes = await buildHomes()
-    const seenPaths: Record<string, string | undefined> = {}
-    spawnMock.mockImplementation((opts: { cwd: string; env?: Record<string, string> }) => {
-      seenPaths[opts.cwd] = opts.env?.['PATH']
-      return Effect.succeed({
-        exitCode: opts.cwd === homes.new ? 0 : 1,
-        stdout: '', stderr: '', durationMs: 3, timedOut: false,
-      })
-    })
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { packCheck: 'mytool --version' }, undefined),
-      homePathEnv: { new: '/new/.local/bin:/usr/bin', old: '/old/.local/bin:/usr/bin' },
-    }
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    expect(seenPaths[homes.new]).toBe('/new/.local/bin:/usr/bin')
-    expect(seenPaths[homes.old]).toBe('/old/.local/bin:/usr/bin')
-  })
-
-  it('gate 6 (docker mode): forwards homePathEnv.new/.old as -e PATH=<value>, one value per side', async () => {
-    const homes = await buildHomes()
-    const seenPaths: Record<string, string | undefined> = {}
-    dockerRunMock.mockImplementation((opts: { homeDir: string; env?: Record<string, string> }) => {
-      seenPaths[opts.homeDir] = opts.env?.['PATH']
-      return opts.homeDir === homes.new
-        ? Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
-        : Effect.fail(new DockerError({ command: 'run', exitCode: 1, stderr: '', timedOut: false }))
-    })
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { isolation: 'docker', packCheck: 'mytool --version' }, undefined),
-      dockerImage: DEFAULT_OPENCODE_IMAGE,
-      homePathEnv: { new: '/home/opencode/.local/bin:/usr/bin', old: '/home/opencode/.local/bin:/usr/bin' },
-    }
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    expect(seenPaths[homes.new]).toBe('/home/opencode/.local/bin:/usr/bin')
-    expect(seenPaths[homes.old]).toBe('/home/opencode/.local/bin:/usr/bin')
-  })
-
-  it('gate 6: without homePathEnv, PATH is left undefined — inherits the image/host default', async () => {
-    const homes = await buildHomes()
-    let sawPath: string | undefined = 'unset'
-    spawnMock.mockImplementation((opts: { cwd: string; env?: Record<string, string> }) => {
-      if (opts.cwd === homes.new) sawPath = opts.env?.['PATH']
-      return Effect.succeed({
-        exitCode: opts.cwd === homes.new ? 0 : 1,
-        stdout: '', stderr: '', durationMs: 3, timedOut: false,
-      })
-    })
-    const input = buildInput(homes, { packCheck: 'mytool --version' }, undefined)
-    await runP(preflight(input))
-    expect(sawPath).toBe(process.env['PATH'])
-  })
-
-  // Real-incident regression (testaipack run b7d56c): 04b-pack-setup copies
-  // the one HOME it installed into over every other new HOME, and until now
-  // gate 6 only ever checked `homePaths.new`/`.old` (run-1's HOME) — proving
-  // nothing about the rest. `homesForCheck` makes the gate check every HOME.
-  const buildSecondHomes = async (root: string): Promise<{ old2: string; new2: string }> => {
-    const oldHome2 = path.join(root, 'home', 'old', 'run-2')
-    const newHome2 = path.join(root, 'home', 'new', 'run-2')
-    for (const h of [oldHome2, newHome2]) {
-      await runP(ensureDir(path.join(h, '.config', 'opencode', 'skills')))
-      await runP(ensureDir(path.join(h, '.config', 'opencode', 'agents')))
-      await runP(ensureDir(path.join(h, '.config', 'opencode', 'plugins')))
-      await runP(ensureDir(path.join(h, '.config', 'opencode', 'command')))
-      await runP(writeFile(path.join(h, '.config', 'opencode', 'agents', 'build.md'), '# build\n'))
-    }
-    return { old2: oldHome2, new2: newHome2 }
-  }
-
-  it('gate 6 (multi-HOME): run-2 new HOME fails while run-1 passes (incomplete copy) → fails loudly before any run/exercise, exitCode=3, runIndex=2', async () => {
-    const homes = await buildHomes()
-    const { old2, new2 } = await buildSecondHomes(homes.root)
-    spawnMock.mockImplementation((opts: { cwd: string }) => {
-      if (opts.cwd === homes.new) {
-        return Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
-      }
-      if (opts.cwd === new2) {
-        return Effect.succeed({
-          exitCode: 127,
-          stdout: '', stderr: 'sh: 1: graphify: not found', durationMs: 3, timedOut: false,
-        })
-      }
-      return Effect.succeed({ exitCode: 1, stdout: '', stderr: '', durationMs: 3, timedOut: false })
-    })
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { packCheck: 'graphify --version' }, undefined),
-      homesForCheck: {
-        new: [{ homeDir: homes.new, pathOverride: undefined }, { homeDir: new2, pathOverride: undefined }],
-        old: [{ homeDir: homes.old, pathOverride: undefined }, { homeDir: old2, pathOverride: undefined }],
-      },
-    }
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PACK_CHECK_FAILED')
-    expect(err.context?.['exitCode']).toBe(3)
-    expect(err.context?.['reason']).toBe('new-side-not-functional')
-    expect(err.context?.['runIndex']).toBe(2)
-  })
-
-  it('gate 6 (multi-HOME): run-2 old HOME unexpectedly has the tool (leaked copy) while run-1 correctly lacks it → fails loudly, runIndex=2', async () => {
-    const homes = await buildHomes()
-    const { old2, new2 } = await buildSecondHomes(homes.root)
-    spawnMock.mockImplementation((opts: { cwd: string }) => {
-      if (opts.cwd === homes.new || opts.cwd === new2) {
-        return Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
-      }
-      if (opts.cwd === old2) {
-        return Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 3, timedOut: false })
-      }
-      return Effect.succeed({ exitCode: 1, stdout: '', stderr: '', durationMs: 3, timedOut: false })
-    })
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { packCheck: 'graphify --version' }, undefined),
-      homesForCheck: {
-        new: [{ homeDir: homes.new, pathOverride: undefined }, { homeDir: new2, pathOverride: undefined }],
-        old: [{ homeDir: homes.old, pathOverride: undefined }, { homeDir: old2, pathOverride: undefined }],
-      },
-    }
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PACK_CHECK_FAILED')
-    expect(err.context?.['reason']).toBe('baseline-already-has-tool')
-    expect(err.context?.['runIndex']).toBe(2)
-  })
-
-  it('gate 6 (multi-HOME): every HOME on both sides passes its invariant → packChecks carries one entry per HOME with the right runIndex', async () => {
-    const homes = await buildHomes()
-    const { old2, new2 } = await buildSecondHomes(homes.root)
-    spawnMock.mockImplementation((opts: { cwd: string }) =>
-      Effect.succeed({
-        exitCode: opts.cwd === homes.new || opts.cwd === new2 ? 0 : 1,
-        stdout: '', stderr: '', durationMs: 3, timedOut: false,
-      }),
-    )
-    const input: PreflightInputExt = {
-      ...buildInput(homes, { packCheck: 'graphify --version' }, undefined),
-      homesForCheck: {
-        new: [{ homeDir: homes.new, pathOverride: undefined }, { homeDir: new2, pathOverride: undefined }],
-        old: [{ homeDir: homes.old, pathOverride: undefined }, { homeDir: old2, pathOverride: undefined }],
-      },
-    }
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    expect(result.packChecks).toHaveLength(4)
-    expect(result.packChecks?.filter((c) => c.side === 'new').map((c) => c.runIndex).sort()).toEqual([1, 2])
-    expect(result.packChecks?.filter((c) => c.side === 'old').map((c) => c.runIndex).sort()).toEqual([1, 2])
-  })
-})
-
-describe('phase 05 — preflight (gates 1-3 for old AND new)', () => {
-  beforeEach(() => {
-    versionMock.mockReset()
-    runMock.mockReset()
-    ensureImageMock.mockReset()
-    ensureImageMock.mockImplementation(() => Effect.void)
-    dockerRunMock.mockReset()
-    dockerRunMock.mockImplementation(() =>
-      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }),
-    )
-    spawnMock.mockReset()
-    spawnMock.mockImplementation(() =>
-      Effect.succeed({ exitCode: 0, stdout: '', stderr: '', durationMs: 1, timedOut: false }),
-    )
-    versionMock.mockImplementation(() => Effect.succeed('1.0.0'))
-    runMock.mockImplementation(() =>
-      Effect.succeed({
-        exitCode: 0,
-        stdout: '{"role":"assistant","text":"OK"}',
-        stderr: '',
-        durationMs: 5,
-        timedOut: false,
-      }),
-    )
-  })
-
-  it('gate 1 fail for new (opencode --version fails in new HOME) → E_PREFLIGHT_FAILED, exit 2', async () => {
-    const homes = await buildHomes()
-    versionMock.mockImplementation((homeDir: string) =>
-      homeDir === homes.new
-        ? Effect.fail(
-            new OpencodeError({
-              command: 'version',
-              exitCode: 1,
-              stderr: 'crash in new HOME',
-              stdout: '',
-              timedOut: false,
-            }),
-          )
-        : Effect.succeed('1.0.0'),
-    )
-    const input = buildInput(homes, {}, undefined)
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_FAILED')
-    expect(err.context?.['exitCode']).toBe(2)
-    expect(err.context?.['check']).toBe('opencode-launch')
-    expect(err.context?.['side']).toBe('new')
-  })
-
-  it('gate 2 fail for new (auth-ping fails in new HOME) → E_PREFLIGHT_FAILED, exit 2', async () => {
-    const homes = await buildHomes()
-    runMock.mockImplementation((opts: { homeDir: string }) =>
-      opts.homeDir === homes.new
-        ? Effect.fail(
-            new OpencodeError({
-              command: 'run',
-              exitCode: 1,
-              stderr: 'HTTP 429 rate limited in new HOME',
-              stdout: '',
-              timedOut: false,
-            }),
-          )
-        : Effect.succeed({
-            exitCode: 0,
-            stdout: '{"role":"assistant","text":"OK"}',
-            stderr: '',
-            durationMs: 5,
-            timedOut: false,
-          }),
-    )
-    const input = buildInput(homes, {}, undefined)
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_FAILED')
-    expect(err.context?.['exitCode']).toBe(2)
-    expect(err.context?.['check']).toBe('auth-ping')
-    expect(err.context?.['side']).toBe('new')
-  })
-
-  it('gate 3 fail for new (build.md absent in new HOME) → E_PREFLIGHT_FAILED, exit 2', async () => {
-    const homes = await buildHomes()
-    await runP(removeDir(path.join(homes.new, '.config', 'opencode', 'agents', 'build.md')))
-    const input = buildInput(homes, {}, undefined)
-    const err = await runFlip(preflight(input))
-    expect(err.code).toBe('E_PREFLIGHT_FAILED')
-    expect(err.context?.['check']).toBe('build-agent')
-    expect(err.context?.['side']).toBe('new')
-  })
-
-  it('gate 5 re-runs gates 1-3 for old (auth-ping invoked twice for old HOME) + pack-leak check', async () => {
-    const homes = await buildHomes()
-    const input = buildInput(homes, {}, undefined)
-    const result = await runP(preflight(input))
-    expect(result.exitCode).toBe(0)
-    // gate 2 runs auth-ping for old once; gate 5 re-runs it for old again → ≥2 calls with homeDir=old
-    const oldCalls = runMock.mock.calls.filter(
-      (c) => (c[0] as { homeDir: string } | undefined)?.homeDir === homes.old,
-    )
-    expect(oldCalls.length).toBeGreaterThanOrEqual(2)
-    // baseline-identical check present and passed
-    const gate5 = result.checks.find((c) => c.name === 'baseline-identical')
-    expect(gate5).toBeDefined()
-    expect(gate5?.passed).toBe(true)
   })
 })
