@@ -256,7 +256,7 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).toContain('## Rebuild provenance')
+    expect(md).toContain('## Провенанс пересборки')
     expect(md).toContain('## Сводка')
   })
 
@@ -321,7 +321,7 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     expect(code).toBe(0)
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
     expect(md).not.toContain('Judge was not requested')
-    expect(md).toContain('requested judging')
+    expect(md).toContain('запрашивал оценку судьи')
     expect(md).toContain('be harsh')
   })
 
@@ -353,9 +353,9 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     expect(existsSync(path.join(tree.results, 'report.html'))).toBe(true)
     const html = await runP(readFile(path.join(tree.results, 'report.html')))
     expect(html).toContain('rebuild-provenance')
-    expect(html).toContain('Rebuild provenance')
+    expect(html).toContain('Провенанс пересборки')
     expect(html).not.toContain('Judge was not requested.')
-    expect(html).toContain('requested judging')
+    expect(html).toContain('запрашивал оценку судьи')
   })
 
   it('a CLI override always wins over run-input.json and is disclosed as supplied', async () => {
@@ -387,9 +387,9 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     expect(titleLine).not.toBe('')
     expect(summaryHeadingLine).not.toBe('')
 
-    expect(md).toContain('## Rebuild provenance')
+    expect(md).toContain('## Провенанс пересборки')
     const titleIndex = md.indexOf(titleLine)
-    const provenanceIndex = md.indexOf('## Rebuild provenance')
+    const provenanceIndex = md.indexOf('## Провенанс пересборки')
     const summaryIndex = md.indexOf(summaryHeadingLine)
     expect(titleIndex).toBeGreaterThanOrEqual(0)
     expect(provenanceIndex).toBeGreaterThan(titleIndex)
@@ -475,7 +475,7 @@ describe('rebuild — prep (results/prep.json read-back)', () => {
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
     ) as { packSetup: { state: string; note: string } }
     expect(prov.packSetup.state).toBe('reused')
-    expect(prov.packSetup.note).toContain('legacy artifact name')
+    expect(prov.packSetup.note).toContain('устаревшее имя артефакта')
   })
 
   it('no prep.json/pack-setup.json, and nothing declared in the manifest -> section genuinely absent', async () => {
@@ -521,7 +521,7 @@ describe('rebuild — prep (results/prep.json read-back)', () => {
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
     ) as { packSetup: { state: string; note: string } }
     expect(prov.packSetup.state).toBe('unavailable')
-    expect(prov.packSetup.note).toContain('not verified evidence')
+    expect(prov.packSetup.note).toContain('не подтверждённое свидетельство')
   })
 })
 
@@ -562,7 +562,7 @@ describe('rebuild — --rejudge (the one opt-in LLM exception)', () => {
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
     ) as { judge: { state: string; note: string } }
     expect(prov.judge.state).toBe('rejudged')
-    expect(prov.judge.note).toContain('not the original run')
+    expect(prov.judge.note).toContain('не из исходного прогона')
   })
 
   it('--rejudge uses --judge as the instructions when supplied, overriding the original', async () => {
@@ -597,7 +597,7 @@ describe('rebuild — --rejudge (the one opt-in LLM exception)', () => {
     }
     expect(report.judge).toBeUndefined()
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).toContain('no judge instructions are available')
+    expect(md).toContain('нет инструкций для судьи')
   })
 
   it('--rejudge survives a judge() failure without failing the whole rebuild', async () => {
@@ -617,7 +617,7 @@ describe('rebuild — --rejudge (the one opt-in LLM exception)', () => {
     expect(code).toBe(0)
     expect(existsSync(path.join(tree.results, 'report.json'))).toBe(true)
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).toContain('--rejudge failed')
+    expect(md).toContain('--rejudge провалился')
   })
 })
 
@@ -682,9 +682,9 @@ describe('rebuild — pre-upgrade (no run-input.json, best-effort)', () => {
       await runP(readFile(path.join(tree.results, 'rebuild-provenance.json'))),
     ) as { pricingWarning: string | undefined }
     expect(prov.pricingWarning).toBeDefined()
-    expect(prov.pricingWarning).toContain('could not be read')
+    expect(prov.pricingWarning).toContain('не удалось прочитать')
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).toContain('could not be read')
+    expect(md).toContain('не удалось прочитать')
   })
 
   it('prints the pricing warning to stderr so a --format json caller sees it too, not only report.md/provenance.json', async () => {
@@ -692,7 +692,7 @@ describe('rebuild — pre-upgrade (no run-input.json, best-effort)', () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     const code = await executeRebuild(baseFlags(workspace, { formats: ['json'] }))
     expect(code).toBe(0)
-    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('cost figures use the built-in pricing table'))
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('встроенную таблицу цен'))
     errSpy.mockRestore()
   })
 
@@ -757,7 +757,7 @@ describe('rebuild — pre-upgrade (no run-input.json, best-effort)', () => {
     expect(code).toBe(0)
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
     expect(md).not.toContain('Judge was not requested')
-    expect(md).toContain('cannot be determined')
+    expect(md).toContain('нельзя определить')
   })
 
   it('a --judge hint without --rejudge is disclosed but never invokes an LLM (judge stays absent from report.json)', async () => {
@@ -770,7 +770,7 @@ describe('rebuild — pre-upgrade (no run-input.json, best-effort)', () => {
     expect(report.judge).toBeUndefined()
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
     expect(md).toContain('score both sides')
-    expect(md).toContain('no LLM was invoked')
+    expect(md).toContain('LLM не вызывалась')
   })
 })
 
@@ -806,7 +806,7 @@ describe('rebuild — per-run result recovery', () => {
     expect(run?.defaultedFields).toContain('successRank')
     expect(run?.defaultedFields).toContain('finishCause')
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).toContain('no [STOP] line found')
+    expect(md).toContain('строка [STOP] не найдена')
   })
 
   it('an unrecoverable-outcome run does not render identically to a genuine rank-0 failure', async () => {
@@ -830,8 +830,8 @@ describe('rebuild — per-run result recovery', () => {
     const line2 = lines.find((l) => l.includes('run old/2 failed'))
     expect(line1).toBeDefined()
     expect(line2).toBeDefined()
-    expect(line1).toContain('outcome unrecoverable')
-    expect(line2).not.toContain('outcome unrecoverable')
+    expect(line1).toContain('исход невозможно восстановить')
+    expect(line2).not.toContain('исход невозможно восстановить')
     expect(line1).not.toBe(line2)
   })
 
@@ -854,8 +854,8 @@ describe('rebuild — per-run result recovery', () => {
     expect(newRun1?.source).toBe('log-recovery')
     expect(newRun1?.resultJsonState).toBe('missing')
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).toContain('run-1.result.json was present but unreadable/invalid — treated as corrupt')
-    expect(md).toContain('run-1.result.json was missing')
+    expect(md).toContain('run-1.result.json — присутствует, но нечитаем/невалиден — считается повреждённым')
+    expect(md).toContain('run-1.result.json — отсутствует')
   })
 })
 

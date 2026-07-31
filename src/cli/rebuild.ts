@@ -194,7 +194,7 @@ const resolveOverridable = <T>(
   census: readonly ManifestFieldStatus[],
 ): { readonly value: T; readonly entry: ProvenanceEntry } =>
   supplied !== undefined
-    ? { value: supplied, entry: { field, source: 'supplied', note: 'given on the rebuild command' } }
+    ? { value: supplied, entry: { field, source: 'supplied', note: 'указано в команде rebuild' } }
     : { value: fallback, entry: { field, source: 'defaulted', note: censusNote(census, field) } }
 
 interface SyntheticRunInputResult {
@@ -301,12 +301,12 @@ const buildSyntheticRunInput = (
     source: 'recovered',
     note:
       protectGit.source === 'manifest'
-        ? `recovered from manifest.flagDefaults.protectGit (written by pipeline.ts since --protect-git shipped): ${String(protectGit.value)}`
-        : `manifest.flagDefaults has no protectGit entry (workspace predates that field) — detected instead from whether gitdirs/${manifest.baseline}/run-1 exists on disk: ${String(protectGit.value)}`,
+        ? `восстановлено из manifest.flagDefaults.protectGit (записывается pipeline.ts начиная с появления --protect-git): ${String(protectGit.value)}`
+        : `в manifest.flagDefaults нет записи protectGit (воркспейс старше появления этого поля) — вместо этого определено по тому, существует ли на диске gitdirs/${manifest.baseline}/run-1: ${String(protectGit.value)}`,
   }
   const foreverDefaultedEntries: readonly ProvenanceEntry[] = FOREVER_DEFAULTED_FIELDS.map((field) => {
     const base = censusNote(fs, field)
-    const suffix = 'irrelevant to a rebuilt report — only governs a live run'
+    const suffix = 'не имеет значения для пересобранного отчёта — влияет только на живой прогон'
     return { field, source: 'defaulted' as const, note: base === '' ? suffix : `${base} (${suffix})` }
   })
 
@@ -342,7 +342,7 @@ const applyOverrides = (
   }
   const fields: readonly ProvenanceEntry[] = OVERRIDABLE_KEYS.flatMap((key) =>
     key in values
-      ? [{ field: key, source: 'supplied' as const, note: 'given on the rebuild command, overrides run-input.json' }]
+      ? [{ field: key, source: 'supplied' as const, note: 'указано в команде rebuild, переопределяет run-input.json' }]
       : [],
   )
   return { runInput: { ...runInput, ...values }, fields }
@@ -474,7 +474,7 @@ const resolveJudge = (
           judge: undefined,
           disclosure: {
             state: 'unknown' as const,
-            note: '--rejudge was requested but no judge instructions are available (supply --judge "..."); no verdict produced',
+            note: 'запрошен --rejudge, но нет инструкций для судьи (передайте --judge "..."); вердикт не создан',
           },
         }
       }
@@ -486,21 +486,21 @@ const resolveJudge = (
           judge: undefined,
           disclosure: {
             state: 'unknown' as const,
-            note: `--rejudge failed: [${outcome.left.code}] ${outcome.left.message}; no verdict produced`,
+            note: `--rejudge провалился: [${outcome.left.code}] ${outcome.left.message}; вердикт не создан`,
           },
         }
       }
       if (outcome.right.judge === null || outcome.right.judge === undefined) {
         return {
           judge: undefined,
-          disclosure: { state: 'unknown' as const, note: '--rejudge ran but produced no verdict' },
+          disclosure: { state: 'unknown' as const, note: '--rejudge выполнен, но не выдал вердикт' },
         }
       }
       return {
         judge: outcome.right.judge as JudgeResult,
         disclosure: {
           state: 'rejudged' as const,
-          note: 'verdict came from a re-judge over rebuilt data (--rejudge), not the original run',
+          note: 'вердикт получен через повторный вызов судьи (--rejudge) над пересобранными данными, а не из исходного прогона',
         },
       }
     }
@@ -510,7 +510,7 @@ const resolveJudge = (
     if (mapped !== undefined) {
       return {
         judge: mapped,
-        disclosure: { state: 'reused', note: 'existing verdict in judge.json reused verbatim; judge was not re-invoked' },
+        disclosure: { state: 'reused', note: 'существующий вердикт из judge.json переиспользован как есть; судья повторно не вызывался' },
       }
     }
     if (runInputMode === 'exact') {
@@ -519,13 +519,13 @@ const resolveJudge = (
           judge: undefined,
           disclosure: {
             state: 'requested-but-missing',
-            note: `the original run requested judging (instructions: "${truncateJudgeText(originalJudge)}") but no verdict was ever persisted to judge.json — pass --rejudge to judge the rebuilt data now, or rerun live to reproduce the original`,
+            note: `исходный прогон запрашивал оценку судьи (инструкции: "${truncateJudgeText(originalJudge)}"), но вердикт так и не был сохранён в judge.json — передайте --rejudge, чтобы оценить пересобранные данные сейчас, или прогоните заново вживую, чтобы воспроизвести исходный результат`,
           },
         }
       }
       return {
         judge: undefined,
-        disclosure: { state: 'confirmed-not-requested', note: 'run-input.json confirms --judge was not set on the original run' },
+        disclosure: { state: 'confirmed-not-requested', note: 'run-input.json подтверждает, что --judge не был задан в исходном прогоне' },
       }
     }
     if (judgeHint !== undefined) {
@@ -533,7 +533,7 @@ const resolveJudge = (
         judge: undefined,
         disclosure: {
           state: 'unknown',
-          note: `this workspace predates run-input.json, so whether the ORIGINAL run used --judge cannot be confirmed. You supplied judge instructions on this rebuild command ("${truncateJudgeText(judgeHint)}") but not --rejudge, so no LLM was invoked and no verdict is produced`,
+          note: `этот воркспейс старше появления run-input.json, поэтому нельзя подтвердить, использовал ли ИСХОДНЫЙ прогон --judge. Вы передали инструкции для судьи в этой команде rebuild ("${truncateJudgeText(judgeHint)}"), но не --rejudge, поэтому LLM не вызывалась и вердикт не создан`,
         },
       }
     }
@@ -541,7 +541,7 @@ const resolveJudge = (
       judge: undefined,
       disclosure: {
         state: 'unknown',
-        note: 'this workspace predates run-input.json; whether --judge was originally requested cannot be determined. The absence of a verdict below does not confirm judging was skipped',
+        note: 'этот воркспейс старше появления run-input.json; нельзя определить, был ли --judge изначально запрошен. Отсутствие вердикта ниже не подтверждает, что оценка судьи была пропущена',
       },
     }
   })
@@ -585,7 +585,7 @@ const resolvePrep = (
     if (mappedPrep !== undefined) {
       return {
         prep: mappedPrep,
-        disclosure: { state: 'reused' as const, note: 'prep.json reused verbatim; harness pack preparation was not re-run' },
+        disclosure: { state: 'reused' as const, note: 'prep.json переиспользован как есть; testaipack не выполнял повторную подготовку пакета' },
       }
     }
 
@@ -596,7 +596,7 @@ const resolvePrep = (
         prep: mappedLegacy,
         disclosure: {
           state: 'reused' as const,
-          note: 'results/pack-setup.json (legacy artifact name, pre-n-way-variants) reused verbatim, mapped to the current shape; harness pack preparation was not re-run',
+          note: 'results/pack-setup.json (устаревшее имя артефакта, до n-way variants) переиспользован как есть, приведён к текущей форме; testaipack не выполнял повторную подготовку пакета',
         },
       }
     }
@@ -609,7 +609,7 @@ const resolvePrep = (
         prep: undefined,
         disclosure: {
           state: 'confirmed-not-used' as const,
-          note: 'manifest confirms no pack setup/check/exercise was declared on the original run',
+          note: 'манифест подтверждает, что в исходном прогоне не были объявлены setup/check/exercise для пакета',
         },
       }
     }
@@ -633,7 +633,7 @@ const resolvePrep = (
       prep: { packs, variants },
       disclosure: {
         state: 'unavailable' as const,
-        note: 'manifest shows pack setup was declared (packs[*].setup/check or variants[*].exercise), but neither prep.json nor pack-setup.json is present/readable — mode below is a conservative lower bound, not verified evidence, and per-run check/exercise rows could not be recovered',
+        note: 'манифест показывает, что подготовка пакета была объявлена (packs[*].setup/check или variants[*].exercise), но ни prep.json, ни pack-setup.json не найдены/не читаются — mode ниже — консервативная нижняя оценка, а не подтверждённое свидетельство, и строки check/exercise по запускам восстановить не удалось',
       },
     }
   })
@@ -643,9 +643,9 @@ const resolvePrep = (
 // ---------------------------------------------------------------------------
 
 const SOURCE_LABEL: Record<ProvenanceSource, string> = {
-  recovered: 'recovered',
-  supplied: 'supplied on the command line',
-  defaulted: 'defaulted',
+  recovered: 'восстановлено',
+  supplied: 'передано на командной строке',
+  defaulted: 'по умолчанию',
 }
 
 /**
@@ -657,8 +657,8 @@ const SOURCE_LABEL: Record<ProvenanceSource, string> = {
 const renderProvenanceMd = (p: RebuildProvenance): string => {
   const header =
     p.runInputMode === 'exact'
-      ? '> ⚠ **This report was rebuilt** (`testaipack report --rebuild`) from a run whose full `run-input.json` survived — inputs below are exact, not guessed.'
-      : '> ⚠ **This report was rebuilt** (`testaipack report --rebuild`) from a workspace that predates `run-input.json` — some inputs are recovered best-effort, some are defaulted. See the field table below.'
+      ? '> ⚠ **Этот отчёт пересобран** (`testaipack report --rebuild`) из прогона, у которого сохранился полный `run-input.json` — входные данные ниже точные, не угаданные.'
+      : '> ⚠ **Этот отчёт пересобран** (`testaipack report --rebuild`) из воркспейса, который старше появления `run-input.json` — часть входных данных восстановлена по мере возможности, часть взята по умолчанию. См. таблицу полей ниже.'
   const fieldLines = p.fields.map(
     (f) => `> - \`${f.field}\`: ${SOURCE_LABEL[f.source]}${f.note === '' ? '' : ` — ${f.note}`}`,
   )
@@ -666,20 +666,20 @@ const renderProvenanceMd = (p: RebuildProvenance): string => {
     .filter((r) => r.source === 'log-recovery')
     .map(
       (r) =>
-        `> - ${r.variant}/run-${String(r.runIndex)}: recovered from its \`.log\`/\`.events.ndjson\` (run-${String(r.runIndex)}.result.json was ${r.resultJsonState === 'corrupt' ? 'present but unreadable/invalid — treated as corrupt' : 'missing'})${r.defaultedFields.length === 0 ? '' : `, defaulted: ${r.defaultedFields.join(', ')}${r.defaultedFields.includes('successRank') ? ' — **outcome unrecoverable** (no [STOP] line found; rank/finishCause below are placeholders, not a real failure)' : ' (no [STOP] line found)'}`}`,
+        `> - ${r.variant}/run-${String(r.runIndex)}: восстановлен из своего \`.log\`/\`.events.ndjson\` (run-${String(r.runIndex)}.result.json — ${r.resultJsonState === 'corrupt' ? 'присутствует, но нечитаем/невалиден — считается повреждённым' : 'отсутствует'})${r.defaultedFields.length === 0 ? '' : `, по умолчанию: ${r.defaultedFields.join(', ')}${r.defaultedFields.includes('successRank') ? ' — **исход невозможно восстановить** (строка [STOP] не найдена; rank/finishCause ниже — заглушки, а не реальный сбой)' : ' (строка [STOP] не найдена)'}`}`,
     )
   const pricingLine = p.pricingWarning === undefined ? [] : [`> ⚠ ${p.pricingWarning}`]
   const body = [
     header,
     '>',
     ...fieldLines,
-    ...(runLines.length === 0 ? [] : ['>', '> Per-run recovery:', ...runLines]),
+    ...(runLines.length === 0 ? [] : ['>', '> Восстановление по запускам:', ...runLines]),
     '>',
-    `> - **judge**: ${p.judge.note}`,
-    `> - **pack setup**: ${p.packSetup.note}`,
+    `> - **судья**: ${p.judge.note}`,
+    `> - **подготовка пакетов**: ${p.packSetup.note}`,
     ...pricingLine,
   ].join('\n')
-  return `## Rebuild provenance\n\n${body}`
+  return `## Провенанс пересборки\n\n${body}`
 }
 
 const escapeHtml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -687,19 +687,19 @@ const escapeHtml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g,
 const renderProvenanceHtml = (p: RebuildProvenance): string => {
   const header =
     p.runInputMode === 'exact'
-      ? 'This report was rebuilt (testaipack report --rebuild) from a run whose full run-input.json survived — inputs are exact, not guessed.'
-      : 'This report was rebuilt (testaipack report --rebuild) from a workspace that predates run-input.json — some inputs are recovered best-effort, some are defaulted.'
+      ? 'Этот отчёт пересобран (testaipack report --rebuild) из прогона, у которого сохранился полный run-input.json — входные данные точные, не угаданные.'
+      : 'Этот отчёт пересобран (testaipack report --rebuild) из воркспейса, который старше появления run-input.json — часть входных данных восстановлена по мере возможности, часть взята по умолчанию.'
   const fieldItems = p.fields
     .map((f) => `<li><code>${escapeHtml(f.field)}</code>: ${escapeHtml(SOURCE_LABEL[f.source])}${f.note === '' ? '' : ` — ${escapeHtml(f.note)}`}</li>`)
     .join('')
   const pricingItem = p.pricingWarning === undefined ? '' : `<li><strong>${escapeHtml(p.pricingWarning)}</strong></li>`
-  return `<section class="rebuild-provenance"><h2>Rebuild provenance</h2><p>${escapeHtml(header)}</p><ul>${fieldItems}<li><strong>judge</strong>: ${escapeHtml(p.judge.note)}</li><li><strong>pack setup</strong>: ${escapeHtml(p.packSetup.note)}</li>${pricingItem}</ul></section>`
+  return `<section class="rebuild-provenance"><h2>Провенанс пересборки</h2><p>${escapeHtml(header)}</p><ul>${fieldItems}<li><strong>судья</strong>: ${escapeHtml(p.judge.note)}</li><li><strong>подготовка пакетов</strong>: ${escapeHtml(p.packSetup.note)}</li>${pricingItem}</ul></section>`
 }
 
 const JUDGE_NOT_REQUESTED_MD = '_Судья не запрошен (--judge не задан)_'
 const JUDGE_NOT_REQUESTED_HTML = '<em>Судья не запрошен (--judge не задан)</em>'
 const MD_SUMMARY_HEADING = '## Сводка'
-const OUTCOME_UNRECOVERABLE_NOTE = ' — outcome unrecoverable, see Rebuild provenance (this is NOT a confirmed failure)'
+const OUTCOME_UNRECOVERABLE_NOTE = ' — исход невозможно восстановить, см. «Провенанс пересборки» (это НЕ подтверждённый сбой)'
 
 const patchOnce = (content: string, marker: string, replacement: string): string =>
   content.includes(marker) ? content.replace(marker, replacement) : content
@@ -960,9 +960,9 @@ export const executeRebuild = async (flags: RebuildFlags): Promise<number> => {
       : undefined
   const pricingUnreadable = pricingProbe !== undefined && pricingProbe._tag === 'Left'
   const pricingWarning = pricingNeverAvailable
-    ? 'pricingPath was not recoverable and none was supplied (--pricing-path) — cost figures use the built-in pricing table, which will misprice a local/custom model'
+    ? 'pricingPath не удалось восстановить, и он не был передан (--pricing-path) — показатели стоимости используют встроенную таблицу цен, которая даст неверную цену для локальной/кастомной модели'
     : pricingUnreadable
-      ? `pricingPath is set (${runInput.pricingPath ?? ''}) but could not be read/parsed at rebuild time (aggregate silently falls back to the built-in pricing table) — cost figures will misprice a local/custom model; fix the path or re-supply --pricing-path`
+      ? `pricingPath задан (${runInput.pricingPath ?? ''}), но не удалось прочитать/разобрать его при пересборке (aggregate молча откатывается на встроенную таблицу цен) — показатели стоимости дадут неверную цену для локальной/кастомной модели; исправьте путь или передайте --pricing-path заново`
       : undefined
   // Stderr is the only sink every `--format` reads: report.md's blockquote and
   // the sidecar `rebuild-provenance.json` field are both invisible to a
