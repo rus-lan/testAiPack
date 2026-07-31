@@ -1,9 +1,10 @@
 /**
  * Phase 07: aggregate
  *
- * Reads raw/<side>/run-{1..N}.json for both sides, validates each against the
- * OpencodeExport schema, extracts primary/secondary metrics, aggregates per side
- * (median + distribution), and computes the new-minus-old MetricsDiff. Writes
+ * Reads raw/<variant>/run-{1..N}.json for every variant, validates each
+ * against the OpencodeExport schema, extracts primary/secondary metrics,
+ * aggregates per variant (median + distribution), and computes the deltas
+ * for every non-baseline variant against the baseline. Writes
  * results/metrics.json.
  *
  * @see docs/phases/07-aggregate.ru.md
@@ -17,9 +18,13 @@ import type {
   ErrorCode,
   FailedRun,
   OpencodeExport,
-  Side,
-  SideAggregates,
+  RunInput,
+  RunResult,
+  VariantAggregates,
+  VariantRunResults,
+  VariantSpec,
   VerifyStats,
+  WorkspaceTree,
 } from '@generated/types'
 import { opencodeExportSchema } from '@generated/schemas'
 import { aggregateError } from '../errors.js'
@@ -32,13 +37,14 @@ import { extractMetricsFromTree, findPhaseBoundary } from '../metrics/extract.js
 import type { ExtractedMetrics } from '../metrics/extract.js'
 import { profileEvents } from '../metrics/events-profile.js'
 import type { EventsProfile } from '../metrics/events-profile.js'
-import { buildSideAggregates, computeDelta } from '../metrics/aggregate.js'
+import { buildVariantAggregates, computeMetricsReport } from '../metrics/aggregate.js'
+import type { VariantAggregationInput } from '../metrics/aggregate.js'
 import { findConfigDriftSignal, parseInstalledInventory } from '../metrics/baseline-contamination.js'
-import type { UnindexedSignal } from '../metrics/baseline-contamination.js'
+import type { ConfigDriftSignal } from '../metrics/baseline-contamination.js'
 import { detectPack } from '../pack/detector.js'
+import { foreignPacksOf } from './00-cli-parse.js'
 import { loadTreeForRun } from './10-timeline.js'
 import type { SessionTreeLoader } from './10-timeline.js'
-import type { RunSideResultExt } from './06-run-side.js'
 import { toNum } from '../util/numeric.js'
 
 /** Injectable tree loader for v0.2 sub-agent aggregation (tests pass a stub). */
@@ -46,15 +52,24 @@ export interface AggregateDeps {
   readonly loadTree?: SessionTreeLoader
 }
 
+/** One (variant, pack) visibility reading from phase 05's pack-visibility gate. */
+export interface PackVisibilityEntry {
+  readonly variant: string
+  readonly pack: string
+  readonly confirmed: boolean
+}
+
 /**
- * Local input extension: carries phase 05's pack-visibility gate outcome so
- * `packUse.visibilityConfirmed` reflects the check that actually ran (docker-
- * aware, see phase 05) instead of aggregate re-deriving its own separate
- * existence check. Absent (`--no-preflight`, or preflight never reached the
- * gate) means "not confirmed", the honest default.
+ * Local input extension: carries phase 05's pack-visibility gate outcome per
+ * (variant, pack) so `packUse.visibilityConfirmed` reflects the check that
+ * actually ran (docker-aware, see phase 05) instead of aggregate re-deriving
+ * its own separate existence check. A pair absent from the list (`--no-
+ * preflight`, or preflight never reached the gate) means "not confirmed",
+ * the honest default — every variant, baseline included, goes through the
+ * same lookup now (no more forcing the baseline to false).
  */
 export interface AggregateInputExt extends AggregateInput {
-  readonly packVisibilityConfirmed?: boolean
+  readonly packVisibility?: readonly PackVisibilityEntry[]
 }
 
 type ProcessedRun =
@@ -68,26 +83,45 @@ type ProcessedRun =
       // profiles to zero gaps; the run then contributes no P5 data point at
       // all instead of a fabricated "0".
       readonly eventsProfile: EventsProfile | undefined
-      /** `RunSideResultExt.initRan === true` — feeds SidePhaseSplit.runsWithLostInit (metric-split spec §5.4). */
+      /** `RunResult.initRan === true` — feeds SidePhaseSplit.runsWithLostInit (metric-split spec §5.4). */
       readonly initRan: boolean
     }
   | { readonly kind: 'failed'; readonly failedRun: FailedRun }
 
-const errorCodeFor = (r: RunSideResultExt): ErrorCode => r.errorCode ?? 'E_RUN_CRASH'
+const errorCodeFor = (r: RunResult): ErrorCode => r.errorCode ?? 'E_RUN_CRASH'
 
-const toFailedRun = (r: RunSideResultExt, timestamp: string): FailedRun => ({
+/**
+ * `run <variant>/<n> failed: ...` — also reconstructed by `src/cli/rebuild.ts`
+ * (WP13) from the same bridged run result, to find and annotate
+ * unrecoverable-outcome runs in the rendered Failed Runs table without
+ * touching this file or `src/report/*`. Exported so both sides read the
+ * exact same string builder instead of two hand-kept copies.
+ */
+export const failedRunMarker = (
+  variant: string,
+  r: {
+    readonly runIndex: number
+    readonly finishCause: string
+    readonly exitCode: number
+    readonly watchdogTriggered: boolean
+  },
+): string =>
+  `run ${variant}/${String(r.runIndex)} failed: finishCause=${r.finishCause} exitCode=${String(r.exitCode)} watchdog=${String(r.watchdogTriggered)}`
+
+export const toFailedRun = (r: RunResult, timestamp: string): FailedRun => ({
+  variant: r.variant,
   runIndex: r.runIndex,
   errorCode: errorCodeFor(r),
-  errorMessage: `run ${r.side}/${String(r.runIndex)} failed: finishCause=${r.finishCause} exitCode=${String(r.exitCode)} watchdog=${String(r.watchdogTriggered)}`,
+  errorMessage: failedRunMarker(r.variant, r),
   timestamp,
 })
 
-const toExportInvalid = (side: Side, runIndex: number, cause: unknown): PhaseError =>
+const toExportInvalid = (variant: string, runIndex: number, cause: unknown): PhaseError =>
   aggregateError(
-    `export invalid for ${side}/run-${String(runIndex)}: missing or schema-mismatch`,
+    `export invalid for ${variant}/run-${String(runIndex)}: missing or schema-mismatch`,
     'E_EXPORT_INVALID',
     {
-      side,
+      variant,
       runIndex,
       reason: 'missing-or-invalid-export',
       ...(cause === undefined ? {} : { cause }),
@@ -111,12 +145,12 @@ const readEventsProfile = (
   )
 
 const readAndExtract = (
-  r: RunSideResultExt,
-  side: Side,
+  r: RunResult,
+  variant: string,
   rawDir: string,
   homeDirs: readonly string[],
   pricing: PricingTable | null,
-  packName: string | undefined,
+  packNames: readonly string[],
   loader?: SessionTreeLoader,
 ): Effect.Effect<
   {
@@ -130,17 +164,17 @@ const readAndExtract = (
   PhaseError
 > =>
   Effect.gen(function* () {
-    const file = path.join(rawDir, side, `run-${String(r.runIndex)}.json`)
+    const file = path.join(rawDir, variant, `run-${String(r.runIndex)}.json`)
     const raw = yield* readFile(file).pipe(
-      Effect.mapError((e: FsError) => toExportInvalid(side, r.runIndex, e)),
+      Effect.mapError((e: FsError) => toExportInvalid(variant, r.runIndex, e)),
     )
     const parsed = yield* Effect.try({
       try: () => JSON.parse(raw) as unknown,
-      catch: (e) => toExportInvalid(side, r.runIndex, e),
+      catch: (e) => toExportInvalid(variant, r.runIndex, e),
     })
     const result = opencodeExportSchema.safeParse(parsed)
     if (!result.success) {
-      return yield* Effect.fail(toExportInvalid(side, r.runIndex, result.error))
+      return yield* Effect.fail(toExportInvalid(variant, r.runIndex, result.error))
     }
     // Zod infers optionals as `T | undefined` while the generated OpencodeExport
     // uses exact-optional under exactOptionalPropertyTypes; the data is already
@@ -155,7 +189,7 @@ const readAndExtract = (
     return {
       kind: 'ok' as const,
       metrics: extractMetricsFromTree(tree, pricing, r.successRank, {
-        ...(packName === undefined ? {} : { packName }),
+        ...(packNames.length === 0 ? {} : { packNames }),
       }),
       id: data.info.id,
       runIndex: r.runIndex,
@@ -172,14 +206,14 @@ const readAndExtract = (
  */
 const readConfigDriftSignal = (
   configRoot: string,
-  side: Side,
-): Effect.Effect<UnindexedSignal | undefined> =>
-  readFile(path.join(configRoot, '.config', 'opencode', side, 'installed.json')).pipe(
+  variant: string,
+): Effect.Effect<ConfigDriftSignal | undefined> =>
+  readFile(path.join(configRoot, '.config', 'opencode', variant, 'installed.json')).pipe(
     Effect.map((raw) => findConfigDriftSignal(parseInstalledInventory(raw))),
     Effect.catchAll(() => Effect.succeed(undefined)),
   )
 
-const buildVerifyStats = (results: readonly RunSideResultExt[]): VerifyStats | undefined => {
+const buildVerifyStats = (results: readonly RunResult[]): VerifyStats | undefined => {
   const passed = results.filter((r) => r.verifyExitCode === 0).length
   const failed = results.filter((r) => r.verifyExitCode !== undefined && r.verifyExitCode !== 0).length
   const timedOut = results.filter((r) => r.errorCode === 'E_VERIFY_TIMEOUT').length
@@ -187,30 +221,37 @@ const buildVerifyStats = (results: readonly RunSideResultExt[]): VerifyStats | u
   return runCount === 0 ? undefined : { passed, failed, timedOut, runCount }
 }
 
-const aggregateSide = (
-  side: Side,
-  results: readonly RunSideResultExt[],
-  rawDir: string,
-  homeDirs: readonly string[],
+const visibilityConfirmedFor = (
+  entries: readonly PackVisibilityEntry[] | undefined,
+  variant: string,
+  pack: string,
+): boolean => (entries ?? []).some((e) => e.variant === variant && e.pack === pack && e.confirmed)
+
+const aggregateVariant = (
+  variant: VariantSpec,
+  runInput: RunInput,
+  results: readonly VariantRunResults[],
+  workspace: WorkspaceTree,
   pricing: PricingTable | null,
   timestamp: string,
-  packName: string | undefined,
-  canDetect: boolean,
-  visibilityConfirmed: boolean,
-  configRoot: string,
+  allPackNames: readonly string[],
+  canDetectByPack: ReadonlyMap<string, boolean>,
+  packVisibility: readonly PackVisibilityEntry[] | undefined,
   loader?: SessionTreeLoader,
-): Effect.Effect<SideAggregates, PhaseError> =>
+): Effect.Effect<VariantAggregates, PhaseError> =>
   Effect.gen(function* () {
-    const configDriftSignal = yield* readConfigDriftSignal(configRoot, side)
+    const runs = results.find((r) => r.name === variant.name)?.runs ?? []
+    const homeDirs = workspace.variantTrees.find((t) => t.name === variant.name)?.homes ?? []
+    const configDriftSignal = yield* readConfigDriftSignal(workspace.config, variant.name)
     const processed = yield* Effect.forEach(
-      results,
+      runs,
       (r): Effect.Effect<ProcessedRun, PhaseError> =>
         r.successRank === 0
           ? Effect.succeed({
               kind: 'failed' as const,
               failedRun: toFailedRun(r, timestamp),
             })
-          : readAndExtract(r, side, rawDir, homeDirs, pricing, packName, loader),
+          : readAndExtract(r, variant.name, workspace.raw, homeDirs, pricing, allPackNames, loader),
       { concurrency: 1 },
     )
     const extracted = processed.flatMap((p) => (p.kind === 'ok' ? [p.metrics] : []))
@@ -226,24 +267,37 @@ const aggregateSide = (
     // Every ATTEMPTED run, not just successful ones — the pack-exercise
     // segment runs before the agent session, so a later agent crash doesn't
     // invalidate its own wall-clock reading (metric-split spec §6.1).
-    const setupWallMsList = results.map((r) => (r.setupWallMs === undefined ? undefined : toNum(r.setupWallMs)))
-    const verifyStats = buildVerifyStats(results)
-    return buildSideAggregates({
-      side,
+    const setupWallMsList = runs.map((r) => (r.setupWallMs === undefined ? undefined : toNum(r.setupWallMs)))
+    const verifyStats = buildVerifyStats(runs)
+
+    const packs = variant.packs.map((name) => ({
+      name,
+      canDetect: canDetectByPack.get(name) ?? false,
+      visibilityConfirmed: visibilityConfirmedFor(packVisibility, variant.name, name),
+    }))
+
+    const aggInput: VariantAggregationInput = {
+      variant: variant.name,
       extracted,
       failedRuns,
       rawRunIds,
       extras,
       runIndexes,
       eventsProfiles,
-      canDetect,
-      visibilityConfirmed,
+      packs,
+      // `foreignPacksOf` (00-cli-parse.ts) is the CANONICAL foreign-set
+      // computation, shared with gate 5's foreign-pack-absent check in
+      // 05-preflight.ts — importing it (rather than a local reimplementation)
+      // guarantees contamination attribution here and the preflight gate
+      // never disagree on either membership OR declaration order (WP7 groups
+      // contamination signals by this array's order, `metrics/aggregate.ts`).
+      foreignPacks: foreignPacksOf(runInput, variant).map((p) => p.name),
       initRanFlags,
       setupWallMsList,
-      ...(packName === undefined ? {} : { packName }),
       ...(verifyStats === undefined ? {} : { verifyStats }),
       ...(configDriftSignal === undefined ? {} : { configDriftSignal }),
-    })
+    }
+    return buildVariantAggregates(aggInput)
   })
 
 const ignorePricingError = (): Effect.Effect<null> => Effect.succeed(null)
@@ -253,62 +307,63 @@ export const aggregate = (
   deps?: AggregateDeps,
 ): Effect.Effect<AggregateResult, PhaseError> =>
   Effect.gen(function* () {
-    const { runInput, workspace, sideResults, manifest } = input
+    const { runInput, workspace, manifest, results } = input
     const loader = deps?.loadTree
     const pricing: PricingTable | null = runInput.pricingPath
       ? yield* loadPricing(runInput.pricingPath).pipe(Effect.catchAll(ignorePricingError))
       : null
 
-    // Wave 1: only a skill pack shows up as tool parts in exports — plugin/mcp/
-    // agent/command usage is invisible there, so canDetect is false for them.
-    // packName still resolves for every pack type (not just skill) so packUse
-    // stays present with canDetect: false instead of being omitted — an
-    // omitted section would look identical to "no --pack at all", the exact
-    // confusion canDetect exists to prevent.
-    const packRef = runInput.packRef
-    const pack =
-      packRef === undefined
-        ? null
-        : yield* detectPack(packRef).pipe(Effect.catchAll(() => Effect.succeed(null)))
-    const packName = pack?.name
-    const canDetect = pack !== null && pack.type === 'skill'
-    // The pack is only ever installed on the new side (old is the baseline);
-    // gate 4 (pack-visibility) only ever checks homePaths.new. A zero-call
-    // reading on old is expected, not "the model chose not to call it".
-    const newVisibilityConfirmed = input.packVisibilityConfirmed ?? false
+    // Wave 1: only a skill pack shows up as tool parts in exports — plugin/
+    // mcp/agent/command usage is invisible there, so canDetect is false for
+    // them. Detected once per REGISTRY pack (not per variant): detectability
+    // is a property of the pack itself, not of who declares it. `cliParse`
+    // (00-cli-parse.ts) already resolves `PackSpec.type` for every pack
+    // before phase 07 ever runs ("so downstream phases never re-detect") —
+    // honor it and skip `detectPack` entirely when it is set; a pack the
+    // user explicitly typed `skill` must not be silently re-derived as
+    // something else from its ref. Only a pack that somehow arrives here
+    // without a resolved type (e.g. a pre-normalization persisted input)
+    // falls back to detection.
+    const packDetections = yield* Effect.forEach(
+      runInput.packs,
+      (p): Effect.Effect<readonly [string, boolean]> =>
+        p.type !== undefined
+          ? Effect.succeed([p.name, p.type === 'skill'])
+          : detectPack(p.ref).pipe(
+              Effect.map((detected): readonly [string, boolean] => [p.name, detected.type === 'skill']),
+              Effect.catchAll(() => Effect.succeed<readonly [string, boolean]>([p.name, false])),
+            ),
+      { concurrency: 1 },
+    )
+    const canDetectByPack = new Map(packDetections)
+    // Extraction scans the FULL registry, not just each variant's own packs
+    // — a variant's foreign-pack contamination signals only exist if
+    // extraction was watching for that name too; `buildVariantAggregates`
+    // below is the one that decides, per variant, which names are its own
+    // vs. foreign (`03-hard-problems.md` §3.1 / phase-07 mechanics).
+    const allPackNames = runInput.packs.map((p) => p.name)
 
     const timestamp = manifest.timestamp
-    const oldAgg = yield* aggregateSide(
-      'old',
-      sideResults.old,
-      workspace.raw,
-      workspace.homeOld,
-      pricing,
-      timestamp,
-      packName,
-      canDetect,
-      false,
-      workspace.config,
-      loader,
+    const variantAggregates = yield* Effect.forEach(
+      runInput.variants,
+      (v) =>
+        aggregateVariant(
+          v,
+          runInput,
+          results,
+          workspace,
+          pricing,
+          timestamp,
+          allPackNames,
+          canDetectByPack,
+          input.packVisibility,
+          loader,
+        ),
+      { concurrency: 1 },
     )
-    const newAgg = yield* aggregateSide(
-      'new',
-      sideResults.new,
-      workspace.raw,
-      workspace.homeNew,
-      pricing,
-      timestamp,
-      packName,
-      canDetect,
-      newVisibilityConfirmed,
-      workspace.config,
-      loader,
-    )
-    const metricsDiff = computeDelta(oldAgg, newAgg)
-    const result: AggregateResult = {
-      metricsDiff,
-      rawAggregates: { old: oldAgg, new: newAgg },
-    }
+
+    const metrics = computeMetricsReport(runInput.baseline, variantAggregates)
+    const result: AggregateResult = { metrics }
 
     yield* ensureDir(workspace.results).pipe(
       Effect.mapError((e: FsError) =>

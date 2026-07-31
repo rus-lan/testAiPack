@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import {
+  deltaEntriesFor,
   fmtCost,
   fmtDurationMs,
   fmtInt,
@@ -14,7 +15,8 @@ import {
   verdictFor,
 } from './format.js'
 import type { MetricKind } from './format.js'
-import type { MetricDelta } from '@generated/types'
+import type { MetricDelta, MetricsReport, PhaseDeltas } from '@generated/types'
+import { makeMetricsReport } from '../../tests/helpers/variants.js'
 
 describe('format — number helpers', () => {
   it.each([
@@ -146,5 +148,81 @@ describe('format — verdict and significance labels', () => {
     ['worse', false, 'in noise'],
   ])('sigLabel(%s, sig=%s) === %s', (better, significant, expected) => {
     expect(sigLabel(delta(better, significant))).toBe(expected)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// deltaEntriesFor — per (baseline, variant) pair basis selection
+// (`03-hard-problems.md` §1.2). `makeMetricsReport` (tests/helpers/variants.ts)
+// gives 3 variants (base/graphify/astgrep), 2 deltas (vs base), no task split.
+// ---------------------------------------------------------------------------
+
+describe('report/format — deltaEntriesFor', () => {
+  it('basis is "total" and 7 entries when the pair has no taskDeltas', () => {
+    const metrics = makeMetricsReport()
+    const { entries, basis } = deltaEntriesFor(metrics, 'graphify')
+    expect(basis).toBe('total')
+    expect(entries).toHaveLength(7)
+  })
+
+  it('reads entries from the (base, variant) pair, not a shared/global bucket', () => {
+    const metrics = makeMetricsReport()
+    const graphify = deltaEntriesFor(metrics, 'graphify')
+    const astgrep = deltaEntriesFor(metrics, 'astgrep')
+    // graphify's totalTokens/stepCount are significant improvements (fixture
+    // comment: Δ -1200 > 2.25*300, Δ -6 > 2.25*2); astgrep's are not.
+    const gTotal = graphify.entries.find((e) => e.key === 'totalTokens')
+    const aTotal = astgrep.entries.find((e) => e.key === 'totalTokens')
+    expect(gTotal?.d.significant).toBe(true)
+    expect(gTotal?.d.better).toBe('better')
+    expect(aTotal?.d.significant).toBe(false)
+  })
+
+  it('unknown variant name -> empty entries, basis "total"', () => {
+    const metrics = makeMetricsReport()
+    const { entries, basis } = deltaEntriesFor(metrics, 'does-not-exist')
+    expect(entries).toEqual([])
+    expect(basis).toBe('total')
+  })
+
+  it('basis is "task" and entries are the 5 phase deltas + successRank/maxParallelism when taskDeltas is present', () => {
+    const taskDeltas: PhaseDeltas = {
+      totalTokens: { absolute: 500, percent: 50, significant: true, better: 'worse' },
+      wallClockMs: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      costUsd: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      stepCount: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      toolCallCount: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+    }
+    const base = makeMetricsReport()
+    const metrics: MetricsReport = {
+      ...base,
+      deltas: base.deltas.map((d) => (d.variant === 'graphify' ? { ...d, taskDeltas } : d)),
+    }
+    const { entries, basis } = deltaEntriesFor(metrics, 'graphify')
+    expect(basis).toBe('task')
+    expect(entries).toHaveLength(7)
+    const totalTokens = entries.find((e) => e.key === 'totalTokens')
+    expect(totalTokens?.d).toEqual(taskDeltas.totalTokens)
+    // successRank/maxParallelism stay sourced from the whole-run `deltas`, not taskDeltas.
+    const graphifyDelta = metrics.deltas.find((d) => d.variant === 'graphify')
+    const successRank = entries.find((e) => e.key === 'successRank')
+    expect(successRank?.d).toEqual(graphifyDelta?.deltas.successRank)
+  })
+
+  it('basis is decided per pair — one variant can be task while another is total', () => {
+    const taskDeltas: PhaseDeltas = {
+      totalTokens: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      wallClockMs: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      costUsd: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      stepCount: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+      toolCallCount: { absolute: 0, percent: 0, significant: false, better: 'neutral' },
+    }
+    const base = makeMetricsReport()
+    const metrics: MetricsReport = {
+      ...base,
+      deltas: base.deltas.map((d) => (d.variant === 'graphify' ? { ...d, taskDeltas } : d)),
+    }
+    expect(deltaEntriesFor(metrics, 'graphify').basis).toBe('task')
+    expect(deltaEntriesFor(metrics, 'astgrep').basis).toBe('total')
   })
 })

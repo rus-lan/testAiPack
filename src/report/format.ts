@@ -6,7 +6,7 @@
  *
  * @see docs/phases/11-report-render.ru.md
  */
-import type { MetricDelta, MetricsDiff, PhaseDeltas, PhaseSlice, PrimaryDeltas, PrimaryMetrics } from '@generated/types'
+import type { MetricDelta, MetricsReport, PhaseDeltas, PhaseSlice, PrimaryDeltas, PrimaryMetrics } from '@generated/types'
 import { toNum } from '../util/numeric.js'
 
 export { toNum }
@@ -62,30 +62,38 @@ export interface DeltaEntry {
 
 /**
  * Entries feeding the headline and the improvement/regression/neutral
- * buckets, on whichever basis the diff supports — task (metric-split spec
- * §5.6, §6: decided, always, in every configuration a split exists for) is
- * the five phase deltas plus the two metrics that never split, still read
- * from the whole-run `diff.deltas`; total (pre-split behavior) is all seven
- * `PRIMARY_METRICS` read from `diff.deltas`, used only when no split is
- * available at all. Shared by `cli/summary.ts` (builds `ReportSummary`) and
- * the md/html renderers (render the Summary section), so both read the
- * identical basis rule off the same `MetricsDiff`.
+ * buckets for ONE (baseline, variant) pair, on whichever basis that pair
+ * supports — task (metric-split spec §5.6, §6: decided, always, in every
+ * configuration a split exists for) is the five phase deltas plus the two
+ * metrics that never split, still read from the pair's whole-run `deltas`;
+ * total (pre-split behavior) is all seven `PRIMARY_METRICS` read from
+ * `deltas`, used only when no split is available at all. Basis is decided
+ * PER PAIR (`03-hard-problems.md` §1.2) — a report can legitimately show one
+ * variant on task basis and another on total basis. Shared by
+ * `cli/summary.ts` (builds `ReportSummary`) and the md/html renderers
+ * (render the Summary section), so both read the identical basis rule off
+ * the same `MetricsReport`.
  */
 export const deltaEntriesFor = (
-  diff: MetricsDiff,
+  metrics: MetricsReport,
+  variant: string,
 ): { readonly entries: readonly DeltaEntry[]; readonly basis: 'task' | 'total' } => {
-  if (diff.taskDeltas === undefined) {
+  const delta = metrics.deltas.find((d) => d.variant === variant)
+  if (delta === undefined) {
+    return { basis: 'total', entries: [] }
+  }
+  if (delta.taskDeltas === undefined) {
     return {
       basis: 'total',
-      entries: PRIMARY_METRICS.map((m) => ({ key: m.key, label: m.label, kind: m.kind, d: diff.deltas[m.key] })),
+      entries: PRIMARY_METRICS.map((m) => ({ key: m.key, label: m.label, kind: m.kind, d: delta.deltas[m.key] })),
     }
   }
-  const taskDeltas = diff.taskDeltas
+  const taskDeltas = delta.taskDeltas
   return {
     basis: 'task',
     entries: [
       ...PHASE_METRICS.map((m) => ({ key: m.key, label: m.label, kind: m.kind, d: taskDeltas[m.key] })),
-      ...WHOLE_RUN_ONLY_METRICS.map((m) => ({ key: m.key, label: m.label, kind: m.kind, d: diff.deltas[m.key] })),
+      ...WHOLE_RUN_ONLY_METRICS.map((m) => ({ key: m.key, label: m.label, kind: m.kind, d: delta.deltas[m.key] })),
     ],
   }
 }
