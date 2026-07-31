@@ -574,6 +574,92 @@ describe('phase 04 — homeIsolation', () => {
     expect(result.envVars.find((e) => e.name === 'multi')!.envs[0]!.OPENCODE_PURE).toBe(false)
   })
 
+  // ---- Stage 2 (WP16): instruction-collision check ------------------------
+
+  it('Stage 2: two packs delivering the same skill name to one variant → E_PACK_INSTALL_FAILED naming both packs, nothing applied', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const aDir = await writePackSkill('shared-skill')
+    const bDir = await writePackSkill('shared-skill')
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-a', 'pack-b'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a' },
+      { name: 'pack-b', ref: 'github:owner/b' },
+    ]
+    const outcome = makeOutcome([
+      skillDelivery('pack-a', aDir, 'shared-skill'),
+      skillDelivery('pack-b', bDir, 'shared-skill'),
+    ])
+    const input = buildInput(variants, packs, outcome)
+    const err = await runFlip(homeIsolation(input))
+    expect(err.code).toBe('E_PACK_INSTALL_FAILED')
+    expect(err.context?.['variant']).toBe('multi')
+    expect(err.context?.['packs']).toEqual(['pack-a', 'pack-b'])
+    expect(err.context?.['kind']).toBe('skill')
+    expect(err.context?.['name']).toBe('shared-skill')
+    const multiHome = homesOf(input.workspace, 'multi')[0]!
+    expect(await runP(exists(path.join(multiHome, '.config', 'opencode', 'skills', 'shared-skill')))).toBe(false)
+  })
+
+  it('Stage 2: two packs declaring the same mcp server name for one variant → E_PACK_INSTALL_FAILED naming both packs', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-a', 'pack-b'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'mcp:srv:{}' },
+      { name: 'pack-b', ref: 'mcp:srv:{}' },
+    ]
+    const outcome = makeOutcome([
+      mcpDelivery('pack-a', 'srv', { command: 'npx' }),
+      mcpDelivery('pack-b', 'srv', { command: 'node' }),
+    ])
+    const input = buildInput(variants, packs, outcome)
+    const err = await runFlip(homeIsolation(input))
+    expect(err.code).toBe('E_PACK_INSTALL_FAILED')
+    expect(err.context?.['variant']).toBe('multi')
+    expect(err.context?.['packs']).toEqual(['pack-a', 'pack-b'])
+    expect(err.context?.['kind']).toBe('config')
+    expect(err.context?.['name']).toBe('srv')
+  })
+
+  it('Stage 2: an agent and a command sharing the same name across two packs do NOT collide (different destination dirs)', async () => {
+    await useFakeHome(async (h) => {
+      await runP(seedOpencodeAuth(h))
+    })
+    const agentSrc = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(agentSrc))
+    const agentFile = path.join(agentSrc, 'deploy.md')
+    await runP(writeFile(agentFile, '# agent\n'))
+    const cmdSrc = makeTempDir('testaipack-pack-src-')
+    await runP(ensureDir(cmdSrc))
+    const cmdFile = path.join(cmdSrc, 'deploy.md')
+    await runP(writeFile(cmdFile, '# cmd\n'))
+
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-a', 'pack-b'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a' },
+      { name: 'pack-b', ref: 'github:owner/b' },
+    ]
+    const outcome = makeOutcome([
+      agentDelivery('pack-a', agentFile, 'deploy'),
+      {
+        pack: 'pack-b',
+        packPath: cmdFile,
+        detectedType: 'command',
+        registeredIn: ['commands'],
+        instructions: [{ kind: 'file', section: 'commands', name: 'deploy', target: cmdFile }],
+      },
+    ])
+    const input = buildInput(variants, packs, outcome)
+    const result = await runP(homeIsolation(input))
+    const multiHome = homesOf(input.workspace, 'multi')[0]!
+    expect(await runP(exists(path.join(multiHome, '.config', 'opencode', 'agents', 'deploy.md')))).toBe(true)
+    expect(await runP(exists(path.join(multiHome, '.config', 'opencode', 'command', 'deploy.md')))).toBe(true)
+    expect(result.homeTrees.find((t) => t.name === 'multi')).toBeDefined()
+  })
+
   it('3 variants (smoke, pack-a, pack-b): purity only on the smoke variant, each pack lands only in its own declaring variant HOMEs, per-variant config/<name>.json written, envVars carries names not positions', async () => {
     await useFakeHome(async (h) => {
       await runP(seedOpencodeAuth(h))

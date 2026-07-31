@@ -1258,13 +1258,18 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       }
     }
 
+    // A variant naming the same pack twice (`packs: ['p1', 'p1']`) is always a
+    // config mistake, not a meaningful "declare it harder" — reject rather
+    // than silently de-duplicating, so the collision is visible at parse time
+    // instead of surfacing later as a confusing double-apply in phase 04.
     for (const v of variants) {
-      if (v.packs.length > 1) {
+      const dup = v.packs.find((name, i) => v.packs.indexOf(name) !== i)
+      if (dup !== undefined) {
         return yield* Effect.fail(
           cliParseError(
-            `multi-pack variants are stage 2: variant "${v.name}" declares ${String(v.packs.length)} packs`,
+            `variant "${v.name}" declares pack "${dup}" more than once`,
             'E_CONFIG_INVALID',
-            { reason: 'multi-pack-stage2', variant: v.name },
+            { reason: 'duplicate-pack-in-variant', variant: v.name, pack: dup },
           ),
         )
       }

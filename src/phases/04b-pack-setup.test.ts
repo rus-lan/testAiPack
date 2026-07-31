@@ -345,6 +345,79 @@ describe('phase 04b — pack-setup', () => {
     expect(spawnMock).toHaveBeenCalledTimes(2)
   })
 
+  // ---- Stage 2 (WP16): multi-pack sequential ordering ---------------------
+
+  it('Stage 2: two packs with setup on ONE variant run sequentially in DECLARATION order, not registry order', async () => {
+    const calls: string[] = []
+    spawnMock.mockImplementation((opts: { args: readonly string[] }) => {
+      calls.push(opts.args[1] ?? '')
+      return Effect.succeed({ stdout: '', stderr: '', exitCode: 0, durationMs: 5, timedOut: false })
+    })
+    // registry order is [pack-a, pack-b] but the variant declares them reversed
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-b', 'pack-a'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a', setup: 'install-a' },
+      { name: 'pack-b', ref: 'github:owner/b', setup: 'install-b' },
+    ]
+    const { input } = buildInput(variants, packs)
+    const result = await runP(packSetup(input))
+    expect(calls).toEqual(['install-b', 'install-a'])
+    expect(result.report.packs.find((p) => p.pack === 'pack-a')!.setups).toHaveLength(1)
+    expect(result.report.packs.find((p) => p.pack === 'pack-b')!.setups).toHaveLength(1)
+  })
+
+  it('Stage 2: a mid-sequence failure on the SECOND pack of one variant aborts naming that variant+pack; the first pack already ran', async () => {
+    let call = 0
+    spawnMock.mockImplementation(() => {
+      call += 1
+      if (call === 1) return Effect.succeed({ stdout: '', stderr: '', exitCode: 0, durationMs: 5, timedOut: false })
+      return Effect.succeed({ stdout: '', stderr: 'boom', exitCode: 1, durationMs: 5, timedOut: false })
+    })
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-a', 'pack-b'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a', setup: 'install-a' },
+      { name: 'pack-b', ref: 'github:owner/b', setup: 'install-b' },
+    ]
+    const { input } = buildInput(variants, packs)
+    const err = await runFlip(packSetup(input))
+    expect(err.code).toBe('E_PACK_SETUP_FAILED')
+    expect(err.context?.['variant']).toBe('multi')
+    expect(err.context?.['pack']).toBe('pack-b')
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('Stage 2: copy-out rewrites BOTH packs\' local-plugin paths when a variant declares two setup packs', async () => {
+    const variants: VariantSpec[] = [{ name: 'multi', packs: ['pack-a', 'pack-b'] }]
+    const packs: PackSpec[] = [
+      { name: 'pack-a', ref: 'github:owner/a', setup: 'install-a' },
+      { name: 'pack-b', ref: 'github:owner/b', setup: 'install-b' },
+    ]
+    const { input, workspace } = buildInput(variants, packs, { runs: 2 })
+    const homes = homesOf(workspace, 'multi')
+    // Simulate what phase 04 already wrote into EACH run's own HOME before
+    // 04b ever runs: two local-plugin registrations, one per pack, each with
+    // a genuinely per-run absolute path.
+    for (const home of homes) {
+      const cfgDir = path.join(home, '.config', 'opencode')
+      await runP(ensureDir(cfgDir))
+      const pluginA = path.join(cfgDir, 'plugins', 'plugin-a.js')
+      const pluginB = path.join(cfgDir, 'plugins', 'plugin-b.js')
+      await runP(writeFile(path.join(cfgDir, 'opencode.json'), JSON.stringify({ plugin: [pluginA, pluginB] })))
+    }
+
+    const result = await runP(packSetup(input))
+    expect(result.report.packs.find((p) => p.pack === 'pack-a')!.setups).toHaveLength(1)
+    expect(result.report.packs.find((p) => p.pack === 'pack-b')!.setups).toHaveLength(1)
+
+    const run2Cfg = JSON.parse(
+      await runP(readFile(path.join(homes[1]!, '.config', 'opencode', 'opencode.json'))),
+    ) as { plugin: string[] }
+    expect(run2Cfg.plugin).toEqual([
+      path.join(homes[1]!, '.config', 'opencode', 'plugins', 'plugin-a.js'),
+      path.join(homes[1]!, '.config', 'opencode', 'plugins', 'plugin-b.js'),
+    ])
+  })
+
   it('reuses phase 04 envVars PATH for the declaring variant run-1 HOME, not recomputed', async () => {
     const variants: VariantSpec[] = [{ name: 'a', packs: ['demo'] }]
     const packs: PackSpec[] = [{ name: 'demo', ref: 'github:owner/demo', setup: 'echo hi' }]

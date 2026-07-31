@@ -754,6 +754,82 @@ describe('phase 05 — preflight', () => {
     expect(result.checks.some((c) => c.variant === 'smoke' && c.details === 'pack-functional [pack-a @ smoke] 1/1 HOME(s) verified')).toBe(true)
   })
 
+  // Stage 2 (WP16): a single variant declaring TWO packs — both must show up
+  // visible (gate 4) and functional in ALL of that variant's HOMEs (gate 6),
+  // while both are correctly foreign (absent, gate 5; non-functional,
+  // gate 6) on a non-declaring variant. Source for gates 4-6 is already
+  // set-based (Stage 1) — this is a coverage gap, not a behavior change.
+  it('Stage 2: multi-pack gate matrix — a variant with 2 declared packs has both visible and functional in ALL its HOMEs, both foreign elsewhere', async () => {
+    const root = makeTempDir()
+    const homes = await buildVariantHomes(root, ['multi', 'smoke'], 2)
+    const multiHomes = new Set(homes['multi'])
+    spawnMock.mockImplementation((opts: { cwd: string }) =>
+      Effect.succeed({
+        exitCode: multiHomes.has(opts.cwd) ? 0 : 1,
+        stdout: '',
+        stderr: '',
+        durationMs: 2,
+        timedOut: false,
+      }),
+    )
+    const input = buildInput(
+      homes,
+      {
+        packs: [
+          { name: 'pack-a', ref: 'github:o/pack-a', check: 'test -f marker-pack-a.txt' },
+          { name: 'pack-b', ref: 'github:o/pack-b', check: 'test -f marker-pack-b.txt' },
+        ],
+        variants: [{ name: 'multi', packs: ['pack-a', 'pack-b'] }, { name: 'smoke', packs: [] }],
+        baseline: 'multi',
+        workspacePath: root,
+        outputPath: path.join(root, 'out'),
+      },
+      {
+        packInstall: packInstallOf([
+          await withMinimalDelivery(homes, 'multi', 'pack-a'),
+          await withMinimalDelivery(homes, 'multi', 'pack-b'),
+        ]),
+      },
+    )
+    const result = await runP(preflight(input))
+    expect(result.exitCode).toBe(0)
+
+    // gate 4: both declared packs visible on 'multi'
+    const multiVisibility = result.checks.filter((c) => c.name === 'pack-visibility' && c.variant === 'multi')
+    expect(multiVisibility).toHaveLength(2)
+    expect(multiVisibility.every((c) => c.passed)).toBe(true)
+    expect(checkByVariant(result, 'pack-visibility', 'smoke')?.details).toBe('skipped (no pack)')
+
+    // gate 5: both packs foreign at 'smoke', correctly absent
+    const smokeForeign = result.checks.filter((c) => c.name === 'foreign-pack-absent' && c.variant === 'smoke')
+    expect(smokeForeign).toHaveLength(2)
+    expect(smokeForeign.every((c) => c.passed)).toBe(true)
+    expect(checkByVariant(result, 'foreign-pack-absent', 'multi')?.details).toBe('skipped (no foreign pack)')
+
+    // gate 6: 2 packs x 2 variants x 2 HOMEs = 8 pack-check runs total
+    expect(result.packChecks).toHaveLength(8)
+    expect(
+      result.checks.some(
+        (c) => c.variant === 'multi' && c.details === 'pack-functional [pack-a @ multi] 2/2 HOME(s) verified',
+      ),
+    ).toBe(true)
+    expect(
+      result.checks.some(
+        (c) => c.variant === 'multi' && c.details === 'pack-functional [pack-b @ multi] 2/2 HOME(s) verified',
+      ),
+    ).toBe(true)
+    expect(
+      result.checks.some(
+        (c) => c.variant === 'smoke' && c.details === 'pack-functional [pack-a @ smoke] 2/2 HOME(s) verified',
+      ),
+    ).toBe(true)
+    expect(
+      result.checks.some(
+        (c) => c.variant === 'smoke' && c.details === 'pack-functional [pack-b @ smoke] 2/2 HOME(s) verified',
+      ),
+    ).toBe(true)
+  })
+
   it('gate 6: declared pack not functional → E_PACK_CHECK_FAILED exitCode=3 reason=declared-not-functional', async () => {
     const root = makeTempDir()
     const homes = await buildVariantHomes(root, ['a'])

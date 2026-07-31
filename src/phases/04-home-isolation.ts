@@ -25,7 +25,7 @@ import type {
   VariantHomes,
   VariantSpec,
 } from '@generated/types'
-import type { PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
+import type { PackDeliveryExt, PackInstallOutcome, RegistrationInstruction } from './03-pack-install.js'
 import { effectiveOf, packsOf } from './00-cli-parse.js'
 import { installPlugin } from '../opencode/cli.js'
 import type { DockerExec, OpencodeError } from '../opencode/cli.js'
@@ -442,6 +442,77 @@ const collectMcpServers = (
   )
 }
 
+/**
+ * The destination an instruction actually writes to, once — two packs
+ * targeting the same one would silently overwrite each other in
+ * `applyInstruction` (last-write-wins, no merge). Deliberately narrower than
+ * `(kind, name)`: a `file` instruction also depends on `section` (an agent
+ * and a command may share a name without colliding, they land in different
+ * dirs), and a local `plugin` instruction collides on its delivered file's
+ * basename, not on `inst.name` (which is only used for an npm-form plugin's
+ * `opencode plugin <module>` install).
+ */
+const instructionDestKey = (inst: RegistrationInstruction): string => {
+  switch (inst.kind) {
+    case 'skill':
+      return `skill:${inst.name}`
+    case 'file':
+      return `file:${inst.section}:${inst.name}`
+    case 'plugin':
+      return inst.target === undefined
+        ? `plugin-module:${inst.name}`
+        : `plugin-file:${path.basename(inst.target)}`
+    case 'config':
+      return `mcp:${inst.name}`
+  }
+}
+
+interface KeyedInstruction {
+  readonly key: string
+  readonly pack: string
+  readonly inst: RegistrationInstruction
+}
+
+const flattenKeyed = (deliveries: readonly PackDeliveryExt[]): readonly KeyedInstruction[] =>
+  deliveries.flatMap((delivery) =>
+    delivery.instructions.map((inst) => ({ key: instructionDestKey(inst), pack: delivery.pack, inst })),
+  )
+
+/** First pair of entries (in delivery order) that share a destination key but come from different packs. */
+const findInstructionCollision = (
+  entries: readonly KeyedInstruction[],
+): { readonly a: KeyedInstruction; readonly b: KeyedInstruction } | undefined => {
+  const pairs = entries.flatMap((a, i) =>
+    entries
+      .slice(i + 1)
+      .filter((b) => b.key === a.key && b.pack !== a.pack)
+      .map((b) => ({ a, b })),
+  )
+  return pairs[0]
+}
+
+/**
+ * Stage 2 (WP16): a variant's declared pack set can now be arbitrarily large
+ * — run this BEFORE any instruction is applied, across the variant's full
+ * set of deliveries, so two packs colliding on the same destination fail
+ * loud (naming both packs) instead of one silently clobbering the other.
+ */
+const checkInstructionCollisions = (
+  variantName: string,
+  deliveries: readonly PackDeliveryExt[],
+): Effect.Effect<void, PhaseError> => {
+  const collision = findInstructionCollision(flattenKeyed(deliveries))
+  if (collision === undefined) return Effect.void
+  const { a, b } = collision
+  return Effect.fail(
+    homeIsolationError(
+      `packs '${a.pack}' and '${b.pack}' both deliver the same ${a.inst.kind} '${a.inst.name}' for variant '${variantName}'`,
+      'E_PACK_INSTALL_FAILED',
+      { variant: variantName, packs: [a.pack, b.pack], kind: a.inst.kind, name: a.inst.name },
+    ),
+  )
+}
+
 /** Connectivity/model-selection fields copied as-is (no CLI override) into every variant's config. */
 export interface ConnectivityExtras {
   readonly provider: Record<string, unknown> | undefined
@@ -572,10 +643,8 @@ export const homeIsolation = (
     const processVariant = (v: VariantSpec): Effect.Effect<VariantResult, PhaseError> =>
       Effect.gen(function* () {
         const declaredPacks = packsOf(runInput, v)
-        // Apply EVERY declared pack's instructions/mcp — Stage 1 caps
-        // declaredPacks at length <=1 (enforced in phase 00), but this loop
-        // is written set-based from the start so Stage 2 (WP16) only has to
-        // drop that guard and add the instruction-collision check; it must
+        // Apply EVERY declared pack's instructions/mcp — this loop is
+        // set-based (Stage 2, WP16: no cap on declaredPacks length); it must
         // never silently apply just the first pack.
         const deliveries = yield* Effect.forEach(
           declaredPacks,
@@ -600,11 +669,11 @@ export const homeIsolation = (
             }),
           { concurrency: 1 },
         )
-        const instructions: readonly RegistrationInstruction[] = deliveries.flatMap((d) =>
-          d === undefined ? [] : [...d.instructions],
-        )
-        const mcpServers = deliveries.reduce<Record<string, unknown>>(
-          (acc, d) => ({ ...acc, ...collectMcpServers(d?.instructions) }),
+        const definedDeliveries = deliveries.filter((d): d is PackDeliveryExt => d !== undefined)
+        yield* checkInstructionCollisions(v.name, definedDeliveries)
+        const instructions: readonly RegistrationInstruction[] = definedDeliveries.flatMap((d) => [...d.instructions])
+        const mcpServers = definedDeliveries.reduce<Record<string, unknown>>(
+          (acc, d) => ({ ...acc, ...collectMcpServers(d.instructions) }),
           {},
         )
         const pure = v.pure ?? declaredPacks.length === 0

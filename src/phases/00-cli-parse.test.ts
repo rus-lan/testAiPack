@@ -1251,7 +1251,9 @@ describe('cliParse — n-way variants: variant-mode validation matrix', () => {
     expect(err.context?.['reason']).toBe('pack-name-collision')
   })
 
-  it('multi-pack-stage2 guard: a variant with 2 packs is rejected in Stage 1', async () => {
+  // Stage 2 (WP16): the Stage-1 `multi-pack-stage2` guard is gone — a
+  // variant may declare an arbitrary set of registered packs.
+  it('Stage 2: a variant with 2 packs parses fine, in declaration order', async () => {
     const cwd = makeTempDir()
     await writeConfig(
       cwd,
@@ -1263,10 +1265,57 @@ describe('cliParse — n-way variants: variant-mode validation matrix', () => {
         variants: [{ name: 'multi', packs: ['p1', 'p2'] }],
       }),
     )
+    const result = await runP(cliParse({ argv: ['run'], cwd }))
+    expect(variantByName(result.runInput, 'multi')?.packs).toEqual(['p1', 'p2'])
+  })
+
+  it('Stage 2: a variant may declare 3+ packs, mixing registered names and bare-ref shorthand', async () => {
+    const cwd = makeTempDir()
+    await writeConfig(
+      cwd,
+      baseVariantConfig({
+        packs: [{ name: 'p1', ref: 'https://example.com/p1.git' }],
+        variants: [
+          { name: 'multi', packs: ['p1', 'https://example.com/p2.git', 'https://example.com/p3.git'] },
+        ],
+      }),
+    )
+    const result = await runP(cliParse({ argv: ['run'], cwd }))
+    expect(variantByName(result.runInput, 'multi')?.packs).toEqual(['p1', 'p2', 'p3'])
+    expect(result.runInput.packs.map((p) => p.name)).toEqual(['p1', 'p2', 'p3'])
+  })
+
+  it('a variant declaring the same pack twice → reason duplicate-pack-in-variant', async () => {
+    const cwd = makeTempDir()
+    await writeConfig(
+      cwd,
+      baseVariantConfig({
+        packs: [{ name: 'p1', ref: 'https://example.com/p1.git' }],
+        variants: [{ name: 'multi', packs: ['p1', 'p1'] }],
+      }),
+    )
     const err = await runFlip(cliParse({ argv: ['run'], cwd }))
     expect(err.code).toBe('E_CONFIG_INVALID')
-    expect(err.context?.['reason']).toBe('multi-pack-stage2')
+    expect(err.context?.['reason']).toBe('duplicate-pack-in-variant')
     expect(err.context?.['variant']).toBe('multi')
+    expect(err.context?.['pack']).toBe('p1')
+  })
+
+  it('a variant declaring the same bare-ref pack twice (resolves to the same auto-registered name) → duplicate-pack-in-variant', async () => {
+    const cwd = makeTempDir()
+    await writeConfig(
+      cwd,
+      baseVariantConfig({
+        variants: [
+          { name: 'multi', packs: ['https://example.com/p1.git', 'https://example.com/p1.git'] },
+        ],
+      }),
+    )
+    const err = await runFlip(cliParse({ argv: ['run'], cwd }))
+    expect(err.code).toBe('E_CONFIG_INVALID')
+    expect(err.context?.['reason']).toBe('duplicate-pack-in-variant')
+    expect(err.context?.['variant']).toBe('multi')
+    expect(err.context?.['pack']).toBe('p1')
   })
 
   it('missing effective prompt on one variant → reason prompt-required naming that variant', async () => {
