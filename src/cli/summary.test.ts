@@ -28,7 +28,7 @@ describe('cli/summary — buildReportSummary (N-way, base/graphify/astgrep fixtu
   it('headline: one clause per variant, exact wording per 03-hard-problems.md §1.4', () => {
     const s = buildReportSummary(makeMetricsReport())
     expect(s.headlineResult).toBe(
-      'vs base: graphify — 2 significant improvement(s): Total tokens, Steps; astgrep — no significant differences (3 better, 1 worse, all within noise).',
+      'По сравнению с base: graphify — 2 значимых улучшения: Всего токенов, Шаги; astgrep — нет значимых различий (3 лучше, 1 хуже, всё в пределах шума).',
     )
   })
 
@@ -65,25 +65,25 @@ describe('cli/summary — allFailed and pairIncomplete', () => {
     const base = makeMetricsReport()
     const metrics: MetricsReport = { ...base, allFailed: true }
     const s = buildReportSummary(metrics)
-    expect(s.headlineResult).toBe('All 3 variants failed — comparison unavailable.')
+    expect(s.headlineResult).toBe('Все 3 варианта провалились — сравнение недоступно.')
   })
 
-  it('a broken pair (pairIncomplete) contributes "no samples (all runs failed)", not a significance clause', () => {
+  it('a broken pair (pairIncomplete) contributes "нет данных (все запуски провалились)", not a significance clause', () => {
     const base = makeMetricsReport()
     const metrics: MetricsReport = {
       ...base,
       deltas: base.deltas.map((d) => (d.variant === 'graphify' ? { ...d, pairIncomplete: true } : d)),
     }
     const s = buildReportSummary(metrics)
-    expect(s.headlineResult).toContain('graphify — no samples (all runs failed)')
-    expect(s.headlineResult).toContain('astgrep — no significant differences')
+    expect(s.headlineResult).toContain('graphify — нет данных (все запуски провалились)')
+    expect(s.headlineResult).toContain('astgrep — нет значимых различий')
   })
 
-  it('a single-variant run (no non-baseline variant, legal per phase 00) gets its own sentence, not "vs base: ."', () => {
+  it('a single-variant run (no non-baseline variant, legal per phase 00) gets its own sentence, not "По сравнению с base: ."', () => {
     const base = makeMetricsReport()
     const metrics: MetricsReport = { ...base, variants: [base.variants[0]!], deltas: [] }
     const s = buildReportSummary(metrics)
-    expect(s.headlineResult).toBe('Only base ran — no comparison.')
+    expect(s.headlineResult).toBe('Запущен только base — сравнивать не с чем.')
     expect(s.perVariant).toEqual([])
   })
 })
@@ -136,8 +136,8 @@ describe('cli/summary — task basis', () => {
     }
     const s = buildReportSummary(metrics)
     expect(s.headlineResult).toContain('astgrep')
-    expect(s.headlineResult).toContain('Steps')
-    expect(s.headlineResult).toContain('significant regression')
+    expect(s.headlineResult).toContain('Шаги')
+    expect(s.headlineResult).toContain('значимая регрессия')
   })
 })
 
@@ -149,7 +149,7 @@ describe('cli/summary — task basis', () => {
 // ---------------------------------------------------------------------------
 
 describe('cli/summary — one clause, two parts (significant improvement AND regression together)', () => {
-  it('joins the improvement/regression parts of one clause with " and ", reserving "; " for the join between variants', () => {
+  it('joins the improvement/regression parts of one clause with " и ", reserving "; " for the join between variants', () => {
     const base = makeMetricsReport()
     const mixedDeltas: PrimaryDeltas = {
       totalTokens: { absolute: -5000, percent: -30, significant: true, better: 'better' },
@@ -166,9 +166,9 @@ describe('cli/summary — one clause, two parts (significant improvement AND reg
     }
     const s = buildReportSummary(metrics)
     expect(s.headlineResult).toContain(
-      'graphify — 1 significant improvement(s): Total tokens and 1 significant regression(s): Wall-clock (ms)',
+      'graphify — 1 значимое улучшение: Всего токенов и 1 значимая регрессия: Время (wall-clock), мс',
     )
-    // The clause boundary before astgrep is still '; ', not ' and '.
-    expect(s.headlineResult).toContain('); astgrep —')
+    // The clause boundary before astgrep is still '; ', not ' и '.
+    expect(s.headlineResult).toContain('мс; astgrep —')
   })
 })

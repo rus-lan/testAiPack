@@ -114,7 +114,7 @@ describe('reportRender — stdout Markdown', () => {
     const result = await runP(reportRender(input))
     expect(result.stdoutMd).toBeDefined()
     expect(typeof result.stdoutMd).toBe('string')
-    expect(result.stdoutMd).toContain(`# testaipack report: ${report.manifest.runId}`)
+    expect(result.stdoutMd).toContain(`# Отчёт testaipack: ${report.manifest.runId}`)
     const onDisk = await runP(readFile(`${out}/report.md`))
     expect(result.stdoutMd).toBe(onDisk)
   })
@@ -165,12 +165,12 @@ describe('reportRender — markdown content (3-variant N-way report)', () => {
     const input = inputFrom(baseReport(), { formats: ['md'], outputPath: out })
     await runP(reportRender(input))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).toContain('## Summary')
-    expect(md).toContain('## Primary metrics — total (init + task)')
-    expect(md).toContain('## Secondary metrics')
-    expect(md).toContain('## LLM Judge')
-    expect(md).toContain('## Timeline summary')
-    expect(md).toContain('## Diff summary')
+    expect(md).toContain('## Сводка')
+    expect(md).toContain('## Основные метрики — итого (init + task)')
+    expect(md).toContain('## Дополнительные метрики')
+    expect(md).toContain('## LLM-судья')
+    expect(md).toContain('## Сводка по таймлайну')
+    expect(md).toContain('## Сводка по diff')
   })
 
   it('primary metrics table shows the metric-major header and baseline row', async () => {
@@ -178,8 +178,8 @@ describe('reportRender — markdown content (3-variant N-way report)', () => {
     const input = inputFrom(baseReport(), { formats: ['md'], outputPath: out })
     await runP(reportRender(input))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).toContain('| Metric | Variant | Median | [min–max] | Δ vs base | Δ% | Significant | Verdict |')
-    expect(md).toContain('| Total tokens | base* |')
+    expect(md).toContain('| Метрика | Вариант | Медиана | [мин–макс] | Δ vs база | Δ% | Значимо | Вердикт |')
+    expect(md).toContain('| Всего токенов | base* |')
   })
 
   it('headline result appears near the top of Summary', async () => {
@@ -205,7 +205,7 @@ describe('reportRender — markdown content (3-variant N-way report)', () => {
     }
     await runP(reportRender(inputFrom(withFailure, { formats: ['md'], outputPath: out })))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).toContain('## Failed runs')
+    expect(md).toContain('## Проваленные запуски')
     expect(md).toContain('E_RUN_CRASH')
   })
 
@@ -214,7 +214,7 @@ describe('reportRender — markdown content (3-variant N-way report)', () => {
     const input = inputFrom(baseReport(), { formats: ['md'], outputPath: out })
     await runP(reportRender(input))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).not.toContain('## Failed runs')
+    expect(md).not.toContain('## Проваленные запуски')
   })
 
   it('judge section shows "not requested" when judge omitted', async () => {
@@ -222,7 +222,7 @@ describe('reportRender — markdown content (3-variant N-way report)', () => {
     const report = withoutJudge(baseReport())
     await runP(reportRender(inputFrom(report, { formats: ['md'], outputPath: out })))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).toContain('_Judge was not requested (--judge not set)_')
+    expect(md).toContain('_Судья не запрошен (--judge не задан)_')
   })
 
   it('allFailed emits the comparison-unreliable warning', async () => {
@@ -231,7 +231,7 @@ describe('reportRender — markdown content (3-variant N-way report)', () => {
     const failed: Report = { ...report, metrics: { ...report.metrics, allFailed: true } }
     await runP(reportRender(inputFrom(failed, { formats: ['md'], outputPath: out })))
     const md = await runP(readFile(`${out}/report.md`))
-    expect(md).toContain('All variants failed — comparison unreliable')
+    expect(md).toContain('Все варианты провалились — сравнение ненадёжно')
   })
 })
 

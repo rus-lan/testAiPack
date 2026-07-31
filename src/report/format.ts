@@ -20,13 +20,13 @@ export interface PrimaryMeta {
 }
 
 export const PRIMARY_METRICS: readonly PrimaryMeta[] = [
-  { key: 'totalTokens', label: 'Total tokens', kind: 'int' },
-  { key: 'wallClockMs', label: 'Wall-clock (ms)', kind: 'int' },
-  { key: 'costUsd', label: 'Cost ($)', kind: 'cost' },
-  { key: 'stepCount', label: 'Steps', kind: 'int' },
-  { key: 'toolCallCount', label: 'Tool calls', kind: 'int' },
-  { key: 'successRank', label: 'Success rank', kind: 'rank' },
-  { key: 'maxParallelism', label: 'Max parallelism', kind: 'int' },
+  { key: 'totalTokens', label: 'Всего токенов', kind: 'int' },
+  { key: 'wallClockMs', label: 'Время (wall-clock), мс', kind: 'int' },
+  { key: 'costUsd', label: 'Стоимость ($)', kind: 'cost' },
+  { key: 'stepCount', label: 'Шаги', kind: 'int' },
+  { key: 'toolCallCount', label: 'Вызовы инструментов', kind: 'int' },
+  { key: 'successRank', label: 'Ранг успеха', kind: 'rank' },
+  { key: 'maxParallelism', label: 'Макс. параллелизм', kind: 'int' },
 ]
 
 export interface PhaseMeta {
@@ -43,11 +43,11 @@ export interface PhaseMeta {
  * (7-key union) isn't assignable to `keyof PhaseSlice` (5-key union).
  */
 export const PHASE_METRICS: readonly PhaseMeta[] = [
-  { key: 'totalTokens', label: 'Total tokens', kind: 'int' },
-  { key: 'wallClockMs', label: 'Wall-clock (ms)', kind: 'int' },
-  { key: 'costUsd', label: 'Cost ($)', kind: 'cost' },
-  { key: 'stepCount', label: 'Steps', kind: 'int' },
-  { key: 'toolCallCount', label: 'Tool calls', kind: 'int' },
+  { key: 'totalTokens', label: 'Всего токенов', kind: 'int' },
+  { key: 'wallClockMs', label: 'Время (wall-clock), мс', kind: 'int' },
+  { key: 'costUsd', label: 'Стоимость ($)', kind: 'cost' },
+  { key: 'stepCount', label: 'Шаги', kind: 'int' },
+  { key: 'toolCallCount', label: 'Вызовы инструментов', kind: 'int' },
 ]
 
 /** `successRank`/`maxParallelism` never split into init/task (spec §3: whole-run verdicts). */
@@ -124,7 +124,7 @@ export const fmtSigned = (v: number, kind: MetricKind): string => {
 }
 
 export const fmtPct = (v: number | undefined): string => {
-  if (v === undefined) return 'n/a'
+  if (v === undefined) return 'н/д'
   if (!Number.isFinite(v)) return String(v)
   const body = v.toFixed(1)
   return v > 0 ? `+${body}%` : `${body}%`
@@ -142,19 +142,19 @@ export const fmtDurationMs = (v: string | number): string => {
 }
 
 const VERDICT_MAP: Record<MetricDelta['better'], string> = {
-  better: '✓ better',
-  worse: '⚠ worse',
-  neutral: '= same',
-  'context-dependent': '≈ ctx',
+  better: '✓ лучше',
+  worse: '⚠ хуже',
+  neutral: '= без изменений',
+  'context-dependent': '≈ контекст',
 }
 
 export const verdictFor = (d: MetricDelta): string => VERDICT_MAP[d.better]
 
 export const sigLabel = (d: MetricDelta): string => {
   if (d.significant) {
-    if (d.better === 'better') return '✓ significant'
-    if (d.better === 'worse') return '⚠ significant'
-    return 'significant'
+    if (d.better === 'better') return '✓ значимо'
+    if (d.better === 'worse') return '⚠ значимо'
+    return 'значимо'
   }
-  return d.better === 'neutral' ? '—' : 'in noise'
+  return d.better === 'neutral' ? '—' : 'в пределах шума'
 }

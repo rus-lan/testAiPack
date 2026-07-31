@@ -79,8 +79,8 @@ describe('format — signed deltas and percent', () => {
     expect(fmtPct(value)).toBe(expected)
   })
 
-  it('fmtPct(undefined) === "n/a" (the omitted 0 -> non-zero percent)', () => {
-    expect(fmtPct(undefined)).toBe('n/a')
+  it('fmtPct(undefined) === "н/д" (the omitted 0 -> non-zero percent)', () => {
+    expect(fmtPct(undefined)).toBe('н/д')
   })
 
   it.each<[string | number, MetricKind, string]>([
@@ -130,22 +130,22 @@ describe('PHASE_METRICS — the five splittable metrics (metric-split spec §5.7
 
 describe('format — verdict and significance labels', () => {
   it.each<[MetricDelta['better'], string]>([
-    ['better', '✓ better'],
-    ['worse', '⚠ worse'],
-    ['neutral', '= same'],
-    ['context-dependent', '≈ ctx'],
+    ['better', '✓ лучше'],
+    ['worse', '⚠ хуже'],
+    ['neutral', '= без изменений'],
+    ['context-dependent', '≈ контекст'],
   ])('verdictFor(%s) === %s', (better, expected) => {
     expect(verdictFor(delta(better, false))).toBe(expected)
   })
 
   it.each<[MetricDelta['better'], boolean, string]>([
-    ['better', true, '✓ significant'],
-    ['worse', true, '⚠ significant'],
-    ['neutral', true, 'significant'],
-    ['context-dependent', true, 'significant'],
+    ['better', true, '✓ значимо'],
+    ['worse', true, '⚠ значимо'],
+    ['neutral', true, 'значимо'],
+    ['context-dependent', true, 'значимо'],
     ['neutral', false, '—'],
-    ['better', false, 'in noise'],
-    ['worse', false, 'in noise'],
+    ['better', false, 'в пределах шума'],
+    ['worse', false, 'в пределах шума'],
   ])('sigLabel(%s, sig=%s) === %s', (better, significant, expected) => {
     expect(sigLabel(delta(better, significant))).toBe(expected)
   })

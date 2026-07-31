@@ -22,32 +22,46 @@ const isRegression = (d: MetricDelta): boolean => d.better === 'worse'
 const isNeutral = (d: MetricDelta): boolean =>
   d.better === 'neutral' || d.better === 'context-dependent'
 
+/** Russian count agreement: 1 → `one`, 2-4 → `few`, 0/5-20/... → `many` (standard mod-10/mod-100 rule). */
+const pluralRu = (n: number, one: string, few: string, many: string): string => {
+  const mod10 = n % 10
+  const mod100 = n % 100
+  if (mod10 === 1 && mod100 !== 11) return one
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few
+  return many
+}
+
+const improvementPhrase = (n: number): string =>
+  `${String(n)} ${pluralRu(n, 'значимое улучшение', 'значимых улучшения', 'значимых улучшений')}`
+const regressionPhrase = (n: number): string =>
+  `${String(n)} ${pluralRu(n, 'значимая регрессия', 'значимые регрессии', 'значимых регрессий')}`
+
 /** One clause per non-baseline variant (`03-hard-problems.md` §1.4). */
 const clauseFor = (metrics: MetricsReport, delta: VariantDelta): string => {
   if (delta.pairIncomplete) {
-    return `${delta.variant} — no samples (all runs failed)`
+    return `${delta.variant} — нет данных (все запуски провалились)`
   }
   const { entries } = deltaEntriesFor(metrics, delta.variant)
   const sig = entries.filter((e) => e.d.significant)
   if (sig.length === 0) {
     const improvements = entries.filter((e) => isImprovement(e.d)).length
     const regressions = entries.filter((e) => isRegression(e.d)).length
-    return `${delta.variant} — no significant differences (${String(improvements)} better, ${String(regressions)} worse, all within noise)`
+    return `${delta.variant} — нет значимых различий (${String(improvements)} лучше, ${String(regressions)} хуже, всё в пределах шума)`
   }
   const sigImprovements = sig.filter((e) => isImprovement(e.d))
   const sigRegressions = sig.filter((e) => isRegression(e.d))
-  // ' and ', not '; ' — '; ' is reserved for the join BETWEEN variant clauses
+  // ' и ', not '; ' — '; ' is reserved for the join BETWEEN variant clauses
   // (buildHeadline below); a variant with both an improvement and a
   // regression part must not look like two separate variant clauses.
   const parts: readonly string[] = [
     ...(sigImprovements.length > 0
-      ? [`${String(sigImprovements.length)} significant improvement(s): ${sigImprovements.map((e) => e.label).join(', ')}`]
+      ? [`${improvementPhrase(sigImprovements.length)}: ${sigImprovements.map((e) => e.label).join(', ')}`]
       : []),
     ...(sigRegressions.length > 0
-      ? [`${String(sigRegressions.length)} significant regression(s): ${sigRegressions.map((e) => e.label).join(', ')}`]
+      ? [`${regressionPhrase(sigRegressions.length)}: ${sigRegressions.map((e) => e.label).join(', ')}`]
       : []),
   ]
-  return `${delta.variant} — ${parts.join(' and ')}`
+  return `${delta.variant} — ${parts.join(' и ')}`
 }
 
 /**
@@ -61,13 +75,16 @@ const clauseFor = (metrics: MetricsReport, delta: VariantDelta): string => {
  */
 const buildHeadline = (metrics: MetricsReport): string => {
   if (metrics.allFailed) {
-    return `All ${String(metrics.variants.length)} variants failed — comparison unavailable.`
+    const n = metrics.variants.length
+    const noun = pluralRu(n, 'вариант', 'варианта', 'вариантов')
+    const verb = n === 1 ? 'провалился' : 'провалились'
+    return `Все ${String(n)} ${noun} ${verb} — сравнение недоступно.`
   }
   if (metrics.deltas.length === 0) {
-    return `Only ${metrics.baseline} ran — no comparison.`
+    return `Запущен только ${metrics.baseline} — сравнивать не с чем.`
   }
   const clauses = metrics.deltas.map((delta) => clauseFor(metrics, delta))
-  return `vs ${metrics.baseline}: ${clauses.join('; ')}.`
+  return `По сравнению с ${metrics.baseline}: ${clauses.join('; ')}.`
 }
 
 /** 'task' iff every pair reports on the task basis; 'total' iff every pair does; omitted when mixed (renderers disclose the mix in the header text). */
