@@ -384,13 +384,13 @@ describe('cli/compare — renderers', () => {
   it('renderCompareMd emits header, summary and the metrics table', async () => {
     const result = await makeResult()
     const md = renderCompareMd(result)
-    expect(md).toContain('# testaipack compare')
+    expect(md).toContain('# Сравнение testaipack')
     expect(md).toContain('**Запуск 1:** run-one')
     expect(md).toContain('**Запуск 2:** run-two')
     expect(md).toContain('вариант: new')
     expect(md).toContain('вариант: b')
     expect(md).toContain('**Основа:** total')
-    expect(md).toContain('## Summary')
+    expect(md).toContain('## Сводка')
     expect(md).toContain(result.headlineResult)
     expect(md).toContain('| Метрика | Запуск 1 | Запуск 2 | Δ | Δ% | Значимо | Вердикт |')
     // raw per-run values (F4) — run1=new (totalTokens 10000), run2=b (totalTokens 9000)
@@ -483,7 +483,7 @@ describe('cli/compare — executeCompare (CLI glue)', () => {
     } finally {
       spy.mockRestore()
     }
-    expect(chunks.join('')).toContain('# testaipack compare')
+    expect(chunks.join('')).toContain('# Сравнение testaipack')
   })
 
   it('writes JSON to stdout when format is json', async () => {
@@ -777,7 +777,7 @@ describe('cli/compare — v1 fixture through the real compat seam (F3)', () => {
     expect(result.run1.metrics.variant).toBe('new')
     expect(result.run2.metrics.variant).toBe('b')
     const md = renderCompareMd(result)
-    expect(md).toContain('# testaipack compare')
+    expect(md).toContain('# Сравнение testaipack')
     expect(md).toContain('| Метрика | Запуск 1 | Запуск 2 |')
   })
 })

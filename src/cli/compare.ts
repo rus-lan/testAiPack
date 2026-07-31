@@ -317,17 +317,17 @@ const rawValueFor = (side: VariantAggregates, key: string, basis: 'task' | 'tota
 
 export const renderCompareMd = (result: CompareResult): string => {
   const header = [
-    '# testaipack compare',
+    '# Сравнение testaipack',
     '',
     `**Запуск 1:** ${runLabel(result.run1)}`,
     `**Запуск 2:** ${runLabel(result.run2)}`,
     `**Основа:** ${result.basis}`,
   ].join('\n')
 
-  const summary = ['## Summary', '', result.headlineResult].join('\n')
+  const summary = ['## Сводка', '', result.headlineResult].join('\n')
 
   const tableHeader = [
-    '## Primary metrics (run2 vs run1)',
+    '## Основные метрики (run2 vs run1)',
     '',
     '| Метрика | Запуск 1 | Запуск 2 | Δ | Δ% | Значимо | Вердикт |',
     '|---|---|---|---|---|---|---|',
