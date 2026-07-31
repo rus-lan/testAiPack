@@ -355,7 +355,7 @@ const runUsage: Usage = {
   description: 'Run an A/B comparison of an opencode pack against a baseline.',
   details:
     'Clones the repo, installs the pack on the new side only, runs the prompt N times per side, collects metrics, and renders a comparison report.\n\n' +
-    'Orchestrator-level flags, parsed ahead of phase 00: `--review-run <n>` (which run index to surface in `review`, default 1), `--ide vscode|cursor|code-insiders` (default vscode), `--ephemeral` (delete apps/, home/ and pack/ after the run, keeps results/), `--config <path>` (path to a testaipack config.json).\n\n' +
+    'Orchestrator-level flags, parsed ahead of phase 00: `--review-run <n>` (which run index to surface in `review`, default 1), `--ide vscode|cursor|code-insiders` (default vscode), `--ephemeral` (delete apps/, home/, gitdirs/ and pack/ after the run, keeps results/), `--config <path>` (path to a testaipack config.json).\n\n' +
     'See the full flag table below.',
   examples: [
     ['Minimal run', '$0 <repo> --pack <pack-ref> --prompt "implement feature X"'],
@@ -529,7 +529,7 @@ const ORCHESTRATOR_FLAG_ROWS: readonly FlagRow[] = [
     names: '--ephemeral',
     type: 'flag',
     def: 'off',
-    description: 'Delete apps/, home/ and pack/ after the run (keeps results/).',
+    description: 'Delete apps/, home/, gitdirs/ and pack/ after the run (keeps results/).',
   },
   {
     names: '--config',
@@ -801,7 +801,7 @@ class GcCommand extends Command {
     category: 'Results',
     description: 'Garbage-collect old runs from the workspace.',
     details:
-      '`--keep-last N` keeps only the N most recent runs. `--older-than 7d` removes runs older than the duration. `--aggressive` also prunes home/ and apps/ from the surviving runs.',
+      '`--keep-last N` keeps only the N most recent runs. `--older-than 7d` removes runs older than the duration. `--aggressive` also prunes home/, apps/ and gitdirs/ from the surviving runs.',
   })
   keepLast = Option.String('--keep-last', { description: 'Keep only the N most recent runs.' })
   olderThan = Option.String('--older-than', { description: 'Duration, e.g. 7d / 12h.' })
