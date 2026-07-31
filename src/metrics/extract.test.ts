@@ -717,7 +717,7 @@ describe('extractMetrics — extras: per-pack maps (packNames)', () => {
     })
     const { extras } = extractMetrics(exp, null, 4, { packNames: ['graphify', 'astgrep'] })
     expect(extras.packActivitySignals['graphify']).toEqual([
-      { kind: 'skill-call', pack: 'graphify', detail: 'skill tool call succeeded for "graphify"' },
+      { kind: 'skill-call', pack: 'graphify', detail: 'вызов инструмента skill успешно завершился для «graphify»' },
     ])
     expect(extras.packActivitySignals['astgrep']).toEqual([
       { kind: 'bash-install', pack: 'astgrep', detail: 'npm install -g astgrep' },

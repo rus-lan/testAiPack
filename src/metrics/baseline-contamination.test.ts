@@ -63,7 +63,7 @@ describe('isInstallShapedCommand — tabular', () => {
 describe('findPackActivitySignals', () => {
   it('flags a successful skill call naming the pack, stamped with that pack name', () => {
     const signals = findPackActivitySignals([skill('graphify')], 'graphify')
-    expect(signals).toEqual([{ kind: 'skill-call', pack: 'graphify', detail: 'skill tool call succeeded for "graphify"' }])
+    expect(signals).toEqual([{ kind: 'skill-call', pack: 'graphify', detail: 'вызов инструмента skill успешно завершился для «graphify»' }])
   })
 
   it('does not flag a FAILED skill call — that is the expected "not found" shape on a real baseline', () => {
@@ -146,7 +146,7 @@ describe('findConfigDriftSignal', () => {
     const signal = findConfigDriftSignal({ identicalAcrossRuns: false, driftFiles: ['skills'] })
     expect(signal).toEqual({
       kind: 'install-drift',
-      detail: "captured config differs across this variant's own runs in: skills",
+      detail: 'снятый конфиг этого варианта отличается между его собственными запусками: skills',
     })
     expect(findConfigDriftSignal({ identicalAcrossRuns: false, driftFiles: ['command'] })?.detail).toContain('command')
   })
@@ -154,11 +154,11 @@ describe('findConfigDriftSignal', () => {
   it('flags drift in a byte-compared config file — the missed case: a plugin/mcp server registered by hand-editing opencode.json, or a dependency via package.json, produced no signal before this fix', () => {
     expect(findConfigDriftSignal({ identicalAcrossRuns: false, driftFiles: ['opencode.json'] })).toEqual({
       kind: 'install-drift',
-      detail: "captured config differs across this variant's own runs in: opencode.json",
+      detail: 'снятый конфиг этого варианта отличается между его собственными запусками: opencode.json',
     })
     expect(findConfigDriftSignal({ identicalAcrossRuns: false, driftFiles: ['package.json'] })).toEqual({
       kind: 'install-drift',
-      detail: "captured config differs across this variant's own runs in: package.json",
+      detail: 'снятый конфиг этого варианта отличается между его собственными запусками: package.json',
     })
   })
 
@@ -167,7 +167,7 @@ describe('findConfigDriftSignal', () => {
       identicalAcrossRuns: false,
       driftFiles: ['skills', 'not-a-real-label', 'plugins'],
     })
-    expect(signal?.detail).toBe("captured config differs across this variant's own runs in: skills, plugins")
+    expect(signal?.detail).toBe('снятый конфиг этого варианта отличается между его собственными запусками: skills, plugins')
   })
 })
 
@@ -214,7 +214,7 @@ describe.skipIf(!hasGoldenWorkspace)('findConfigDriftSignal — real captured co
     const signal = findConfigDriftSignal(parseInstalledInventory(raw))
     expect(signal).toEqual({
       kind: 'install-drift',
-      detail: "captured config differs across this variant's own runs in: skills",
+      detail: 'снятый конфиг этого варианта отличается между его собственными запусками: skills',
     })
   })
 })

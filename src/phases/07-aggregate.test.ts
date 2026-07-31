@@ -445,7 +445,7 @@ describe('aggregate — config-drift signal, per variant (fires for every varian
     const graphifyCall = vi.mocked(buildVariantAggregates).mock.calls.find(([i]) => i.variant === 'graphify')
     expect(graphifyCall?.[0].configDriftSignal).toEqual({
       kind: 'install-drift',
-      detail: "captured config differs across this variant's own runs in: skills",
+      detail: 'снятый конфиг этого варианта отличается между его собственными запусками: skills',
     })
     const baseCall = vi.mocked(buildVariantAggregates).mock.calls.find(([i]) => i.variant === 'base')
     expect(baseCall?.[0].configDriftSignal).toBeUndefined()

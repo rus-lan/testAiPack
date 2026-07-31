@@ -108,7 +108,7 @@ export const findPackActivitySignals = (
   if (packName === undefined || packName === '') return []
   return tools.flatMap((p): readonly UnindexedSignal[] => {
     if (isSuccessfulSkillCall(p, packName)) {
-      return [{ kind: 'skill-call', pack: packName, detail: `skill tool call succeeded for "${packName}"` }]
+      return [{ kind: 'skill-call', pack: packName, detail: `вызов инструмента skill успешно завершился для «${packName}»` }]
     }
     if (p.tool === 'bash' && isRecord(p.state.input)) {
       const command = p.state.input['command']
@@ -189,6 +189,6 @@ export const findConfigDriftSignal = (
   if (relevant.length === 0) return undefined
   return {
     kind: 'install-drift',
-    detail: `captured config differs across this variant's own runs in: ${relevant.join(', ')}`,
+    detail: `снятый конфиг этого варианта отличается между его собственными запусками: ${relevant.join(', ')}`,
   }
 }
