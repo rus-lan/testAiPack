@@ -670,17 +670,16 @@ const renderPackSignal = (report: Report): string => {
 // ---------------------------------------------------------------------------
 
 const renderSafety = (report: Report): string => {
-  const rows = report.manifest.variants
-    .flatMap((spec) => {
-      const agg = variantAggFor(report.metrics, spec.name)
-      return (agg?.riskyCommands ?? []).map(
-        (r) =>
-          `<tr><td>${escapeHtml(spec.name)}</td><td>${String(r.runIndex)}</td><td><code>${escapeHtml(r.command)}</code></td><td>${String(r.completed)}</td><td>${r.exitCode === undefined ? '—' : String(r.exitCode)}</td></tr>`,
-      )
-    })
-    .join('')
-  if (rows === '') return ''
-  return `<section><h2>Безопасность</h2><table><thead><tr><th>Вариант</th><th>Запуск</th><th>Команда</th><th>Завершено</th><th>Выход</th></tr></thead><tbody>${rows}</tbody></table></section>`
+  const rowsArr = report.manifest.variants.flatMap((spec) => {
+    const agg = variantAggFor(report.metrics, spec.name)
+    return (agg?.riskyCommands ?? []).map(
+      (r) =>
+        `<tr><td>${escapeHtml(spec.name)}</td><td>${String(r.runIndex)}</td><td><code>${escapeHtml(r.command)}</code></td><td>${String(r.completed)}</td><td>${r.exitCode === undefined ? '—' : String(r.exitCode)}</td></tr>`,
+    )
+  })
+  if (rowsArr.length === 0) return ''
+  const count = `Обнаружено: ${String(rowsArr.length)} ${pluralRu(rowsArr.length, 'опасная команда', 'опасные команды', 'опасных команд')}.`
+  return `<section><h2>Безопасность</h2><p>${escapeHtml(count)}</p><table><thead><tr><th>Вариант</th><th>Запуск</th><th>Команда</th><th>Завершено</th><th>Выход</th></tr></thead><tbody>${rowsArr.join('')}</tbody></table></section>`
 }
 
 // ---------------------------------------------------------------------------
@@ -690,21 +689,21 @@ const renderSafety = (report: Report): string => {
 /** `pack === ''` is WP7's sentinel for a variant-level signal (e.g. `install-drift`) that isn't attributable to one pack — render as "not pack-specific", not an empty-looking cell. */
 const contaminationPackCell = (pack: string): string => (pack === '' ? '—' : escapeHtml(pack))
 
-const contaminationRows = (report: Report): string =>
-  report.manifest.variants
-    .flatMap((spec) => {
-      const agg = variantAggFor(report.metrics, spec.name)
-      return (agg?.contaminationSignals ?? []).map(
-        (s) =>
-          `<tr><td>${escapeHtml(s.kind)}</td><td>${escapeHtml(spec.name)}</td><td>${contaminationPackCell(s.pack)}</td><td>${s.runIndex === undefined ? '—' : String(s.runIndex)}</td><td><code>${escapeHtml(s.detail)}</code></td></tr>`,
-      )
-    })
-    .join('')
+const contaminationRows = (report: Report): readonly string[] =>
+  report.manifest.variants.flatMap((spec) => {
+    const agg = variantAggFor(report.metrics, spec.name)
+    return (agg?.contaminationSignals ?? []).map(
+      (s) =>
+        `<tr><td>${escapeHtml(s.kind)}</td><td>${escapeHtml(spec.name)}</td><td>${contaminationPackCell(s.pack)}</td><td>${s.runIndex === undefined ? '—' : String(s.runIndex)}</td><td><code>${escapeHtml(s.detail)}</code></td></tr>`,
+    )
+  })
 
 const renderContamination = (report: Report): string => {
   const rows = contaminationRows(report)
-  if (rows === '') return ''
-  return `<section><h2>Контаминация</h2><table><thead><tr><th>Тип</th><th>Вариант</th><th>Пакет</th><th>Запуск</th><th>Детали</th></tr></thead><tbody>${rows}</tbody></table></section>`
+  if (rows.length === 0) return ''
+  // Not escaped as a whole: the sentence embeds a real `<code>` element, not literal text.
+  const count = `Обнаружено: ${String(rows.length)} ${pluralRu(rows.length, 'сигнал', 'сигнала', 'сигналов')} того, что вариант получил или использовал пакет, который он не объявляет. Это эвристическая проверка по наблюдаемым действиям, а не доказательство — она может пропустить пути, не оставляющие здесь следа; сама по себе она не означает, что запуск недействителен. См. <code>src/metrics/baseline-contamination.ts</code>.`
+  return `<section><h2>Контаминация</h2><p>${count}</p><table><thead><tr><th>Тип</th><th>Вариант</th><th>Пакет</th><th>Запуск</th><th>Детали</th></tr></thead><tbody>${rows.join('')}</tbody></table></section>`
 }
 
 // ---------------------------------------------------------------------------
@@ -738,7 +737,7 @@ const renderJudge = (report: Report): string => {
     j.pairwiseFallback === true
       ? '<p class="basis"><em>Баллы получены через попарные вызовы каждого варианта против базового варианта (промпт превысил бюджет одного вызова).</em></p>'
       : ''
-  return `<section><h2>LLM-судья</h2>${contaminationWarn}<p>Вердикт: <strong>${escapeHtml(j.verdict)}</strong>${note}</p><p>Ранжирование: ${escapeHtml(j.ranking.join(' > '))}</p><p>Качество: ${escapeHtml(quality)}; модель <code>${escapeHtml(j.modelUsed)}</code></p><p>${escapeHtml(j.explanation)}</p>${pairwiseHtml}${renderRawResponse(j.rawResponse)}</section>`
+  return `<section><h2>LLM-судья</h2>${contaminationWarn}<p>Вердикт: <strong>${escapeHtml(j.verdict)}</strong>${note}</p><p>Ранжирование: ${escapeHtml(j.ranking.join(' > '))}</p><p>Качество: ${escapeHtml(quality)}; модель <code>${escapeHtml(j.modelUsed)}</code></p><p>Объяснение: ${escapeHtml(j.explanation)}</p>${pairwiseHtml}${renderRawResponse(j.rawResponse)}</section>`
 }
 
 const renderFailures = (report: Report): string => {

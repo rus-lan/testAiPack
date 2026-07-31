@@ -176,6 +176,11 @@ describe('renderHtml — document shape', () => {
     expect(html).toContain('I &lt;really&gt; cannot decide.')
   })
 
+  it('judge explanation carries the "Объяснение:" label, matching md.ts', () => {
+    const html = renderHtml(threeVariantsReport())
+    expect(html).toContain('<p>Объяснение: graphify produces the cleanest output of the three variants.</p>')
+  })
+
   it('B2 regression: hint: "" DISABLES the inherited global — the divergence still fires the "variants differ" suffix', () => {
     const report = threeVariantsReport()
     const withHint: Report = {
@@ -345,6 +350,11 @@ describe('renderHtml — harness preparation, pack signal, safety, contamination
     expect(html).toContain('graphify</strong> (вариант base): 2 вызова — чужой')
     expect(html).toContain('<th>Вариант</th><th>Запуск</th><th>Команда</th><th>Завершено</th><th>Выход</th>')
     expect(html).toContain('<th>Тип</th><th>Вариант</th><th>Пакет</th><th>Запуск</th><th>Детали</th>')
+    // Safety/Contamination must carry the same lead sentence as md.ts (count + register — not a bare table).
+    expect(html).toContain('<p>Обнаружено: 1 опасная команда.</p>')
+    expect(html).toContain(
+      '<p>Обнаружено: 1 сигнал того, что вариант получил или использовал пакет, который он не объявляет. Это эвристическая проверка по наблюдаемым действиям, а не доказательство — она может пропустить пути, не оставляющие здесь следа; сама по себе она не означает, что запуск недействителен. См. <code>src/metrics/baseline-contamination.ts</code>.</p>',
+    )
   })
 
   it('a variant-level install-drift signal (WP7 sentinel pack: "") renders "—" in the Pack cell, not empty', () => {
