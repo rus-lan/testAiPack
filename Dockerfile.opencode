@@ -7,11 +7,25 @@
 #   # or: docker build -t testaipack-opencode:latest -f Dockerfile.opencode .
 FROM node:22-slim
 
-# System deps: git (clone/diff), ca-certificates (HTTPS), curl (download).
+# System deps: git (clone/diff), ca-certificates (HTTPS), curl (download),
+# pipx (installs Python packs).
+#
+# Packs are cloned from arbitrary repos and can declare any `setup` command
+# (contract/main.tsp), including installing a PyPI package — e.g. the
+# `graphifyy` and `code-review-graph` packs. Debian marks the system Python
+# "externally managed" (PEP 668), so a plain `pip install` fails with
+# `error: externally-managed-environment`. pipx installs each tool into its
+# own isolated venv and drops the entry-point shims in `~/.local/bin`, which
+# is exactly the directory testaipack prepends onto PATH for every variant
+# whenever any registry pack declares `setup` — no extra PATH wiring needed
+# here. (`pip install --break-system-packages` would also clear PEP 668, but
+# it installs into the shared system site-packages, so two packs with
+# conflicting dependency pins can break each other; pipx keeps them apart.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
     curl \
+    pipx \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned opencode version — bump deliberately, not by rebuilding against

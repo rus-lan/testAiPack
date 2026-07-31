@@ -15,6 +15,13 @@
  * variant declaring it, and non-zero in every HOME of every variant that
  * does not (gate 6), unless overridden via `variant.allowPacks`.
  *
+ * Exception: a pack delivered purely via `setup` (a CLI installed into
+ * $HOME, no skill/agent/command/plugin files phase 03 can see) records zero
+ * registration instructions by design. Gates 4/5 pass such a pack without
+ * files to check rather than rejecting it, but never report it as
+ * confirmed — that would only be true, and gate 6 proves it, when the pack
+ * also declares `check`.
+ *
  * @see docs/phases/05-preflight.ru.md
  * @see contract/phases/05-preflight.tsp
  */
@@ -595,16 +602,44 @@ const gatePackVisibilityForPack = (
     // returning `passed: true` would report a false confirmation downstream
     // (WP12's visibility map, phase 07's `visibilityConfirmed`) for a pack
     // that was never actually proven visible.
+    //
+    // A pack delivered entirely through `setup` (a CLI installed into $HOME,
+    // e.g. `pipx install graphifyy`) is a legitimate exception: it has no
+    // files phase 03 can recognize as a skill/agent/command/plugin, so zero
+    // instructions is the expected, correct outcome, not a delivery bug —
+    // failing loud here would reject every such pack unconditionally. Pass
+    // instead of failing, but do NOT claim confirmation: the returned
+    // `details` deliberately does not start with `pack-visibility [` (the
+    // only string `resolvePackVisibilityConfirmed`, cli/pipeline.ts, reads as
+    // proof), so this pack is carried downstream as "not confirmed" — the
+    // honest state, with an existing rendering path
+    // ("видимость не подтверждена" in report/md.ts and report/html.ts).
+    // When the pack also declares `check`, gate 6 below independently proves
+    // presence (exit 0 in every HOME of every declaring variant) and absence
+    // elsewhere — a stronger, functional proof this gate does not duplicate.
     if (insts.length === 0) {
-      yield* fail(
-        'E_PREFLIGHT_FAILED',
-        'pack-visibility',
-        variant.name,
-        2,
-        `no registration instructions recorded for pack '${pack.name}' — visibility cannot be proven`,
-        checks,
-        { pack: pack.name },
-      )
+      if (pack.setup === undefined) {
+        yield* fail(
+          'E_PREFLIGHT_FAILED',
+          'pack-visibility',
+          variant.name,
+          2,
+          `no registration instructions recorded for pack '${pack.name}' — visibility cannot be proven`,
+          checks,
+          { pack: pack.name },
+        )
+      }
+      const proof =
+        pack.check === undefined
+          ? 'no check command either — visibility is not verified by preflight at all for this pack'
+          : "presence is instead proven by gate 6's check command"
+      return {
+        name: 'pack-visibility',
+        variant: variant.name,
+        passed: true,
+        durationMs: String(Date.now() - start),
+        details: `pack '${pack.name}' delivered via setup (no registration instructions) for variant '${variant.name}' — visibility not confirmed by gate 4; ${proof}`,
+      }
     }
     for (const inst of insts) {
       const visible = yield* instructionVisible(inst, homeDir, docker)
@@ -687,16 +722,35 @@ const gateForeignPackAbsentForPack = (
     const insts = instructionsOfPack(input, pack.name)
     // Symmetric with gate 4's guard above: an empty instruction list means
     // absence was never actually checked, not that there is nothing to leak.
+    //
+    // Same CLI-installed exception as gate 4: a pack delivered via `setup`
+    // has no files to check for a leak either, so pass instead of failing —
+    // absence is proven instead by gate 6's foreign-must-fail direction when
+    // the pack declares `check` (it must exit non-zero in every HOME of
+    // every variant that does not declare the pack).
     if (insts.length === 0) {
-      yield* fail(
-        'E_PREFLIGHT_FAILED',
-        'foreign-pack-absent',
-        variant.name,
-        2,
-        `no registration instructions recorded for foreign pack '${pack.name}' — absence cannot be proven`,
-        checks,
-        { pack: pack.name },
-      )
+      if (pack.setup === undefined) {
+        yield* fail(
+          'E_PREFLIGHT_FAILED',
+          'foreign-pack-absent',
+          variant.name,
+          2,
+          `no registration instructions recorded for foreign pack '${pack.name}' — absence cannot be proven`,
+          checks,
+          { pack: pack.name },
+        )
+      }
+      const proof =
+        pack.check === undefined
+          ? 'no check command either — absence is not verified by preflight at all for this pack'
+          : "absence is instead proven by gate 6's foreign-must-fail check"
+      return {
+        name: 'foreign-pack-absent',
+        variant: variant.name,
+        passed: true,
+        durationMs: String(Date.now() - start),
+        details: `foreign pack '${pack.name}' delivered via setup (no registration instructions) — absence not confirmed by gate 5 for variant '${variant.name}'; ${proof}`,
+      }
     }
     for (const inst of insts) {
       const leaked = yield* leakedInto(inst, homeDir, docker, variant.name)
