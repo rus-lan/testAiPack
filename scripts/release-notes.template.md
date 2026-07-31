@@ -18,7 +18,8 @@ curl -fsSL https://github.com/rus-lan/testAiPack/releases/latest/download/instal
 
 ```
 testaipack run <repo> [--pack <ref>] --prompt <text|@file>
-testaipack compare <run-id-1> <run-id-2> [--perspective auto]
+testaipack run [--config <path>]                        # N-way: variants + pack registry read from config.json
+testaipack compare <run-id-1> <run-id-2> [--variant <name>|best] [--variant2 <name>|best]
 testaipack review [run-id]
 testaipack report [run-id]
 testaipack gc [--keep-last N | --older-than 7d]
@@ -28,6 +29,21 @@ testaipack doctor
 ```
 
 Полная документация и changelog: [README.md](https://github.com/rus-lan/testAiPack/blob/main/README.md)
+
+## v0.7.0 (N-way варианты, schemaVersion 2)
+
+- **N named variants replace the fixed two-sided `old`/`new` pair.** A run is now a pack registry plus a list of named variants, each with its own pack set, with one variant designated `baseline`. Every delta, significance test, judge score, timeline lane, and report table is computed per-variant-vs-baseline (N−1 comparisons), not just `new − old`. The classic two-sided flag invocation (`--pack`, `--prompt`, `--pure-baseline`, `--init-side`, …) still works exactly as before — it desugars into two variants named `old`/`new` under the hood, and stays supported indefinitely, not deprecated.
+- **Per-variant overrides**: `prompt`, `init`, `model`, `hint`, `verify`, `exercise`, `allowPacks`, and `pure` can now be set per variant in `.testaipack/config.json` — each falls back to the same-named global setting when absent, and an explicit empty string (`hint: ""`) disables the inherited global instead of falling back to it.
+- **Several packs per variant.** A variant can declare more than one pack; the same pack name declared twice on one variant is rejected (`duplicate-pack-in-variant`) rather than silently deduplicated. Two packs on the same variant registering the same thing — the same skill, the same mcp server, the same npm plugin module, an agent/command sharing both name AND section — fail before any HOME is built, naming both packs; an agent and a command may share a name (different sections, no collision), and the harness's own `build` agent is protected the same way a second pack would be.
+- **`--parallel <n>`** (default 2) caps how many variants run concurrently; runs within one variant stay sequential. **`--baseline <name>`** picks which variant every other one is compared against (defaults to the first variant). **`--hint <text>`** is the new canonical name for the global task-prompt hint (`--pack-hint` kept as a deprecated alias).
+- **`compare --variant <name>|best` / `--variant2 <name>|best`** — pick a variant by name (or by highest median successRank) on each of the two compared runs independently, including comparing a v1 run (which only ever has `old`/`new`) against a v2 run with arbitrary variant names. `--perspective` is kept as a hidden legacy alias.
+- **BREAKING: `report.json`/`manifest.json`/`run-input.json` now carry `schemaVersion: 2`.** Any external script reading `metricsDiff.old`/`.new`/`.deltas`/`.bothFailed` directly off `report.json` breaks — read `metrics.baseline`, `metrics.variants[]`, and `metrics.deltas[]` instead (one `VariantDelta` per non-baseline variant). `diff`/`timeline`/`judge` shapes changed the same way (`diffs: DiffResult[]`, `timeline.lanes[]`, `judge.scores: [{variant, quality}]`).
+- **v1 workspaces keep opening.** `report --rebuild`, `compare`, and `list` read a workspace with no `schemaVersion` through a compatibility layer and expose it as `old`/`new` variants automatically — no manual migration needed.
+- **`--no-pure-baseline` now genuinely disables the baseline's purity isolation** — it used to be decorative outside the parser (never reached the run's environment). A one-line stderr notice is printed when this changes behavior on the legacy invocation path.
+- **Disk cost scales with variants × runs**, not `2 × runs`: each variant × run pair gets its own working copy and its own isolated `$HOME` — a 4-variant × 3-run experiment is 12 app copies, not 6.
+- **Security**: a pack's short name (derived from its `ref` and disclosed in the manifest, the report, and the judge prompt) is now credential-redacted before the name is derived — a `ref` carrying userinfo (`https://user:token@host/...`) used to leak `user:token` into that derived name even though the `ref` field itself was already redacted everywhere else.
+
+Full changelog: https://github.com/rus-lan/testAiPack/compare/v0.6.5...v0.7.0
 
 ## v0.6.5 (installer atomic rename, binary permissions, signal cleanup)
 
