@@ -256,7 +256,7 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     expect(code).toBe(0)
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
     expect(md).toContain('## Rebuild provenance')
-    expect(md).toContain('## Summary')
+    expect(md).toContain('## Сводка')
   })
 
   it('report.json (and --format json stdout) discloses the rebuild via manifest.flagDefaults — not just the md/html text', async () => {
@@ -329,7 +329,7 @@ describe('rebuild — post-upgrade (run-input.json + run-N.result.json present)'
     const code = await executeRebuild(baseFlags(workspace))
     expect(code).toBe(0)
     const md = await runP(readFile(path.join(tree.results, 'report.md')))
-    expect(md).toContain('Judge was not requested')
+    expect(md).toContain('Судья не запрошен')
   })
 
   it('a recorded outputPath that disagrees with the given --workspace is ignored, with a notice — never honored (workspace-escape guard)', async () => {

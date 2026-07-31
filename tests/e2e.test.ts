@@ -277,7 +277,7 @@ describe('e2e: full A/B pipeline via runCli', () => {
       // report.md + report.json
       expect(existsSync(path.join(results, 'report.md'))).toBe(true)
       const md = await runP(readFile(path.join(results, 'report.md')))
-      expect(md).toContain('# testaipack report')
+      expect(md).toContain('# Отчёт testaipack')
       expect(existsSync(path.join(results, 'report.json'))).toBe(true)
       const reportRaw = await runP(readFile(path.join(results, 'report.json')))
       expect(reportSchema.safeParse(JSON.parse(reportRaw)).success).toBe(true)
@@ -380,7 +380,7 @@ describe('e2e: full A/B pipeline via runCli', () => {
           }
         })
         expect(jsonWrite).toBeDefined()
-        expect(writes.some((w) => w.includes('# testaipack report'))).toBe(false)
+        expect(writes.some((w) => w.includes('# Отчёт testaipack'))).toBe(false)
       } finally {
         writeSpy.mockRestore()
       }
@@ -408,7 +408,7 @@ describe('e2e: full A/B pipeline via runCli', () => {
         ])
         expect(code).toBe(0)
         const writes = writeSpy.mock.calls.map((c) => String(c[0]))
-        expect(writes.some((w) => w.includes('# testaipack report'))).toBe(true)
+        expect(writes.some((w) => w.includes('# Отчёт testaipack'))).toBe(true)
       } finally {
         writeSpy.mockRestore()
       }
