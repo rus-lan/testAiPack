@@ -83,7 +83,7 @@ export const runShellInHome = (
         const e: DockerError = outcome.left
         return {
           exitCode: e.exitCode ?? -1,
-          durationMs: 0,
+          durationMs: e.durationMs ?? 0,
           outputTail: tail(e.stderr, OUTPUT_TAIL_CHARS),
           timedOut: e.timedOut,
         }

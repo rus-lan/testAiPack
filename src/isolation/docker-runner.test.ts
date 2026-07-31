@@ -203,10 +203,10 @@ describe('docker-runner — dockerRun', () => {
     expect(result.durationMs).toBe(4)
   })
 
-  it('propagates a non-zero container exit as DockerError', async () => {
+  it('propagates a non-zero container exit as DockerError, carrying the real elapsed time', async () => {
     sp.mockImplementation((input) => {
       lastSpawn = input
-      return Effect.succeed(okSpawn({ exitCode: 2, stderr: 'boom' }))
+      return Effect.succeed(okSpawn({ exitCode: 2, stderr: 'boom', durationMs: 733 }))
     })
     const err = await runFlip(dockerRun(baseOpts))
     expect(err).toBeInstanceOf(DockerError)
@@ -214,17 +214,19 @@ describe('docker-runner — dockerRun', () => {
     expect(err.exitCode).toBe(2)
     expect(err.stderr).toBe('boom')
     expect(err.timedOut).toBe(false)
+    expect(err.durationMs).toBe(733)
   })
 
-  it('on timeout: best-effort docker kill + DockerError {timedOut:true}', async () => {
+  it('on timeout: best-effort docker kill + DockerError {timedOut:true}, carrying the real elapsed time', async () => {
     sp.mockImplementation((input) => {
       lastSpawn = input
-      return Effect.succeed(okSpawn({ exitCode: null, timedOut: true, stderr: 'hang' }))
+      return Effect.succeed(okSpawn({ exitCode: null, timedOut: true, stderr: 'hang', durationMs: 5041 }))
     })
     const err = await runFlip(dockerRun({ ...baseOpts, timeoutMs: 50 }))
     expect(err).toBeInstanceOf(DockerError)
     expect(err.timedOut).toBe(true)
     expect(err.exitCode).toBe(null)
+    expect(err.durationMs).toBe(5041)
     // the kill best-effort call ran against the same container name
     const nameIdx = lastSpawn?.args.indexOf('--name') ?? -1
     const containerName = lastSpawn?.args[nameIdx + 1]

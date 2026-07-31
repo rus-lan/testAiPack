@@ -76,24 +76,26 @@ describe('shell-runner — runShellInHome (docker mode)', () => {
     expect(out).toEqual({ exitCode: 0, durationMs: 42, outputTail: 'mytool v1.0.0\n', timedOut: false })
   })
 
-  it('maps a non-zero exit (DockerError, not timed out) to {exitCode, timedOut:false} — never throws', async () => {
+  it('maps a non-zero exit (DockerError, not timed out) to {exitCode, timedOut:false} — never throws, and keeps the real duration instead of reporting 0', async () => {
     sp.mockImplementation((input) => {
       lastSpawn = input
-      return Effect.succeed(okSpawn({ exitCode: 127, stderr: 'mytool: not found' }))
+      return Effect.succeed(okSpawn({ exitCode: 127, stderr: 'mytool: not found', durationMs: 356 }))
     })
     const out = await runP(runShellInHome('mytool --version', '/host/home', '/host/apps', { image: 'img:latest' }, 5000))
     expect(out.exitCode).toBe(127)
     expect(out.timedOut).toBe(false)
     expect(out.outputTail).toContain('not found')
+    expect(out.durationMs).toBe(356)
   })
 
-  it('maps a timeout to {timedOut:true} — never throws', async () => {
+  it('maps a timeout to {timedOut:true} — never throws, and reports the real elapsed time, not 0', async () => {
     sp.mockImplementation((input) => {
       lastSpawn = input
-      return Effect.succeed(okSpawn({ exitCode: null, timedOut: true, stderr: 'hang' }))
+      return Effect.succeed(okSpawn({ exitCode: null, timedOut: true, stderr: 'hang', durationMs: 5012 }))
     })
     const out = await runP(runShellInHome('sleep 999', '/host/home', '/host/apps', { image: 'img:latest' }, 50))
     expect(out.timedOut).toBe(true)
+    expect(out.durationMs).toBe(5012)
   })
 })
 
@@ -125,5 +127,16 @@ describe('shell-runner — runShellInHome (home mode, docker undefined)', () => 
   it('never touches execCmd (docker-only path) in home mode', async () => {
     await runP(runShellInHome('cmd', '/host/home', '/host/apps', undefined, 5000))
     expect(ex).not.toHaveBeenCalled()
+  })
+
+  it('reports the real duration on a non-zero exit, same as a clean run — unaffected by the docker error path', async () => {
+    sp.mockImplementation((input) => {
+      lastSpawn = input
+      return Effect.succeed(okSpawn({ exitCode: 127, stderr: 'mytool: not found', durationMs: 356 }))
+    })
+    const out = await runP(runShellInHome('mytool --version', '/host/home', '/host/apps', undefined, 5000))
+    expect(out.exitCode).toBe(127)
+    expect(out.timedOut).toBe(false)
+    expect(out.durationMs).toBe(356)
   })
 })

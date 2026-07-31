@@ -41,6 +41,12 @@ export class DockerError extends Data.TaggedError('DockerError')<{
   readonly stderr: string
   readonly timedOut: boolean
   readonly cause?: unknown
+  /**
+   * Real elapsed time of the failed command, when known. Set by `dockerRun`
+   * (the spawner always measures it, exit code or timeout notwithstanding).
+   * Unset for `pullImage` failures — `execCmd` doesn't track duration.
+   */
+  readonly durationMs?: number
 }> {}
 
 export interface DockerRunOptions {
@@ -191,6 +197,7 @@ export const dockerRun = (
           exitCode: null,
           stderr: out.stderr,
           timedOut: true,
+          durationMs: out.durationMs,
         }),
       )
     }
@@ -201,6 +208,7 @@ export const dockerRun = (
           exitCode: out.exitCode,
           stderr: out.stderr,
           timedOut: false,
+          durationMs: out.durationMs,
         }),
       )
     }
