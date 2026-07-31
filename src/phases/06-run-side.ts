@@ -648,7 +648,7 @@ export const runSide = (
       const b = budget()
       const initStart = Date.now()
       const r = yield* runOnce(
-        baseOpts(effectiveInit ?? '', false, undefined),
+        baseOpts(effectiveInit, false, undefined),
         state,
         watchdogMs,
         b.timeoutMs,
@@ -792,8 +792,8 @@ export const runSide = (
     const hasVerify =
       exportFailed === undefined && effectiveVerify !== undefined && effectiveVerify !== ''
     if (hasVerify) {
-      yield* log(`[VERIFY] running "${effectiveVerify ?? ''}"`)
-      const vres = yield* executeVerify(effectiveVerify ?? '', appCwd, timeouts.verifySeconds, {
+      yield* log(`[VERIFY] running "${effectiveVerify}"`)
+      const vres = yield* executeVerify(effectiveVerify, appCwd, timeouts.verifySeconds, {
         ...envRecord,
         HOME: homeEnv.HOME,
       })

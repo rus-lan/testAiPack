@@ -546,7 +546,7 @@ describe('phase 06 — run-side', () => {
       Effect.sync(() => {
         // Both the global and the variant verify text run through spawnProcess
         // as `sh -c <cmd>`; asserting the exact command proves which one won.
-        return { stdout: opts.args?.[1] ?? '', stderr: '', exitCode: 0, durationMs: 1, timedOut: false }
+        return { stdout: opts.args[1] ?? '', stderr: '', exitCode: 0, durationMs: 1, timedOut: false }
       }),
     )
     const input = buildInput(root, {
