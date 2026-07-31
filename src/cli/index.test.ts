@@ -6,23 +6,58 @@ import { Effect } from 'effect'
 import pkg from '../../package.json' with { type: 'json' }
 import { makeTempDir } from '../../tests/setup.js'
 import { ensureDir, exists, readFile, writeJson, writeFile } from '../util/fs.js'
-import {
-  makeManifest,
-  makeMetricsDiff,
-  makeWorkspace,
-} from '../../tests/report-fixture.js'
+// tests/report-fixture.ts is v1-shaped and shared by nine test files across
+// five packages with nobody owning it this wave (orchestrator ruling) — build
+// what's needed from WP1's v2 fixtures (tests/helpers/variants.ts) instead,
+// plus a small local builder for the one shape variants.ts doesn't export
+// directly (a standalone Manifest).
+import { makeMetricsReport, makeReportV2, makeWorkspaceTree } from '../../tests/helpers/variants.js'
+import type { Manifest } from '@generated/types'
 import { VALUE_FLAGS, BOOLEAN_FLAGS } from '../phases/00-cli-parse.js'
+import type * as CompareModule from './compare.js'
+
+const makeFakeManifest = (over: Partial<Manifest> = {}): Manifest => ({
+  ...makeReportV2().manifest,
+  ...over,
+})
 
 vi.mock('./pipeline.js', () => ({ runPipeline: vi.fn() }))
 vi.mock('node:child_process', () => ({ spawn: vi.fn() }))
+// src/cli/rebuild.ts (WP13's file) still references a v1-only generated
+// schema removed by the contract barrier and crashes at module load — stub
+// it here so importing cli/index.ts (which imports rebuild.js) doesn't take
+// this whole test file down. TODO(WP15): unmock once rebuild.ts is v2-shaped.
+vi.mock('./rebuild.js', () => ({ executeRebuild: vi.fn(() => Promise.resolve(0)) }))
+// compare.ts (WP14) has landed with real `isVariantSelector`/`isCompareFormat`
+// — those are pure, pinned, trivial functions, so they run for real here.
+// `executeCompare` alone stays mocked: it does real report I/O, and this file
+// tests CompareCommand's FLAG ROUTING, not compare.ts's own execution (that's
+// compare.test.ts's job).
+vi.mock('./compare.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof CompareModule>()
+  return {
+    ...actual,
+    executeCompare: vi.fn(() => Promise.resolve(0)),
+  }
+})
 
-import { runCli, executeInit, executeReport, executeReview, splitRunFlags } from './index.js'
+import {
+  runCli,
+  executeInit,
+  executeList,
+  executeReport,
+  executeReview,
+  splitRunFlags,
+  resolveVariantSelector,
+} from './index.js'
 import { runPipeline } from './pipeline.js'
 import type { PipelineOutcome } from './pipeline.js'
 import { spawn } from 'node:child_process'
+import { executeCompare } from './compare.js'
 
 const runPipelineMock = vi.mocked(runPipeline)
 const spawnMock = vi.mocked(spawn)
+const executeCompareMock = vi.mocked(executeCompare)
 
 const captureStdout = (): { readonly text: () => string } => {
   const chunks: string[] = []
@@ -112,6 +147,16 @@ describe('cli/index — run --help flag table', () => {
     await runCli(['run', '--help'])
     expect(out.text()).not.toContain('See `testaipack --help` for the full flag table')
   })
+
+  it('lists the n-way variant flags (--parallel, --baseline, --hint) with real defaults', async () => {
+    const out = captureStdout()
+    await runCli(['run', '--help'])
+    const text = out.text()
+    expect(text).toContain('--parallel')
+    expect(text).toContain('--baseline')
+    expect(text).toContain('--hint')
+    expect(text).toContain('default: 2') // DEFAULT_PARALLEL
+  })
 })
 
 describe('cli/index — splitRunFlags', () => {
@@ -179,10 +224,10 @@ describe('cli/index — splitRunFlags', () => {
 describe('cli/index — run wiring (splitRunFlags -> executeRun -> runPipeline)', () => {
   const fakeOutcome: PipelineOutcome = {
     runId: 'run-fake',
-    manifest: makeManifest(),
-    workspace: makeWorkspace(1),
+    manifest: makeFakeManifest(),
+    workspace: makeWorkspaceTree(makeTempDir(), 1, ['old', 'new']),
     rootPath: '/fake/root',
-    metricsDiff: makeMetricsDiff(),
+    metrics: makeMetricsReport(),
     reportPaths: {},
     reviewCommand: 'code /fake/review.code-workspace',
     summary: 'ok',
@@ -248,6 +293,207 @@ describe('cli/index — run wiring (splitRunFlags -> executeRun -> runPipeline)'
     runPipelineMock.mockReturnValue(Effect.succeed({ ...fakeOutcome, diffEscalated: true }))
     const code = await runCli(['run', 'https://example.com/repo.git', '--prompt', 'x'])
     expect(code).not.toBe(0)
+  })
+})
+
+describe('cli/index — resolveVariantSelector (D9 --perspective -> --variant mapping)', () => {
+  it('no --perspective given → the --variant value passes through unchanged', () => {
+    expect(resolveVariantSelector('best', undefined)).toBe('best')
+    expect(resolveVariantSelector('graphify', undefined)).toBe('graphify')
+  })
+
+  it('new-vs-new / old-vs-old map to the new/old variant names', () => {
+    expect(resolveVariantSelector('best', 'new-vs-new')).toBe('new')
+    expect(resolveVariantSelector('best', 'old-vs-old')).toBe('old')
+  })
+
+  it('best / auto map to "best"', () => {
+    expect(resolveVariantSelector('best', 'best')).toBe('best')
+    expect(resolveVariantSelector('best', 'auto')).toBe('best')
+  })
+})
+
+describe('cli/index — compare command (--variant / --variant2 / --perspective routing)', () => {
+  beforeEach(() => {
+    executeCompareMock.mockReset()
+    executeCompareMock.mockResolvedValue(0)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('defaults --variant to "best", applies it to BOTH variant1/variant2, format defaults to md', async () => {
+    const code = await runCli(['compare', 'run-1', 'run-2'])
+    expect(code).toBe(0)
+    expect(executeCompareMock).toHaveBeenCalledTimes(1)
+    const opts = executeCompareMock.mock.calls[0]?.[0] as { variant1?: string; variant2?: string; format?: string }
+    expect(opts.variant1).toBe('best')
+    expect(opts.variant2).toBe('best')
+    expect(opts.format).toBe('md')
+  })
+
+  it('--variant <name> is forwarded as-is to both variant1 and variant2', async () => {
+    await runCli(['compare', 'run-1', 'run-2', '--variant', 'graphify'])
+    const opts = executeCompareMock.mock.calls[0]?.[0] as { variant1?: string; variant2?: string }
+    expect(opts.variant1).toBe('graphify')
+    expect(opts.variant2).toBe('graphify')
+  })
+
+  it('--variant2 overrides run 2\'s selection independently, e.g. comparing a v1 report (old/new) against a v2 report (arbitrary names)', async () => {
+    await runCli(['compare', 'run-1', 'run-2', '--variant', 'new', '--variant2', 'b'])
+    const opts = executeCompareMock.mock.calls[0]?.[0] as { variant1?: string; variant2?: string }
+    expect(opts.variant1).toBe('new')
+    expect(opts.variant2).toBe('b')
+  })
+
+  it('--perspective new-vs-new maps to variant "new" on BOTH sides before reaching executeCompare', async () => {
+    await runCli(['compare', 'run-1', 'run-2', '--perspective', 'new-vs-new'])
+    const opts = executeCompareMock.mock.calls[0]?.[0] as { variant1?: string; variant2?: string }
+    expect(opts.variant1).toBe('new')
+    expect(opts.variant2).toBe('new')
+  })
+
+  it('--perspective old-vs-old maps to "old" on both sides', async () => {
+    await runCli(['compare', 'run-1', 'run-2', '--perspective', 'old-vs-old'])
+    const opts = executeCompareMock.mock.calls[0]?.[0] as { variant1?: string; variant2?: string }
+    expect(opts.variant1).toBe('old')
+    expect(opts.variant2).toBe('old')
+  })
+
+  it('--perspective auto maps to "best" on both sides (still accepted, D9)', async () => {
+    await runCli(['compare', 'run-1', 'run-2', '--perspective', 'auto'])
+    const opts = executeCompareMock.mock.calls[0]?.[0] as { variant1?: string; variant2?: string }
+    expect(opts.variant1).toBe('best')
+    expect(opts.variant2).toBe('best')
+  })
+
+  it('--perspective still lets --variant2 override run 2 independently', async () => {
+    await runCli(['compare', 'run-1', 'run-2', '--perspective', 'new-vs-new', '--variant2', 'b'])
+    const opts = executeCompareMock.mock.calls[0]?.[0] as { variant1?: string; variant2?: string }
+    expect(opts.variant1).toBe('new')
+    expect(opts.variant2).toBe('b')
+  })
+
+  it('an unrecognized --perspective value errors clearly instead of falling through', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const code = await runCli(['compare', 'run-1', 'run-2', '--perspective', 'bogus'])
+    expect(code).toBe(2)
+    expect(executeCompareMock).not.toHaveBeenCalled()
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('invalid --perspective'))
+  })
+
+  it('an empty --variant is rejected by the real isVariantSelector (empty string) instead of calling executeCompare', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const code = await runCli(['compare', 'run-1', 'run-2', '--variant', ''])
+    expect(code).toBe(2)
+    expect(executeCompareMock).not.toHaveBeenCalled()
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('invalid --variant'))
+  })
+
+  it('an empty --variant2 is rejected the same way, naming --variant2 specifically', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const code = await runCli(['compare', 'run-1', 'run-2', '--variant2', ''])
+    expect(code).toBe(2)
+    expect(executeCompareMock).not.toHaveBeenCalled()
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('invalid --variant2'))
+  })
+
+  it('an invalid --format still errors before --variant is even validated', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const code = await runCli(['compare', 'run-1', 'run-2', '--format', 'xml'])
+    expect(code).toBe(2)
+    expect(executeCompareMock).not.toHaveBeenCalled()
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('invalid --format'))
+  })
+
+  it('--format json is forwarded', async () => {
+    await runCli(['compare', 'run-1', 'run-2', '--format', 'json'])
+    const opts = executeCompareMock.mock.calls[0]?.[0] as { format?: string }
+    expect(opts.format).toBe('json')
+  })
+})
+
+describe('cli/index — executeList (PACK column + IMP/REG per 02-phases.md "compare (and list)")', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('"No runs found" when the workspace is empty', async () => {
+    const ws = makeTempDir()
+    const out = captureStdout()
+    const code = await executeList(ws)
+    expect(code).toBe(0)
+    expect(out.text()).toContain('No runs found')
+  })
+
+  it('PACK column joins every registered pack name; IMP/REG sums summary.perVariant across every variant bucket', async () => {
+    const ws = makeTempDir()
+    const dir = path.join(ws, 'run-1')
+    const report = makeReportV2()
+    await Effect.runPromise(ensureDir(path.join(dir, 'results')))
+    await Effect.runPromise(writeJson(path.join(dir, 'manifest.json'), report.manifest))
+    await Effect.runPromise(writeJson(path.join(dir, 'results', 'report.json'), report))
+
+    const out = captureStdout()
+    const code = await executeList(ws)
+    expect(code).toBe(0)
+    const text = out.text()
+    // report.manifest.packs = [graphify, astgrep] (tests/helpers/variants.ts)
+    expect(text).toContain('graphify,astgrep')
+    // perVariant has 2 entries (graphify, astgrep), each with 2 improvements
+    // + 3 regressions (tests/helpers/variants.ts buildSummary) -> 4/6 total.
+    expect(text).toContain('4/6')
+  })
+
+  it('PACK column falls back to "-" for a run with an empty pack registry', async () => {
+    const ws = makeTempDir()
+    const dir = path.join(ws, 'run-1')
+    await Effect.runPromise(ensureDir(path.join(dir, 'results')))
+    await Effect.runPromise(writeJson(path.join(dir, 'manifest.json'), makeFakeManifest({ packs: [] })))
+
+    const out = captureStdout()
+    const code = await executeList(ws)
+    expect(code).toBe(0)
+    const [, dataLine] = out.text().split('\n')
+    expect(dataLine).toMatch(/\s-\s/)
+  })
+
+  it('IMP/REG falls back to "-/-" when report.json is absent (run exists, no report yet)', async () => {
+    const ws = makeTempDir()
+    const dir = path.join(ws, 'run-1')
+    await Effect.runPromise(ensureDir(path.join(dir, 'results')))
+    await Effect.runPromise(writeJson(path.join(dir, 'manifest.json'), makeFakeManifest({ runId: 'run-1' })))
+
+    const out = captureStdout()
+    await executeList(ws)
+    expect(out.text()).toContain('-/-')
+  })
+
+  it('lists multiple runs, most recent first', async () => {
+    const ws = makeTempDir()
+    const older = path.join(ws, 'run-older')
+    const newer = path.join(ws, 'run-newer')
+    await Effect.runPromise(ensureDir(path.join(older, 'results')))
+    await Effect.runPromise(ensureDir(path.join(newer, 'results')))
+    await Effect.runPromise(
+      writeJson(
+        path.join(older, 'manifest.json'),
+        makeFakeManifest({ runId: 'older', timestamp: '2025-01-01T00:00:00.000Z' }),
+      ),
+    )
+    await Effect.runPromise(
+      writeJson(
+        path.join(newer, 'manifest.json'),
+        makeFakeManifest({ runId: 'newer', timestamp: '2025-06-01T00:00:00.000Z' }),
+      ),
+    )
+
+    const out = captureStdout()
+    const code = await executeList(ws)
+    expect(code).toBe(0)
+    const text = out.text()
+    expect(text.indexOf('newer')).toBeLessThan(text.indexOf('older'))
   })
 })
 
@@ -326,6 +572,37 @@ describe('cli/index — executeInit (.gitignore entry)', () => {
     )
     expect(content).toContain('.testaipack/')
   })
+
+  // N2: the scaffold must stay usable the moment a user adds a `variants`
+  // block — `pureBaseline` (legacy-shim-only) in the template would make
+  // that instantly fail as legacy-flag-with-variants (02-phases.md "init").
+  it('the generated config.json does not contain the legacy-only pureBaseline key', async () => {
+    const workspace = path.join(makeTempDir(), 'ws')
+    const code = await executeInit(workspace)
+    expect(code).toBe(0)
+    const raw = await Effect.runPromise(readFile(path.join(workspace, 'config.json')))
+    const config = JSON.parse(raw) as Record<string, unknown>
+    expect(config['pureBaseline']).toBeUndefined()
+  })
+
+  it('adding a variants block on top of the generated scaffold parses cleanly (no legacy-flag-with-variants)', async () => {
+    const workspace = path.join(makeTempDir(), 'ws')
+    await executeInit(workspace)
+    const cfgPath = path.join(workspace, 'config.json')
+    const raw = await Effect.runPromise(readFile(cfgPath))
+    const scaffold = JSON.parse(raw) as Record<string, unknown>
+    await Effect.runPromise(
+      writeJson(cfgPath, {
+        ...scaffold,
+        repoUrl: 'https://example.com/repo.git',
+        prompt: 'x',
+        variants: [{ name: 'a', packs: [] }],
+      }),
+    )
+    const { cliParse } = await import('../phases/00-cli-parse.js')
+    const result = await Effect.runPromise(cliParse({ argv: ['run'], cwd: workspace, configFile: cfgPath }))
+    expect(result.runInput.variants.map((v) => v.name)).toEqual(['a'])
+  })
 })
 
 describe('cli/index — executeReport (typed error channel)', () => {
@@ -337,7 +614,7 @@ describe('cli/index — executeReport (typed error channel)', () => {
     const ws = makeTempDir()
     const dir = path.join(ws, 'run-1')
     await Effect.runPromise(ensureDir(path.join(dir, 'results')))
-    await Effect.runPromise(writeJson(path.join(dir, 'manifest.json'), makeManifest({ runId: 'run-1' })))
+    await Effect.runPromise(writeJson(path.join(dir, 'manifest.json'), makeFakeManifest({ runId: 'run-1' })))
     await Effect.runPromise(writeFile(path.join(dir, 'results', 'report.json'), '{ not json'))
 
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
@@ -361,7 +638,7 @@ describe('cli/index — executeReview (spawn error handling)', () => {
   const seedReviewWorkspace = async (ws: string): Promise<void> => {
     const dir = path.join(ws, 'run-1')
     await Effect.runPromise(ensureDir(path.join(dir, 'results')))
-    await Effect.runPromise(writeJson(path.join(dir, 'manifest.json'), makeManifest({ runId: 'run-1' })))
+    await Effect.runPromise(writeJson(path.join(dir, 'manifest.json'), makeFakeManifest({ runId: 'run-1' })))
     await Effect.runPromise(writeFile(path.join(dir, 'results', 'review.code-workspace'), '{}'))
   }
 

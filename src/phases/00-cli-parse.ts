@@ -3,6 +3,8 @@
  *
  * @see docs/phases/00-cli-parse.ru.md
  * @see contract/phases/00-cli-parse.tsp
+ * @see .research/n-way-variants/00-overview.md §4 (legacy shim)
+ * @see .research/n-way-variants/02-phases.md §00 (mechanics + AC)
  */
 import { Effect } from 'effect'
 import path from 'node:path'
@@ -11,25 +13,27 @@ import type {
   AuthWhitelist,
   CliParseInput,
   CliParseResult,
-  InitSide,
   IsolationMode,
   LogLevel,
   OutputFormat,
+  PackSpec,
   PackType,
   RunInput,
   TimeoutConfig,
   TimelineMode,
+  VariantSpec,
 } from '@generated/types'
 import {
   authWhitelistSchema,
-  initSideSchema,
   isolationModeSchema,
   logLevelSchema,
   outputFormatSchema,
+  packSpecSchema,
   packTypeSchema,
   runInputSchema,
   timeoutConfigSchema,
   timelineModeSchema,
+  variantSpecSchema,
 } from '@generated/schemas'
 import { detectPack, safeRefDisplay } from '../pack/detector.js'
 import type { PackDetectError } from '../pack/detector.js'
@@ -37,6 +41,7 @@ import { cliParseError } from '../errors.js'
 import type { PhaseError } from '../errors.js'
 import { exists, readFile } from '../util/fs.js'
 import { isDockerAvailable } from '../util/docker.js'
+import { redactUrlCredentials } from '../util/redact.js'
 
 export type CliParseOutput = CliParseResult & {
   readonly flagDefaults: Readonly<Record<string, unknown>>
@@ -44,10 +49,109 @@ export type CliParseOutput = CliParseResult & {
   readonly outputPathProvided: boolean
 }
 
+// ---------------------------------------------------------------------------
+// Shared conveniences (n-way variants) — every other package imports these
+// from here rather than re-implementing them.
+// ---------------------------------------------------------------------------
+
+export const VARIANT_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/
+export const RESERVED_VARIANT_NAMES: ReadonlySet<string> = new Set(['source'])
+
+/**
+ * Pack names become a `pack/<name>/` directory segment (03-pack-install.ts)
+ * with no containment guard downstream — so, unlike variant names, this
+ * allows npm-style dots/underscores (real package names use them, e.g.
+ * `lodash.merge`) while still rejecting every path-unsafe shape: no `/` or
+ * `\`, no leading dot (rules out `.`/`..`/hidden-file names in one stroke),
+ * no empty string.
+ */
+const PACK_NAME_SAFE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+/**
+ * A short, comparable name out of a pack ref: strips the `npm:`/`mcp:`/
+ * `agent:`/`command:` prefix, an `mcp:name:config` payload, a trailing
+ * `.git`, and takes the last `/`-segment (handles scoped npm names, git
+ * URLs, and local paths alike). Approximate on purpose — this only feeds a
+ * best-effort naming heuristic (the legacy shim's pack name, and the
+ * variant.packs bare-ref shorthand), not `pack/detector.ts`'s real detection.
+ *
+ * Unlike `ref` itself, the NAME this returns is a disclosed identifier — it
+ * lands in manifest/report provenance and the judge prompt, none of which
+ * redact `ref`. `https://user:token@host/...` must not leak `user:token`
+ * into the name, so the ref is redacted first (harmless no-op for every
+ * other ref shape — `redactUrlCredentials` only matches `http(s)/ssh/git`
+ * URLs with userinfo).
+ */
+export const packShortName = (ref: string): string => {
+  const safeRef = redactUrlCredentials(ref)
+  const prefixMatch = /^(npm:|mcp:|agent:|command:)/i.exec(safeRef)
+  const afterPrefix = prefixMatch === null ? safeRef : safeRef.slice(prefixMatch[0].length)
+  const afterMcpConfig =
+    prefixMatch?.[0].toLowerCase() === 'mcp:' && afterPrefix.includes(':')
+      ? afterPrefix.slice(0, afterPrefix.indexOf(':'))
+      : afterPrefix
+  const clean = afterMcpConfig.replace(/\.git$/, '').replace(/\/+$/, '')
+  const parts = clean.split('/')
+  return (parts[parts.length - 1] ?? clean).toLowerCase()
+}
+
+type EffectiveKey = 'prompt' | 'init' | 'model' | 'hint' | 'verify'
+
+/**
+ * A variant's own field wins when set — EXCEPT an explicit `''`, which
+ * disables the inherited global outright rather than falling back to it
+ * (D7: `init: ""` / `hint: ""` / `verify: ""` explicitly disables).
+ */
+export const effectiveOf = (
+  v: VariantSpec,
+  g: string | undefined,
+  key: EffectiveKey,
+): string | undefined => {
+  const own = v[key]
+  if (own === undefined) return g
+  if (own === '') return undefined
+  return own
+}
+
+/** Resolves `variant.packs` name references against the run's pack registry. */
+export const packsOf = (runInput: RunInput, v: VariantSpec): readonly PackSpec[] => {
+  const registry = new Map(runInput.packs.map((p) => [p.name, p]))
+  return v.packs.flatMap((name) => {
+    const p = registry.get(name)
+    return p === undefined ? [] : [p]
+  })
+}
+
+/** union(every OTHER variant's packs) − this variant's own packs. */
+export const foreignPacksOf = (runInput: RunInput, v: VariantSpec): readonly PackSpec[] => {
+  const own = new Set(v.packs)
+  const foreignNames = runInput.variants
+    .filter((other) => other.name !== v.name)
+    .flatMap((other) => other.packs)
+    .filter((name, i, all) => !own.has(name) && all.indexOf(name) === i)
+  return foreignNames.flatMap((name) => {
+    const p = runInput.packs.find((pp) => pp.name === name)
+    return p === undefined ? [] : [p]
+  })
+}
+
+/** By `runInput.baseline`. Throws if the RunInput was not validated first — every RunInput phase 00 produces satisfies this. */
+export const baselineOf = (runInput: RunInput): VariantSpec => {
+  const found = runInput.variants.find((v) => v.name === runInput.baseline)
+  if (found === undefined) {
+    throw new Error(`baselineOf: no variant named "${runInput.baseline}" (RunInput was not validated)`)
+  }
+  return found
+}
+
+// ---------------------------------------------------------------------------
 // Defaults applied when neither the CLI nor the config file set a value.
 // Named (not inlined at each `?? ...`) so the `run --help` flag table can
 // read the exact value the parser uses instead of a copy that could drift.
+// ---------------------------------------------------------------------------
+
 export const DEFAULT_RUNS = 3
+export const DEFAULT_PARALLEL = 2
 export const DEFAULT_FORMATS: readonly OutputFormat[] = ['md']
 const ALL_FORMATS: readonly OutputFormat[] = ['md', 'html', 'json', 'yaml']
 export const DEFAULT_TIMEOUTS: TimeoutConfig = {
@@ -75,10 +179,16 @@ export const DEFAULT_PROTECT_GIT = false
 export const DEFAULT_COLLAPSE_REPEATS = false
 export const DEFAULT_ALLOW_BASELINE_TOOL = false
 export const DEFAULT_TIMELINE_MODE: TimelineMode = 'side-by-side'
-export const DEFAULT_INIT_SIDE: InitSide = 'both'
 export const DEFAULT_LOG_LEVEL: LogLevel = 'info'
 export const DEFAULT_OUTPUT_PATH = './results'
 export const DEFAULT_WORKSPACE_PATH = './.testaipack'
+
+// `InitSide`/`initSideSchema` no longer exist on the wire (contract barrier,
+// 01-contract.md §1) — `--init-side` is now a pure legacy-shim CLI concept
+// that decides which of the shim's two desugared variants receive `--init`.
+const legacyInitSideSchema = z.enum(['both', 'old', 'new'])
+type LegacyInitSide = z.infer<typeof legacyInitSideSchema>
+export const DEFAULT_INIT_SIDE: LegacyInitSide = 'both'
 
 type TimeoutUpdate = { readonly [K in keyof TimeoutConfig]?: number | undefined }
 type AuthUpdate = { readonly [K in keyof AuthWhitelist]?: boolean | undefined }
@@ -89,13 +199,20 @@ const authPartialSchema = authWhitelistSchema.partial()
 const configFileSchema = z
   .object({
     repoUrl: z.string().optional(),
+    // --- n-way variants (v2) ---
+    variants: z.array(variantSpecSchema).optional(),
+    packs: z.array(packSpecSchema).optional(),
+    baseline: z.string().optional(),
+    parallel: z.number().int().optional(),
+    hint: z.string().optional(),
+    // --- legacy two-sided surface (kept indefinitely) ---
     packRef: z.string().optional(),
     packType: packTypeSchema.optional(),
     prompt: z.string().optional(),
     promptFiles: z.array(z.string()).optional(),
     init: z.string().optional(),
     initFiles: z.array(z.string()).optional(),
-    initSide: initSideSchema.optional(),
+    initSide: legacyInitSideSchema.optional(),
     verify: z.string().optional(),
     judge: z.string().optional(),
     judgeFiles: z.array(z.string()).optional(),
@@ -128,12 +245,42 @@ const configFileSchema = z
   .strict()
 
 type ConfigFile = z.infer<typeof configFileSchema>
+type ConfigPackSpec = NonNullable<ConfigFile['packs']>[number]
+type ConfigVariantSpec = NonNullable<ConfigFile['variants']>[number]
+
+// zod's `.optional()` infers `x?: T | undefined` (an explicit union); the
+// generated `PackSpec`/`VariantSpec` declare plain optionals (`x?: T`).
+// Under `exactOptionalPropertyTypes`, those are NOT the same type — a
+// present-with-`undefined` key is allowed by the former, forbidden by the
+// latter — so a config-parsed pack/variant needs rebuilding through the
+// same conditional-spread pattern the rest of this file already uses for
+// RunInput's own optional fields, not a direct pass-through.
+const toPackSpec = (p: ConfigPackSpec): PackSpec => ({
+  name: p.name,
+  ref: p.ref,
+  ...(p.type !== undefined ? { type: p.type } : {}),
+  ...(p.setup !== undefined ? { setup: p.setup } : {}),
+  ...(p.check !== undefined ? { check: p.check } : {}),
+})
+
+const toVariantSpec = (v: ConfigVariantSpec): VariantSpec => ({
+  name: v.name,
+  packs: [...v.packs],
+  ...(v.prompt !== undefined ? { prompt: v.prompt } : {}),
+  ...(v.init !== undefined ? { init: v.init } : {}),
+  ...(v.model !== undefined ? { model: v.model } : {}),
+  ...(v.hint !== undefined ? { hint: v.hint } : {}),
+  ...(v.pure !== undefined ? { pure: v.pure } : {}),
+  ...(v.verify !== undefined ? { verify: v.verify } : {}),
+  ...(v.exercise !== undefined ? { exercise: v.exercise } : {}),
+  ...(v.allowPacks !== undefined ? { allowPacks: [...v.allowPacks] } : {}),
+})
 
 interface CliRaw {
   readonly repoUrl?: string
   readonly prompts: readonly string[]
   readonly inits: readonly string[]
-  readonly initSide?: InitSide
+  readonly initSide?: LegacyInitSide
   readonly verifies: readonly string[]
   readonly judges: readonly string[]
   readonly runs?: number
@@ -161,6 +308,9 @@ interface CliRaw {
   readonly packExercise?: string
   readonly allowBaselineTool?: boolean
   readonly packHint?: string
+  readonly hint?: string
+  readonly parallel?: number
+  readonly baseline?: string
   readonly timeouts: TimeoutUpdate
   readonly auth: AuthUpdate
 }
@@ -208,6 +358,9 @@ export const VALUE_FLAGS: Readonly<Record<string, string>> = {
   '--pack-check': 'packCheck',
   '--pack-exercise': 'packExercise',
   '--pack-hint': 'packHint',
+  '--hint': 'hint',
+  '--parallel': 'parallel',
+  '--baseline': 'baseline',
   '--timeout-preflight': 'preflightSeconds',
   '--timeout-run': 'runSeconds',
   '--timeout-verify': 'verifySeconds',
@@ -255,6 +408,23 @@ export const AUTH_KEYS: ReadonlySet<keyof AuthWhitelist> = new Set([
 ])
 
 export const NO_AUTH_PREFIX = '--no-auth-'
+
+// Legacy variant-shaping flags/keys: forbidden together with a `variants`
+// config key (00-overview.md §4, normative). `hint`/`--hint` is the new
+// n-way global default and stays allowed in variant mode; `packHint`/
+// `--pack-hint` is its legacy name and is treated the same as the other
+// legacy pack flags here.
+const LEGACY_VARIANT_SHAPING_KEYS: readonly (keyof CliRaw & keyof ConfigFile)[] = [
+  'packRef',
+  'packType',
+  'pureBaseline',
+  'initSide',
+  'packSetup',
+  'packCheck',
+  'packExercise',
+  'allowBaselineTool',
+  'packHint',
+]
 
 const parseIntStrict = (s: string): number | undefined => {
   if (!/^\s*-?\d+\s*$/.test(s)) return undefined
@@ -320,6 +490,16 @@ const parseValueFlag = (
       }
       return setScalar(acc, 'runs', n)
     }
+    if (dest === 'parallel') {
+      const n = parseIntStrict(raw)
+      if (n === undefined) {
+        return yield* Effect.fail(
+          cliParseError(`invalid --parallel value: ${raw}`, 'E_CONFIG_INVALID', { value: raw }),
+        )
+      }
+      return setScalar(acc, 'parallel', n)
+    }
+    if (dest === 'baseline') return setScalar(acc, 'baseline', raw)
     if (dest === 'isolation') {
       const v = yield* parseEnum(raw, isolationModeSchema, '--isolation')
       return setScalar(acc, 'isolation', v)
@@ -333,7 +513,7 @@ const parseValueFlag = (
       return setScalar(acc, 'timelineMode', v)
     }
     if (dest === 'initSide') {
-      const v = yield* parseEnum(raw, initSideSchema, '--init-side')
+      const v = yield* parseEnum(raw, legacyInitSideSchema, '--init-side')
       return setScalar(acc, 'initSide', v)
     }
     if (dest === 'logLevel') {
@@ -358,6 +538,7 @@ const parseValueFlag = (
     if (dest === 'packCheck') return setScalar(acc, 'packCheck', raw)
     if (dest === 'packExercise') return setScalar(acc, 'packExercise', raw)
     if (dest === 'packHint') return setScalar(acc, 'packHint', raw)
+    if (dest === 'hint') return setScalar(acc, 'hint', raw)
     return yield* Effect.fail(
       cliParseError(`unknown flag destination: ${dest}`, 'E_CONFIG_INVALID', { dest }),
     )
@@ -604,6 +785,190 @@ const resolveIsolation = (requested: IsolationMode): Effect.Effect<IsolationResu
       : { isolation: 'home', dockerDowngraded: true }
   })
 
+// ---------------------------------------------------------------------------
+// n-way variants: legacy shim desugaring (00-overview.md §4)
+// ---------------------------------------------------------------------------
+
+interface LegacyDesugarParams {
+  readonly packRef: string | undefined
+  readonly packName: string | undefined
+  readonly packType: PackType | undefined
+  readonly packSetup: string | undefined
+  readonly packCheck: string | undefined
+  readonly packExercise: string | undefined
+  readonly pureBaseline: boolean
+  readonly initSide: LegacyInitSide
+  readonly initText: string | undefined
+  readonly allowBaselineTool: boolean
+}
+
+interface LegacyDesugarResult {
+  readonly packs: readonly PackSpec[]
+  readonly variants: readonly VariantSpec[]
+  readonly baseline: string
+}
+
+const desugarLegacy = (p: LegacyDesugarParams): LegacyDesugarResult => {
+  const packs: readonly PackSpec[] =
+    p.packRef === undefined
+      ? []
+      : [
+          {
+            name: p.packName as string,
+            ref: p.packRef,
+            ...(p.packType !== undefined ? { type: p.packType } : {}),
+            ...(p.packSetup !== undefined ? { setup: p.packSetup } : {}),
+            ...(p.packCheck !== undefined ? { check: p.packCheck } : {}),
+          },
+        ]
+  const oldGetsInit = p.initText !== undefined && (p.initSide === 'both' || p.initSide === 'old')
+  const newGetsInit = p.initText !== undefined && (p.initSide === 'both' || p.initSide === 'new')
+  const variants: readonly VariantSpec[] = [
+    {
+      name: 'old',
+      packs: [],
+      pure: p.pureBaseline,
+      ...(oldGetsInit ? { init: p.initText } : {}),
+      ...(p.allowBaselineTool && p.packName !== undefined ? { allowPacks: [p.packName] } : {}),
+    },
+    {
+      name: 'new',
+      packs: p.packName !== undefined ? [p.packName] : [],
+      pure: false,
+      ...(newGetsInit ? { init: p.initText } : {}),
+      ...(p.packExercise !== undefined ? { exercise: p.packExercise } : {}),
+    },
+  ]
+  return { packs, variants, baseline: 'old' }
+}
+
+interface ResolvedVariantTexts {
+  readonly variants: readonly VariantSpec[]
+  readonly promptFiles: readonly string[]
+  readonly initFiles: readonly string[]
+}
+
+interface ResolvedVariantText {
+  readonly variant: VariantSpec
+  readonly promptFiles: readonly string[]
+  readonly initFiles: readonly string[]
+}
+
+const resolveOneVariantText = (
+  v: VariantSpec,
+  cwd: string,
+): Effect.Effect<ResolvedVariantText, PhaseError> =>
+  Effect.gen(function* () {
+    const promptResolved =
+      v.prompt !== undefined ? yield* resolveTextSpecs([v.prompt], cwd, `variant "${v.name}" prompt`) : undefined
+    const initResolved =
+      v.init !== undefined ? yield* resolveTextSpecs([v.init], cwd, `variant "${v.name}" init`) : undefined
+    const hintResolved =
+      v.hint !== undefined ? yield* resolveTextSpecs([v.hint], cwd, `variant "${v.name}" hint`) : undefined
+    return {
+      variant: {
+        ...v,
+        ...(promptResolved !== undefined ? { prompt: promptResolved.text } : {}),
+        ...(initResolved !== undefined ? { init: initResolved.text } : {}),
+        ...(hintResolved !== undefined ? { hint: hintResolved.text } : {}),
+      },
+      promptFiles: promptResolved?.files ?? [],
+      initFiles: initResolved?.files ?? [],
+    }
+  })
+
+/** `@file` resolution for native-mode variant prompt/init/hint (02-phases.md §00 item 7). */
+const resolveVariantTextFields = (
+  variants: readonly VariantSpec[],
+  cwd: string,
+): Effect.Effect<ResolvedVariantTexts, PhaseError> =>
+  Effect.gen(function* () {
+    const resolved = yield* Effect.forEach(variants, (v) => resolveOneVariantText(v, cwd))
+    return {
+      variants: resolved.map((r) => r.variant),
+      promptFiles: resolved.flatMap((r) => r.promptFiles),
+      initFiles: resolved.flatMap((r) => r.initFiles),
+    }
+  })
+
+interface PackResolution {
+  readonly packs: readonly PackSpec[]
+  readonly variants: readonly VariantSpec[]
+}
+
+interface PackNamesResolution {
+  readonly packs: readonly PackSpec[]
+  readonly names: readonly string[]
+}
+
+/** Resolves one variant's `packs` entries against (and possibly into) the registry-so-far. */
+const resolvePackNamesForOneVariant = (
+  variantName: string,
+  packs: readonly PackSpec[],
+  entries: readonly string[],
+): Effect.Effect<PackNamesResolution, PhaseError> =>
+  Effect.reduce(entries, { packs, names: [] } as PackNamesResolution, (acc, entry) =>
+    Effect.gen(function* () {
+      const existing = acc.packs.find((p) => p.name === entry)
+      if (existing !== undefined) {
+        return { packs: acc.packs, names: [...acc.names, entry] }
+      }
+      const name = packShortName(entry)
+      const collision = acc.packs.find((p) => p.name === name)
+      if (collision !== undefined && collision.ref !== entry) {
+        return yield* Effect.fail(
+          cliParseError(
+            `variant "${variantName}"'s pack ref resolves to a name already registered with a different ref: ${name}`,
+            'E_CONFIG_INVALID',
+            { reason: 'pack-name-collision', variant: variantName, pack: name },
+          ),
+        )
+      }
+      const nextPacks = collision === undefined ? [...acc.packs, { name, ref: entry }] : acc.packs
+      return { packs: nextPacks, names: [...acc.names, name] }
+    }),
+  )
+
+/**
+ * `variant.packs` entries may name a registered pack, or be a bare ref that
+ * auto-registers a new pack named `packShortName(ref)` (D4). Rewrites each
+ * variant's `packs` to canonical registered names, so downstream phases
+ * never re-implement this shorthand.
+ */
+const resolvePacksForVariants = (
+  initialPacks: readonly PackSpec[],
+  variants: readonly VariantSpec[],
+): Effect.Effect<PackResolution, PhaseError> =>
+  Effect.reduce(
+    variants,
+    { packs: initialPacks, variants: [] } as PackResolution,
+    (acc, v) =>
+      Effect.gen(function* () {
+        const resolved = yield* resolvePackNamesForOneVariant(v.name, acc.packs, v.packs)
+        return { packs: resolved.packs, variants: [...acc.variants, { ...v, packs: [...resolved.names] }] }
+      }),
+  )
+
+/** For each PackSpec without `type`, run `detectPack(ref)` so downstream phases never re-detect. */
+const detectPackTypes = (
+  packs: readonly PackSpec[],
+): Effect.Effect<readonly PackSpec[], PhaseError> =>
+  Effect.forEach(packs, (p) =>
+    Effect.gen(function* () {
+      if (p.type !== undefined) return p
+      const detected = yield* detectPack(p.ref).pipe(
+        Effect.mapError((e: PackDetectError) =>
+          cliParseError(`invalid pack reference: ${safeRefDisplay(p.ref)}`, 'E_CONFIG_INVALID', {
+            pack: p.name,
+            ref: safeRefDisplay(p.ref),
+            reason: e.reason,
+          }),
+        ),
+      )
+      return { ...p, type: detected.type }
+    }),
+  )
+
 export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, PhaseError> =>
   Effect.gen(function* () {
     const head = input.argv[0]
@@ -620,6 +985,23 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       )
     }
 
+    const variantMode = cfg?.variants !== undefined
+
+    if (variantMode) {
+      const offender = LEGACY_VARIANT_SHAPING_KEYS.find(
+        (key) => cli[key] !== undefined || cfg[key] !== undefined,
+      )
+      if (offender !== undefined) {
+        return yield* Effect.fail(
+          cliParseError(
+            `--variants (config) cannot be combined with the legacy "${offender}" flag/key`,
+            'E_CONFIG_INVALID',
+            { reason: 'legacy-flag-with-variants', key: offender },
+          ),
+        )
+      }
+    }
+
     const cliPromptSpecs = cli.prompts
     const cfgPromptSpecs: readonly string[] = [
       ...(cfg?.promptFiles ?? []),
@@ -628,18 +1010,14 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const promptSpecs = cliPromptSpecs.length > 0 ? cliPromptSpecs : cfgPromptSpecs
     const promptSrc: 'cli' | 'config' | 'default' =
       cliPromptSpecs.length > 0 ? 'cli' : cfgPromptSpecs.length > 0 ? 'config' : 'default'
-    if (promptSpecs.length === 0) {
-      return yield* Effect.fail(
-        cliParseError('--prompt is required for the run subcommand', 'E_CONFIG_INVALID', {
-          reason: 'prompt-required',
-        }),
-      )
-    }
-    const promptResolved = yield* resolveTextSpecs([...promptSpecs], input.cwd, 'prompt')
+    // Global prompt is optional in v2 (D7) — every variant needs an EFFECTIVE
+    // (own or global) non-empty prompt, checked once packs/variants are built.
+    const promptResolved: ResolvedText | undefined =
+      promptSpecs.length > 0 ? yield* resolveTextSpecs([...promptSpecs], input.cwd, 'prompt') : undefined
 
     const initSpecs: readonly string[] =
       cli.inits.length > 0 ? cli.inits : cfg?.init !== undefined ? [cfg.init] : []
-    const initResolved: ResolvedText | undefined =
+    const globalInitResolved: ResolvedText | undefined =
       initSpecs.length > 0 ? yield* resolveTextSpecs([...initSpecs], input.cwd, 'init') : undefined
 
     const initSidePick = pick(cli.initSide, cfg?.initSide)
@@ -676,25 +1054,6 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
 
     const packRefPick = pick(cli.packRef, cfg?.packRef)
     const explicitPackType = pick(cli.packType, cfg?.packType)
-    const packTypeResolved = yield* Effect.gen(function* () {
-      if (explicitPackType.value !== undefined) {
-        return { value: explicitPackType.value, src: explicitPackType.src }
-      }
-      if (packRefPick.value === undefined) {
-        return { value: undefined as PackType | undefined, src: 'default' as const }
-      }
-      const ref = packRefPick.value
-      const detected = yield* detectPack(ref).pipe(
-        Effect.mapError((e: PackDetectError) =>
-          cliParseError(`invalid --pack reference: ${safeRefDisplay(ref)}`, 'E_CONFIG_INVALID', {
-            packRef: safeRefDisplay(ref),
-            reason: e.reason,
-          }),
-        ),
-      )
-      return { value: detected.type, src: packRefPick.src }
-    })
-    const { value: packTypeValue, src: packTypeSrc } = packTypeResolved
 
     const formats = resolveFormats(cli.formats, normalizeConfigFormats(cfg?.formats))
 
@@ -715,7 +1074,12 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     const packCheckPick = pick(cli.packCheck, cfg?.packCheck)
     const packExercisePick = pick(cli.packExercise, cfg?.packExercise)
     const allowBaselineToolPick = pick(cli.allowBaselineTool, cfg?.allowBaselineTool)
-    const packHintPick = pick(cli.packHint, cfg?.packHint)
+    // `--hint` and its legacy alias `--pack-hint` both feed one global value —
+    // tracked as separate CliRaw/config fields only so the mixing guard above
+    // can still tell `--pack-hint` (legacy) apart from `--hint` (always allowed).
+    const hintPick = pick(cli.hint ?? cli.packHint, cfg?.hint ?? cfg?.packHint)
+    const parallelPick = pick(cli.parallel, cfg?.parallel)
+    const baselinePick = pick(cli.baseline, cfg?.baseline)
 
     const timeouts = mergeTimeouts(cli.timeouts, cfg?.timeouts)
     const badTimeout = firstNonPositiveTimeout(timeouts)
@@ -753,7 +1117,8 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
     }
 
     // --pack-setup/--pack-check/--pack-exercise install/verify/run the PACK's
-    // own runtime — meaningless without a pack under test.
+    // own runtime — meaningless without a pack under test. Legacy-mode-only:
+    // in variant mode these keys are already rejected above.
     if (
       packRefPick.value === undefined &&
       (packSetupPick.value !== undefined || packCheckPick.value !== undefined || packExercisePick.value !== undefined)
@@ -767,19 +1132,221 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       )
     }
 
+    // ---- build packs + variants + baseline (mode-specific) ----
+    interface ModeResult {
+      readonly packs: readonly PackSpec[]
+      readonly variants: readonly VariantSpec[]
+      readonly baselineDefault: string
+      readonly promptFiles: readonly string[]
+      readonly initFiles: readonly string[]
+    }
+
+    const packName = packRefPick.value !== undefined ? packShortName(packRefPick.value) : undefined
+    const desugared = desugarLegacy({
+      packRef: packRefPick.value,
+      packName,
+      packType: explicitPackType.value,
+      packSetup: packSetupPick.value,
+      packCheck: packCheckPick.value,
+      packExercise: packExercisePick.value,
+      pureBaseline: pureBaselinePick.value ?? DEFAULT_PURE_BASELINE,
+      initSide: initSidePick.value ?? DEFAULT_INIT_SIDE,
+      initText: globalInitResolved?.text,
+      allowBaselineTool: allowBaselineToolPick.value ?? DEFAULT_ALLOW_BASELINE_TOOL,
+    })
+
+    const modeResult: ModeResult = variantMode
+      ? yield* resolveVariantTextFields((cfg.variants ?? []).map(toVariantSpec), input.cwd).pipe(
+          Effect.map((resolvedTexts) => ({
+            packs: (cfg.packs ?? []).map(toPackSpec),
+            variants: resolvedTexts.variants,
+            baselineDefault: resolvedTexts.variants[0]?.name ?? '',
+            promptFiles: resolvedTexts.promptFiles,
+            initFiles: resolvedTexts.initFiles,
+          })),
+        )
+      : {
+          packs: desugared.packs,
+          variants: desugared.variants,
+          baselineDefault: desugared.baseline,
+          promptFiles: [],
+          initFiles: [],
+        }
+    const { promptFiles: variantPromptFiles, initFiles: variantInitFiles } = modeResult
+
+    if (modeResult.variants.length === 0) {
+      return yield* Effect.fail(
+        cliParseError('at least one variant is required', 'E_CONFIG_INVALID', { reason: 'no-variants' }),
+      )
+    }
+
+    const invalidName = modeResult.variants.find((v) => !VARIANT_NAME_RE.test(v.name))
+    if (invalidName !== undefined) {
+      return yield* Effect.fail(
+        cliParseError(`invalid variant name: ${invalidName.name}`, 'E_CONFIG_INVALID', {
+          reason: 'invalid-variant-name',
+          variant: invalidName.name,
+        }),
+      )
+    }
+    const reservedName = modeResult.variants.find((v) => RESERVED_VARIANT_NAMES.has(v.name))
+    if (reservedName !== undefined) {
+      return yield* Effect.fail(
+        cliParseError(`variant name is reserved: ${reservedName.name}`, 'E_CONFIG_INVALID', {
+          reason: 'reserved-variant-name',
+          variant: reservedName.name,
+        }),
+      )
+    }
+    const allNames = modeResult.variants.map((v) => v.name)
+    const duplicateName = allNames.find((name, i) => allNames.indexOf(name) !== i)
+    if (duplicateName !== undefined) {
+      return yield* Effect.fail(
+        cliParseError(`duplicate variant name: ${duplicateName}`, 'E_CONFIG_INVALID', {
+          reason: 'duplicate-variant-name',
+          variant: duplicateName,
+        }),
+      )
+    }
+
+    const packResolution = yield* resolvePacksForVariants(modeResult.packs, modeResult.variants)
+
+    // Pack names become a `pack/<name>/` path segment downstream (phase 03)
+    // with no containment guard there — reject anything unsafe here, the
+    // single validation point (both config-declared names and D4 bare-ref
+    // auto-registered ones, which derive from packShortName and could still
+    // land on `..`/`.`/`` for a pathological ref like `.../foo/..`). Runs
+    // BEFORE detectPackTypes on purpose: detectPack has its own internal
+    // name-safety check, but it re-derives that name from `ref` independently
+    // (not from the PackSpec.name this phase actually persists) — it is not
+    // a substitute for validating the name that downstream phases consume.
+    const invalidPackName = packResolution.packs.find((p) => !PACK_NAME_SAFE_RE.test(p.name))
+    if (invalidPackName !== undefined) {
+      return yield* Effect.fail(
+        cliParseError(`invalid pack name: ${invalidPackName.name}`, 'E_CONFIG_INVALID', {
+          reason: 'invalid-pack-name',
+          pack: invalidPackName.name,
+        }),
+      )
+    }
+    const rawPackNames = packResolution.packs.map((p) => p.name)
+    const duplicatePackName = rawPackNames.find((name, i) => rawPackNames.indexOf(name) !== i)
+    if (duplicatePackName !== undefined) {
+      return yield* Effect.fail(
+        cliParseError(`duplicate pack name in registry: ${duplicatePackName}`, 'E_CONFIG_INVALID', {
+          reason: 'duplicate-pack-name',
+          pack: duplicatePackName,
+        }),
+      )
+    }
+
+    const packs = yield* detectPackTypes(packResolution.packs)
+    const variants = packResolution.variants
+
+    const packNames = new Set(rawPackNames)
+    for (const v of variants) {
+      for (const name of v.allowPacks ?? []) {
+        if (!packNames.has(name)) {
+          return yield* Effect.fail(
+            cliParseError(
+              `variant "${v.name}"'s allowPacks names an unknown pack: ${name}`,
+              'E_CONFIG_INVALID',
+              { reason: 'unknown-pack-ref', variant: v.name, pack: name },
+            ),
+          )
+        }
+      }
+    }
+
+    for (const v of variants) {
+      if (v.packs.length > 1) {
+        return yield* Effect.fail(
+          cliParseError(
+            `multi-pack variants are stage 2: variant "${v.name}" declares ${String(v.packs.length)} packs`,
+            'E_CONFIG_INVALID',
+            { reason: 'multi-pack-stage2', variant: v.name },
+          ),
+        )
+      }
+    }
+
+    // `--pack-setup/--pack-check/--pack-exercise require --pack` (above) only
+    // covered the legacy flags; `variant.exercise` is the native-mode
+    // equivalent and was never generalized (02-phases.md §00 item 4:
+    // "variant.exercise requires >=1 pack on the variant, OR any pack in the
+    // run"). Unreachable for the shim (packExercisePick already requires
+    // packRefPick above), so this is purely the native-mode gap — keep the
+    // old message text for the (dead, but symmetric) shim branch.
+    for (const v of variants) {
+      if (v.exercise !== undefined && v.packs.length === 0 && packs.length === 0) {
+        return yield* Effect.fail(
+          cliParseError(
+            variantMode
+              ? `variant "${v.name}" declares exercise but no pack is declared anywhere in the run`
+              : '--pack-setup/--pack-check/--pack-exercise require --pack (or packRef in config)',
+            'E_CONFIG_INVALID',
+            { reason: 'pack-setup-without-pack', variant: v.name },
+          ),
+        )
+      }
+    }
+
+    const baseline = baselinePick.value ?? modeResult.baselineDefault
+    if (!variants.some((v) => v.name === baseline)) {
+      return yield* Effect.fail(
+        cliParseError(`baseline names an unknown variant: ${baseline}`, 'E_CONFIG_INVALID', {
+          reason: 'unknown-baseline',
+          baseline,
+        }),
+      )
+    }
+
+    // Unlike prompt/init/judge, the global hint was never `@file`-resolved as
+    // `--pack-hint` (v1) — kept as a raw string here for the same reason.
+    // Per-variant `hint` (native mode) DOES get `@file` resolution, above.
+    const globalHintValue = hintPick.value
+
+    for (const v of variants) {
+      const effective = effectiveOf(v, promptResolved?.text, 'prompt')
+      if (effective === undefined || effective === '') {
+        return yield* Effect.fail(
+          cliParseError(`variant "${v.name}" has no effective prompt`, 'E_CONFIG_INVALID', {
+            reason: 'prompt-required',
+            variant: v.name,
+          }),
+        )
+      }
+    }
+
+    const parallel = parallelPick.value ?? DEFAULT_PARALLEL
+    if (parallel < 1) {
+      return yield* Effect.fail(
+        cliParseError('--parallel must be ≥ 1', 'E_CONFIG_INVALID', {
+          reason: 'parallel-min',
+          value: parallel,
+        }),
+      )
+    }
+
     // `--pack-check` only ever runs inside preflight's gate 6 (05-preflight.ts)
-    // — with preflight disabled the check is declared but never executed, so
-    // a report claiming the pack was verified functional would be confident
-    // but unverified. Refused outright rather than silently downgrading mode.
-    if (packCheckPick.value !== undefined && !(preflightPick.value ?? DEFAULT_PREFLIGHT_ENABLED)) {
+    // — with preflight disabled a declared check is never executed, so a
+    // report claiming the pack was verified functional would be confident but
+    // unverified. Generalizes the old side-specific check to any pack in the
+    // registry (both legacy and native mode).
+    const preflightEnabledValue = preflightPick.value ?? DEFAULT_PREFLIGHT_ENABLED
+    const packWithCheck = packs.find((p) => p.check !== undefined)
+    if (!preflightEnabledValue && packWithCheck !== undefined) {
       return yield* Effect.fail(
         cliParseError(
-          '--pack-check requires preflight to run it (remove --no-preflight, or drop --pack-check)',
+          `pack "${packWithCheck.name}" declares check, but preflight is disabled (remove --no-preflight, or drop the check)`,
           'E_CONFIG_INVALID',
-          { reason: 'pack-check-without-preflight' },
+          { reason: 'pack-check-without-preflight', pack: packWithCheck.name },
         ),
       )
     }
+
+    const combinedPromptFiles = [...(promptResolved?.files ?? []), ...variantPromptFiles]
+    const combinedInitFiles = [...(globalInitResolved?.files ?? []), ...variantInitFiles]
 
     const sources: readonly ('cli' | 'config' | 'default')[] = [
       repoUrlPick.src,
@@ -787,7 +1354,7 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       runsPick.src,
       isolationPick.src,
       packRefPick.src,
-      packTypeSrc,
+      explicitPackType.src,
       pureBaselinePick.src,
       preflightPick.src,
       diffHtmlPick.src,
@@ -807,7 +1374,10 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       packCheckPick.src,
       packExercisePick.src,
       allowBaselineToolPick.src,
-      packHintPick.src,
+      hintPick.src,
+      parallelPick.src,
+      baselinePick.src,
+      ...(variantMode ? (['config'] as const) : []),
     ]
     const hasCli = sources.includes('cli')
     const hasConfig = sources.includes('config')
@@ -815,30 +1385,33 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       hasCli && hasConfig ? 'merged' : hasConfig ? 'config' : 'cli'
 
     const runInput: RunInput = {
+      schemaVersion: 2,
       repoUrl: repoUrlPick.value,
-      prompt: promptResolved.text,
       runs,
+      parallel,
+      baseline,
+      packs: [...packs],
+      variants: [...variants],
       isolation,
       auth,
-      pureBaseline: pureBaselinePick.value ?? DEFAULT_PURE_BASELINE,
-      preflightEnabled: preflightPick.value ?? DEFAULT_PREFLIGHT_ENABLED,
+      preflightEnabled: preflightEnabledValue,
       formats: [...formats],
       outputPath: outputPick.value ?? DEFAULT_OUTPUT_PATH,
       diffHtml: diffHtmlPick.value ?? DEFAULT_DIFF_HTML,
       protectGit: protectGitPick.value ?? DEFAULT_PROTECT_GIT,
       collapseRepeats: collapsePick.value ?? DEFAULT_COLLAPSE_REPEATS,
       timelineMode: timelinePick.value ?? DEFAULT_TIMELINE_MODE,
-      initSide: initSidePick.value ?? DEFAULT_INIT_SIDE,
       timeouts,
       workspacePath: workspacePick.value ?? DEFAULT_WORKSPACE_PATH,
       logLevel: logPick.value ?? DEFAULT_LOG_LEVEL,
-      allowBaselineTool: allowBaselineToolPick.value ?? DEFAULT_ALLOW_BASELINE_TOOL,
-      ...(packRefPick.value !== undefined ? { packRef: packRefPick.value } : {}),
-      ...(packTypeValue !== undefined ? { packType: packTypeValue } : {}),
-      ...(promptResolved.files.length > 0 ? { promptFiles: [...promptResolved.files] } : {}),
-      ...(initResolved !== undefined
-        ? { init: initResolved.text, initFiles: [...initResolved.files] }
-        : {}),
+      ...(promptResolved !== undefined ? { prompt: promptResolved.text } : {}),
+      ...(combinedPromptFiles.length > 0 ? { promptFiles: combinedPromptFiles } : {}),
+      // The legacy shim distributes `init` per-variant (via --init-side) and
+      // must NOT also set the global `init` — a set global would be inherited
+      // by whichever shim variant was deliberately excluded (D7 fallback).
+      ...(variantMode && globalInitResolved !== undefined ? { init: globalInitResolved.text } : {}),
+      ...(combinedInitFiles.length > 0 ? { initFiles: combinedInitFiles } : {}),
+      ...(globalHintValue !== undefined ? { hint: globalHintValue } : {}),
       ...(verifyResolved !== undefined ? { verify: verifyResolved.text } : {}),
       ...(judgeResolved !== undefined
         ? { judge: judgeResolved.text, judgeFiles: [...judgeResolved.files] }
@@ -848,15 +1421,6 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       ...(modelPick.value !== undefined ? { model: modelPick.value } : {}),
       ...(pricingPick.value !== undefined ? { pricingPath: pricingPick.value } : {}),
       ...(dockerNetworkPick.value !== undefined ? { dockerNetwork: dockerNetworkPick.value } : {}),
-      ...(packSetupPick.value !== undefined ? { packSetup: packSetupPick.value } : {}),
-      ...(packCheckPick.value !== undefined ? { packCheck: packCheckPick.value } : {}),
-      ...(packExercisePick.value !== undefined ? { packExercise: packExercisePick.value } : {}),
-      // Unlike `--init` (which has `--init-side` to target one side on
-      // purpose, see below), `--pack-hint` has no side-targeting knob at
-      // all: `RunInput.packHint` is one scalar field, read by the single
-      // prompt-building path in `06-run-side.ts` with no `side` branch, so
-      // there is no configuration that could send it to only one side.
-      ...(packHintPick.value !== undefined ? { packHint: packHintPick.value } : {}),
     }
 
     const zodResult = runInputSchema.safeParse(runInput)
@@ -868,13 +1432,17 @@ export const cliParse = (input: CliParseInput): Effect.Effect<CliParseOutput, Ph
       )
     }
 
-    // `initSide` has no dedicated report section (see 06-run-side.ru.md) — the
-    // open `flagDefaults` record is how a run's report/manifest discloses which
-    // side(s) actually got `--init`, the same channel `dockerDowngraded` uses.
+    // `initSide` has no report section of its own in v2 — the per-variant
+    // `init` fields in the manifest disclose the same fact, so it no longer
+    // needs a flagDefaults echo. `legacyShim` lets the pipeline (which prints
+    // the D2 --no-pure-baseline behavior-change notice) tell the two modes
+    // apart without re-deriving it from the desugared shape.
     const flagDefaults: Record<string, unknown> = {
       dockerDowngraded,
       configSource,
-      initSide: runInput.initSide,
+      parallel,
+      baseline,
+      legacyShim: !variantMode,
     }
 
     return {

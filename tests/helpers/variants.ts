@@ -190,8 +190,8 @@ const baseSamples: PrimarySampleSet = {
   maxParallelism: 2,
 }
 
-// totalTokens Δ = -1200 (> 2.25*300=675 -> significant, better);
-// stepCount Δ = -6 (> 2.25*2=4.5 -> significant, better); rest in noise.
+// totalTokens Δ = -1200 (|Δ| > 1.5*IQR = 1.5*300 = 450 -> significant, better);
+// stepCount Δ = -6 (|Δ| > 1.5*IQR = 1.5*3 = 4.5 -> significant, better); rest in noise.
 const graphifySamples: PrimarySampleSet = {
   totalTokens: [10_600, 10_800, 11_000, 11_200], // median 10900
   wallClockMs: [37_000, 40_000, 43_000, 46_000], // median 41500 (Δ -3000, ns)
@@ -202,7 +202,7 @@ const graphifySamples: PrimarySampleSet = {
   maxParallelism: 2,
 }
 
-// Every metric moves less than 2.25*d vs base -> "no significant differences",
+// Every metric stays within 1.5*IQR(base) -> "no significant differences",
 // 3 better / 1 worse (totalTokens/wallClockMs/costUsd better, stepCount worse).
 const astgrepSamples: PrimarySampleSet = {
   totalTokens: [11_600, 11_800, 12_000, 12_200], // median 11900 (Δ -200, ns better)

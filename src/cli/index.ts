@@ -36,8 +36,8 @@ import {
 import { runDoctor, hasCriticalFailure } from './doctor.js'
 import {
   executeCompare,
-  isComparePerspective,
   isCompareFormat,
+  isVariantSelector,
 } from './compare.js'
 import { exists, writeJson } from '../util/fs.js'
 import { updateGitignore } from '../util/gitignore.js'
@@ -51,6 +51,7 @@ import {
   NO_AUTH_PREFIX,
   TIMEOUT_KEYS,
   DEFAULT_RUNS,
+  DEFAULT_PARALLEL,
   DEFAULT_TIMEOUTS,
   DEFAULT_AUTH,
   DEFAULT_ISOLATION,
@@ -72,11 +73,10 @@ import {
   packTypeSchema,
   isolationModeSchema,
   timelineModeSchema,
-  initSideSchema,
   logLevelSchema,
   outputFormatSchema,
 } from '@generated/schemas'
-import type { OutputFormat, TimelineMode } from '@generated/types'
+import type { OutputFormat, ReportSummary, TimelineMode } from '@generated/types'
 import { DEFAULT_OPENCODE_IMAGE } from '../isolation/docker-runner.js'
 import pkg from '../../package.json' with { type: 'json' }
 
@@ -235,6 +235,13 @@ const toOutputFormats = (raw: readonly string[]): readonly OutputFormat[] =>
 const padCol = (s: string, n: number): string =>
   s.length >= n ? s : `${s}${' '.repeat(n - s.length)}`
 
+/** Total improvements/regressions across every non-baseline variant's bucket. */
+const perVariantDeltaCounts = (summary: ReportSummary): { readonly imp: number; readonly reg: number } =>
+  summary.perVariant.reduce(
+    (acc, v) => ({ imp: acc.imp + v.improvements.length, reg: acc.reg + v.regressions.length }),
+    { imp: 0, reg: 0 },
+  )
+
 export const executeList = async (workspace: string): Promise<number> => {
   const runs = await Effect.runPromise(listRuns(workspace))
   if (runs.length === 0) {
@@ -247,13 +254,13 @@ export const executeList = async (workspace: string): Promise<number> => {
         (v) => v,
         () => null,
       )
-      const imp = rep === null ? '-' : String(rep.summary.improvements.length)
-      const reg = rep === null ? '-' : String(rep.summary.regressions.length)
+      const counts = rep === null ? undefined : perVariantDeltaCounts(rep.summary)
+      const pack = r.manifest.packs.map((p) => p.name).join(',') || '-'
       return {
         runId: r.runId,
         timestamp: r.timestamp,
-        pack: r.manifest.packRef ?? '-',
-        delta: `${imp}/${reg}`,
+        pack,
+        delta: counts === undefined ? '-/-' : `${String(counts.imp)}/${String(counts.reg)}`,
       }
     }),
   )
@@ -302,11 +309,14 @@ export const executeGc = async (flags: GcFlags): Promise<number> => {
 // init
 // ---------------------------------------------------------------------------
 
+// `pureBaseline` deliberately absent (02-phases.md "doctor / init"): it is a
+// legacy-shim-only key, and the scaffold must stay usable the moment a user
+// adds a `variants` block — with `pureBaseline` present that would instantly
+// fail as `legacy-flag-with-variants`.
 const DEFAULT_CONFIG = {
   runs: 3,
   isolation: 'home',
   formats: ['md'],
-  pureBaseline: true,
   preflightEnabled: true,
 }
 
@@ -376,6 +386,9 @@ const FLAG_DESCRIPTIONS: Readonly<Record<string, string>> = {
   repoUrl: 'Git repository URL to run the A/B comparison against.',
   prompts: 'Prompt for the agent on the build side. Repeatable; @file reads the file content.',
   inits: 'Optional prompt run BEFORE --prompt in the same session (environment setup).',
+  parallel: 'Max variants executed concurrently. Runs within one variant always stay sequential.',
+  baseline: 'Name of the baseline variant that every other variant is compared against. Defaults to the first variant (`old` in the legacy two-sided shim).',
+  hint: 'Text appended to every variant\'s task prompt, identically — e.g. "If the project contains a prepared code index in .graphify/, use it to navigate the code. If it is absent, work as usual." Write it as a conditional so a variant that finds nothing spends at most a couple of tool calls confirming that. Recorded in manifest.json/report. A variant\'s own `hint` field overrides this global.',
   initSide: 'Which side(s) receive --init text. `both` (default) is right for environment prep both sides need for a fair comparison; use `new` for a pack TRIGGER (e.g. a slash command) so the baseline stays unaware of the pack under test; `old` sends it to the baseline only.',
   verifies: 'Optional shell command run after the agent finishes (e.g. "npm test").',
   judges: 'Prompt for an LLM judge that scores the semantic diff between the two sides.',
@@ -398,14 +411,14 @@ const FLAG_DESCRIPTIONS: Readonly<Record<string, string>> = {
   packSetup: 'Shell command that installs the pack\'s runtime into $HOME. Runs once for the whole experiment, then the resulting HOME is copied to every new-side run.',
   packCheck: 'Shell command that exits 0 iff the pack\'s runtime is functional. Runs in every new HOME (must pass) and every old HOME (must fail, unless --allow-baseline-tool).',
   packExercise: 'Shell command that runs the pack\'s own pipeline, once per new-side run, before the agent session starts. Absent -> mode `installed-only` (not an error) when the pack has nothing runnable.',
-  packHint: 'Text appended to the task prompt for BOTH sides, identically — e.g. "If the project contains a prepared code index in .graphify/, use it to navigate the code. If it is absent, work as usual." Never sent to only one side: a one-sided hint would make the comparison meaningless. Write it as a conditional ("if X is present, use it; if not, work as usual") so a baseline that finds nothing spends at most a couple of tool calls confirming that. Typically paired with --pack-exercise, whose output the hint is pointing at. Recorded in manifest.json/report.',
+  packHint: 'Deprecated alias for --hint, kept for existing scripts. Same effect: sets the global hint appended to every variant\'s task prompt.',
   preflightSeconds: 'Timeout for the pre-flight stage (seconds).',
   runSeconds: 'Timeout for a single agent run (seconds).',
   verifySeconds: 'Timeout for the --verify command (seconds).',
   installSeconds: 'Timeout for pack installation (seconds).',
   watchdogSeconds: 'A run is considered hung if there is no output for this many seconds.',
   totalSeconds: 'Overall run timeout (seconds), on top of the other timeouts.',
-  pureBaseline: 'Run the old (baseline) side with --pure (no third-party plugins/skills besides the pack under test). The new side is never pure, or the pack under test would not load.',
+  pureBaseline: 'Legacy two-sided shim only. Run the old (baseline) side with --pure (no third-party plugins/skills besides the pack under test). The new side is never pure, or the pack under test would not load. --no-pure-baseline genuinely disables purity on the baseline (prints a one-line notice).',
   preflightEnabled: 'Pre-flight stage (model ping, pack check).',
   diffHtml: 'Generate an HTML side-by-side diff.',
   protectGit: 'Keeps each run\'s git dir outside the workspace so the agent cannot delete it; costs you opencode\'s snapshot/patch export parts, which need /workspace/.git (exports get poorer). Weak under --isolation home (agent can still reach it). Default: off.',
@@ -439,20 +452,27 @@ const timeoutDefault = (dest: string): number | undefined => {
   return undefined
 }
 
+// `InitSide` no longer exists on the wire (contract barrier) — `--init-side`
+// is a legacy-shim-only CLI concept, so its choices are listed by hand here
+// rather than read off a generated enum schema.
+const LEGACY_INIT_SIDE_CHOICES = 'both|old|new'
+
 const valueFlagType = (dest: string): string => {
   if (dest === 'isolation') return enumChoices(isolationModeSchema)
   if (dest === 'packType') return enumChoices(packTypeSchema)
   if (dest === 'timelineMode') return enumChoices(timelineModeSchema)
-  if (dest === 'initSide') return enumChoices(initSideSchema)
+  if (dest === 'initSide') return LEGACY_INIT_SIDE_CHOICES
   if (dest === 'logLevel') return enumChoices(logLevelSchema)
   if (dest === 'formats') return `${enumChoices(outputFormatSchema)} (repeatable)`
   if (dest === 'auth') return `${[...AUTH_KEYS].join('|')} (repeatable)`
-  if (dest === 'runs' || TIMEOUT_KEYS.has(dest)) return 'int'
+  if (dest === 'runs' || dest === 'parallel' || TIMEOUT_KEYS.has(dest)) return 'int'
   return 'string'
 }
 
 const valueFlagDefault = (dest: string): string => {
   if (dest === 'runs') return String(DEFAULT_RUNS)
+  if (dest === 'parallel') return String(DEFAULT_PARALLEL)
+  if (dest === 'baseline') return 'first variant (`old` in the legacy shim)'
   if (dest === 'isolation') return DEFAULT_ISOLATION
   if (dest === 'packType') return 'auto (from --pack)'
   if (dest === 'timelineMode') return DEFAULT_TIMELINE_MODE
@@ -812,23 +832,50 @@ class GcCommand extends Command {
   }
 }
 
+// D9: `--perspective` is kept as a hidden legacy alias for `--variant`, whose
+// old 4-value enum maps onto the new name|'best' selector. Validated locally
+// (not via a compare.ts export) so this table survives WP14 renaming/removing
+// whatever `ComparePerspective`-shaped exports compare.ts used to have.
+const LEGACY_PERSPECTIVE_TO_VARIANT: Readonly<Record<string, string>> = {
+  'new-vs-new': 'new',
+  'old-vs-old': 'old',
+  best: 'best',
+  auto: 'best',
+}
+
+export const resolveVariantSelector = (
+  variantFlag: string,
+  perspectiveFlag: string | undefined,
+): string =>
+  perspectiveFlag === undefined ? variantFlag : (LEGACY_PERSPECTIVE_TO_VARIANT[perspectiveFlag] ?? perspectiveFlag)
+
 class CompareCommand extends Command {
   static override paths = [['compare']]
   static override usage = Command.Usage({
     category: 'Results',
     description: 'Compare two runs side by side (cross-run A/B).',
     details:
-      'Compares a chosen side of run-id-1 against run-id-2. `--perspective new-vs-new` compares the pack sides; `old-vs-old` compares baselines; `best` picks the higher-successRank side of each run; `auto` decides from the manifests (both pack → new-vs-new, both smoke-test → old-vs-old, otherwise best). `--format md|json` selects the output.',
+      'Compares a chosen variant of run-id-1 against a chosen variant of run-id-2 (run 1\'s selection plays the baseline role). `--variant <name>` selects a variant by name on BOTH runs; `best` (default) picks the variant with the higher median successRank. `--variant2 <name>` overrides run 2\'s selection independently — needed when the two runs use different variant name sets (e.g. comparing a v1 report, which only has old/new, against a v2 report with arbitrary names). `--perspective` is kept as a hidden legacy alias, applied symmetrically to both: `new-vs-new` -> `new`, `old-vs-old` -> `old`, `best`/`auto` -> `best`. `--format md|json` selects the output.',
     examples: [
-      ['Pack then vs now', '$0 compare <run-id-1> <run-id-2> --perspective new-vs-new'],
+      ['Pack then vs now', '$0 compare <run-id-1> <run-id-2> --variant new'],
+      ['Cross-name compare', '$0 compare <run-id-1> <run-id-2> --variant new --variant2 b'],
       ['JSON output', '$0 compare <run-id-1> <run-id-2> --format json'],
     ],
   })
 
   runId1 = Option.String({ required: true, name: 'run-id-1' })
   runId2 = Option.String({ required: true, name: 'run-id-2' })
-  perspective = Option.String('--perspective', 'auto', {
-    description: 'new-vs-new | old-vs-old | best | auto.',
+  variant = Option.String('--variant', 'best', {
+    description: 'Variant name to compare on both runs, or `best` (highest median successRank).',
+  })
+  variant2 = Option.String('--variant2', {
+    required: false,
+    description: 'Override run 2\'s variant selection independently of --variant (defaults to whatever --variant/--perspective resolved to).',
+  })
+  perspective = Option.String('--perspective', {
+    required: false,
+    hidden: true,
+    description: 'Deprecated alias for --variant (applied to both runs): new-vs-new|old-vs-old|best|auto.',
   })
   format = Option.String('--format', 'md', {
     description: 'md | json.',
@@ -838,22 +885,32 @@ class CompareCommand extends Command {
   })
 
   async execute(): Promise<number> {
-    const perspective = this.perspective
     const format = this.format
-    if (!isComparePerspective(perspective)) {
+    if (!isCompareFormat(format)) {
+      console.error(`invalid --format: ${format} (expected md|json)`)
+      return 2
+    }
+    if (this.perspective !== undefined && LEGACY_PERSPECTIVE_TO_VARIANT[this.perspective] === undefined) {
       console.error(
-        `invalid --perspective: ${perspective} (expected new-vs-new|old-vs-old|best|auto)`,
+        `invalid --perspective: ${this.perspective} (expected new-vs-new|old-vs-old|best|auto)`,
       )
       return 2
     }
-    if (!isCompareFormat(format)) {
-      console.error(`invalid --format: ${format} (expected md|json)`)
+    const variant1 = resolveVariantSelector(this.variant, this.perspective)
+    const variant2 = this.variant2 ?? variant1
+    if (!isVariantSelector(variant1)) {
+      console.error(`invalid --variant: ${variant1} (expected a variant name or "best")`)
+      return 2
+    }
+    if (!isVariantSelector(variant2)) {
+      console.error(`invalid --variant2: ${variant2} (expected a variant name or "best")`)
       return 2
     }
     return executeCompare({
       runId1: this.runId1,
       runId2: this.runId2,
-      perspective,
+      variant1,
+      variant2,
       format,
       workspace: this.workspace,
     })
